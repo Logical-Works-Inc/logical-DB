@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "repo-map.schema.json",
+  "title": "Repo Map",
+  "description": "Declarative, relational source of truth for repository structure. Rendered to REPO_MAP.md and reconciled/GC'd by scripts/repo-map.mjs.",
+  "type": "object",
+  "required": ["schema_version", "updated", "canon", "statuses", "repos", "pillars", "nodes", "edges", "reading_order"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string" },
+    "updated": { "type": "string", "description": "ISO date (YYYY-MM-DD) of last reconcile." },
+    "canon": { "type": "string", "description": "ADR that defines the canonical app surface." },
+    "note": { "type": "string" },
+    "statuses": {
+      "type": "object",
+      "description": "Allowed node statuses → meaning. Keys are the enum used by node.status.",
+      "additionalProperties": { "type": "string" }
+    },
+    "repos": {
+      "type": "object",
+      "description": "Dual-repo map. Exactly one entry has this:true (the repo this file lives in).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["role"],
+        "properties": {
+          "this": { "type": "boolean" },
+          "path": { "type": "string" },
+          "ref": { "type": "string" },
+          "role": { "type": "string" },
+          "provides": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "pillars": {
+      "type": "object",
+      "description": "Pillar id → one-line description. Node.pillar must reference a key here.",
+      "additionalProperties": { "type": "string" }
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "path", "status", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "path": { "type": ["string", "null"], "description": "Repo-relative path (trailing / for dirs). null = no single path (e.g. removed root files)." },
+          "status": { "type": "string", "enum": ["live", "meta", "planned", "retired"] },
+          "pillar": { "type": "string" },
+          "kind": { "type": "string" },
+          "summary": { "type": "string" },
+          "components": { "type": "array", "items": { "type": "string" } },
+          "adrs": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Relations between nodes/ADRs. rel is a controlled verb.",
+      "items": {
+        "type": "object",
+        "required": ["from", "rel", "to"],
+        "additionalProperties": false,
+        "properties": {
+          "from": { "type": "string" },
+          "rel": { "type": "string", "enum": ["part_of", "depends_on", "deploys", "supersedes", "superseded_by", "generated_from", "governs"] },
+          "to": { "type": "string" }
+        }
+      }
+    },
+    "reading_order": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ref", "why"],
+        "additionalProperties": false,
+        "properties": { "ref": { "type": "string" }, "why": { "type": "string" } }
+      }
+    }
+  }
+}

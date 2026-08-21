@@ -1,0 +1,49 @@
+<!-- GENERATED from repo-map.json by scripts/repo-map.mjs — DO NOT EDIT BY HAND. -->
+# REPO MAP
+
+Rendered view of `repo-map.json`. Canon: **ADR-001 (canonical DB-model authority)**. Updated: 2026-08-21.
+Reconcile with `node scripts/repo-map.mjs check`.
+
+## Repos (cross-repo)
+
+- `logical-DB` (this repo) — canonical DB model + kernel home (INV-ONE-MODEL-EVERYWHERE)
+- `sentinel` — first consumer — evidence/epistemics engine; pathway researched here 2026-08-21
+- `logic-os-kernel` — consumer — governance structure donor; Fact envelope / Tape contract adapter pending ADR-001 ratification
+- `keel` — CI provider — keel-ci-plan renders and enforces the workflow
+
+## LIVE — authoritative today
+
+| Path | Pillar | What it is |
+|------|--------|------------|
+| `VISION.md` | spec | Thesis, the wall, sequence, day-1 invariants. |
+| `docs/DB_PATHWAY.md` | spec | Spec of record: evidence base, storage classes, compute fraction, phases DB-A…DB-E, axes (GNN §8, filesystem §9, packs §10, DiD §11). (ADR-001) |
+| `GOVERNANCE.md` | governance | Project constitution: authority model, invariants, decision process, proof ladder, licenses. |
+| `laws/governance/` | governance | Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards. Components: operating-model.md, definition-of-done.md, collaboration-standards.md, issue-template.md. |
+| `laws/governance/adr-001-canonical-db-model-authority.md` | governance | PROPOSED: this repo owns the one DB model; constellation registration pending Director ratification. |
+| `scripts/spec-lint.py` | infra | 80-column prose contract over markdown; CI-enforced with teeth. |
+| `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, ci-plan-current, eval-log, cleanup. |
+| `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
+| `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
+
+## META — agent/process tooling
+
+| Path | Pillar | What it is |
+|------|--------|------------|
+| `README.md` | spec | Public charter: five axes, status, read order. |
+| `CODEBOOK.md` | governance | Agent execution index: intent, risk zones, file ownership, delivery loop. |
+| `CLAUDE.md` | governance | Runtime entry & agent contract; AGENTS.md symlinks here. |
+| `repo-map.json` | infra | Declarative structure source of truth (this file). |
+| `scripts/repo-map.mjs` | infra | Validates repo-map.json against its schema and renders REPO_MAP.md; check detects drift. |
+
+## PLANNED — designed, not built
+
+| Path | Pillar | What it is |
+|------|--------|------------|
+| `kernel/` | kernel | Rust workspace: append-only content-addressed core, four storage classes, ports, packs. Lands via DB-A…DB-E. (ADR-001) |
+
+## Reading order
+
+1. `VISION.md` — minute-1 orientation: thesis, five axes, wall, sequence
+2. `docs/DB_PATHWAY.md` — the spec of record — every claim and its evidence
+3. `GOVERNANCE.md` — constitution: invariants that outrank convenience
+4. `laws/governance/README.md` — process map: ticketing, DoD, ADRs
