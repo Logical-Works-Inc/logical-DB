@@ -16,6 +16,13 @@
 # binary's portable tools (differential, differential-selftest). Cargo jobs
 # self-skip until kernel/ lands with DB-A — the guard is loud, not silent,
 # so a future Cargo.toml activates them without editing this plan.
+#
+# Bootstrap edge (hit 2026-08-21, run 32520217693): the FIRST push creating
+# main carries github.event.before = 0000…0, which keel renders as base;
+# keel differential cannot merge-base a zero-SHA and the eval JSONL embeds
+# a base no local run reproduces. Every later push diffs against the prior
+# main tip, which .wwfd/local-ci.sh records identically — parity holds from
+# the second commit onward. Never judge the harness by the bootstrap run.
 version = 1
 name = "Keel CI"
 generated_workflow = ".github/workflows/ci.yml"
