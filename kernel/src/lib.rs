@@ -13,6 +13,7 @@ pub use lgwks_std;
 
 pub mod address;
 pub mod adjacency;
+pub mod claim;
 pub mod error;
 pub mod journal;
 pub mod memkv;
