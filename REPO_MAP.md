@@ -24,8 +24,9 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, ci-plan-current, eval-log, cleanup. |
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
-| `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy) and the gap list G1…G6. |
-| `kernel/` | kernel | DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, Ldb store. G2…G6 land here next. (ADR-001) |
+| `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. |
+| `kernel/` | kernel | DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, BLAKE3 content ids, Ldb store. G2…G6 land here next. (ADR-001) |
+| `organs/` | kernel | Donor-engine dump: fjall, redb, arroy+heed, fst, petgraph, memmap2, half — one functional smoke each; cleanup pass deletes what we do not graft. |
 
 ## META — agent/process tooling
 

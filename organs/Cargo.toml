@@ -1,0 +1,22 @@
+[package]
+name = "ldb-organs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Donor engines from docs/FRANKENSTEIN.md — the dump pass. Each gets a
+# functional smoke in src/dump.rs; the cleanup pass deletes what we do
+# not graft. foundationdb is named there but absent here: it needs
+# libfdb_c on the host (brew install foundationdb) before it can link.
+arroy = "0.8"        # HNSW-in-KV over LMDB (vector organ)
+fst = "0.4"          # finite-state term dictionary
+fjall = "3"          # LSM keyspace, batched journal writer
+half = "2"           # f16/bf16 quantized payload types
+heed = "0.22"        # LMDB binding arroy is built on
+memmap2 = "0.9"      # read-only segment mapping
+petgraph = "0.6"     # graph algorithms for the GNN-query axis
+rand = "0.10"        # seeded RNG demanded by arroy 0.8's builder
+redb = "4"           # embedded ACID B-tree, savepoint tracker
+
+[dev-dependencies]
+tempfile = "3"

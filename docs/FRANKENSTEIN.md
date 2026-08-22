@@ -37,6 +37,26 @@ GOVERNANCE §6 (Apache/MIT donors only land on default paths).
 - u64-packed tree keys — arroy `src/key.rs:9,140`: whole node key
   bit-packs into one u64 for the KV → DB-B vec-code packing.
 
+## Internal donors (the constellation's own)
+
+`~/secure-authority` is the security workspace; its crates are the first
+place to borrow before any external dependency for:
+
+- DiD gauntlet (G4, spec §11) — `secure-identity`, `secure-core`.
+- Claim-class receipts and provenance rows — `secure-audit`,
+  `secure-audit-verify`.
+- At-rest segment crypto — `secure-vault`.
+- Hardware-key provider pattern (TPM/Secure Enclave) — `secure-provider-*`.
+
+## Dump state (organs/)
+
+The donor engines now compile and run under `organs/src/dump.rs`, one
+functional smoke each: fjall 3, redb 4, arroy 0.8 (+heed), fst,
+petgraph, memmap2, half. INV-ORGANS-COMPILE-AND-RUN: a donor that
+cannot pass here is recorded below, never silently dropped.
+Blocked: `foundationdb` crate needs `libfdb_c` on the host (brew
+install foundationdb) before it can link — G5 unblocks it.
+
 ## Sync-layer donors (web-grounded)
 
 - CloudKit: per-zone opaque change token; fetch changes since token;

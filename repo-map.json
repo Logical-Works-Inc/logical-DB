@@ -55,8 +55,9 @@
     { "id": "ci-plan", "path": "ci/keel-ci.toml", "status": "live", "pillar": "infra", "kind": "config", "summary": "Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, ci-plan-current, eval-log, cleanup." },
     { "id": "ci-workflow", "path": ".github/workflows/ci.yml", "status": "live", "pillar": "infra", "kind": "generated", "summary": "Rendered workflow — canonical bytes enforced against the plan in CI." },
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
-    { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy) and the gap list G1…G6." },
-    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, Ldb store. G2…G6 land here next.", "adrs": ["ADR-001"] }
+    { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6." },
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, BLAKE3 content ids, Ldb store. G2…G6 land here next.", "adrs": ["ADR-001"] },
+    { "id": "organs", "path": "organs/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "Donor-engine dump: fjall, redb, arroy+heed, fst, petgraph, memmap2, half — one functional smoke each; cleanup pass deletes what we do not graft." }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },
