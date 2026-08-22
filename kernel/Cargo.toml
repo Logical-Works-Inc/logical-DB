@@ -1,0 +1,8 @@
+[package]
+name = "ldb-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# stdlib has no SHA-2; content identity needs collision resistance.
+sha2 = "0.10"

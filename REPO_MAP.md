@@ -24,6 +24,8 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, ci-plan-current, eval-log, cleanup. |
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
+| `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy) and the gap list G1…G6. |
+| `kernel/` | kernel | DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, Ldb store. G2…G6 land here next. (ADR-001) |
 
 ## META — agent/process tooling
 
@@ -34,12 +36,6 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `CLAUDE.md` | governance | Runtime entry & agent contract; AGENTS.md symlinks here. |
 | `repo-map.json` | infra | Declarative structure source of truth (this file). |
 | `scripts/repo-map.mjs` | infra | Validates repo-map.json against its schema and renders REPO_MAP.md; check detects drift. |
-
-## PLANNED — designed, not built
-
-| Path | Pillar | What it is |
-|------|--------|------------|
-| `kernel/` | kernel | Rust workspace: append-only content-addressed core, four storage classes, ports, packs. Lands via DB-A…DB-E. (ADR-001) |
 
 ## Reading order
 
