@@ -21,7 +21,7 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `laws/governance/` | governance | Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards. Components: operating-model.md, definition-of-done.md, collaboration-standards.md, issue-template.md. |
 | `laws/governance/adr-001-canonical-db-model-authority.md` | governance | PROPOSED: this repo owns the one DB model; constellation registration pending Director ratification. |
 | `scripts/spec-lint.py` | infra | 80-column prose contract over markdown; CI-enforced with teeth. |
-| `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, ci-plan-current, eval-log, cleanup. |
+| `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, property gauntlet, Kani proofs, cargo-mutants teeth, MC/DC slot (keel#480), ci-plan-current, eval-log, cleanup. |
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
 | `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. |

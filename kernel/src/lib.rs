@@ -9,6 +9,8 @@
 //! INV-DURABLE-BEFORE-ACK (fsync lands before the KV sees the write).
 #![forbid(unsafe_code)]
 
+pub use lgwks_std;
+
 pub mod address;
 pub mod error;
 pub mod journal;
@@ -16,6 +18,8 @@ pub mod memkv;
 pub mod model;
 pub mod port;
 pub mod store;
+#[cfg(kani)]
+mod verify;
 
 pub use error::KernelError;
 pub type Result<T> = std::result::Result<T, KernelError>;

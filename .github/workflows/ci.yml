@@ -216,6 +216,99 @@ jobs:
           fi
           cargo clippy --workspace --all-targets -- -D warnings
 
+  property-verify:
+    name: "Property — replay equals the committed-prefix fold"
+    runs-on: ["self-hosted"]
+    needs: ["stack-position", "change-scope"]
+    timeout-minutes: 5
+    steps:
+      - name: "Crash gauntlet: every byte cut recovers an exact batch prefix"
+        if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
+        run: |
+          set -e
+          export KEEL_RUN_ROOT="$HOME/.keel-ci/runs/$KEEL_RUN_ID"
+          export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
+          export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
+          export CARGO_TARGET_DIR="$KEEL_RUN_ROOT/target"
+          mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
+          set -eu
+          if [ ! -f Cargo.toml ]; then
+            echo "SKIP no workspace yet — activates with DB-A kernel/."
+            exit 0
+          fi
+          cargo test -p ldb-kernel --test property_replay_fold
+
+  kani-verify:
+    name: "Proof — Kani harnesses over the pure layers"
+    runs-on: ["self-hosted"]
+    needs: ["stack-position", "change-scope"]
+    timeout-minutes: 20
+    steps:
+      - name: "Prove the proof gate can fail (keel self-test)"
+        run: |
+          set -e
+          export KEEL_RUN_ROOT="$HOME/.keel-ci/runs/$KEEL_RUN_ID"
+          export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
+          export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
+          export CARGO_TARGET_DIR="$KEEL_RUN_ROOT/target"
+          mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
+          keel kani-gate-selftest
+      - name: "Verify model codec totality and journal prefix consistency"
+        if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
+        run: |
+          set -e
+          export KEEL_RUN_ROOT="$HOME/.keel-ci/runs/$KEEL_RUN_ID"
+          export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
+          export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
+          export CARGO_TARGET_DIR="$KEEL_RUN_ROOT/target"
+          mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
+          set -eu
+          if [ ! -f Cargo.toml ]; then
+            echo "SKIP no workspace yet — activates with DB-A kernel/."
+            exit 0
+          fi
+          cargo kani -p ldb-kernel
+
+  mutation-test-verify:
+    name: "Teeth — cargo-mutants refuses survivors in ldb-kernel"
+    runs-on: ["self-hosted"]
+    needs: ["stack-position", "change-scope"]
+    timeout-minutes: 25
+    steps:
+      - name: "Refuse survived or indeterminate mutants"
+        if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
+        run: |
+          set -e
+          export KEEL_RUN_ROOT="$HOME/.keel-ci/runs/$KEEL_RUN_ID"
+          export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
+          export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
+          export CARGO_TARGET_DIR="$KEEL_RUN_ROOT/target"
+          mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
+          set -eu
+          if [ ! -f Cargo.toml ]; then
+            echo "SKIP no workspace yet — activates with DB-A kernel/."
+            exit 0
+          fi
+          cargo mutants -p ldb-kernel
+
+  mcdc-coverage:
+    name: "Coverage — MC/DC awaits the keel consumer contract (keel#480)"
+    runs-on: ["self-hosted"]
+    needs: ["stack-position"]
+    timeout-minutes: 1
+    steps:
+      - name: "Loud skip until keel#480 lands the consumer shape"
+        run: |
+          set -e
+          export KEEL_RUN_ROOT="$HOME/.keel-ci/runs/$KEEL_RUN_ID"
+          export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
+          export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
+          mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
+          set -eu
+          echo "SKIP MC/DC gate is keel-side work in progress: keel#480."
+          echo "     This slot exists so the gap is loud in every run, not silent."
+          exit 0
+
   ci-plan-current:
     name: "Canonical CI — generated workflow is current"
     runs-on: ["self-hosted"]
@@ -250,7 +343,7 @@ jobs:
   eval-log:
     name: "Eval Log — compiled run observability"
     runs-on: ["self-hosted"]
-    needs: ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy", "ci-plan-current"]
+    needs: ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy", "property-verify", "kani-verify", "mutation-test-verify", "mcdc-coverage", "ci-plan-current"]
     if: ${{ always() }}
     timeout-minutes: 1
     steps:
@@ -267,13 +360,17 @@ jobs:
           export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           cat > "$KEEL_EVIDENCE_DIR/eval.jsonl" <<'KEEL_EVAL'
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"21d2f6358f4d658781bac840c398b3d60e8db73612e626de5e4b87c6c1fb6aa4","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
           KEEL_EVAL
           local_eval="$HOME/.keel-ci/eval/$KEEL_HEAD_SHA.jsonl"
           if [ ! -f "$local_eval" ]; then

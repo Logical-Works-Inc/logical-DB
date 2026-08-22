@@ -249,6 +249,100 @@ fi
 cargo clippy --workspace --all-targets -- -D warnings'''
 
 [[job]]
+id = "property-verify"
+name = "Property — replay equals the committed-prefix fold"
+needs = ["stack-position", "change-scope"]
+condition = "success()"
+timeout_minutes = 5
+cost = "expensive"
+working_directory = "."
+runner = ["self-hosted"]
+evidence = ["log", "status"]
+[job.runtime_env]
+CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
+[[job.step]]
+name = "Crash gauntlet: every byte cut recovers an exact batch prefix"
+condition = "needs.change-scope.outputs.code_changed == 'yes'"
+kind = "run"
+run = '''set -eu
+if [ ! -f Cargo.toml ]; then
+  echo "SKIP no workspace yet — activates with DB-A kernel/."
+  exit 0
+fi
+cargo test -p ldb-kernel --test property_replay_fold'''
+
+[[job]]
+id = "kani-verify"
+name = "Proof — Kani harnesses over the pure layers"
+needs = ["stack-position", "change-scope"]
+condition = "success()"
+timeout_minutes = 20
+cost = "expensive"
+working_directory = "."
+runner = ["self-hosted"]
+evidence = ["log", "status"]
+[job.runtime_env]
+CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
+[[job.step]]
+name = "Prove the proof gate can fail (keel self-test)"
+condition = "success()"
+kind = "run"
+run = '''keel kani-gate-selftest'''
+[[job.step]]
+name = "Verify model codec totality and journal prefix consistency"
+condition = "needs.change-scope.outputs.code_changed == 'yes'"
+kind = "run"
+run = '''set -eu
+if [ ! -f Cargo.toml ]; then
+  echo "SKIP no workspace yet — activates with DB-A kernel/."
+  exit 0
+fi
+cargo kani -p ldb-kernel'''
+
+[[job]]
+id = "mutation-test-verify"
+name = "Teeth — cargo-mutants refuses survivors in ldb-kernel"
+needs = ["stack-position", "change-scope"]
+condition = "success()"
+timeout_minutes = 25
+cost = "expensive"
+working_directory = "."
+runner = ["self-hosted"]
+evidence = ["log", "status"]
+[job.runtime_env]
+CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
+[[job.step]]
+name = "Refuse survived or indeterminate mutants"
+condition = "needs.change-scope.outputs.code_changed == 'yes'"
+kind = "run"
+run = '''set -eu
+if [ ! -f Cargo.toml ]; then
+  echo "SKIP no workspace yet — activates with DB-A kernel/."
+  exit 0
+fi
+cargo mutants -p ldb-kernel'''
+
+[[job]]
+id = "mcdc-coverage"
+name = "Coverage — MC/DC awaits the keel consumer contract (keel#480)"
+needs = ["stack-position"]
+condition = "success()"
+timeout_minutes = 1
+cost = "deterministic"
+working_directory = "."
+runner = ["self-hosted"]
+evidence = ["log", "status"]
+[[job.step]]
+name = "Loud skip until keel#480 lands the consumer shape"
+condition = "success()"
+kind = "run"
+run = '''set -eu
+echo "SKIP MC/DC gate is keel-side work in progress: keel#480."
+echo "     This slot exists so the gap is loud in every run, not silent."
+exit 0
+'''
+
+[[job]]
 id = "ci-plan-current"
 name = "Canonical CI — generated workflow is current"
 needs = ["stack-position"]
@@ -284,7 +378,9 @@ echo "OK   generated workflow is byte-current with ci/keel-ci.toml."
 [[job]]
 id = "eval-log"
 name = "Eval Log — compiled run observability"
-needs = ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy", "ci-plan-current"]
+needs = ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy",
+         "property-verify", "kani-verify", "mutation-test-verify", "mcdc-coverage",
+         "ci-plan-current"]
 condition = "always()"
 timeout_minutes = 1
 cost = "epilogue"

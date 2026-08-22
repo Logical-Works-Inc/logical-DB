@@ -2,13 +2,15 @@
 //! type with its wire codec. INV-ONE-CORE-FOUR-CLASSES: a row is
 //! exactly one of five classes; unknown wire tags are unconstructable.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{KernelError, Result};
 
 // ── Class ────────────────────────────────────────────────────
 
 /// The five storage classes. Wire tags 1..=5; tag 0 stays unused so a
 /// zeroed buffer never decodes to a valid class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Class {
     Record = 1,
     Term = 2,
@@ -217,5 +219,27 @@ mod tests {
         let a = Row::new(Class::Record, "x", 1, vec![]);
         let b = Row::new(Class::Record, "x", 2, vec![]);
         assert!(a.key() < b.key());
+    }
+
+    #[test]
+    fn class_survives_json_roundtrip() {
+        for class in [
+            Class::Record,
+            Class::Term,
+            Class::Edge,
+            Class::VecCode,
+            Class::Claim,
+        ] {
+            let json = lgwks_std::json::to_string(&class).unwrap();
+            let back: Class = lgwks_std::json::from_str(&json).unwrap();
+            assert_eq!(back, class);
+        }
+    }
+
+    #[test]
+    fn key_hex_is_inspectable() {
+        let key = point_key(Class::Record, b"doc/1", 42);
+        let hex = lgwks_std::hex::encode(&key);
+        assert!(hex.starts_with("01"), "record tag is 0x01");
     }
 }

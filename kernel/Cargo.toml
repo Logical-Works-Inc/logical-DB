@@ -3,7 +3,12 @@ name = "ldb-kernel"
 version = "0.1.0"
 edition = "2021"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dependencies]
-# stdlib has no cryptographic hash; content identity needs collision
-# resistance plus speed — BLAKE3 (SIMD-backed, 32-byte ids).
-blake3 = "1"
+# lgwks_std is the estate's one approved non-std surface; blake3, hex,
+# serde, and serialization come from it rather than as direct deps.
+lgwks_std = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

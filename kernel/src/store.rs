@@ -10,6 +10,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::journal;
 use crate::model::{self, Class, Row};
 use crate::port::{ClockPort, KvPort};
@@ -19,7 +21,7 @@ use crate::{KernelError, Result};
 
 /// One pending write. The store assigns the ts: a batch commits at a
 /// single version, exactly as FDB commits a transaction at one version.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mutation {
     pub class: Class,
     pub id: Vec<u8>,
