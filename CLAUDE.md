@@ -27,8 +27,9 @@ through published ports; model changes happen here or nowhere.
   (process: operating model, ticketing taxonomy, DoD, issue template, ADRs).
 - **CI** — keel-derived: `ci/keel-ci.toml` → generated
   `.github/workflows/ci.yml`; local runs via `.wwfd/local-ci.sh`.
-- **Kernel code** — `kernel/` is PLANNED (DB-A). Do not create it outside an
-  approved DB-A issue.
+- **Kernel code** — `kernel/` holds the DB-A spine (`ldb-kernel` crate,
+  issue #1). New kernel surface lands via a DB-A…DB-E issue only; the
+  organ map for what gets grafted next is `docs/FRANKENSTEIN.md`.
 
 ## Source of truth
 

@@ -3,7 +3,7 @@
   "schema_version": "1.0.0",
   "updated": "2026-08-21",
   "canon": "ADR-001 (canonical DB-model authority)",
-  "note": "One storage kernel for every repo. Kernel code is planned (DB-A); spec and governance are live today.",
+  "note": "One storage kernel for every repo. DB-A spine landed (kernel/ldb-kernel); spec and governance live.",
   "statuses": {
     "live": "exists and is authoritative today",
     "meta": "agent/process tooling, not product surface",
@@ -55,7 +55,8 @@
     { "id": "ci-plan", "path": "ci/keel-ci.toml", "status": "live", "pillar": "infra", "kind": "config", "summary": "Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, ci-plan-current, eval-log, cleanup." },
     { "id": "ci-workflow", "path": ".github/workflows/ci.yml", "status": "live", "pillar": "infra", "kind": "generated", "summary": "Rendered workflow — canonical bytes enforced against the plan in CI." },
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
-    { "id": "kernel", "path": "kernel/", "status": "planned", "pillar": "kernel", "kind": "dir", "summary": "Rust workspace: append-only content-addressed core, four storage classes, ports, packs. Lands via DB-A…DB-E.", "adrs": ["ADR-001"] }
+    { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy) and the gap list G1…G6." },
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, Ldb store. G2…G6 land here next.", "adrs": ["ADR-001"] }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },
@@ -63,6 +64,7 @@
     { "from": "spec-lint", "rel": "governs", "to": "pathway" },
     { "from": "adr-001", "rel": "governs", "to": "kernel" },
     { "from": "constitution", "rel": "governs", "to": "governance-process" },
+    { "from": "frankenstein", "rel": "governs", "to": "kernel" },
     { "from": "kernel", "rel": "depends_on", "to": "pathway" },
     { "from": "repo-map-script", "rel": "generated_from", "to": "repo-map" }
   ],
