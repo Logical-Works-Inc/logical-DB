@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# stdlib has no SHA-2; content identity needs collision resistance.
-sha2 = "0.10"
+# stdlib has no cryptographic hash; content identity needs collision
+# resistance plus speed — BLAKE3 (SIMD-backed, 32-byte ids).
+blake3 = "1"

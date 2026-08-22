@@ -10,6 +10,10 @@ This repo is the **canonical home of the DB model and kernel** — one model
 across every repo (INV-ONE-MODEL-EVERYWHERE, GOVERNANCE §2). Consumers bind
 through published ports; model changes happen here or nowhere.
 
+**Thesis:** we are Anthropic from the other side — they have the model;
+we have everything else. The DB is the deterministic substrate under
+every model, built for petabytes at a fraction of the cost.
+
 - **Authorities held here:** row model `(class,id,ts,payload)`, storage
   classes, query AST, ingest gauntlet, port traits, pack format.
 - **Authorities NOT held here:** Cid (owner: Braid), Receipt schema (owner:
