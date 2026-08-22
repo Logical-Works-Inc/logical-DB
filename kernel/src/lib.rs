@@ -20,6 +20,7 @@ pub mod model;
 pub mod port;
 pub mod record;
 pub mod store;
+pub mod term;
 #[cfg(kani)]
 mod verify;
 
