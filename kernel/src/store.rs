@@ -160,6 +160,10 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
         self.last_ts
     }
 
+    pub fn kv(&self) -> &S {
+        &self.kv
+    }
+
     pub fn into_parts(self) -> (S, C) {
         (self.kv, self.clock)
     }

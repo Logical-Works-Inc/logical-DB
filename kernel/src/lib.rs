@@ -12,11 +12,13 @@
 pub use lgwks_std;
 
 pub mod address;
+pub mod adjacency;
 pub mod error;
 pub mod journal;
 pub mod memkv;
 pub mod model;
 pub mod port;
+pub mod record;
 pub mod store;
 #[cfg(kani)]
 mod verify;

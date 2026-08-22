@@ -18,6 +18,8 @@ pub enum KernelError {
     TruncatedRow,
     /// A length field exceeds the wire limit (u32).
     RowTooLarge,
+    /// An edge id contains the 0xFF separator byte.
+    InvalidEdgeId,
 }
 
 impl fmt::Display for KernelError {
@@ -32,6 +34,9 @@ impl fmt::Display for KernelError {
             }
             KernelError::TruncatedRow => write!(f, "row ends mid-field"),
             KernelError::RowTooLarge => write!(f, "row field exceeds u32 limit"),
+            KernelError::InvalidEdgeId => {
+                write!(f, "edge id contains the 0xFF separator byte")
+            }
         }
     }
 }
