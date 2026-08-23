@@ -51,7 +51,7 @@ const SEP: u8 = 0xFF;
 
 fn validate_id(id: &[u8]) -> Result<()> {
     if id.contains(&SEP) {
-        return Err(KernelError::InvalidEdgeId);
+        return Err(KernelError::SeparatorInId);
     }
     Ok(())
 }
@@ -310,7 +310,7 @@ mod tests {
         let mut c = test_claim(b"ok", b"ok", b"ok");
         c.claim_id = vec![0x01, 0xFF, 0x02];
         let err = ci.assert_claim(&c).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidEdgeId));
+        assert!(matches!(err, KernelError::SeparatorInId));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -320,7 +320,7 @@ mod tests {
         let mut c = test_claim(b"ok", b"ok", b"ok");
         c.subject = vec![0xFF];
         let err = ci.assert_claim(&c).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidEdgeId));
+        assert!(matches!(err, KernelError::SeparatorInId));
         let _ = std::fs::remove_file(&path);
     }
 }

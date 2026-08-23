@@ -40,6 +40,8 @@ pub trait Adjacency {
     fn outgoing(&self, src: &[u8]) -> Result<Vec<EdgeRow>>;
     fn incoming(&self, dst: &[u8]) -> Result<Vec<EdgeRow>>;
     /// BFS k-hop neighborhood gather (GNN message-passing primitive).
+    /// Iteration order is non-deterministic; callers needing stable
+    /// output must sort the returned ids.
     fn neighbors_k_hop(&self, src: &[u8], k: usize) -> Result<Vec<Vec<u8>>>;
 }
 
@@ -51,7 +53,7 @@ const REV_MARKER: u8 = 0x00;
 
 fn validate_id(id: &[u8]) -> Result<()> {
     if id.contains(&SEP) {
-        return Err(KernelError::InvalidEdgeId);
+        return Err(KernelError::SeparatorInId);
     }
     Ok(())
 }
@@ -341,7 +343,7 @@ mod tests {
         let (mut adj, path) = make_adj("sep");
         let bad_id = &[0x01, 0xFF, 0x02];
         let err = adj.link(bad_id, b"ok", vec![]).unwrap_err();
-        assert!(matches!(err, KernelError::InvalidEdgeId));
+        assert!(matches!(err, KernelError::SeparatorInId));
         let _ = std::fs::remove_file(&path);
     }
 

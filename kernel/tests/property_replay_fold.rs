@@ -51,7 +51,13 @@ fn fold_in(s: &mut Latest, batch: &[Mutation], ts: u64) {
 fn recovered_latest(path: &PathBuf) -> Latest {
     let db = Ldb::open(path, MemKv::new(), CountingClock::default()).unwrap();
     let mut actual = Latest::new();
-    for class in [Class::Record, Class::Term, Class::Edge] {
+    for class in [
+        Class::Record,
+        Class::Term,
+        Class::Edge,
+        Class::VecCode,
+        Class::Claim,
+    ] {
         for row in db.scan_class(class).unwrap() {
             // Ascending key order ⇒ the last insert is the newest version.
             actual.insert(
@@ -68,7 +74,13 @@ fn recovered_latest(path: &PathBuf) -> Latest {
 fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
     let mut rng = Xorshift(0x5EED_2026_0821);
     let ids: Vec<Vec<u8>> = (0..6).map(|i| format!("e{i}").into_bytes()).collect();
-    let classes = [Class::Record, Class::Term, Class::Edge];
+    let classes = [
+        Class::Record,
+        Class::Term,
+        Class::Edge,
+        Class::VecCode,
+        Class::Claim,
+    ];
 
     let path = tmp_path("main");
     let _ = std::fs::remove_file(&path);
@@ -85,7 +97,7 @@ fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
             let batch: Vec<Mutation> = (0..n)
                 .map(|_| {
                     let id = ids[rng.below(ids.len() as u64) as usize].clone();
-                    let class = classes[rng.below(3) as usize];
+                    let class = classes[rng.below(classes.len() as u64) as usize];
                     let len = rng.below(17) as usize;
                     Mutation::new(class, id, (0..len).map(|_| rng.next() as u8).collect())
                 })
