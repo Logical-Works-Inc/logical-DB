@@ -18,8 +18,12 @@ pub enum KernelError {
     TruncatedRow,
     /// A length field exceeds the wire limit (u32).
     RowTooLarge,
-    /// An id field contains the 0xFF separator byte.
-    SeparatorInId,
+    /// A composite-key component exceeds the maximum length (u16).
+    ComponentTooLong,
+    /// An encoded composite key is truncated or malformed.
+    MalformedCompositeKey,
+    /// Attempted to store NaN or infinite confidence.
+    InvalidConfidence,
 }
 
 impl fmt::Display for KernelError {
@@ -34,8 +38,14 @@ impl fmt::Display for KernelError {
             }
             KernelError::TruncatedRow => write!(f, "row ends mid-field"),
             KernelError::RowTooLarge => write!(f, "row field exceeds u32 limit"),
-            KernelError::SeparatorInId => {
-                write!(f, "id field contains the 0xFF separator byte")
+            KernelError::ComponentTooLong => {
+                write!(f, "composite-key component exceeds u16 limit")
+            }
+            KernelError::MalformedCompositeKey => {
+                write!(f, "composite key is truncated or malformed")
+            }
+            KernelError::InvalidConfidence => {
+                write!(f, "confidence must be finite (no NaN or infinity)")
             }
         }
     }

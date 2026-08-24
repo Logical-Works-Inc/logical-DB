@@ -158,9 +158,8 @@ mod tests {
     #[test]
     fn a_decode_failure_inside_an_intact_frame_is_a_hard_error() {
         let mut bytes = Vec::new();
-        // Intact frame whose payload carries invalid wire (tag 0).
-        append_frame(&mut bytes, &[0u8]).unwrap();
-        // The sink does what the store's sink does: decode the frame.
+        // Intact frame whose payload carries invalid wire (class tag 0, op tag 1).
+        append_frame(&mut bytes, &[0u8, 1u8]).unwrap();
         let mut calls = 0;
         let err = replay(&mut bytes.as_slice(), |frame| {
             calls += 1;

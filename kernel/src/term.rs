@@ -3,21 +3,18 @@
 //! to exactly one `Class::Term` row — no shadow index, no separate
 //! inverted file.
 //!
-//! Key layout (id field passed to `Mutation::new`):
-//! - `[term][0xFF][doc_id]`
-//!
-//! The class tag `0x02` is prepended by `model::point_key`; the id
-//! field here is everything after the tag. Neither term nor doc_id
-//! may contain `0xFF`.
+//! Key layout (length-prefixed composite, no reserved bytes):
+//! - Posting: namespace 0x01: `[0x01][len(term) u16 BE][term][len(doc_id) u16 BE][doc_id]`
+//! - Doc manifest: namespace 0x02: `[0x02][len(doc_id) u16 BE][doc_id]`
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Class;
+use crate::model::{self, Class};
 use crate::port::{ClockPort, KvPort};
 use crate::store::{Ldb, Mutation};
-use crate::{KernelError, Result};
+use crate::Result;
 
 // ── Posting ─────────────────────────────────────────────────
 
@@ -28,63 +25,43 @@ pub struct Posting {
     pub field_len: u32,
 }
 
+/// Per-document manifest stored alongside postings for O(1) stats.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DocManifest {
+    field_len: u32,
+    term_count: u32,
+}
+
 // ── TermIndex port ──────────────────────────────────────────
 
 /// Port trait for the Term storage class. Engines are swappable
 /// behind this; MemTermIndex is the deterministic reference impl.
 pub trait TermIndex {
-    /// Indexes all terms for one document in one atomic batch.
-    /// `terms` is `(term_bytes, term_frequency)` per term.
     fn index_doc(&mut self, doc_id: &[u8], terms: &[(Vec<u8>, u32)], field_len: u32)
         -> Result<u64>;
 
-    /// Tombstone removal: writes zero-length payload for each
-    /// (term, doc_id) pair in one atomic batch.
     fn remove_doc(&mut self, doc_id: &[u8], terms: &[Vec<u8>]) -> Result<u64>;
 
-    /// BM25 ranked search returning top-k (doc_id, score) pairs,
-    /// descending by score.
     fn search(&self, query_terms: &[Vec<u8>], k: usize) -> Result<Vec<(Vec<u8>, f64)>>;
 
-    /// Raw posting list for one term (all live versions).
     fn postings_for_term(&self, term: &[u8]) -> Result<Vec<Posting>>;
 }
 
 // ── Key helpers ─────────────────────────────────────────────
 
-const SEP: u8 = 0xFF;
+const POSTING_NS: u8 = 0x01;
+const MANIFEST_NS: u8 = 0x02;
 
-fn validate_id(id: &[u8]) -> Result<()> {
-    if id.contains(&SEP) {
-        return Err(KernelError::SeparatorInId);
-    }
-    Ok(())
+fn posting_id(term: &[u8], doc_id: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(POSTING_NS, &[term, doc_id])
 }
 
-fn term_doc_id(term: &[u8], doc_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(term.len() + 1 + doc_id.len());
-    id.extend_from_slice(term);
-    id.push(SEP);
-    id.extend_from_slice(doc_id);
-    id
+fn posting_term_prefix(term: &[u8]) -> Result<Vec<u8>> {
+    model::composite_prefix(POSTING_NS, term)
 }
 
-/// Prefix for all postings of one term: `[term][0xFF]`.
-fn term_prefix(term: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(term.len() + 1);
-    p.extend_from_slice(term);
-    p.push(SEP);
-    p
-}
-
-/// Splits a Term-class key's id portion `[term][0xFF][doc_id]`
-/// back into `(term, doc_id)`.
-fn split_term_id(id: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let sep_pos = id
-        .iter()
-        .position(|&b| b == SEP)
-        .ok_or(KernelError::TruncatedRow)?;
-    Ok((id[..sep_pos].to_vec(), id[sep_pos + 1..].to_vec()))
+fn manifest_id(doc_id: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(MANIFEST_NS, &[doc_id])
 }
 
 // ── MemTermIndex ────────────────────────────────────────────
@@ -102,23 +79,27 @@ impl<S: KvPort, C: ClockPort> MemTermIndex<S, C> {
         self.store
     }
 
-    /// Collects corpus stats from all live Term rows: (doc_count,
-    /// avg_field_len). A doc is counted once per unique doc_id seen
-    /// in the latest posting version.
     fn corpus_stats(&self) -> Result<(usize, f64)> {
-        let prefix = crate::model::class_prefix(Class::Term);
-        let rows = self.store.kv().scan_prefix(&prefix)?;
+        let mut prefix = model::class_prefix(Class::Term);
+        prefix.extend_from_slice(&model::composite_ns_prefix(MANIFEST_NS));
+        let raw = self.store.kv().scan_prefix(&prefix)?;
         let mut docs: HashMap<Vec<u8>, u32> = HashMap::new();
-        for (key, payload) in &rows {
-            if payload.is_empty() {
+        for (key, stored) in &raw {
+            if stored.is_empty() || stored[0] == 2 {
+                let (_, id, _) = model::split_key(key)?;
+                let (_, parts) = model::decode_composite(&id)?;
+                if !parts.is_empty() {
+                    docs.remove(&parts[0]);
+                }
                 continue;
             }
-            let (_class, id, _ts) = crate::model::split_key(key)?;
-            let (_term, doc_id) = split_term_id(&id)?;
-            if let Ok(posting) = serde_json::from_slice::<Posting>(payload) {
-                docs.entry(doc_id)
-                    .and_modify(|fl| *fl = posting.field_len)
-                    .or_insert(posting.field_len);
+            let payload = &stored[1..];
+            if let Ok(manifest) = serde_json::from_slice::<DocManifest>(payload) {
+                let (_, id, _) = model::split_key(key)?;
+                let (_, parts) = model::decode_composite(&id)?;
+                if !parts.is_empty() {
+                    docs.insert(parts[0].clone(), manifest.field_len);
+                }
             }
         }
         let n = docs.len();
@@ -137,57 +118,60 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
         terms: &[(Vec<u8>, u32)],
         field_len: u32,
     ) -> Result<u64> {
-        validate_id(doc_id)?;
-        let mut batch = Vec::with_capacity(terms.len());
+        let mut batch = Vec::with_capacity(terms.len() + 1);
         for (term, freq) in terms {
-            validate_id(term)?;
             let posting = Posting {
                 doc_id: doc_id.to_vec(),
                 term_freq: *freq,
                 field_len,
             };
             let payload = serde_json::to_vec(&posting).map_err(|e| {
-                KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                crate::KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })?;
-            batch.push(Mutation::new(
+            batch.push(Mutation::put(
                 Class::Term,
-                term_doc_id(term, doc_id),
+                posting_id(term, doc_id)?,
                 payload,
             ));
         }
+        let manifest = DocManifest {
+            field_len,
+            term_count: terms.len() as u32,
+        };
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|e| {
+            crate::KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+        batch.push(Mutation::put(
+            Class::Term,
+            manifest_id(doc_id)?,
+            manifest_payload,
+        ));
         self.store.commit(&batch)
     }
 
     fn remove_doc(&mut self, doc_id: &[u8], terms: &[Vec<u8>]) -> Result<u64> {
-        validate_id(doc_id)?;
-        let mut batch = Vec::with_capacity(terms.len());
+        let mut batch = Vec::with_capacity(terms.len() + 1);
         for term in terms {
-            validate_id(term)?;
-            batch.push(Mutation::new(
-                Class::Term,
-                term_doc_id(term, doc_id),
-                vec![],
-            ));
+            batch.push(Mutation::delete(Class::Term, posting_id(term, doc_id)?));
         }
+        batch.push(Mutation::delete(Class::Term, manifest_id(doc_id)?));
         self.store.commit(&batch)
     }
 
     fn postings_for_term(&self, term: &[u8]) -> Result<Vec<Posting>> {
-        let mut key_prefix = crate::model::class_prefix(Class::Term);
-        key_prefix.extend_from_slice(&term_prefix(term));
+        let mut key_prefix = model::class_prefix(Class::Term);
+        key_prefix.extend_from_slice(&posting_term_prefix(term)?);
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
-        // Keys sort ascending by (doc_id, ts); last entry per doc_id
-        // is the latest version. Overwrite unconditionally, then drop
-        // tombstones (empty payload).
         let mut best: HashMap<Vec<u8>, Option<Posting>> = HashMap::new();
-        for (_key, payload) in raw {
-            if payload.is_empty() {
-                if let Ok((_class, id, _ts)) = crate::model::split_key(&_key) {
-                    let (_term, doc_id) = split_term_id(&id)?;
-                    best.insert(doc_id, None);
+        for (key, stored) in raw {
+            let (_, id, _) = model::split_key(&key)?;
+            if stored.is_empty() || stored[0] == 2 {
+                best.insert(id, None);
+            } else {
+                let payload = &stored[1..];
+                if let Ok(posting) = serde_json::from_slice::<Posting>(payload) {
+                    best.insert(id, Some(posting));
                 }
-            } else if let Ok(posting) = serde_json::from_slice::<Posting>(&payload) {
-                best.insert(posting.doc_id.clone(), Some(posting));
             }
         }
         Ok(best.into_values().flatten().collect())
@@ -207,7 +191,6 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
         for term in query_terms {
             let postings = self.postings_for_term(term)?;
             let df = postings.len() as f64;
-            // IDF: log((N - df + 0.5) / (df + 0.5) + 1.0)
             let idf = ((n as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
 
             for p in &postings {
@@ -219,7 +202,11 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
         }
 
         let mut ranked: Vec<_> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         ranked.truncate(k);
         Ok(ranked)
     }
@@ -270,12 +257,12 @@ mod tests {
     }
 
     #[test]
-    fn remove_doc_writes_tombstone() {
+    fn remove_doc_hides_postings() {
         let (mut idx, path) = make_idx("tomb");
         idx.index_doc(b"d1", &[(b"hello".to_vec(), 2)], 8).unwrap();
         idx.remove_doc(b"d1", &[b"hello".to_vec()]).unwrap();
         let postings = idx.postings_for_term(b"hello").unwrap();
-        assert!(postings.is_empty(), "tombstoned postings are filtered out");
+        assert!(postings.is_empty(), "deleted postings are hidden");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -294,12 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn separator_in_term_is_rejected() {
-        let (mut idx, path) = make_idx("sep");
-        let err = idx
-            .index_doc(b"d", &[(vec![0x01, 0xFF, 0x02], 1)], 5)
-            .unwrap_err();
-        assert!(matches!(err, KernelError::SeparatorInId));
+    fn arbitrary_byte_terms_are_accepted() {
+        let (mut idx, path) = make_idx("arb");
+        let term = vec![0xFF, 0x00, 0xFF];
+        idx.index_doc(b"d", &[(term.clone(), 1)], 5).unwrap();
+        let postings = idx.postings_for_term(&term).unwrap();
+        assert_eq!(postings.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 

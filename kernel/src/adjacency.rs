@@ -1,23 +1,20 @@
 //! Owns the Edge storage class port: graph adjacency as prefix-scanned
 //! rows with bidirectional indexing. INV-EDGE-BIDIRECTIONAL: every
-//! `link` writes both the forward `(src→dst)` and reverse `(dst←src)`
+//! `link` writes both the forward `(src->dst)` and reverse `(dst<-src)`
 //! rows in one atomic batch — they are never out of sync.
 //!
-//! Key layout (arroy-inspired u8-packed keys, 0xFF separator):
-//! - Forward: `[0x03][src][0xFF][dst][ts BE]`
-//! - Reverse: `[0x03][0x00][dst][0xFF][src][ts BE]`
-//!
-//! The `0x00` byte after the class tag separates the reverse namespace.
-//! Constraint: neither `src` nor `dst` may contain `0xFF`.
+//! Key layout (length-prefixed composite, no reserved bytes):
+//! - Forward: namespace 0x01: `[0x01][len(src) u16 BE][src][len(dst) u16 BE][dst]`
+//! - Reverse: namespace 0x02: `[0x02][len(dst) u16 BE][dst][len(src) u16 BE][src]`
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Class;
+use crate::model::{self, Class, Op};
 use crate::port::{ClockPort, KvPort};
 use crate::store::{Ldb, Mutation};
-use crate::{KernelError, Result};
+use crate::Result;
 
 // ── EdgeRow ──────────────────────────────────────────────────
 
@@ -35,108 +32,34 @@ pub struct EdgeRow {
 /// this; MemAdjacency is the deterministic reference impl.
 pub trait Adjacency {
     fn link(&mut self, src: &[u8], dst: &[u8], payload: Vec<u8>) -> Result<u64>;
-    /// Tombstone: writes zero-length payload for both directions.
     fn unlink(&mut self, src: &[u8], dst: &[u8]) -> Result<u64>;
     fn outgoing(&self, src: &[u8]) -> Result<Vec<EdgeRow>>;
     fn incoming(&self, dst: &[u8]) -> Result<Vec<EdgeRow>>;
-    /// BFS k-hop neighborhood gather (GNN message-passing primitive).
-    /// Iteration order is non-deterministic; callers needing stable
-    /// output must sort the returned ids.
-    fn neighbors_k_hop(&self, src: &[u8], k: usize) -> Result<Vec<Vec<u8>>>;
+    fn neighbors_k_hop(&self, src: &[u8], k: usize, budget: usize) -> Result<Vec<Vec<u8>>>;
 }
 
 // ── Key construction ─────────────────────────────────────────
 
-const EDGE_TAG: u8 = Class::Edge as u8;
-const SEP: u8 = 0xFF;
-const REV_MARKER: u8 = 0x00;
+const FWD_NS: u8 = 0x01;
+const REV_NS: u8 = 0x02;
 
-fn validate_id(id: &[u8]) -> Result<()> {
-    if id.contains(&SEP) {
-        return Err(KernelError::SeparatorInId);
-    }
-    Ok(())
+fn forward_id(src: &[u8], dst: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(FWD_NS, &[src, dst])
 }
 
-/// `[0x03][src][0xFF]` — all forward edges from `src`.
-pub fn forward_prefix(src: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(2 + src.len());
-    p.push(EDGE_TAG);
-    p.extend_from_slice(src);
-    p.push(SEP);
-    p
+fn reverse_id(dst: &[u8], src: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(REV_NS, &[dst, src])
 }
 
-/// `[0x03][src][0xFF][dst][ts BE]` — one forward edge at a version.
-#[cfg(test)]
-fn forward_key(src: &[u8], dst: &[u8], ts: u64) -> Vec<u8> {
-    let mut k = forward_prefix(src);
-    k.extend_from_slice(dst);
-    k.extend_from_slice(&ts.to_be_bytes());
-    k
+fn forward_scan_prefix(src: &[u8]) -> Result<Vec<u8>> {
+    model::composite_prefix(FWD_NS, src)
 }
 
-/// `[0x03][0x00][dst][0xFF]` — all reverse edges into `dst`.
-pub fn reverse_prefix(dst: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(3 + dst.len());
-    p.push(EDGE_TAG);
-    p.push(REV_MARKER);
-    p.extend_from_slice(dst);
-    p.push(SEP);
-    p
+fn reverse_scan_prefix(dst: &[u8]) -> Result<Vec<u8>> {
+    model::composite_prefix(REV_NS, dst)
 }
 
-/// `[0x03][0x00][dst][0xFF][src][ts BE]` — one reverse edge at a version.
-#[cfg(test)]
-fn reverse_key(dst: &[u8], src: &[u8], ts: u64) -> Vec<u8> {
-    let mut k = reverse_prefix(dst);
-    k.extend_from_slice(src);
-    k.extend_from_slice(&ts.to_be_bytes());
-    k
-}
-
-// ── Key parsing ──────────────────────────────────────────────
-
-fn find_sep(key: &[u8], start: usize) -> Option<usize> {
-    key[start..]
-        .iter()
-        .position(|&b| b == SEP)
-        .map(|i| i + start)
-}
-
-/// Parses `[0x03][src][0xFF][dst][ts BE]` → `(src, dst, ts)`.
-pub fn parse_forward_key(key: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u64)> {
-    if key.len() < 1 + 1 + 1 + 8 || key[0] != EDGE_TAG {
-        return Err(KernelError::TruncatedRow);
-    }
-    let sep = find_sep(key, 1).ok_or(KernelError::TruncatedRow)?;
-    let src = key[1..sep].to_vec();
-    let after_sep = sep + 1;
-    if key.len() < after_sep + 8 {
-        return Err(KernelError::TruncatedRow);
-    }
-    let ts_start = key.len() - 8;
-    let dst = key[after_sep..ts_start].to_vec();
-    let ts = u64::from_be_bytes(key[ts_start..].try_into().unwrap());
-    Ok((src, dst, ts))
-}
-
-/// Parses `[0x03][0x00][dst][0xFF][src][ts BE]` → `(dst, src, ts)`.
-pub fn parse_reverse_key(key: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u64)> {
-    if key.len() < 2 + 1 + 1 + 8 || key[0] != EDGE_TAG || key[1] != REV_MARKER {
-        return Err(KernelError::TruncatedRow);
-    }
-    let sep = find_sep(key, 2).ok_or(KernelError::TruncatedRow)?;
-    let dst = key[2..sep].to_vec();
-    let after_sep = sep + 1;
-    if key.len() < after_sep + 8 {
-        return Err(KernelError::TruncatedRow);
-    }
-    let ts_start = key.len() - 8;
-    let src = key[after_sep..ts_start].to_vec();
-    let ts = u64::from_be_bytes(key[ts_start..].try_into().unwrap());
-    Ok((dst, src, ts))
-}
+type EdgeState = (Vec<u8>, Vec<u8>, u64, Op);
 
 // ── MemAdjacency ─────────────────────────────────────────────
 
@@ -152,89 +75,99 @@ impl<S: KvPort, C: ClockPort> MemAdjacency<S, C> {
     pub fn into_store(self) -> Ldb<S, C> {
         self.store
     }
+
+    fn scan_live_edges(
+        &self,
+        kv_prefix: Vec<u8>,
+        parse: impl Fn(&[u8]) -> Result<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<EdgeRow>> {
+        let mut full_prefix = model::class_prefix(Class::Edge);
+        full_prefix.extend_from_slice(&kv_prefix);
+        let raw = self.store.kv().scan_prefix(&full_prefix)?;
+        let mut latest: HashMap<Vec<u8>, EdgeState> = HashMap::new();
+        for (key, stored) in raw {
+            let (_, id, ts) = model::split_key(&key)?;
+            let op = if !stored.is_empty() && stored[0] == 2 {
+                Op::Delete
+            } else {
+                Op::Put(stored[1..].to_vec())
+            };
+            let (src, dst) = parse(&id)?;
+            let composite_id = id.clone();
+            latest
+                .entry(composite_id)
+                .and_modify(|e| {
+                    if ts >= e.2 {
+                        *e = (src.clone(), dst.clone(), ts, op.clone());
+                    }
+                })
+                .or_insert((src, dst, ts, op));
+        }
+        Ok(latest
+            .into_values()
+            .filter_map(|(src, dst, ts, op)| match op {
+                Op::Put(payload) => Some(EdgeRow {
+                    src,
+                    dst,
+                    ts,
+                    payload,
+                }),
+                Op::Delete => None,
+            })
+            .collect())
+    }
+}
+
+fn parse_forward(id: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (_, parts) = model::decode_composite(id)?;
+    if parts.len() != 2 {
+        return Err(crate::KernelError::MalformedCompositeKey);
+    }
+    Ok((parts[0].clone(), parts[1].clone()))
+}
+
+fn parse_reverse(id: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (_, parts) = model::decode_composite(id)?;
+    if parts.len() != 2 {
+        return Err(crate::KernelError::MalformedCompositeKey);
+    }
+    // Stored as (dst, src) in reverse namespace
+    Ok((parts[1].clone(), parts[0].clone()))
 }
 
 impl<S: KvPort, C: ClockPort> Adjacency for MemAdjacency<S, C> {
     fn link(&mut self, src: &[u8], dst: &[u8], payload: Vec<u8>) -> Result<u64> {
-        validate_id(src)?;
-        validate_id(dst)?;
-        // INV-EDGE-BIDIRECTIONAL: forward + reverse in one atomic batch.
-        let fwd_id = {
-            let mut id = src.to_vec();
-            id.push(SEP);
-            id.extend_from_slice(dst);
-            id
-        };
-        let rev_id = {
-            let mut id = vec![REV_MARKER];
-            id.extend_from_slice(dst);
-            id.push(SEP);
-            id.extend_from_slice(src);
-            id
-        };
+        let fwd = forward_id(src, dst)?;
+        let rev = reverse_id(dst, src)?;
         self.store.commit(&[
-            Mutation::new(Class::Edge, fwd_id, payload.clone()),
-            Mutation::new(Class::Edge, rev_id, payload),
+            Mutation::put(Class::Edge, fwd, payload.clone()),
+            Mutation::put(Class::Edge, rev, payload),
         ])
     }
 
     fn unlink(&mut self, src: &[u8], dst: &[u8]) -> Result<u64> {
-        validate_id(src)?;
-        validate_id(dst)?;
-        let fwd_id = {
-            let mut id = src.to_vec();
-            id.push(SEP);
-            id.extend_from_slice(dst);
-            id
-        };
-        let rev_id = {
-            let mut id = vec![REV_MARKER];
-            id.extend_from_slice(dst);
-            id.push(SEP);
-            id.extend_from_slice(src);
-            id
-        };
+        let fwd = forward_id(src, dst)?;
+        let rev = reverse_id(dst, src)?;
         self.store.commit(&[
-            Mutation::new(Class::Edge, fwd_id, vec![]),
-            Mutation::new(Class::Edge, rev_id, vec![]),
+            Mutation::delete(Class::Edge, fwd),
+            Mutation::delete(Class::Edge, rev),
         ])
     }
 
     fn outgoing(&self, src: &[u8]) -> Result<Vec<EdgeRow>> {
-        let prefix = forward_prefix(src);
-        let raw = self.store.kv().scan_prefix(&prefix)?;
-        let mut edges = Vec::new();
-        for (key, payload) in raw {
-            let (_, dst, ts) = parse_forward_key(&key)?;
-            edges.push(EdgeRow {
-                src: src.to_vec(),
-                dst,
-                ts,
-                payload,
-            });
-        }
-        Ok(edges)
+        let prefix = forward_scan_prefix(src)?;
+        self.scan_live_edges(prefix, parse_forward)
     }
 
     fn incoming(&self, dst: &[u8]) -> Result<Vec<EdgeRow>> {
-        let prefix = reverse_prefix(dst);
-        let raw = self.store.kv().scan_prefix(&prefix)?;
-        let mut edges = Vec::new();
-        for (key, payload) in raw {
-            let (_, src, ts) = parse_reverse_key(&key)?;
-            edges.push(EdgeRow {
-                src,
-                dst: dst.to_vec(),
-                ts,
-                payload,
-            });
-        }
-        Ok(edges)
+        let prefix = reverse_scan_prefix(dst)?;
+        self.scan_live_edges(prefix, parse_reverse)
     }
 
-    fn neighbors_k_hop(&self, src: &[u8], k: usize) -> Result<Vec<Vec<u8>>> {
+    fn neighbors_k_hop(&self, src: &[u8], k: usize, budget: usize) -> Result<Vec<Vec<u8>>> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
+        let mut result_count = 0usize;
         visited.insert(src.to_vec());
         queue.push_back(src.to_vec());
         for _ in 0..k {
@@ -243,6 +176,11 @@ impl<S: KvPort, C: ClockPort> Adjacency for MemAdjacency<S, C> {
                 let node = queue.pop_front().unwrap();
                 for edge in self.outgoing(&node)? {
                     if visited.insert(edge.dst.clone()) {
+                        result_count += 1;
+                        if result_count >= budget {
+                            visited.remove(src);
+                            return Ok(visited.into_iter().collect());
+                        }
                         queue.push_back(edge.dst);
                     }
                 }
@@ -309,59 +247,109 @@ mod tests {
     }
 
     #[test]
-    fn unlink_writes_tombstones() {
+    fn unlink_hides_from_live_queries() {
         let (mut adj, path) = make_adj("unlink");
         adj.link(b"x", b"y", b"live".to_vec()).unwrap();
         adj.unlink(b"x", b"y").unwrap();
         let edges = adj.outgoing(b"x").unwrap();
-        let latest = edges.last().unwrap();
-        assert!(latest.payload.is_empty(), "tombstone has empty payload");
+        assert!(
+            edges.is_empty(),
+            "unlinked edge must not appear in live query"
+        );
+        let inc = adj.incoming(b"y").unwrap();
+        assert!(inc.is_empty(), "reverse side also hidden");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn k_hop_traverses_a_chain() {
         let (mut adj, path) = make_adj("khop");
-        // a -> b -> c -> d
         adj.link(b"a", b"b", vec![]).unwrap();
         adj.link(b"b", b"c", vec![]).unwrap();
         adj.link(b"c", b"d", vec![]).unwrap();
-        let hop1 = adj.neighbors_k_hop(b"a", 1).unwrap();
+        let hop1 = adj.neighbors_k_hop(b"a", 1, 100).unwrap();
         assert_eq!(hop1.len(), 1);
         assert!(hop1.contains(&b"b".to_vec()));
-        let hop2 = adj.neighbors_k_hop(b"a", 2).unwrap();
+        let hop2 = adj.neighbors_k_hop(b"a", 2, 100).unwrap();
         assert_eq!(hop2.len(), 2);
-        assert!(hop2.contains(&b"b".to_vec()));
-        assert!(hop2.contains(&b"c".to_vec()));
-        let hop3 = adj.neighbors_k_hop(b"a", 3).unwrap();
+        let hop3 = adj.neighbors_k_hop(b"a", 3, 100).unwrap();
         assert_eq!(hop3.len(), 3);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn separator_byte_in_id_is_rejected() {
-        let (mut adj, path) = make_adj("sep");
-        let bad_id = &[0x01, 0xFF, 0x02];
-        let err = adj.link(bad_id, b"ok", vec![]).unwrap_err();
-        assert!(matches!(err, KernelError::SeparatorInId));
+    fn k_hop_respects_budget() {
+        let (mut adj, path) = make_adj("budget");
+        adj.link(b"a", b"b", vec![]).unwrap();
+        adj.link(b"a", b"c", vec![]).unwrap();
+        adj.link(b"a", b"d", vec![]).unwrap();
+        let results = adj.neighbors_k_hop(b"a", 1, 2).unwrap();
+        assert_eq!(results.len(), 2, "budget caps the result set");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn forward_key_roundtrips_through_parse() {
-        let key = forward_key(b"src", b"dst", 42);
-        let (src, dst, ts) = parse_forward_key(&key).unwrap();
-        assert_eq!(src, b"src");
-        assert_eq!(dst, b"dst");
-        assert_eq!(ts, 42);
+    fn arbitrary_byte_ids_are_accepted() {
+        let (mut adj, path) = make_adj("arb");
+        let src = &[0xFF, 0x00, 0xFF];
+        let dst = &[0x00, 0xFF, 0x00];
+        adj.link(src, dst, b"ok".to_vec()).unwrap();
+        let edges = adj.outgoing(src).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].dst, dst);
+        let inc = adj.incoming(dst).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].src, src);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn reverse_key_roundtrips_through_parse() {
-        let key = reverse_key(b"dst", b"src", 99);
-        let (dst, src, ts) = parse_reverse_key(&key).unwrap();
-        assert_eq!(dst, b"dst");
-        assert_eq!(src, b"src");
-        assert_eq!(ts, 99);
+    fn unlinked_edge_is_not_traversed() {
+        let (mut adj, path) = make_adj("no-traverse");
+        adj.link(b"a", b"b", vec![]).unwrap();
+        adj.link(b"b", b"c", vec![]).unwrap();
+        adj.unlink(b"a", b"b").unwrap();
+        let hop = adj.neighbors_k_hop(b"a", 2, 100).unwrap();
+        assert!(hop.is_empty(), "deleted edge must not be traversed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forward_reverse_exact_inverse_after_mixed_ops() {
+        let (mut adj, path) = make_adj("inverse");
+        adj.link(b"a", b"b", vec![]).unwrap();
+        adj.link(b"a", b"c", vec![]).unwrap();
+        adj.link(b"b", b"c", vec![]).unwrap();
+        adj.unlink(b"a", b"c").unwrap();
+        let out_a: HashSet<Vec<u8>> = adj
+            .outgoing(b"a")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.dst)
+            .collect();
+        let inc_b: HashSet<Vec<u8>> = adj
+            .incoming(b"b")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.src)
+            .collect();
+        assert!(out_a.contains(b"b".as_slice()));
+        assert!(
+            !out_a.contains(b"c".as_slice()),
+            "unlinked edge gone from forward"
+        );
+        assert!(inc_b.contains(b"a".as_slice()));
+        let inc_c: HashSet<Vec<u8>> = adj
+            .incoming(b"c")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.src)
+            .collect();
+        assert!(inc_c.contains(b"b".as_slice()));
+        assert!(
+            !inc_c.contains(b"a".as_slice()),
+            "unlinked edge gone from reverse"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -4,16 +4,16 @@
 //! index + predicate index in one atomic batch — they are never out
 //! of sync.
 //!
-//! Key layout (id field passed to `Mutation::new`):
-//! - Main:      `[0x01][claim_id]`
-//! - Subject:   `[0x02][subject][0xFF][claim_id]`
-//! - Predicate: `[0x03][predicate][0xFF][claim_id]`
+//! Key layout (length-prefixed composite, no reserved bytes):
+//! - Main:      namespace 0x01: `[0x01][len(claim_id) u16 BE][claim_id]`
+//! - Subject:   namespace 0x02: `[0x02][len(subject) u16 BE][subject][len(claim_id) u16 BE][claim_id]`
+//! - Predicate: namespace 0x03: `[0x03][len(predicate) u16 BE][predicate][len(claim_id) u16 BE][claim_id]`
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Class;
+use crate::model::{self, Class, Op};
 use crate::port::{ClockPort, KvPort};
 use crate::store::{Ldb, Mutation};
 use crate::{KernelError, Result};
@@ -35,7 +35,6 @@ pub struct Claim {
 /// Port trait for the Claim storage class.
 pub trait ClaimIndex {
     fn assert_claim(&mut self, claim: &Claim) -> Result<u64>;
-    /// Tombstone: writes zero-length payload for all three keys.
     fn retract_claim(&mut self, claim_id: &[u8]) -> Result<u64>;
     fn get_claim(&self, claim_id: &[u8]) -> Result<Option<Claim>>;
     fn claims_by_subject(&self, subject: &[u8]) -> Result<Vec<Claim>>;
@@ -44,57 +43,28 @@ pub trait ClaimIndex {
 
 // ── Key helpers ─────────────────────────────────────────────
 
-const MAIN_TAG: u8 = 0x01;
-const SUBJECT_TAG: u8 = 0x02;
-const PREDICATE_TAG: u8 = 0x03;
-const SEP: u8 = 0xFF;
+const MAIN_NS: u8 = 0x01;
+const SUBJECT_NS: u8 = 0x02;
+const PREDICATE_NS: u8 = 0x03;
 
-fn validate_id(id: &[u8]) -> Result<()> {
-    if id.contains(&SEP) {
-        return Err(KernelError::SeparatorInId);
-    }
-    Ok(())
+fn main_id(claim_id: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(MAIN_NS, &[claim_id])
 }
 
-fn main_id(claim_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(1 + claim_id.len());
-    id.push(MAIN_TAG);
-    id.extend_from_slice(claim_id);
-    id
+fn subject_id(subject: &[u8], claim_id: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(SUBJECT_NS, &[subject, claim_id])
 }
 
-fn subject_id(subject: &[u8], claim_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(1 + subject.len() + 1 + claim_id.len());
-    id.push(SUBJECT_TAG);
-    id.extend_from_slice(subject);
-    id.push(SEP);
-    id.extend_from_slice(claim_id);
-    id
+fn predicate_id(predicate: &[u8], claim_id: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(PREDICATE_NS, &[predicate, claim_id])
 }
 
-fn predicate_id(predicate: &[u8], claim_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(1 + predicate.len() + 1 + claim_id.len());
-    id.push(PREDICATE_TAG);
-    id.extend_from_slice(predicate);
-    id.push(SEP);
-    id.extend_from_slice(claim_id);
-    id
+fn subject_scan_prefix(subject: &[u8]) -> Result<Vec<u8>> {
+    model::composite_prefix(SUBJECT_NS, subject)
 }
 
-fn subject_scan_prefix(subject: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(1 + subject.len() + 1);
-    p.push(SUBJECT_TAG);
-    p.extend_from_slice(subject);
-    p.push(SEP);
-    p
-}
-
-fn predicate_scan_prefix(predicate: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(1 + predicate.len() + 1);
-    p.push(PREDICATE_TAG);
-    p.extend_from_slice(predicate);
-    p.push(SEP);
-    p
+fn predicate_scan_prefix(predicate: &[u8]) -> Result<Vec<u8>> {
+    model::composite_prefix(PREDICATE_NS, predicate)
 }
 
 fn deserialize_claim(payload: &[u8]) -> Result<Claim> {
@@ -105,6 +75,13 @@ fn deserialize_claim(payload: &[u8]) -> Result<Claim> {
 fn serialize_claim(claim: &Claim) -> Result<Vec<u8>> {
     serde_json::to_vec(claim)
         .map_err(|e| KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+fn validate_confidence(c: f32) -> Result<()> {
+    if c.is_nan() || c.is_infinite() {
+        return Err(KernelError::InvalidConfidence);
+    }
+    Ok(())
 }
 
 // ── MemClaimIndex ───────────────────────────────────────────
@@ -123,16 +100,19 @@ impl<S: KvPort, C: ClockPort> MemClaimIndex<S, C> {
     }
 
     fn scan_index(&self, prefix: Vec<u8>) -> Result<Vec<Claim>> {
-        let mut full_prefix = crate::model::class_prefix(Class::Claim);
+        let mut full_prefix = model::class_prefix(Class::Claim);
         full_prefix.extend_from_slice(&prefix);
         let raw = self.store.kv().scan_prefix(&full_prefix)?;
         let mut best: HashMap<Vec<u8>, Option<Claim>> = HashMap::new();
-        for (key, payload) in raw {
-            let (_class, id, _ts) = crate::model::split_key(&key)?;
-            if payload.is_empty() {
+        for (key, stored) in raw {
+            let (_, id, _) = model::split_key(&key)?;
+            if stored.is_empty() || stored[0] == 2 {
                 best.insert(id, None);
-            } else if let Ok(claim) = deserialize_claim(&payload) {
-                best.insert(id, Some(claim));
+            } else {
+                let payload = &stored[1..];
+                if let Ok(claim) = deserialize_claim(payload) {
+                    best.insert(id, Some(claim));
+                }
             }
         }
         Ok(best.into_values().flatten().collect())
@@ -141,69 +121,57 @@ impl<S: KvPort, C: ClockPort> MemClaimIndex<S, C> {
 
 impl<S: KvPort, C: ClockPort> ClaimIndex for MemClaimIndex<S, C> {
     fn assert_claim(&mut self, claim: &Claim) -> Result<u64> {
-        validate_id(&claim.claim_id)?;
-        validate_id(&claim.subject)?;
-        validate_id(&claim.predicate)?;
+        validate_confidence(claim.confidence)?;
         let payload = serialize_claim(claim)?;
-        // INV-CLAIM-TRIPLE-KEY: main + subject + predicate in one batch.
         self.store.commit(&[
-            Mutation::new(Class::Claim, main_id(&claim.claim_id), payload.clone()),
-            Mutation::new(
+            Mutation::put(Class::Claim, main_id(&claim.claim_id)?, payload.clone()),
+            Mutation::put(
                 Class::Claim,
-                subject_id(&claim.subject, &claim.claim_id),
+                subject_id(&claim.subject, &claim.claim_id)?,
                 payload.clone(),
             ),
-            Mutation::new(
+            Mutation::put(
                 Class::Claim,
-                predicate_id(&claim.predicate, &claim.claim_id),
+                predicate_id(&claim.predicate, &claim.claim_id)?,
                 payload,
             ),
         ])
     }
 
     fn retract_claim(&mut self, claim_id: &[u8]) -> Result<u64> {
-        validate_id(claim_id)?;
-        let mid = main_id(claim_id);
-        let current = self.store.latest(Class::Claim, &mid)?;
-        let mut batch = vec![Mutation::new(Class::Claim, mid, vec![])];
-        if let Some((_ts, payload)) = current {
-            if !payload.is_empty() {
-                if let Ok(claim) = deserialize_claim(&payload) {
-                    batch.push(Mutation::new(
-                        Class::Claim,
-                        subject_id(&claim.subject, claim_id),
-                        vec![],
-                    ));
-                    batch.push(Mutation::new(
-                        Class::Claim,
-                        predicate_id(&claim.predicate, claim_id),
-                        vec![],
-                    ));
-                }
+        let mid = main_id(claim_id)?;
+        let current = self.store.latest_with_op(Class::Claim, &mid)?;
+        let mut batch = vec![Mutation::delete(Class::Claim, mid)];
+        if let Some((_, Op::Put(payload))) = current {
+            if let Ok(claim) = deserialize_claim(&payload) {
+                batch.push(Mutation::delete(
+                    Class::Claim,
+                    subject_id(&claim.subject, claim_id)?,
+                ));
+                batch.push(Mutation::delete(
+                    Class::Claim,
+                    predicate_id(&claim.predicate, claim_id)?,
+                ));
             }
         }
         self.store.commit(&batch)
     }
 
     fn get_claim(&self, claim_id: &[u8]) -> Result<Option<Claim>> {
-        let key_id = main_id(claim_id);
-        match self.store.latest(Class::Claim, &key_id)? {
+        let key_id = main_id(claim_id)?;
+        match self.store.latest_with_op(Class::Claim, &key_id)? {
             None => Ok(None),
-            Some((_ts, payload)) => {
-                if payload.is_empty() {
-                    return Ok(None);
-                }
-                Ok(Some(deserialize_claim(&payload)?))
-            }
+            Some((_, Op::Delete)) => Ok(None),
+            Some((_, Op::Put(payload))) => Ok(Some(deserialize_claim(&payload)?)),
         }
     }
 
     fn claims_by_subject(&self, subject: &[u8]) -> Result<Vec<Claim>> {
-        self.scan_index(subject_scan_prefix(subject))
+        self.scan_index(subject_scan_prefix(subject)?)
     }
 
     fn claims_by_predicate(&self, predicate: &[u8]) -> Result<Vec<Claim>> {
-        self.scan_index(predicate_scan_prefix(predicate))
+        self.scan_index(predicate_scan_prefix(predicate)?)
     }
 }
 
@@ -259,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn retract_writes_tombstone() {
+    fn retract_hides_from_all_indexes() {
         let (mut ci, path) = make_ci("tomb");
         let c = test_claim(b"c1", b"alice", b"knows");
         ci.assert_claim(&c).unwrap();
@@ -305,22 +273,35 @@ mod tests {
     }
 
     #[test]
-    fn separator_in_claim_id_is_rejected() {
-        let (mut ci, path) = make_ci("sep");
+    fn arbitrary_byte_ids_are_accepted() {
+        let (mut ci, path) = make_ci("arb");
         let mut c = test_claim(b"ok", b"ok", b"ok");
-        c.claim_id = vec![0x01, 0xFF, 0x02];
-        let err = ci.assert_claim(&c).unwrap_err();
-        assert!(matches!(err, KernelError::SeparatorInId));
+        c.claim_id = vec![0xFF, 0x00, 0xFF];
+        c.subject = vec![0x00, 0xFF];
+        c.predicate = vec![0xFF];
+        ci.assert_claim(&c).unwrap();
+        let got = ci.get_claim(&[0xFF, 0x00, 0xFF]).unwrap().unwrap();
+        assert_eq!(got.claim_id, vec![0xFF, 0x00, 0xFF]);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn separator_in_subject_is_rejected() {
-        let (mut ci, path) = make_ci("sep-subj");
-        let mut c = test_claim(b"ok", b"ok", b"ok");
-        c.subject = vec![0xFF];
+    fn nan_confidence_is_rejected() {
+        let (mut ci, path) = make_ci("nan");
+        let mut c = test_claim(b"c1", b"s", b"p");
+        c.confidence = f32::NAN;
         let err = ci.assert_claim(&c).unwrap_err();
-        assert!(matches!(err, KernelError::SeparatorInId));
+        assert!(matches!(err, KernelError::InvalidConfidence));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn infinite_confidence_is_rejected() {
+        let (mut ci, path) = make_ci("inf");
+        let mut c = test_claim(b"c1", b"s", b"p");
+        c.confidence = f32::INFINITY;
+        let err = ci.assert_claim(&c).unwrap_err();
+        assert!(matches!(err, KernelError::InvalidConfidence));
         let _ = std::fs::remove_file(&path);
     }
 }

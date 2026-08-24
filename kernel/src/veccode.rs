@@ -1,18 +1,17 @@
 //! Owns the VecCode storage class port: quantized vector codes with
 //! centroid-indexed similarity search. INV-VECCODE-DUAL-KEY: every
-//! `insert_vec` writes both the main entry `[0x01][vector_id]` and
-//! the centroid index entry `[0x00][centroid_id BE][0xFF][vector_id]`
-//! in one atomic batch — they are never out of sync.
+//! `insert_vec` writes both the main entry and the centroid index
+//! entry in one atomic batch — they are never out of sync.
 //!
-//! Hamming distance over quantized codes is the primary scan
-//! primitive (popcount of XOR). Full-precision rescore is the
-//! caller's responsibility.
+//! Key layout (length-prefixed composite, no reserved bytes):
+//! - Main:     namespace 0x01: `[0x01][len(vector_id) u16 BE][vector_id]`
+//! - Centroid: namespace 0x02: `[0x02][len(centroid_be4) u16 BE][centroid_be4][len(vector_id) u16 BE][vector_id]`
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Class;
+use crate::model::{self, Class, Op};
 use crate::port::{ClockPort, KvPort};
 use crate::store::{Ldb, Mutation};
 use crate::{KernelError, Result};
@@ -39,53 +38,29 @@ pub trait VectorCodes {
         centroid_id: u32,
     ) -> Result<u64>;
 
-    /// Tombstone: writes zero-length payload for both keys.
     fn remove_vec(&mut self, vector_id: &[u8]) -> Result<u64>;
-
     fn get_vec(&self, vector_id: &[u8]) -> Result<Option<VecEntry>>;
-
     fn scan_centroid(&self, centroid_id: u32) -> Result<Vec<VecEntry>>;
-
-    /// Hamming distance brute scan over all live vectors, returning
-    /// top-k `(vector_id, distance)` ascending by distance.
     fn brute_scan(&self, query_code: &[u8], k: usize) -> Result<Vec<(Vec<u8>, u32)>>;
 }
 
 // ── Key helpers ─────────────────────────────────────────────
 
-const MAIN_PREFIX: u8 = 0x01;
-const CENTROID_PREFIX: u8 = 0x00;
-const SEP: u8 = 0xFF;
+const MAIN_NS: u8 = 0x01;
+const CENTROID_NS: u8 = 0x02;
 
-fn validate_id(id: &[u8]) -> Result<()> {
-    if id.contains(&SEP) {
-        return Err(KernelError::SeparatorInId);
-    }
-    Ok(())
+fn main_id(vector_id: &[u8]) -> Result<Vec<u8>> {
+    model::encode_composite(MAIN_NS, &[vector_id])
 }
 
-fn main_id(vector_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(1 + vector_id.len());
-    id.push(MAIN_PREFIX);
-    id.extend_from_slice(vector_id);
-    id
+fn centroid_index_id(centroid: u32, vector_id: &[u8]) -> Result<Vec<u8>> {
+    let centroid_bytes = centroid.to_be_bytes();
+    model::encode_composite(CENTROID_NS, &[&centroid_bytes, vector_id])
 }
 
-fn centroid_id(centroid: u32, vector_id: &[u8]) -> Vec<u8> {
-    let mut id = Vec::with_capacity(1 + 4 + 1 + vector_id.len());
-    id.push(CENTROID_PREFIX);
-    id.extend_from_slice(&centroid.to_be_bytes());
-    id.push(SEP);
-    id.extend_from_slice(vector_id);
-    id
-}
-
-fn centroid_scan_prefix(centroid: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(1 + 4 + 1);
-    p.push(CENTROID_PREFIX);
-    p.extend_from_slice(&centroid.to_be_bytes());
-    p.push(SEP);
-    p
+fn centroid_scan_prefix(centroid: u32) -> Result<Vec<u8>> {
+    let centroid_bytes = centroid.to_be_bytes();
+    model::composite_prefix(CENTROID_NS, &centroid_bytes)
 }
 
 fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
@@ -93,6 +68,16 @@ fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
         .zip(b.iter())
         .map(|(&x, &y)| (x ^ y).count_ones())
         .sum()
+}
+
+fn deserialize_entry(stored: &[u8]) -> Result<Option<VecEntry>> {
+    if stored.is_empty() || stored[0] == 2 {
+        return Ok(None);
+    }
+    let payload = &stored[1..];
+    serde_json::from_slice::<VecEntry>(payload)
+        .map(Some)
+        .map_err(|e| KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
 // ── MemVectorCodes ──────────────────────────────────────────
@@ -119,7 +104,6 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
         norm: f32,
         centroid_id_val: u32,
     ) -> Result<u64> {
-        validate_id(vector_id)?;
         let entry = VecEntry {
             vector_id: vector_id.to_vec(),
             code,
@@ -129,88 +113,72 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
         let payload = serde_json::to_vec(&entry).map_err(|e| {
             KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
-        // INV-VECCODE-DUAL-KEY: main + centroid index in one batch.
         self.store.commit(&[
-            Mutation::new(Class::VecCode, main_id(vector_id), payload.clone()),
-            Mutation::new(
+            Mutation::put(Class::VecCode, main_id(vector_id)?, payload.clone()),
+            Mutation::put(
                 Class::VecCode,
-                centroid_id(centroid_id_val, vector_id),
+                centroid_index_id(centroid_id_val, vector_id)?,
                 payload,
             ),
         ])
     }
 
     fn remove_vec(&mut self, vector_id: &[u8]) -> Result<u64> {
-        validate_id(vector_id)?;
-        // Need the centroid_id to tombstone the index entry. Read the
-        // current main entry to find it.
-        let main_key_id = main_id(vector_id);
-        let current = self.store.latest(Class::VecCode, &main_key_id)?;
-        let mut batch = vec![Mutation::new(Class::VecCode, main_key_id, vec![])];
-        if let Some((_ts, payload)) = current {
-            if !payload.is_empty() {
-                if let Ok(entry) = serde_json::from_slice::<VecEntry>(&payload) {
-                    batch.push(Mutation::new(
-                        Class::VecCode,
-                        centroid_id(entry.centroid_id, vector_id),
-                        vec![],
-                    ));
-                }
+        let mid = main_id(vector_id)?;
+        let current = self.store.latest_with_op(Class::VecCode, &mid)?;
+        let mut batch = vec![Mutation::delete(Class::VecCode, mid)];
+        if let Some((_, Op::Put(payload))) = current {
+            if let Ok(entry) = serde_json::from_slice::<VecEntry>(&payload) {
+                batch.push(Mutation::delete(
+                    Class::VecCode,
+                    centroid_index_id(entry.centroid_id, vector_id)?,
+                ));
             }
         }
         self.store.commit(&batch)
     }
 
     fn get_vec(&self, vector_id: &[u8]) -> Result<Option<VecEntry>> {
-        let key_id = main_id(vector_id);
-        match self.store.latest(Class::VecCode, &key_id)? {
+        let key_id = main_id(vector_id)?;
+        match self.store.latest_with_op(Class::VecCode, &key_id)? {
             None => Ok(None),
-            Some((_ts, payload)) => {
-                if payload.is_empty() {
-                    return Ok(None);
-                }
-                let entry = serde_json::from_slice::<VecEntry>(&payload).map_err(|e| {
+            Some((_, Op::Delete)) => Ok(None),
+            Some((_, Op::Put(payload))) => serde_json::from_slice::<VecEntry>(&payload)
+                .map(Some)
+                .map_err(|e| {
                     KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                })?;
-                Ok(Some(entry))
-            }
+                }),
         }
     }
 
     fn scan_centroid(&self, centroid_id_val: u32) -> Result<Vec<VecEntry>> {
-        let mut key_prefix = crate::model::class_prefix(Class::VecCode);
-        key_prefix.extend_from_slice(&centroid_scan_prefix(centroid_id_val));
+        let mut key_prefix = model::class_prefix(Class::VecCode);
+        key_prefix.extend_from_slice(&centroid_scan_prefix(centroid_id_val)?);
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
         let mut best: HashMap<Vec<u8>, Option<VecEntry>> = HashMap::new();
-        for (_key, payload) in raw {
-            if payload.is_empty() {
-                if let Ok((_class, id, _ts)) = crate::model::split_key(&_key) {
-                    best.insert(id, None);
-                }
-            } else if let Ok(entry) = serde_json::from_slice::<VecEntry>(&payload) {
-                best.insert(entry.vector_id.clone(), Some(entry));
-            }
+        for (key, stored) in raw {
+            let (_, id, _) = model::split_key(&key)?;
+            let entry = deserialize_entry(&stored)?;
+            best.insert(id, entry);
         }
         Ok(best.into_values().flatten().collect())
     }
 
     fn brute_scan(&self, query_code: &[u8], k: usize) -> Result<Vec<(Vec<u8>, u32)>> {
-        // Scan all main entries (prefix 0x01 under VecCode class).
-        let mut key_prefix = crate::model::class_prefix(Class::VecCode);
-        key_prefix.push(MAIN_PREFIX);
+        let mut key_prefix = model::class_prefix(Class::VecCode);
+        key_prefix.extend_from_slice(&model::composite_ns_prefix(MAIN_NS));
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
 
-        // Latest version per vector_id.
         let mut latest: HashMap<Vec<u8>, VecEntry> = HashMap::new();
-        for (_key, payload) in raw {
-            if payload.is_empty() {
-                if let Ok((_class, id, _ts)) = crate::model::split_key(&_key) {
+        for (key, stored) in raw {
+            let (_, id, _) = model::split_key(&key)?;
+            match deserialize_entry(&stored)? {
+                Some(entry) => {
+                    latest.insert(id, entry);
+                }
+                None => {
                     latest.remove(&id);
                 }
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_slice::<VecEntry>(&payload) {
-                latest.insert(entry.vector_id.clone(), entry);
             }
         }
 
@@ -221,7 +189,7 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
                 (e.vector_id, dist)
             })
             .collect();
-        distances.sort_by_key(|&(_, d)| d);
+        distances.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         distances.truncate(k);
         Ok(distances)
     }
@@ -269,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_writes_tombstone() {
+    fn remove_hides_from_get() {
         let (mut vc, path) = make_vc("tomb");
         vc.insert_vec(b"v", vec![0x01], 1.0, 0).unwrap();
         vc.remove_vec(b"v").unwrap();
@@ -297,10 +265,6 @@ mod tests {
     #[test]
     fn brute_scan_orders_by_distance() {
         let (mut vc, path) = make_vc("brute");
-        // query = 0xFF (all ones)
-        // vec "close" = 0xFE (1 bit diff)
-        // vec "far"   = 0x00 (8 bits diff)
-        // vec "mid"   = 0xF0 (4 bits diff)
         vc.insert_vec(b"far", vec![0x00], 1.0, 0).unwrap();
         vc.insert_vec(b"mid", vec![0xF0], 1.0, 0).unwrap();
         vc.insert_vec(b"close", vec![0xFE], 1.0, 0).unwrap();
@@ -316,12 +280,24 @@ mod tests {
     }
 
     #[test]
-    fn separator_in_vector_id_is_rejected() {
-        let (mut vc, path) = make_vc("sep");
-        let err = vc
-            .insert_vec(&[0x01, 0xFF, 0x02], vec![0x00], 1.0, 0)
-            .unwrap_err();
-        assert!(matches!(err, KernelError::SeparatorInId));
+    fn arbitrary_byte_vector_ids_are_accepted() {
+        let (mut vc, path) = make_vc("arb");
+        let id = &[0xFF, 0x00, 0xFF];
+        vc.insert_vec(id, vec![0x42], 1.0, 0).unwrap();
+        let entry = vc.get_vec(id).unwrap().unwrap();
+        assert_eq!(entry.vector_id, id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn removed_vec_excluded_from_brute_scan() {
+        let (mut vc, path) = make_vc("rm-scan");
+        vc.insert_vec(b"a", vec![0xFF], 1.0, 0).unwrap();
+        vc.insert_vec(b"b", vec![0x00], 1.0, 0).unwrap();
+        vc.remove_vec(b"a").unwrap();
+        let results = vc.brute_scan(&[0xFF], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, b"b");
         let _ = std::fs::remove_file(&path);
     }
 
