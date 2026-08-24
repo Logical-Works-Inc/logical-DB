@@ -131,6 +131,11 @@ name = "Decide whether code changed (or docs only)"
 condition = "success()"
 kind = "run"
 run = '''set -eu
+# INV-FRESH-DIFFERENTIAL: newer keel guards refuse an existing output dir
+# outright, but the local runner pre-creates an EMPTY $KEEL_RUN_ROOT/differential
+# before this step. rmdir drops only an empty dir — a stale non-empty prior
+# output survives and the gate still refuses, so the guard stays fail-closed.
+rmdir "$KEEL_DIFFERENTIAL_DIR" 2>/dev/null || true
 keel differential "$SCOPE_BASE" "$KEEL_DIFFERENTIAL_DIR" | tee "$RUNNER_TEMP/keel-differential.out"
 eval "$(grep -E '^(code_changed|differential_dir)=' "$RUNNER_TEMP/keel-differential.out")"
 echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"

@@ -100,6 +100,11 @@ jobs:
           export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           set -eu
+          # INV-FRESH-DIFFERENTIAL: newer keel guards refuse an existing output dir
+          # outright, but the local runner pre-creates an EMPTY $KEEL_RUN_ROOT/differential
+          # before this step. rmdir drops only an empty dir — a stale non-empty prior
+          # output survives and the gate still refuses, so the guard stays fail-closed.
+          rmdir "$KEEL_DIFFERENTIAL_DIR" 2>/dev/null || true
           keel differential "$SCOPE_BASE" "$KEEL_DIFFERENTIAL_DIR" | tee "$RUNNER_TEMP/keel-differential.out"
           eval "$(grep -E '^(code_changed|differential_dir)=' "$RUNNER_TEMP/keel-differential.out")"
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
@@ -360,17 +365,17 @@ jobs:
           export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           cat > "$KEEL_EVIDENCE_DIR/eval.jsonl" <<'KEEL_EVAL'
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"162e22a18dcdd405589471a2e5dc1209b74c3dde0be9848bb0255a03eb27362e","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"a5fa4fa3dfb5fa99d50ba9045e3af802ae606382b15a794c22caf6292550937f","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
           KEEL_EVAL
           local_eval="$HOME/.keel-ci/eval/$KEEL_HEAD_SHA.jsonl"
           if [ ! -f "$local_eval" ]; then
