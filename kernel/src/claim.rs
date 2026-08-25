@@ -304,4 +304,28 @@ mod tests {
         assert!(matches!(err, KernelError::InvalidConfidence));
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn all_three_rows_land_under_their_expected_composite_keys() {
+        // The index keys are built independently here so a broken key
+        // helper cannot agree with itself across write and read.
+        let (mut ci, path) = make_ci("keys");
+        let c = test_claim(b"c1", b"alice", b"knows");
+        let ts = ci.assert_claim(&c).unwrap();
+
+        let payload = lgwks_std::json::to_vec(&c).unwrap();
+        let main = model::encode_composite(0x01, &[&b"c1"[..]]).unwrap();
+        let subject = model::encode_composite(0x02, &[&b"alice"[..], &b"c1"[..]]).unwrap();
+        let predicate = model::encode_composite(0x03, &[&b"knows"[..], &b"c1"[..]]).unwrap();
+        let store = ci.into_store();
+        let stored = [vec![1], payload].concat();
+        for id in [main, subject, predicate] {
+            assert_eq!(
+                store.get_raw(Class::Claim, &id, ts).unwrap(),
+                Some(stored.clone()),
+                "row under {id:?} must carry the op-tagged claim"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }

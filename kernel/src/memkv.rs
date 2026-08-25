@@ -75,4 +75,21 @@ mod tests {
         kv.put(vec![1], vec![]).unwrap();
         assert_eq!(kv.scan_prefix(&[]).unwrap().len(), 1);
     }
+
+    #[test]
+    fn len_delete_and_emptiness_track_the_map() {
+        let mut kv = MemKv::new();
+        assert!(kv.is_empty());
+        assert_eq!(kv.len(), 0);
+        kv.put(b"a".to_vec(), b"1".to_vec()).unwrap();
+        kv.put(b"b".to_vec(), b"2".to_vec()).unwrap();
+        assert_eq!(kv.len(), 2);
+        assert!(!kv.is_empty());
+        kv.delete(b"a").unwrap();
+        assert_eq!(kv.get(b"a").unwrap(), None, "delete must remove");
+        assert_eq!(kv.get(b"b").unwrap().as_deref(), Some(b"2".as_slice()));
+        assert_eq!(kv.len(), 1);
+        kv.delete(b"missing").unwrap();
+        assert_eq!(kv.len(), 1, "deleting a missing key is a no-op");
+    }
 }

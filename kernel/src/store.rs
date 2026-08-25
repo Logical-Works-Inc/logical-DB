@@ -428,4 +428,57 @@ mod tests {
         assert!(Class::from_tag(6).is_err());
         assert_eq!(Class::from_tag(5).unwrap(), Class::Claim);
     }
+
+    #[test]
+    fn a_clock_tick_may_repeat_across_commits_but_never_go_back() {
+        let path = tmp_path("equal-ts");
+        let mut db = Ldb::open(&path, MemKv::new(), Frozen(5)).unwrap();
+        db.insert(&Mutation::put(Class::Record, "a", b"1".to_vec()))
+            .unwrap();
+        let ts = db
+            .insert(&Mutation::put(Class::Record, "a", b"2".to_vec()))
+            .expect("an equal ts is monotonic, not a regression");
+        assert_eq!(ts, 5);
+        assert_eq!(db.last_ts(), 5);
+        assert_eq!(
+            db.latest(Class::Record, b"a").unwrap().unwrap().1,
+            b"2".to_vec()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn last_ts_tracks_the_latest_commit_exactly() {
+        let path = tmp_path("lastts");
+        let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
+        assert_eq!(db.last_ts(), 0);
+        db.insert(&Mutation::put(Class::Record, "a", b"1".to_vec()))
+            .unwrap();
+        db.insert(&Mutation::put(Class::Record, "b", b"2".to_vec()))
+            .unwrap();
+        assert_eq!(db.last_ts(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_raw_exposes_the_op_tag_prefixed_stored_value() {
+        let path = tmp_path("raw");
+        let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
+        let ts = db
+            .insert(&Mutation::put(Class::Record, "d", b"payload".to_vec()))
+            .unwrap();
+        assert_eq!(
+            db.get_raw(Class::Record, b"d", ts).unwrap(),
+            Some([b"\x01".as_slice(), b"payload"].concat()),
+            "put rows store wire-tag 1 in front of the payload"
+        );
+        let dts = db.insert(&Mutation::delete(Class::Record, "d")).unwrap();
+        assert_eq!(
+            db.get_raw(Class::Record, b"d", dts).unwrap(),
+            Some(vec![2]),
+            "delete rows store the bare tombstone tag"
+        );
+        assert_eq!(db.get_raw(Class::Record, b"nope", 1).unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
 }

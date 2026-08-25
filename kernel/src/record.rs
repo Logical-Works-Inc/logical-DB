@@ -182,4 +182,24 @@ mod tests {
         assert_eq!(live[0].id, b"b");
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn get_at_returns_the_exact_historical_payload_or_none() {
+        let path = tmp_path("getat");
+        let store = Ldb::open(&path, MemKv::new(), Seq(Cell::new(0))).unwrap();
+        let mut idx = MemRecordIndex::new(store);
+        idx.put(b"d", b"first-version".to_vec()).unwrap();
+        idx.put(b"d", b"second-version".to_vec()).unwrap();
+        assert_eq!(
+            idx.get_at(b"d", 1).unwrap().as_deref(),
+            Some(b"first-version".as_slice())
+        );
+        assert_eq!(
+            idx.get_at(b"d", 2).unwrap().as_deref(),
+            Some(b"second-version".as_slice())
+        );
+        assert_eq!(idx.get_at(b"d", 9).unwrap(), None, "no version at ts 9");
+        assert_eq!(idx.get_at(b"missing", 1).unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
 }

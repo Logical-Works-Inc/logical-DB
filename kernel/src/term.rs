@@ -297,4 +297,72 @@ mod tests {
         assert!(results.is_empty());
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Reference BM25 computed here from the published constants — not
+    /// by calling kernel code — so any drift in the scoring arithmetic,
+    /// the corpus stats, or the accumulation shows up as a value diff.
+    fn reference_score(tf: f64, dl: f64, avgdl: f64, df: f64, n: f64) -> f64 {
+        let k1 = 1.2;
+        let b = 0.75;
+        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let tf_norm = (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * dl / avgdl));
+        idf * tf_norm
+    }
+
+    fn assert_close(got: f64, expected: f64) {
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "score {got} must equal reference {expected}"
+        );
+    }
+
+    #[test]
+    fn bm25_scores_match_the_reference_formula_exactly() {
+        // Corpus of unequal field lengths so the mean-length term is
+        // observable, plus a two-term query so accumulation is pinned.
+        let (mut idx, path) = make_idx("bm25");
+        idx.index_doc(b"d1", &[(b"x".to_vec(), 1)], 4).unwrap();
+        idx.index_doc(b"d2", &[(b"x".to_vec(), 1), (b"y".to_vec(), 1)], 2)
+            .unwrap();
+
+        let results = idx.search(&[b"x".to_vec(), b"y".to_vec()], 10).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let (n, avgdl) = (2.0, 3.0);
+        let want_d1 = reference_score(1.0, 4.0, avgdl, 2.0, n);
+        let want_d2 =
+            reference_score(1.0, 2.0, avgdl, 2.0, n) + reference_score(1.0, 2.0, avgdl, 1.0, n);
+        assert_close(results[0].1, want_d2);
+        assert_close(results[1].1, want_d1);
+        assert_eq!(results[0].0, b"d2".to_vec());
+        assert_eq!(results[1].0, b"d1".to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_removed_doc_leaves_the_corpus_statistics() {
+        let (mut idx, path) = make_idx("rm-stats");
+        idx.index_doc(b"d1", &[(b"x".to_vec(), 1)], 4).unwrap();
+        idx.index_doc(b"d2", &[(b"x".to_vec(), 1)], 2).unwrap();
+        idx.remove_doc(b"d1", &[b"x".to_vec()]).unwrap();
+
+        let results = idx.search(&[b"x".to_vec()], 10).unwrap();
+        assert_eq!(results.len(), 1, "d1 postings are gone");
+        // n=1, avgdl=2 (=dl): tf-normalization collapses to exactly 1.
+        assert_close(results[0].1, reference_score(1.0, 2.0, 2.0, 1.0, 1.0));
+        assert_eq!(results[0].0, b"d2".to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_empty_doc_id_still_counts_toward_corpus_statistics() {
+        let (mut idx, path) = make_idx("empty-id");
+        idx.index_doc(b"", &[(b"z".to_vec(), 1)], 3).unwrap();
+
+        let results = idx.search(&[b"z".to_vec()], 10).unwrap();
+        assert_eq!(results.len(), 1, "the empty-id document must be indexed");
+        assert_eq!(results[0].0, Vec::<u8>::new());
+        assert_close(results[0].1, reference_score(1.0, 3.0, 3.0, 1.0, 1.0));
+        let _ = std::fs::remove_file(&path);
+    }
 }

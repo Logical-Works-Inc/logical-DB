@@ -386,4 +386,55 @@ mod tests {
         let b = encode_composite(0x01, &[b"a", b"b"]).unwrap();
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn minimal_key_with_empty_id_roundtrips_and_short_keys_are_rejected() {
+        // tag + ts with a zero-length id is the smallest legal key: the
+        // length guard must accept exactly this shape and nothing below.
+        let key = point_key(Class::Claim, b"", 5);
+        assert_eq!(key.len(), 9);
+        let (class, id, ts) = split_key(&key).unwrap();
+        assert_eq!(class, Class::Claim);
+        assert!(id.is_empty());
+        assert_eq!(ts, 5);
+        assert!(split_key(&key[..8]).is_err(), "8 bytes is not a key");
+        assert!(split_key(&[]).is_err());
+    }
+
+    #[test]
+    fn op_wire_tags_and_predicates_agree() {
+        assert_eq!(Op::Put(vec![1]).wire_tag(), 1);
+        assert_eq!(Op::Delete.wire_tag(), 2);
+        assert!(Op::Delete.is_delete());
+        assert!(!Op::Put(vec![]).is_delete());
+        assert!(Op::Delete.payload().is_empty());
+    }
+
+    #[test]
+    fn u16_boundary_components_roundtrip_and_overflow_is_rejected() {
+        let max: Vec<u8> = vec![0xA5; u16::MAX as usize];
+        let over: Vec<u8> = vec![0xA5; u16::MAX as usize + 1];
+
+        let enc = encode_composite(0x7F, &[&max, b"x"]).unwrap();
+        let (ns, parts) = decode_composite(&enc).unwrap();
+        assert_eq!(ns, 0x7F);
+        assert_eq!(parts[0].len(), u16::MAX as usize);
+
+        assert!(matches!(
+            encode_composite(0x7F, &[&over]),
+            Err(KernelError::ComponentTooLong)
+        ));
+        assert!(matches!(
+            composite_prefix(0x7F, &over),
+            Err(KernelError::ComponentTooLong)
+        ));
+        let pref = composite_prefix(0x7F, &max).unwrap();
+        assert_eq!(&pref[3..], max.as_slice());
+
+        // A trailing zero-length component is legal: two header bytes
+        // close the stream exactly.
+        let tail = encode_composite(0x01, &[b"a", b""]).unwrap();
+        let (_, parts) = decode_composite(&tail).unwrap();
+        assert_eq!(parts, [b"a".to_vec(), vec![]]);
+    }
 }
