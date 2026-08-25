@@ -1,11 +1,10 @@
 //! Property gauntlet for the spine (DONE conjunct 1 at the store
-//! boundary, where Kani cannot follow because fs syscalls are outside
-//! its model): for a generated workload W and EVERY byte cut c of its
+//! boundary): for a generated workload W and EVERY byte cut c of its
 //! journal, reopening at c must yield exactly the fold of the batches
 //! fully contained in c — never a partial batch, never a lost prefix.
 
 use ldb_kernel::memkv::MemKv;
-use ldb_kernel::model::Class;
+use ldb_kernel::model::{Class, Op};
 use ldb_kernel::port::ClockPort;
 use ldb_kernel::store::{Ldb, Mutation};
 use std::cell::Cell;
@@ -34,47 +33,50 @@ impl Xorshift {
 
 // ── Harness ──────────────────────────────────────────────────
 
-type Latest = HashMap<(u8, Vec<u8>), (u64, Vec<u8>)>;
+type Latest = HashMap<(u8, Vec<u8>), (u64, Op)>;
 
 fn tmp_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ldb-prop-{}-{tag}.journal", std::process::id()))
 }
 
-/// The algebra fold, computed alongside the store: last write per
-/// (class, id) wins, exactly what recovery must reproduce.
 fn fold_in(s: &mut Latest, batch: &[Mutation], ts: u64) {
     for m in batch {
-        s.insert((m.class.tag(), m.id.clone()), (ts, m.payload.clone()));
+        s.insert((m.class.tag(), m.id.clone()), (ts, m.op.clone()));
     }
 }
 
 fn recovered_latest(path: &PathBuf) -> Latest {
     let db = Ldb::open(path, MemKv::new(), CountingClock::default()).unwrap();
     let mut actual = Latest::new();
-    for class in [Class::Record, Class::Term, Class::Edge] {
+    for class in [
+        Class::Record,
+        Class::Term,
+        Class::Edge,
+        Class::VecCode,
+        Class::Claim,
+    ] {
         for row in db.scan_class(class).unwrap() {
-            // Ascending key order ⇒ the last insert is the newest version.
-            actual.insert(
-                (row.class.tag(), row.id.clone()),
-                (row.ts, row.payload.clone()),
-            );
+            actual.insert((row.class.tag(), row.id.clone()), (row.ts, row.op.clone()));
         }
     }
     actual
 }
 
-/// replay_of_every_byte_cut_equals_the_committed_prefix_fold
 #[test]
 fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
     let mut rng = Xorshift(0x5EED_2026_0821);
     let ids: Vec<Vec<u8>> = (0..6).map(|i| format!("e{i}").into_bytes()).collect();
-    let classes = [Class::Record, Class::Term, Class::Edge];
+    let classes = [
+        Class::Record,
+        Class::Term,
+        Class::Edge,
+        Class::VecCode,
+        Class::Claim,
+    ];
 
     let path = tmp_path("main");
     let _ = std::fs::remove_file(&path);
 
-    // Build W batch by batch, snapshotting the fold and the journal
-    // length after each commit.
     let mut expected: Vec<Latest> = vec![Latest::new()];
     let mut batch_ends: Vec<u64> = Vec::new();
     {
@@ -85,9 +87,13 @@ fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
             let batch: Vec<Mutation> = (0..n)
                 .map(|_| {
                     let id = ids[rng.below(ids.len() as u64) as usize].clone();
-                    let class = classes[rng.below(3) as usize];
-                    let len = rng.below(17) as usize;
-                    Mutation::new(class, id, (0..len).map(|_| rng.next() as u8).collect())
+                    let class = classes[rng.below(classes.len() as u64) as usize];
+                    if rng.below(5) == 0 {
+                        Mutation::delete(class, id)
+                    } else {
+                        let len = rng.below(17) as usize;
+                        Mutation::put(class, id, (0..len).map(|_| rng.next() as u8).collect())
+                    }
                 })
                 .collect();
             let ts = db.commit(&batch).unwrap();
@@ -97,7 +103,6 @@ fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
         }
     }
 
-    // The gauntlet: every byte cut, fresh recovery, exact-prefix fold.
     let bytes = std::fs::read(&path).unwrap();
     let cut_path = tmp_path("cut");
     for cut in 0..=bytes.len() {
@@ -112,8 +117,6 @@ fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
         );
     }
 
-    // Recovery journey: a tear inside batch six's frame truncates the
-    // file back to the last intact boundary, never further.
     let mid = batch_ends[5] as usize - 1;
     std::fs::write(&cut_path, &bytes[..mid]).unwrap();
     let _ = recovered_latest(&cut_path);
@@ -129,7 +132,6 @@ fn replay_of_every_byte_cut_equals_the_committed_prefix_fold() {
 
 // ── Clock ────────────────────────────────────────────────────
 
-/// Deterministic clock: each tick advances by one.
 #[derive(Default)]
 struct CountingClock(Cell<u64>);
 

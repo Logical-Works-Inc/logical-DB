@@ -58,6 +58,11 @@ KEEL_HEAD_SHA = "${{ ci.head_sha }}"
 KEEL_RUN_ROOT = "$HOME/.keel-ci/runs/$KEEL_RUN_ID"
 KEEL_DIFFERENTIAL_DIR = "$KEEL_RUN_ROOT/differential"
 KEEL_EVIDENCE_DIR = "$KEEL_RUN_ROOT/evidence"
+# The runner shell is `bash --noprofile --norc` on launchd PATH, which
+# carries neither ~/.local/bin nor ~/.cargo/bin — a bare `keel` exits 127
+# (run 32598109326). Every gate invocation goes through this absolute
+# path, the same convention ci-plan-current already applies to keel-ci-plan.
+KEEL_GATE_BIN = "$HOME/.local/bin/keel"
 
 [[job]]
 id = "stack-position"
@@ -124,14 +129,19 @@ echo "SCOPE_BASE=$KEEL_BASE_REF" >> "$GITHUB_ENV"
 name = "Prove the differential gate can emit BOTH verdicts (self-test)"
 condition = "success()"
 kind = "run"
-run = '''keel differential-selftest'''
+run = '''$KEEL_GATE_BIN differential-selftest'''
 [[job.step]]
 id = "scope"
 name = "Decide whether code changed (or docs only)"
 condition = "success()"
 kind = "run"
 run = '''set -eu
-keel differential "$SCOPE_BASE" "$KEEL_DIFFERENTIAL_DIR" | tee "$RUNNER_TEMP/keel-differential.out"
+# INV-FRESH-DIFFERENTIAL: newer keel guards refuse an existing output dir
+# outright, but the local runner pre-creates an EMPTY $KEEL_RUN_ROOT/differential
+# before this step. rmdir drops only an empty dir — a stale non-empty prior
+# output survives and the gate still refuses, so the guard stays fail-closed.
+rmdir "$KEEL_DIFFERENTIAL_DIR" 2>/dev/null || true
+$KEEL_GATE_BIN differential "$SCOPE_BASE" "$KEEL_DIFFERENTIAL_DIR" | tee "$RUNNER_TEMP/keel-differential.out"
 eval "$(grep -E '^(code_changed|differential_dir)=' "$RUNNER_TEMP/keel-differential.out")"
 echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
 '''
@@ -287,7 +297,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 name = "Prove the proof gate can fail (keel self-test)"
 condition = "success()"
 kind = "run"
-run = '''keel kani-gate-selftest'''
+run = '''$KEEL_GATE_BIN kani-gate-selftest'''
 [[job.step]]
 name = "Verify model codec totality and journal prefix consistency"
 condition = "needs.change-scope.outputs.code_changed == 'yes'"

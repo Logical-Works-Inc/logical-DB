@@ -18,6 +18,12 @@ pub enum KernelError {
     TruncatedRow,
     /// A length field exceeds the wire limit (u32).
     RowTooLarge,
+    /// A composite-key component exceeds the maximum length (u16).
+    ComponentTooLong,
+    /// An encoded composite key is truncated or malformed.
+    MalformedCompositeKey,
+    /// Attempted to store NaN or infinite confidence.
+    InvalidConfidence,
 }
 
 impl fmt::Display for KernelError {
@@ -32,6 +38,15 @@ impl fmt::Display for KernelError {
             }
             KernelError::TruncatedRow => write!(f, "row ends mid-field"),
             KernelError::RowTooLarge => write!(f, "row field exceeds u32 limit"),
+            KernelError::ComponentTooLong => {
+                write!(f, "composite-key component exceeds u16 limit")
+            }
+            KernelError::MalformedCompositeKey => {
+                write!(f, "composite key is truncated or malformed")
+            }
+            KernelError::InvalidConfidence => {
+                write!(f, "confidence must be finite (no NaN or infinity)")
+            }
         }
     }
 }
@@ -48,5 +63,55 @@ impl std::error::Error for KernelError {
 impl From<std::io::Error> for KernelError {
     fn from(e: std::io::Error) -> Self {
         KernelError::Io(e)
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_strings_are_stable_per_variant() {
+        let io = KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "boom"));
+        assert_eq!(io.to_string(), "io: boom");
+        assert_eq!(
+            KernelError::TsRegression { last: 11, got: 3 }.to_string(),
+            "ts regression: got 3, last committed 11"
+        );
+        assert_eq!(
+            KernelError::UnknownClass(0).to_string(),
+            "unknown class tag 0x00"
+        );
+        assert_eq!(KernelError::TruncatedRow.to_string(), "row ends mid-field");
+        assert_eq!(
+            KernelError::RowTooLarge.to_string(),
+            "row field exceeds u32 limit"
+        );
+        assert_eq!(
+            KernelError::ComponentTooLong.to_string(),
+            "composite-key component exceeds u16 limit"
+        );
+        assert_eq!(
+            KernelError::MalformedCompositeKey.to_string(),
+            "composite key is truncated or malformed"
+        );
+        assert_eq!(
+            KernelError::InvalidConfidence.to_string(),
+            "confidence must be finite (no NaN or infinity)"
+        );
+    }
+
+    #[test]
+    fn io_errors_keep_their_source_and_others_have_none() {
+        let source_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let wrapped = KernelError::Io(source_err);
+        let src = std::error::Error::source(&wrapped)
+            .expect("io variant must preserve its source")
+            .downcast_ref::<std::io::Error>()
+            .expect("the preserved source is the original io error");
+        assert_eq!(src.kind(), std::io::ErrorKind::NotFound);
+        assert!(std::error::Error::source(&KernelError::TruncatedRow).is_none());
     }
 }

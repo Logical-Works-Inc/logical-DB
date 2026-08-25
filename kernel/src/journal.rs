@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::{KernelError, Result};
+use crate::Result;
 
 // ── CRC32 (IEEE, reflected, 0xEDB88320) ──────────────────────
 
@@ -63,41 +63,47 @@ pub struct ReplayStats {
     pub valid_bytes: u64,
 }
 
-/// Streams every intact frame through `sink`, stopping cleanly at EOF
-/// or at the first torn/corrupt frame. A frame that is complete and
-/// crc-valid but fails to decode is a hard error — that is corruption
-/// inside a good frame, not a torn tail, and must not be truncated
-/// away silently.
-pub fn replay<R: Read>(
-    r: &mut R,
+/// Pure stopping rule over an in-memory buffer — no `std::io`, no
+/// `io::Error`: the model checker proves this function, and the dyn
+/// drop glue inside io error values makes that state space explode.
+/// A frame that is complete and crc-valid but fails to decode is a
+/// hard error raised by the sink, never truncated away silently.
+pub(crate) fn scan_intact_frames(
+    bytes: &[u8],
     mut sink: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<ReplayStats> {
     let mut stats = ReplayStats {
         frames: 0,
         valid_bytes: 0,
     };
-    let mut header = [0u8; HEADER_LEN];
-    loop {
-        match r.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(stats),
-            Err(e) => return Err(KernelError::Io(e)),
+    let mut rest = bytes;
+    while rest.len() >= HEADER_LEN {
+        let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(rest[4..8].try_into().unwrap());
+        let payload_end = match HEADER_LEN.checked_add(len) {
+            Some(end) if end <= rest.len() => end,
+            // Torn frame: fewer than `len` payload bytes follow.
+            _ => break,
+        };
+        let payload = &rest[HEADER_LEN..payload_end];
+        if crc32(payload) != crc {
+            break;
         }
-        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        let mut payload = vec![0u8; len];
-        match r.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(stats),
-            Err(e) => return Err(KernelError::Io(e)),
-        }
-        if crc32(&payload) != crc {
-            return Ok(stats);
-        }
-        sink(&payload)?;
+        sink(payload)?;
         stats.frames += 1;
         stats.valid_bytes += HEADER_LEN as u64 + len as u64;
+        rest = &rest[payload_end..];
     }
+    Ok(stats)
+}
+
+/// Streams every intact frame through `sink`, stopping cleanly at EOF
+/// or at the first torn/corrupt frame. Thin io adapter over
+/// [`scan_intact_frames`] — all stopping-rule logic lives there.
+pub fn replay<R: Read>(r: &mut R, sink: impl FnMut(&[u8]) -> Result<()>) -> Result<ReplayStats> {
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf)?;
+    scan_intact_frames(&buf, sink)
 }
 
 // ── Tests ────────────────────────────────────────────────────
@@ -105,6 +111,7 @@ pub fn replay<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::KernelError;
 
     #[test]
     fn crc_matches_the_ieee_check_value() {
@@ -158,9 +165,8 @@ mod tests {
     #[test]
     fn a_decode_failure_inside_an_intact_frame_is_a_hard_error() {
         let mut bytes = Vec::new();
-        // Intact frame whose payload carries invalid wire (tag 0).
-        append_frame(&mut bytes, &[0u8]).unwrap();
-        // The sink does what the store's sink does: decode the frame.
+        // Intact frame whose payload carries invalid wire (class tag 0, op tag 1).
+        append_frame(&mut bytes, &[0u8, 1u8]).unwrap();
         let mut calls = 0;
         let err = replay(&mut bytes.as_slice(), |frame| {
             calls += 1;

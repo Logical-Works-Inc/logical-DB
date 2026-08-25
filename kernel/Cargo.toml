@@ -8,7 +8,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [dependencies]
 # lgwks_std is the estate's one approved non-std surface; blake3, hex,
-# serde, and serialization come from it rather than as direct deps.
+# and JSON serialization come from it rather than as direct deps. serde
+# stays direct solely because derive expansion requires it (see root).
 lgwks_std = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }

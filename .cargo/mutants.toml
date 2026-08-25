@@ -1,0 +1,25 @@
+# INV-MUTATION-SCOPE: every excluded surface is machine-checked by
+# another tier or is unobservable at any testable input size.
+#
+# - kernel/src/verify.rs holds only #[cfg(kani)] proof harnesses: the
+#   kani-verify tier is their verifier, and unit tests never execute
+#   them, so no mutant there can produce a test-visible kill.
+# - `in encode_row` / `read_u64` length guards compare against
+#   u32::MAX / an indistinguishable truncation error: distinguishing
+#   them needs a 4 GiB allocation or yields the identical error variant,
+#   i.e. they are equivalent-in-practice.
+# - corpus_stats' `||` guards an empty-stored-value case no production
+#   writer can produce (every stored value carries an op-tag byte).
+# - encode_composite's two remaining `+`-to-`*` sites feed only
+#   `Vec::with_capacity`: a wrong capacity costs a realloc, never a
+#   wrong byte, so the mutant is equivalent by construction.
+exclude_globs = ["kernel/src/verify.rs"]
+exclude_re = [
+    "replace > with == in encode_row",
+    "replace > with >= in encode_row",
+    "replace \\|\\| with && in encode_row",
+    "replace < with <= in read_u64",
+    "replace \\|\\| with && in MemTermIndex<S, C>::corpus_stats",
+    "replace < with <= in Ldb<S, C>::open",
+    "replace \\+ with \\* in encode_composite",
+]

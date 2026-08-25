@@ -25,15 +25,23 @@ use crate::{KernelError, Result};
 pub struct Mutation {
     pub class: Class,
     pub id: Vec<u8>,
-    pub payload: Vec<u8>,
+    pub op: model::Op,
 }
 
 impl Mutation {
-    pub fn new(class: Class, id: impl Into<Vec<u8>>, payload: Vec<u8>) -> Self {
+    pub fn put(class: Class, id: impl Into<Vec<u8>>, payload: Vec<u8>) -> Self {
         Mutation {
             class,
             id: id.into(),
-            payload,
+            op: model::Op::Put(payload),
+        }
+    }
+
+    pub fn delete(class: Class, id: impl Into<Vec<u8>>) -> Self {
+        Mutation {
+            class,
+            id: id.into(),
+            op: model::Op::Delete,
         }
     }
 }
@@ -66,7 +74,14 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
             while !cursor.is_empty() {
                 let row = model::decode_row(&mut cursor)?;
                 last_ts = last_ts.max(row.ts);
-                kv.put(row.key(), row.payload)?;
+                let key = row.key();
+                let value = row.op.payload().to_vec();
+                // Store the op tag as the first byte of the KV value so
+                // latest/scan can distinguish Put from Delete.
+                let mut stored = Vec::with_capacity(1 + value.len());
+                stored.push(row.op.wire_tag());
+                stored.extend_from_slice(&value);
+                kv.put(key, stored)?;
             }
             Ok(())
         })?;
@@ -100,7 +115,7 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
         let mut frame = Vec::new();
         for m in batch {
             model::encode_row(
-                &Row::new(m.class, m.id.clone(), ts, m.payload.clone()),
+                &Row::new(m.class, m.id.clone(), ts, m.op.clone()),
                 &mut frame,
             )?;
         }
@@ -110,8 +125,12 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
         // changes. A crash before the apply loop replays from here.
         self.journal.get_ref().sync_data()?;
         for m in batch {
-            self.kv
-                .put(model::point_key(m.class, &m.id, ts), m.payload.clone())?;
+            let key = model::point_key(m.class, &m.id, ts);
+            let payload = m.op.payload();
+            let mut stored = Vec::with_capacity(1 + payload.len());
+            stored.push(m.op.wire_tag());
+            stored.extend_from_slice(payload);
+            self.kv.put(key, stored)?;
         }
         self.last_ts = ts;
         Ok(ts)
@@ -122,19 +141,67 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
         self.commit(std::slice::from_ref(m))
     }
 
+    /// Returns `(op_tag, payload)` from the stored value format.
+    fn decode_stored(stored: &[u8]) -> (u8, &[u8]) {
+        if stored.is_empty() {
+            (0, &[])
+        } else {
+            (stored[0], &stored[1..])
+        }
+    }
+
     pub fn get(&self, class: Class, id: &[u8], ts: u64) -> Result<Option<Vec<u8>>> {
+        match self.kv.get(&model::point_key(class, id, ts))? {
+            None => Ok(None),
+            Some(stored) => {
+                let (tag, payload) = Self::decode_stored(&stored);
+                if tag == 2 {
+                    Ok(None)
+                } else {
+                    Ok(Some(payload.to_vec()))
+                }
+            }
+        }
+    }
+
+    /// Returns raw stored value including op tag for internal callers.
+    pub fn get_raw(&self, class: Class, id: &[u8], ts: u64) -> Result<Option<Vec<u8>>> {
         self.kv.get(&model::point_key(class, id, ts))
     }
 
-    /// The newest version of one entity: last key under its history
-    /// prefix, which is the highest ts by key construction.
+    /// The newest version of one entity. Returns `None` if the entity
+    /// never existed or its latest operation is `Delete`.
     pub fn latest(&self, class: Class, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
         let history = self.kv.scan_prefix(&model::history_prefix(class, id))?;
         match history.last() {
             None => Ok(None),
-            Some((k, v)) => {
+            Some((k, stored)) => {
                 let (_, _, ts) = model::split_key(k)?;
-                Ok(Some((ts, v.clone())))
+                let (tag, payload) = Self::decode_stored(stored);
+                if tag == 2 {
+                    Ok(None)
+                } else {
+                    Ok(Some((ts, payload.to_vec())))
+                }
+            }
+        }
+    }
+
+    /// The newest version of one entity, including deletes. Returns
+    /// `(ts, Op)` or `None` if no history exists at all.
+    pub fn latest_with_op(&self, class: Class, id: &[u8]) -> Result<Option<(u64, model::Op)>> {
+        let history = self.kv.scan_prefix(&model::history_prefix(class, id))?;
+        match history.last() {
+            None => Ok(None),
+            Some((k, stored)) => {
+                let (_, _, ts) = model::split_key(k)?;
+                let (tag, payload) = Self::decode_stored(stored);
+                let op = if tag == 2 {
+                    model::Op::Delete
+                } else {
+                    model::Op::Put(payload.to_vec())
+                };
+                Ok(Some((ts, op)))
             }
         }
     }
@@ -144,20 +211,25 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
         self.kv
             .scan_prefix(&model::class_prefix(class))?
             .into_iter()
-            .map(|(k, payload)| {
+            .map(|(k, stored)| {
                 let (class, id, ts) = model::split_key(&k)?;
-                Ok(Row {
-                    class,
-                    id,
-                    ts,
-                    payload,
-                })
+                let (tag, payload) = Self::decode_stored(&stored);
+                let op = if tag == 2 {
+                    model::Op::Delete
+                } else {
+                    model::Op::Put(payload.to_vec())
+                };
+                Ok(Row { class, id, ts, op })
             })
             .collect()
     }
 
     pub fn last_ts(&self) -> u64 {
         self.last_ts
+    }
+
+    pub fn kv(&self) -> &S {
+        &self.kv
     }
 
     pub fn into_parts(self) -> (S, C) {
@@ -208,8 +280,8 @@ mod tests {
         let path = tmp_path("roundtrip");
         let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
         db.commit(&[
-            Mutation::new(Class::Record, "doc/1", b"one".to_vec()),
-            Mutation::new(Class::Term, "hello", b"idx".to_vec()),
+            Mutation::put(Class::Record, "doc/1", b"one".to_vec()),
+            Mutation::put(Class::Term, "hello", b"idx".to_vec()),
         ])
         .unwrap();
         let (kv, _) = db.into_parts();
@@ -232,10 +304,9 @@ mod tests {
         let clean_len;
         {
             let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
-            db.insert(&Mutation::new(Class::Record, "a", b"1".to_vec()))
+            db.insert(&Mutation::put(Class::Record, "a", b"1".to_vec()))
                 .unwrap();
             clean_len = File::open(&path).unwrap().metadata().unwrap().len();
-            // Simulate a crash mid-append: three stray bytes past the frame.
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(&[0xDE, 0xAD, 0xBE]).unwrap();
         }
@@ -253,16 +324,15 @@ mod tests {
     fn a_batch_is_atomic_when_the_journal_tears_mid_batch() {
         let path = tmp_path("atomic");
         let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
-        db.commit(&[Mutation::new(Class::Record, "keep/1", b"k".to_vec())])
+        db.commit(&[Mutation::put(Class::Record, "keep/1", b"k".to_vec())])
             .unwrap();
         db.commit(&[
-            Mutation::new(Class::Record, "drop/1", b"d".to_vec()),
-            Mutation::new(Class::Record, "drop/2", b"d".to_vec()),
+            Mutation::put(Class::Record, "drop/1", b"d".to_vec()),
+            Mutation::put(Class::Record, "drop/2", b"d".to_vec()),
         ])
         .unwrap();
         drop(db);
 
-        // Tear inside the second frame: chop three payload bytes.
         let mut bytes = std::fs::read(&path).unwrap();
         let torn = bytes.len() - 3;
         bytes.truncate(torn);
@@ -281,11 +351,11 @@ mod tests {
     fn a_clock_regression_is_rejected() {
         let path = tmp_path("regress");
         let mut db = Ldb::open(&path, MemKv::new(), Seq(Cell::new(10))).unwrap();
-        db.insert(&Mutation::new(Class::Claim, "c", b"x".to_vec()))
+        db.insert(&Mutation::put(Class::Claim, "c", b"x".to_vec()))
             .unwrap();
         let mut backwards = Ldb::open(&path, MemKv::new(), Frozen(3)).unwrap();
         let err = backwards
-            .insert(&Mutation::new(Class::Claim, "c", b"y".to_vec()))
+            .insert(&Mutation::put(Class::Claim, "c", b"y".to_vec()))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -308,9 +378,9 @@ mod tests {
     fn latest_returns_the_newest_version() {
         let path = tmp_path("latest");
         let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
-        db.insert(&Mutation::new(Class::Record, "d", b"v1".to_vec()))
+        db.insert(&Mutation::put(Class::Record, "d", b"v1".to_vec()))
             .unwrap();
-        db.insert(&Mutation::new(Class::Record, "d", b"v2".to_vec()))
+        db.insert(&Mutation::put(Class::Record, "d", b"v2".to_vec()))
             .unwrap();
         let (ts, payload) = db.latest(Class::Record, b"d").unwrap().unwrap();
         assert_eq!((ts, payload.as_slice()), (2, b"v2".as_slice()));
@@ -323,10 +393,92 @@ mod tests {
     }
 
     #[test]
+    fn explicit_delete_hides_from_latest() {
+        let path = tmp_path("del");
+        let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
+        db.insert(&Mutation::put(Class::Record, "d", b"alive".to_vec()))
+            .unwrap();
+        db.insert(&Mutation::delete(Class::Record, "d")).unwrap();
+        assert!(db.latest(Class::Record, b"d").unwrap().is_none());
+        assert_eq!(
+            db.scan_class(Class::Record).unwrap().len(),
+            2,
+            "history includes the delete"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_payload_put_is_valid_live_data() {
+        let path = tmp_path("empty-put");
+        let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
+        db.insert(&Mutation::put(Class::Record, "e", vec![]))
+            .unwrap();
+        let (_, payload) = db.latest(Class::Record, b"e").unwrap().unwrap();
+        assert!(
+            payload.is_empty(),
+            "empty put is live data, not a tombstone"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn unknown_class_tags_never_enter_through_the_store() {
-        // The wire door rejects them before a Row can exist.
         assert!(Class::from_tag(0).is_err());
         assert!(Class::from_tag(6).is_err());
         assert_eq!(Class::from_tag(5).unwrap(), Class::Claim);
+    }
+
+    #[test]
+    fn a_clock_tick_may_repeat_across_commits_but_never_go_back() {
+        let path = tmp_path("equal-ts");
+        let mut db = Ldb::open(&path, MemKv::new(), Frozen(5)).unwrap();
+        db.insert(&Mutation::put(Class::Record, "a", b"1".to_vec()))
+            .unwrap();
+        let ts = db
+            .insert(&Mutation::put(Class::Record, "a", b"2".to_vec()))
+            .expect("an equal ts is monotonic, not a regression");
+        assert_eq!(ts, 5);
+        assert_eq!(db.last_ts(), 5);
+        assert_eq!(
+            db.latest(Class::Record, b"a").unwrap().unwrap().1,
+            b"2".to_vec()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn last_ts_tracks_the_latest_commit_exactly() {
+        let path = tmp_path("lastts");
+        let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
+        assert_eq!(db.last_ts(), 0);
+        db.insert(&Mutation::put(Class::Record, "a", b"1".to_vec()))
+            .unwrap();
+        db.insert(&Mutation::put(Class::Record, "b", b"2".to_vec()))
+            .unwrap();
+        assert_eq!(db.last_ts(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_raw_exposes_the_op_tag_prefixed_stored_value() {
+        let path = tmp_path("raw");
+        let mut db = Ldb::open(&path, MemKv::new(), seq()).unwrap();
+        let ts = db
+            .insert(&Mutation::put(Class::Record, "d", b"payload".to_vec()))
+            .unwrap();
+        assert_eq!(
+            db.get_raw(Class::Record, b"d", ts).unwrap(),
+            Some([b"\x01".as_slice(), b"payload"].concat()),
+            "put rows store wire-tag 1 in front of the payload"
+        );
+        let dts = db.insert(&Mutation::delete(Class::Record, "d")).unwrap();
+        assert_eq!(
+            db.get_raw(Class::Record, b"d", dts).unwrap(),
+            Some(vec![2]),
+            "delete rows store the bare tombstone tag"
+        );
+        assert_eq!(db.get_raw(Class::Record, b"nope", 1).unwrap(), None);
+        let _ = std::fs::remove_file(&path);
     }
 }

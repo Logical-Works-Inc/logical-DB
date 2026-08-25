@@ -3,6 +3,14 @@ resolver = "2"
 members = ["kernel", "organs"]
 
 [workspace.dependencies]
-lgwks_std = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "a14b8156" }
+# Pinned to the Braid commit that declares the truthful MSRV 1.93
+# (INV-KANI-MSRV-BRIDGE) so the keel Proof tier can resolve this graph.
+lgwks_std = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "5b5e1cd19bc2", features = [
+  "hash",
+  "json",
+] }
+# Derive macros expand to `serde::…` paths, which cargo resolves against a
+# direct dependency only — the lgwks_std::json re-export covers function
+# surface, not proc-macro expansion. serde_json stays out; every call goes
+# through lgwks_std::json (estate convention from the Braid migration).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
