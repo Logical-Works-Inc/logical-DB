@@ -75,7 +75,7 @@ fn deserialize_entry(stored: &[u8]) -> Result<Option<VecEntry>> {
         return Ok(None);
     }
     let payload = &stored[1..];
-    serde_json::from_slice::<VecEntry>(payload)
+    lgwks_std::json::from_slice::<VecEntry>(payload)
         .map(Some)
         .map_err(|e| KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
@@ -110,7 +110,7 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
             norm,
             centroid_id: centroid_id_val,
         };
-        let payload = serde_json::to_vec(&entry).map_err(|e| {
+        let payload = lgwks_std::json::to_vec(&entry).map_err(|e| {
             KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
         self.store.commit(&[
@@ -128,7 +128,7 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
         let current = self.store.latest_with_op(Class::VecCode, &mid)?;
         let mut batch = vec![Mutation::delete(Class::VecCode, mid)];
         if let Some((_, Op::Put(payload))) = current {
-            if let Ok(entry) = serde_json::from_slice::<VecEntry>(&payload) {
+            if let Ok(entry) = lgwks_std::json::from_slice::<VecEntry>(&payload) {
                 batch.push(Mutation::delete(
                     Class::VecCode,
                     centroid_index_id(entry.centroid_id, vector_id)?,
@@ -143,7 +143,7 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
         match self.store.latest_with_op(Class::VecCode, &key_id)? {
             None => Ok(None),
             Some((_, Op::Delete)) => Ok(None),
-            Some((_, Op::Put(payload))) => serde_json::from_slice::<VecEntry>(&payload)
+            Some((_, Op::Put(payload))) => lgwks_std::json::from_slice::<VecEntry>(&payload)
                 .map(Some)
                 .map_err(|e| {
                     KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))

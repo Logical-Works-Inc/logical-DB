@@ -94,7 +94,7 @@ impl<S: KvPort, C: ClockPort> MemTermIndex<S, C> {
                 continue;
             }
             let payload = &stored[1..];
-            if let Ok(manifest) = serde_json::from_slice::<DocManifest>(payload) {
+            if let Ok(manifest) = lgwks_std::json::from_slice::<DocManifest>(payload) {
                 let (_, id, _) = model::split_key(key)?;
                 let (_, parts) = model::decode_composite(&id)?;
                 if !parts.is_empty() {
@@ -125,7 +125,7 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
                 term_freq: *freq,
                 field_len,
             };
-            let payload = serde_json::to_vec(&posting).map_err(|e| {
+            let payload = lgwks_std::json::to_vec(&posting).map_err(|e| {
                 crate::KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })?;
             batch.push(Mutation::put(
@@ -138,7 +138,7 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
             field_len,
             term_count: terms.len() as u32,
         };
-        let manifest_payload = serde_json::to_vec(&manifest).map_err(|e| {
+        let manifest_payload = lgwks_std::json::to_vec(&manifest).map_err(|e| {
             crate::KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
         batch.push(Mutation::put(
@@ -169,7 +169,7 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
                 best.insert(id, None);
             } else {
                 let payload = &stored[1..];
-                if let Ok(posting) = serde_json::from_slice::<Posting>(payload) {
+                if let Ok(posting) = lgwks_std::json::from_slice::<Posting>(payload) {
                     best.insert(id, Some(posting));
                 }
             }

@@ -68,12 +68,12 @@ fn predicate_scan_prefix(predicate: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn deserialize_claim(payload: &[u8]) -> Result<Claim> {
-    serde_json::from_slice(payload)
+    lgwks_std::json::from_slice(payload)
         .map_err(|e| KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
 fn serialize_claim(claim: &Claim) -> Result<Vec<u8>> {
-    serde_json::to_vec(claim)
+    lgwks_std::json::to_vec(claim)
         .map_err(|e| KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 

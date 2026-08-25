@@ -2,7 +2,7 @@
 //! conjuncts 1-2 at the pure layers): model codec totality, key-layout
 //! monotonicity, and journal prefix consistency.
 
-use crate::journal::{append_frame, replay, HEADER_LEN};
+use crate::journal::{crc32, scan_intact_frames, HEADER_LEN};
 use crate::model::{decode_row, encode_row, point_key, split_key, Class, Op, Row};
 
 // ── Conjunct 2 - codec totality ──────────────────────────────
@@ -48,6 +48,15 @@ fn keys_never_order_a_later_version_before_an_earlier_one() {
 
 // ── Conjunct 1 - journal prefix consistency ──────────────────
 
+/// Proof-side frame assembly — byte-identical to the journal wire
+/// format (`[len u32 LE][crc32 u32 LE][payload]`) without dragging
+/// std::io error machinery into the proof scope.
+fn frame_bytes(wire: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(wire.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32(wire).to_le_bytes());
+    out.extend_from_slice(wire);
+}
+
 #[kani::proof]
 #[kani::unwind(32)]
 fn a_cut_frame_yields_the_whole_frame_or_nothing() {
@@ -55,7 +64,7 @@ fn a_cut_frame_yields_the_whole_frame_or_nothing() {
     let mut wire = Vec::new();
     encode_row(&row, &mut wire).unwrap();
     let mut frame = Vec::new();
-    append_frame(&mut frame, &wire).unwrap();
+    frame_bytes(&wire, &mut frame);
     let wire_len = wire.len();
 
     let class: u8 = kani::any();
@@ -70,7 +79,7 @@ fn a_cut_frame_yields_the_whole_frame_or_nothing() {
         _ => frame.len(),
     };
 
-    let stats = replay(&mut &frame[..cut], |_p| Ok(())).unwrap();
+    let stats = scan_intact_frames(&frame[..cut], |_p| Ok(())).unwrap();
 
     if cut == frame.len() {
         assert_eq!(stats.frames, 1);
@@ -89,11 +98,11 @@ fn a_two_frame_stream_recovers_exactly_a_committed_prefix() {
     let mut f1 = Vec::new();
     let mut w1 = Vec::new();
     encode_row(&r1, &mut w1).unwrap();
-    append_frame(&mut f1, &w1).unwrap();
+    frame_bytes(&w1, &mut f1);
     let mut f2 = Vec::new();
     let mut w2 = Vec::new();
     encode_row(&r2, &mut w2).unwrap();
-    append_frame(&mut f2, &w2).unwrap();
+    frame_bytes(&w2, &mut f2);
     let boundary = f1.len();
     let mut stream = f1;
     stream.extend_from_slice(&f2);
@@ -112,7 +121,7 @@ fn a_two_frame_stream_recovers_exactly_a_committed_prefix() {
     };
 
     let mut frames_seen: u32 = 0;
-    let stats = replay(&mut &stream[..cut], |_frame| {
+    let stats = scan_intact_frames(&stream[..cut], |_frame| {
         frames_seen += 1;
         Ok(())
     })
