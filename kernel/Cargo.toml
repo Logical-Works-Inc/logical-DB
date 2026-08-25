@@ -11,6 +11,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # and JSON serialization come from it rather than as direct deps. serde
 # stays direct solely because derive expansion requires it (see root).
 lgwks_std = { workspace = true }
+redb = "4.2.0"
 serde = { workspace = true }
 
 # Plain-binary benchmark suite (issue #6 §9): stdlib timing, JSONL

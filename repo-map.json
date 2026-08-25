@@ -3,7 +3,7 @@
   "schema_version": "1.0.0",
   "updated": "2026-08-25",
   "canon": "ADR-001 (canonical DB-model authority)",
-  "note": "One storage kernel for every repo. v0.1 RC: the logical-db crate ships row model, journal, five storage classes, proof triad, benches; redb backend pending.",
+  "note": "One storage kernel for every repo. v0.1 RC: the logical-db crate ships row model, five storage classes, proof triad, benches, and the redb production backend (issue #6 §5) beside the journaled reference path.",
   "statuses": {
     "live": "exists and is authoritative today",
     "meta": "agent/process tooling, not product surface",
@@ -56,8 +56,8 @@
     { "id": "ci-workflow", "path": ".github/workflows/ci.yml", "status": "live", "pillar": "infra", "kind": "generated", "summary": "Rendered workflow — canonical bytes enforced against the plan in CI." },
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
     { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC." },
-    { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), what is not yet stable, benchmark results schema and algorithmic gates." },
-    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/ClockPort, MemKv default backend, framed CRC32 journal, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite.", "adrs": ["ADR-001"] }
+    { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), two persistence paths with one crash story each (redb production / journaled reference), what is not yet stable, benchmark results schema and algorithmic gates." },
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5), MemKv reference backend, framed CRC32 journal as fault oracle, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine parity + kill-recovery (both backends) + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite.", "adrs": ["ADR-001"] }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },

@@ -8,12 +8,15 @@ mechanism is named in `docs/DB_PATHWAY.md` §3 and its measured surface
 in `docs/FORMAT.md`.
 
 **Status:** v0.1 release candidate. The kernel crate (`logical-db`) ships
-the row model, framed CRC32 journal, MemKv backend, all five storage
-classes (record, term, edge, vec-code, claim), a randomized state-machine
-suite, planted-corruption negative tests, process-kill recovery proof,
-Kani property proofs, and the §9 benchmark suite (`docs/FORMAT.md`).
-Pending for v0.1 done: production redb backend behind KvPort (issue #6
-§5). Trust state: FUNCTIONAL — every claim above traces to a test or a
+the row model, all five storage classes (record, term, edge, vec-code,
+claim), and two durability paths with one crash story each: production
+persistence through redb (`RedbBackend`, issue #6 §5 — one atomic
+transaction per batch, no journal), plus the framed CRC32 journal over
+MemKv as the deterministic reference and fault oracle. Both backends
+pass the same randomized state-machine suite and the same process-kill
+recovery proof; planted-corruption negative tests and Kani property
+proofs cover the codec; `docs/FORMAT.md` carries the §9 benchmark suite.
+Trust state: FUNCTIONAL — every claim above traces to a test or a
 benchmark artifact.
 
 ## Try it

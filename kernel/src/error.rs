@@ -28,6 +28,9 @@ pub enum KernelError {
     MalformedKey,
     /// Attempted to store NaN or infinite confidence.
     InvalidConfidence,
+    /// The durable backend (issue #6 §5) refused an operation; the
+    /// message names the backend-level cause.
+    Backend(String),
 }
 
 impl fmt::Display for KernelError {
@@ -54,6 +57,7 @@ impl fmt::Display for KernelError {
             KernelError::InvalidConfidence => {
                 write!(f, "confidence must be finite (no NaN or infinity)")
             }
+            KernelError::Backend(msg) => write!(f, "durable backend: {msg}"),
         }
     }
 }
@@ -111,6 +115,10 @@ mod tests {
         assert_eq!(
             KernelError::InvalidConfidence.to_string(),
             "confidence must be finite (no NaN or infinity)"
+        );
+        assert_eq!(
+            KernelError::Backend("lock held".into()).to_string(),
+            "durable backend: lock held"
         );
     }
 

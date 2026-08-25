@@ -2,11 +2,14 @@
 //! deterministic batches until SIGKILL lands mid-flight; every reopen
 //! must observe either the full committed prefix or the prior state —
 //! never a partial batch, never a gap in the durable marker sequence
-//! (INV-KILL-ALL-OR-NOTHING).
+//! (INV-KILL-ALL-OR-NOTHING). The identical contract is enforced twice:
+//! once against the journaled reference path, once against the durable
+//! redb backend whose own transactions are the crash story (issue #6 §5).
 
 use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op};
 use logical_db::port::ClockPort;
+use logical_db::redb_backend::RedbBackend;
 use logical_db::store::{Ldb, Mutation};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -19,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const CHILD_ENV: &str = "LDB_KILL_ROLE";
 const PATH_ENV: &str = "LDB_KILL_JOURNAL";
 const ROLE_WRITER: &str = "writer";
+const ROLE_WRITER_REDB: &str = "writer-redb";
 const ITERATIONS: usize = 12;
 /// Batch `k` plants `batch/{k:05}` plus its `/pair` sibling in one
 /// commit; both present or both absent proves batch atomicity.
@@ -113,19 +117,14 @@ fn marker_index(id: &[u8]) -> Option<u64> {
 
 // ── Recovery observation ─────────────────────────────────────
 
-/// Reopens the journal from scratch and returns `(batches, live)`:
-/// the highest contiguous surviving batch number and the live payload
-/// per key. A gap in the marker sequence is itself a violation —
-/// replay is sequential, so no middle batch can be missing.
-fn observe(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
-    let db = Ldb::open(path, MemKv::new(), CountingClock::default()).unwrap();
-    // scan_class yields versions ascending by ts within an id, so the
-    // last insert per id is its newest version.
-    let mut latest_by_id: BTreeMap<Vec<u8>, Op> = BTreeMap::new();
-    for row in db.scan_class(Class::Record).unwrap() {
-        latest_by_id.insert(row.id, row.op);
-    }
-
+/// The backend-independent half of recovery: from the newest op per id
+/// over `Class::Record`, return `(batches, live)` — the highest
+/// contiguous surviving batch number and the live payload per key. A
+/// gap in the marker sequence is itself a violation: commits are
+/// version-ordered, so no middle batch can be missing.
+fn fold_observation(
+    latest_by_id: impl IntoIterator<Item = (Vec<u8>, Op)>,
+) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
     let mut markers: Vec<u64> = Vec::new();
     let mut live = BTreeMap::new();
     for (id, op) in latest_by_id {
@@ -149,7 +148,144 @@ fn observe(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
     ((markers.len() as u64), live)
 }
 
+/// Reopens the journal from scratch and folds it.
+fn observe(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
+    let db = Ldb::open(path, MemKv::new(), CountingClock::default()).unwrap();
+    // scan_class yields versions ascending by ts within an id, so the
+    // last insert per id is its newest version.
+    let latest_by_id: BTreeMap<Vec<u8>, Op> = db
+        .scan_class(Class::Record)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.id, row.op))
+        .collect();
+    fold_observation(latest_by_id)
+}
+
+/// Reopens the durable backend from scratch and folds it.
+fn observe_redb(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
+    let db = Ldb::open_durable(RedbBackend::open(path).unwrap(), CountingClock::default()).unwrap();
+    let latest_by_id: BTreeMap<Vec<u8>, Op> = db
+        .scan_class(Class::Record)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.id, row.op))
+        .collect();
+    fold_observation(latest_by_id)
+}
+
 // ── Harness ──────────────────────────────────────────────────
+
+/// Which crash story the child writes through.
+#[derive(Clone, Copy)]
+enum Backend {
+    /// Framed journal in front of MemKv — the reference path.
+    Journal,
+    /// redb's own transactions; no journal ever exists.
+    Redb,
+}
+
+impl Backend {
+    fn role(self) -> &'static str {
+        match self {
+            Backend::Journal => ROLE_WRITER,
+            Backend::Redb => ROLE_WRITER_REDB,
+        }
+    }
+}
+
+/// One spawn→commit-cadence→SIGKILL→reopen cycle; returns how many
+/// batches survived. Shared verbatim by both backends so the fault
+/// contract cannot drift between them.
+fn kill_once(
+    test_name: &str,
+    backend: Backend,
+    iteration: usize,
+    rng: &mut Xorshift,
+    exe: &std::path::Path,
+) -> u64 {
+    let ext = match backend {
+        Backend::Journal => "journal",
+        Backend::Redb => "redb",
+    };
+    let path =
+        std::env::temp_dir().join(format!("ldb-kill-{}-{iteration}.{ext}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let ready = PathBuf::from(format!("{}.ready", path.display()));
+    let _ = std::fs::remove_file(&ready);
+
+    let mut child = Command::new(exe)
+        .args([test_name, "--exact", "--nocapture"])
+        .env(CHILD_ENV, backend.role())
+        .env(PATH_ENV, &path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the writer child");
+
+    // Wait for the first durable commit, then kill at a random moment
+    // inside the commit cadence.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let signaled = match backend {
+            // The journal only grows when frames land.
+            Backend::Journal => std::fs::metadata(&path).is_ok_and(|m| m.len() > 0),
+            // A fresh redb file already carries header pages, so size
+            // proves nothing; the child plants a sentinel instead.
+            Backend::Redb => ready.exists(),
+        };
+        if signaled {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("child never produced a durable byte at iteration {iteration}");
+        }
+        std::thread::sleep(Duration::from_micros(150));
+    }
+    std::thread::sleep(Duration::from_micros(1 + rng.below(9000)));
+
+    let _ = Command::new("/bin/kill")
+        .arg("-9")
+        .arg(child.id().to_string())
+        .status();
+    child.wait().expect("reap the killed child");
+
+    let (batches, live) = match backend {
+        Backend::Journal => observe(&path),
+        Backend::Redb => observe_redb(&path),
+    };
+    if batches == 0 {
+        assert!(live.is_empty(), "no durable batch but data appeared");
+    } else {
+        let expected_live: BTreeMap<Vec<u8>, Vec<u8>> = expected_fold(batches)
+            .into_iter()
+            .filter_map(|(id, op)| match op {
+                Op::Put(p) => Some((id, p)),
+                Op::Delete => None,
+            })
+            .collect();
+        assert_eq!(
+            live, expected_live,
+            "iteration {iteration}: recovered state diverged at batch {batches}"
+        );
+        let pair = format!("batch/{batches:05}/pair").into_bytes();
+        assert!(
+            live.contains_key(&pair),
+            "the newest surviving batch must be whole, not half-applied"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&ready);
+    batches
+}
+
+fn parent_rng() -> Xorshift {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u64;
+    Xorshift(nanos ^ (std::process::id() as u64) << 32)
+}
 
 #[test]
 fn process_kill_recovery_never_leaves_a_partial_batch() {
@@ -163,79 +299,56 @@ fn process_kill_recovery_never_leaves_a_partial_batch() {
         return; // reached only if the parent's kill never landed
     }
 
-    let mut rng = Xorshift({
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64;
-        nanos ^ (std::process::id() as u64) << 32
-    });
+    let mut rng = parent_rng();
     let exe = std::env::current_exe().unwrap();
 
     let mut total_survived = 0u64;
     for iteration in 0..ITERATIONS {
-        let path = std::env::temp_dir().join(format!(
-            "ldb-kill-{}-{iteration}.journal",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        total_survived += kill_once(
+            "process_kill_recovery_never_leaves_a_partial_batch",
+            Backend::Journal,
+            iteration,
+            &mut rng,
+            &exe,
+        );
+    }
 
-        let mut child = Command::new(&exe)
-            .args([
-                "process_kill_recovery_never_leaves_a_partial_batch",
-                "--exact",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, ROLE_WRITER)
-            .env(PATH_ENV, &path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the writer child");
+    assert!(
+        total_survived >= ITERATIONS as u64,
+        "harness went vacuous: {total_survived} batches survived across {ITERATIONS} kills"
+    );
+}
 
-        // Wait for the first frame bytes to land, then kill at a random
-        // moment inside the commit cadence.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match std::fs::metadata(&path) {
-                Ok(m) if m.len() > 0 => break,
-                _ if Instant::now() > deadline => {
-                    panic!("child never produced a durable byte at iteration {iteration}")
-                }
-                _ => std::thread::sleep(Duration::from_micros(150)),
+#[test]
+fn process_kill_recovery_on_the_durable_backend_never_leaves_a_partial_batch() {
+    if std::env::var(CHILD_ENV).as_deref() == Ok(ROLE_WRITER_REDB) {
+        let path = std::env::var(PATH_ENV).expect("child needs a database path");
+        let mut db =
+            Ldb::open_durable(RedbBackend::open(&path).unwrap(), CountingClock::default()).unwrap();
+        for k in 1..=CHILD_BATCH_CAP {
+            db.commit(&batch_for(k)).unwrap();
+            if k == 1 {
+                // Readiness signal: the parent cannot watch the redb
+                // file grow (header pages exist before any commit).
+                std::fs::write(format!("{}.ready", path), b"1").unwrap();
             }
+            std::thread::sleep(Duration::from_micros(300));
         }
-        std::thread::sleep(Duration::from_micros(1 + rng.below(9000)));
+        return; // reached only if the parent's kill never landed
+    }
 
-        let _ = Command::new("/bin/kill")
-            .arg("-9")
-            .arg(child.id().to_string())
-            .status();
-        child.wait().expect("reap the killed child");
+    let mut rng = parent_rng();
+    let exe = std::env::current_exe().unwrap();
 
-        let (batches, live) = observe(&path);
-        total_survived += batches;
-        if batches == 0 {
-            assert!(live.is_empty(), "no durable batch but data appeared");
-        } else {
-            let expected_live: BTreeMap<Vec<u8>, Vec<u8>> = expected_fold(batches)
-                .into_iter()
-                .filter_map(|(id, op)| match op {
-                    Op::Put(p) => Some((id, p)),
-                    Op::Delete => None,
-                })
-                .collect();
-            assert_eq!(
-                live, expected_live,
-                "iteration {iteration}: recovered state diverged at batch {batches}"
-            );
-            let pair = format!("batch/{batches:05}/pair").into_bytes();
-            assert!(
-                live.contains_key(&pair),
-                "the newest surviving batch must be whole, not half-applied"
-            );
-        }
-        let _ = std::fs::remove_file(&path);
+    let mut total_survived = 0u64;
+    for iteration in 0..ITERATIONS {
+        total_survived += kill_once(
+            "process_kill_recovery_on_the_durable_backend_never_leaves_a_partial_batch",
+            Backend::Redb,
+            iteration,
+            &mut rng,
+            &exe,
+        );
     }
 
     assert!(

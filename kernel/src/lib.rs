@@ -20,6 +20,7 @@ pub mod memkv;
 pub mod model;
 pub mod port;
 pub mod record;
+pub mod redb_backend;
 pub mod store;
 pub mod term;
 pub mod veccode;
