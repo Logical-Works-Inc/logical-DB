@@ -161,38 +161,42 @@ pub fn point_key(class: Class, id: &[u8], ts: u64) -> Vec<u8> {
 
 /// The inverse of [`point_key`]; keeps all key-layout knowledge here.
 /// Rejects any key whose id region breaks the escape framing instead
-/// of guessing at field boundaries.
+/// of guessing at field boundaries. Parsing walks slice patterns, not
+/// indices: there is no offset arithmetic to drift.
 pub fn split_key(key: &[u8]) -> Result<(Class, Vec<u8>, u64)> {
     if key.len() < 1 + 2 + 8 {
         return Err(KernelError::TruncatedRow);
     }
-    let class = Class::from_tag(key[0])?;
-    let ts_at = key.len() - 8;
-    let term_at = ts_at - 2;
-    if key[term_at] != 0x00 || key[term_at + 1] != 0x00 {
-        return Err(KernelError::MalformedKey);
-    }
-    let escaped = &key[1..term_at];
-    let mut id = Vec::with_capacity(escaped.len());
-    let mut i = 0;
-    while i < escaped.len() {
-        match escaped[i] {
-            0x00 if escaped.get(i + 1) == Some(&0xFF) => {
-                id.push(0x00);
-                i += 2;
+    let (tag, rest) = key.split_first().ok_or(KernelError::TruncatedRow)?;
+    let class = Class::from_tag(*tag)?;
+    let (escaped, tail) =
+        rest.split_at(rest.len().checked_sub(8).ok_or(KernelError::TruncatedRow)?);
+    // The id region must close on the two-byte terminator `[0x00 0x00]`;
+    // anything else is not a key this crate wrote.
+    match escaped.split_last() {
+        Some((0x00, body)) if body.last() == Some(&0x00) => {
+            let mut id = Vec::with_capacity(body.len());
+            let mut cursor = &body[..body.len() - 1];
+            while let Some((byte, rest)) = cursor.split_first() {
+                match byte {
+                    0x00 => match rest.split_first() {
+                        Some((0xFF, after_escape)) => {
+                            id.push(0x00);
+                            cursor = after_escape;
+                        }
+                        _ => return Err(KernelError::MalformedKey),
+                    },
+                    plain => {
+                        id.push(*plain);
+                        cursor = rest;
+                    }
+                }
             }
-            0x00 => return Err(KernelError::MalformedKey),
-            b => {
-                id.push(b);
-                i += 1;
-            }
+            let ts = u64::from_be_bytes(tail.try_into().expect("tail is exactly 8 bytes"));
+            Ok((class, id, ts))
         }
+        _ => Err(KernelError::MalformedKey),
     }
-    let tail = &key[ts_at..];
-    let ts = u64::from_be_bytes([
-        tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7],
-    ]);
-    Ok((class, id, ts))
 }
 
 // ── Wire codec ───────────────────────────────────────────────
@@ -485,6 +489,52 @@ mod tests {
         assert!(Op::Delete.is_delete());
         assert!(!Op::Put(vec![]).is_delete());
         assert!(Op::Delete.payload().is_empty());
+    }
+
+    #[test]
+    fn point_key_bytes_are_pinned_exactly() {
+        // Byte-exact layout pins: tag, escape pairs, terminator, and
+        // big-endian ts must each sit exactly where the layout says.
+        assert_eq!(
+            point_key(Class::Record, b"", 0),
+            [0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            point_key(Class::Record, &[0xFF], 1),
+            [0x01, 0xFF, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            point_key(Class::Record, &[0x00, 0xFF], 2),
+            [0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 2]
+        );
+        assert_eq!(history_prefix(Class::Claim, b"x"), [0x05, b'x', 0x00, 0x00]);
+    }
+
+    #[test]
+    fn malformed_framing_is_rejected_strictly() {
+        let good = point_key(Class::Record, &[0xFF], 9);
+        assert_eq!(good.len(), 12);
+        assert!(split_key(&good).is_ok());
+
+        // Terminator's second byte corrupted: the key no longer closes.
+        let mut bad_term = good.clone();
+        bad_term[2] = 0xFF;
+        assert!(matches!(
+            split_key(&bad_term),
+            Err(KernelError::MalformedKey)
+        ));
+
+        // Bare 0x00 inside the id region, not followed by 0xFF: an
+        // escaped zero must always come in pairs.
+        let mut bare = point_key(Class::Record, &[0xAB, 0xCD], 9);
+        bare[2] = 0x00;
+        assert!(matches!(split_key(&bare), Err(KernelError::MalformedKey)));
+
+        // Below the minimum framed length (tag + terminator + ts).
+        assert!(matches!(
+            split_key(&good[..10]),
+            Err(KernelError::TruncatedRow)
+        ));
     }
 
     #[test]
