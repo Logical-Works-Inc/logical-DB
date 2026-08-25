@@ -1,5 +1,5 @@
 [package]
-name = "ldb-kernel"
+name = "logical-db"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,3 +12,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # stays direct solely because derive expansion requires it (see root).
 lgwks_std = { workspace = true }
 serde = { workspace = true }
+
+# Plain-binary benchmark suite (issue #6 §9): stdlib timing, JSONL
+# results on stdout — no criterion dependency.
+[[bench]]
+name = "ship_bench"
+harness = false

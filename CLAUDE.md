@@ -31,9 +31,10 @@ every model, built for petabytes at a fraction of the cost.
   (process: operating model, ticketing taxonomy, DoD, issue template, ADRs).
 - **CI** — keel-derived: `ci/keel-ci.toml` → generated
   `.github/workflows/ci.yml`; local runs via `.wwfd/local-ci.sh`.
-- **Kernel code** — `kernel/` holds the DB-A spine (`ldb-kernel` crate,
-  issue #1). New kernel surface lands via a DB-A…DB-E issue only; the
-  organ map for what gets grafted next is `docs/FRANKENSTEIN.md`.
+- **Kernel code** — `kernel/` holds the kernel spine (`logical-db`
+  crate, issue #1; five storage classes per issue #5/#6). New kernel
+  surface lands via a DB-A…DB-E issue only; the organ map for what gets
+  grafted next is `docs/FRANKENSTEIN.md`.
 
 ## Source of truth
 

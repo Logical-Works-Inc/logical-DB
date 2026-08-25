@@ -39,7 +39,7 @@ postings — closure-expansion fixes boundary misses); RaBitQ `2405.12497`
 (1-bit codes with theoretical error bound). GNN anchors (design references,
 not fresh fetches): GCN `1609.02907`, GAT `1710.10903` (§8).
 
-## 2. Why the blend works: one core, four storage classes
+## 2. Why the blend works: one core, five storage classes
 
 The industry splits along engine lines (Postgres+pgvector, Redis, Neo4j).
 That split IS the compute waste: four WALs, four caches, four serialization
@@ -61,7 +61,7 @@ discipline**. Concretely, over one append-only segment store:
 - `claim`: content-addressed claims with provenance — already built,
   unchanged.
 
-One journal, one cache, one crash story. INV-ONE-CORE-FOUR-CLASSES.
+One journal, one cache, one crash story. INV-ONE-CORE-FIVE-CLASSES.
 
 ## 3. The compute fraction (the real SOTA)
 
@@ -82,7 +82,9 @@ One journal, one cache, one crash story. INV-ONE-CORE-FOUR-CLASSES.
 
 Net effect: brute-force fp32 scan replaced by popcount scan + K rescores;
 write path = append + periodic compaction; read path = mmap + SIMD. That is
-the "fraction of compute" claim, mechanism named.
+the "fraction of compute" claim, mechanism named; its measured surface is
+the benchmark suite in `docs/FORMAT.md` §4 — a claim without a run there
+does not change this document.
 
 ## 4. Mouldability contract (what "mouldable" means operationally)
 
@@ -97,19 +99,20 @@ the "fraction of compute" claim, mechanism named.
 - HelixDB remains an outboard engine; the kernel must be functional WITHOUT
   it (fail-closed out-of-box rule).
 
-## 5. Pathway phases (proposal, Director-gated)
+## 5. Pathway phases (status 2026-08-25)
 
-- **DB-A — Kernel spine**: append-only segmented core + journal + mmap reads;
-  content-addressed segment IDs. Exit: crash-consistency test (kill -9
-  mid-append replay) + 10^6-row ingest benchmark + deterministic simulation
-  harness (INV-SIMULATE-THE-SPINE, §6).
-- **DB-B — Record + adjacency classes**: rows + graph edges as rows; parity
-  tests vs sqlite paths bit-for-bit on identical corpora.
-- **DB-C — Term class**: postings with FTS5-parity ranking; A/B against a
-  live sqlite FTS5 store on parity queries.
-- **DB-D — Vec class**: RaBitQ codes + centroid table + rescore.
-- **DB-E — Outboard**: object-store tier + HelixDB interop + FDB adapter
-  (§6).
+- **DB-A — Kernel spine — LANDED** (row model, framed CRC32 journal,
+  MemKv default backend, kill-9 recovery proof; segment packing and
+  mmap reads remain future work).
+- **DB-B — Record + adjacency classes — LANDED** (`logical-db` crate;
+  sqlite bit-for-bit parity was not built; correctness is held by the
+  randomized reference-model suite instead).
+- **DB-C — Term class — LANDED** (BM25 postings with maintained term
+  manifests; FTS5 A/B was not run).
+- **DB-D — Vec class — LANDED** for the quantized path (codes +
+  centroid index + brute_scan top-K); exact fp32 baseline pending.
+- **DB-E — Outboard — PENDING**: redb production backend first (issue
+  #6 §5), then object-store tier + HelixDB interop + FDB adapter (§6).
 
 Dependency order A→B→C→D→E; B/C can parallelize after A. §9's filesystem
 face and §10's packs ride on B–D; §8's GNN compute rides on D.
@@ -164,6 +167,16 @@ FDB is one swappable engine beneath a port we own.
   scope we do not need; MVCC shape noted for DB-A journal design.
 - FDB as the embedded default: rejected per §6 — daemon-per-clone breaks
   the out-of-box rule; adopted instead as the scale-out adapter tier.
+
+## 8–11. Future axes (design intent, not v0.1 scope)
+
+Sections 8 (GNN compute), 9 (filesystem face), 10 (use-case packs), and
+11 (DiD gauntlet) are the axes this kernel is being built TOWARD, kept
+here as design intent with their evidence. None of them is required to
+call logical-DB finished at v0.1 (issue #6 §10.7): no filesystem, no
+pack interpreter, no sync, no agent surface blocks the library boundary.
+They are named future phases, Director-gated, and nothing in them
+constrains the shipped crate today.
 
 ## 8. GNN-native compute — the DB acts like a GNN model
 

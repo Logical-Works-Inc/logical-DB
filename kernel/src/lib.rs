@@ -2,7 +2,7 @@
 //!
 //! Owns the canonical row model, the storage and clock ports, and the
 //! framed journal that makes batch commits atomic. Invariants enforced
-//! here: INV-ONE-CORE-FOUR-CLASSES (five classes, unknown tags
+//! here: INV-ONE-CORE-FIVE-CLASSES (five classes, unknown tags
 //! unconstructable), INV-BATCH-IS-ONE-FRAME (a batch is one journal
 //! frame, so replay applies it whole or not at all), INV-TS-MONOTONIC
 //! (journal ts never regresses — version-ordered commits), and

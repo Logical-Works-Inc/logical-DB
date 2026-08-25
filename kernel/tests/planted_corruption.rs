@@ -4,12 +4,12 @@
 //! boundary; absurd length fields fail closed instead of allocating
 //! attacker-chosen buffers (issue #6 §8 negative tests).
 
-use ldb_kernel::journal::crc32;
-use ldb_kernel::memkv::MemKv;
-use ldb_kernel::model::Class;
-use ldb_kernel::port::ClockPort;
-use ldb_kernel::store::{Ldb, Mutation};
-use ldb_kernel::KernelError;
+use logical_db::journal::crc32;
+use logical_db::memkv::MemKv;
+use logical_db::model::Class;
+use logical_db::port::ClockPort;
+use logical_db::store::{Ldb, Mutation};
+use logical_db::KernelError;
 use std::cell::Cell;
 use std::path::PathBuf;
 

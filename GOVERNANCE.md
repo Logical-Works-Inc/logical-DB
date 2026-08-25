@@ -108,5 +108,5 @@ The security surface is deliberately small and fail-closed:
 |---|---|---|
 | Workspace license | Director | open |
 | Constellation registration of authorities | Director | open — ADR-001 |
-| FUSE backend choice | Director | open — post DB-B |
+| FUSE backend choice | Director | open — post redb backend |
 | HelixDB adapter scope | Director | settled 2026-08-21 — survives |

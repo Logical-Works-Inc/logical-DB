@@ -12,7 +12,7 @@ pub enum KernelError {
     Io(std::io::Error),
     /// INV-TS-MONOTONIC violated: a row's ts precedes committed time.
     TsRegression { last: u64, got: u64 },
-    /// INV-ONE-CORE-FOUR-CLASSES violated at the wire boundary.
+    /// INV-ONE-CORE-FIVE-CLASSES violated at the wire boundary.
     UnknownClass(u8),
     /// A row codec hit end-of-buffer mid-field.
     TruncatedRow,
