@@ -7,14 +7,14 @@
 //! - Posting: namespace 0x01: `[0x01][len(term) u16 BE][term][len(doc_id) u16 BE][doc_id]`
 //! - Doc manifest: namespace 0x02: `[0x02][len(doc_id) u16 BE][doc_id]`
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::{self, Class};
 use crate::port::{ClockPort, KvPort};
 use crate::store::{Ldb, Mutation};
-use crate::Result;
+use crate::{KernelError, Result};
 
 // ── Posting ─────────────────────────────────────────────────
 
@@ -64,6 +64,18 @@ fn manifest_id(doc_id: &[u8]) -> Result<Vec<u8>> {
     model::encode_composite(MANIFEST_NS, &[doc_id])
 }
 
+/// `(op_tag, payload)` → posting. Tombstones decode to `None`; a live
+/// payload that no longer decodes is a hard error (FORMAT.md §1),
+/// never a silently skipped result.
+fn deserialize_posting(stored: &[u8]) -> Result<Option<Posting>> {
+    if stored.is_empty() || stored[0] == 2 {
+        return Ok(None);
+    }
+    lgwks_std::json::from_slice::<Posting>(&stored[1..])
+        .map(Some)
+        .map_err(|e| KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
 // ── MemTermIndex ────────────────────────────────────────────
 
 pub struct MemTermIndex<S: KvPort, C: ClockPort> {
@@ -93,12 +105,13 @@ impl<S: KvPort, C: ClockPort> MemTermIndex<S, C> {
                 continue;
             }
             let payload = &stored[1..];
-            if let Ok(manifest) = lgwks_std::json::from_slice::<DocManifest>(payload) {
-                let (_, id, _) = model::split_key(key)?;
-                let (_, parts) = model::decode_composite(&id)?;
-                if !parts.is_empty() {
-                    docs.insert(parts[0].clone(), manifest.field_len);
-                }
+            let manifest: DocManifest = lgwks_std::json::from_slice(payload).map_err(|e| {
+                crate::KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            let (_, id, _) = model::split_key(key)?;
+            let (_, parts) = model::decode_composite(&id)?;
+            if !parts.is_empty() {
+                docs.insert(parts[0].clone(), manifest.field_len);
             }
         }
         let n = docs.len();
@@ -160,17 +173,13 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
     fn postings_for_term(&self, term: &[u8]) -> Result<Vec<Posting>> {
         let key_prefix = model::class_id_prefix(Class::Term, &posting_term_prefix(term)?);
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
-        let mut best: HashMap<Vec<u8>, Option<Posting>> = HashMap::new();
+        // BTreeMap keeps the newest version per doc id and returns them
+        // in ascending composite-key order — deterministic reference
+        // order (DB_PATHWAY §4).
+        let mut best: BTreeMap<Vec<u8>, Option<Posting>> = BTreeMap::new();
         for (key, stored) in raw {
             let (_, id, _) = model::split_key(&key)?;
-            if stored.is_empty() || stored[0] == 2 {
-                best.insert(id, None);
-            } else {
-                let payload = &stored[1..];
-                if let Ok(posting) = lgwks_std::json::from_slice::<Posting>(payload) {
-                    best.insert(id, Some(posting));
-                }
-            }
+            best.insert(id, deserialize_posting(&stored)?);
         }
         Ok(best.into_values().flatten().collect())
     }
@@ -267,14 +276,37 @@ mod tests {
     #[test]
     fn postings_for_term_returns_all_docs() {
         let (mut idx, path) = make_idx("postings");
+        idx.index_doc(b"c", &[(b"y".to_vec(), 1)], 3).unwrap();
         idx.index_doc(b"a", &[(b"x".to_vec(), 1)], 5).unwrap();
         idx.index_doc(b"b", &[(b"x".to_vec(), 2)], 7).unwrap();
-        idx.index_doc(b"c", &[(b"y".to_vec(), 1)], 3).unwrap();
         let postings = idx.postings_for_term(b"x").unwrap();
         assert_eq!(postings.len(), 2);
-        let doc_ids: Vec<_> = postings.iter().map(|p| p.doc_id.clone()).collect();
-        assert!(doc_ids.contains(&b"a".to_vec()));
-        assert!(doc_ids.contains(&b"b".to_vec()));
+        // Exact order, not just membership: postings come back in
+        // ascending doc-id order, deterministically.
+        let doc_ids: Vec<_> = postings.iter().map(|p| p.doc_id.as_slice()).collect();
+        assert_eq!(doc_ids, [&b"a"[..], &b"b"[..]]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_posting_payload_fails_the_scan_loudly() {
+        // FORMAT.md §1: a stored value that no longer decodes is a hard
+        // error — never a silently missing posting.
+        let (mut idx, path) = make_idx("corrupt");
+        idx.index_doc(b"d1", &[(b"x".to_vec(), 1)], 5).unwrap();
+        let mut store = idx.into_store();
+        let pid = model::encode_composite(0x01, &[&b"x"[..], &b"d1"[..]]).unwrap();
+        // Plant a fresh posting version whose payload no longer
+        // decodes, through the store's own commit path.
+        store
+            .commit(&[Mutation::put(Class::Term, pid, b"{not json".to_vec())])
+            .unwrap();
+        let idx = MemTermIndex::new(store);
+        let err = idx.postings_for_term(b"x").unwrap_err();
+        assert!(
+            matches!(err, KernelError::Io(_)),
+            "corrupt payload must fail the scan, got {err:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

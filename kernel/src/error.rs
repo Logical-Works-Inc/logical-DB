@@ -28,6 +28,11 @@ pub enum KernelError {
     MalformedKey,
     /// Attempted to store NaN or infinite confidence.
     InvalidConfidence,
+    /// Attempted to store a NaN or infinite vector norm.
+    InvalidNorm,
+    /// A Hamming distance was requested between codes of different
+    /// lengths; the distance is undefined there.
+    CodeLengthMismatch { expected: usize, got: usize },
     /// The durable backend (issue #6 §5) refused an operation; the
     /// message names the backend-level cause.
     Backend(String),
@@ -56,6 +61,15 @@ impl fmt::Display for KernelError {
             }
             KernelError::InvalidConfidence => {
                 write!(f, "confidence must be finite (no NaN or infinity)")
+            }
+            KernelError::InvalidNorm => {
+                write!(f, "norm must be finite (no NaN or infinity)")
+            }
+            KernelError::CodeLengthMismatch { expected, got } => {
+                write!(
+                    f,
+                    "code lengths differ: expected {expected} bytes, got {got}"
+                )
             }
             KernelError::Backend(msg) => write!(f, "durable backend: {msg}"),
         }
@@ -115,6 +129,18 @@ mod tests {
         assert_eq!(
             KernelError::InvalidConfidence.to_string(),
             "confidence must be finite (no NaN or infinity)"
+        );
+        assert_eq!(
+            KernelError::InvalidNorm.to_string(),
+            "norm must be finite (no NaN or infinity)"
+        );
+        assert_eq!(
+            KernelError::CodeLengthMismatch {
+                expected: 32,
+                got: 30
+            }
+            .to_string(),
+            "code lengths differ: expected 32 bytes, got 30"
         );
         assert_eq!(
             KernelError::Backend("lock held".into()).to_string(),

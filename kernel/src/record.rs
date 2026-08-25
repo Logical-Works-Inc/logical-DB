@@ -77,8 +77,11 @@ impl<S: KvPort, C: ClockPort> RecordIndex for MemRecordIndex<S, C> {
 
     fn scan_all_live(&self) -> Result<Vec<LiveRecord>> {
         let rows = self.store.scan_class(Class::Record)?;
-        let mut latest: std::collections::HashMap<Vec<u8>, (u64, Op)> =
-            std::collections::HashMap::new();
+        // BTreeMap keeps the newest version per id and hands the live
+        // records back in ascending id order — deterministic reference
+        // order (DB_PATHWAY §4).
+        let mut latest: std::collections::BTreeMap<Vec<u8>, (u64, Op)> =
+            std::collections::BTreeMap::new();
         for row in rows {
             latest.insert(row.id.clone(), (row.ts, row.op));
         }
@@ -174,12 +177,16 @@ mod tests {
         let path = tmp_path("scan");
         let store = Ldb::open(&path, MemKv::new(), Seq(Cell::new(0))).unwrap();
         let mut idx = MemRecordIndex::new(store);
+        idx.put(b"c", b"v1".to_vec()).unwrap();
         idx.put(b"a", b"v1".to_vec()).unwrap();
         idx.put(b"b", b"v1".to_vec()).unwrap();
         idx.delete(b"a").unwrap();
         let live = idx.scan_all_live().unwrap();
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].id, b"b");
+        assert_eq!(live.len(), 2);
+        // Exact order, not just membership: live records come back in
+        // ascending id order, deterministically.
+        let ids: Vec<_> = live.iter().map(|r| r.id.as_slice()).collect();
+        assert_eq!(ids, [&b"b"[..], &b"c"[..]]);
         let _ = std::fs::remove_file(&path);
     }
 
