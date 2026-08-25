@@ -4,10 +4,10 @@
 //! never a partial batch, never a gap in the durable marker sequence
 //! (INV-KILL-ALL-OR-NOTHING).
 
-use ldb_kernel::memkv::MemKv;
-use ldb_kernel::model::{Class, Op};
-use ldb_kernel::port::ClockPort;
-use ldb_kernel::store::{Ldb, Mutation};
+use logical_db::memkv::MemKv;
+use logical_db::model::{Class, Op};
+use logical_db::port::ClockPort;
+use logical_db::store::{Ldb, Mutation};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;

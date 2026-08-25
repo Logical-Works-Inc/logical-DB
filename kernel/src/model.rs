@@ -1,5 +1,5 @@
 //! Owns the canonical row model: the five storage classes and the Row
-//! type with its wire codec. INV-ONE-CORE-FOUR-CLASSES: a row is
+//! type with its wire codec. INV-ONE-CORE-FIVE-CLASSES: a row is
 //! exactly one of five classes; unknown wire tags are unconstructable.
 
 use serde::{Deserialize, Serialize};

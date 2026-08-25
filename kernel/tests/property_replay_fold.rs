@@ -3,10 +3,10 @@
 //! journal, reopening at c must yield exactly the fold of the batches
 //! fully contained in c — never a partial batch, never a lost prefix.
 
-use ldb_kernel::memkv::MemKv;
-use ldb_kernel::model::{Class, Op};
-use ldb_kernel::port::ClockPort;
-use ldb_kernel::store::{Ldb, Mutation};
+use logical_db::memkv::MemKv;
+use logical_db::model::{Class, Op};
+use logical_db::port::ClockPort;
+use logical_db::store::{Ldb, Mutation};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::File;

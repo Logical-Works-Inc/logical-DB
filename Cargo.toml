@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "organs"]
+members = ["kernel"]
 
 [workspace.dependencies]
 # Pinned to the Braid commit that declares the truthful MSRV 1.93

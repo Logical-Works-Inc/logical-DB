@@ -279,7 +279,7 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo test -p ldb-kernel --test property_replay_fold'''
+cargo test -p logical-db --test property_replay_fold'''
 
 [[job]]
 id = "kani-verify"
@@ -307,11 +307,11 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo kani -p ldb-kernel'''
+cargo kani -p logical-db'''
 
 [[job]]
 id = "mutation-test-verify"
-name = "Teeth — cargo-mutants refuses survivors in ldb-kernel"
+name = "Teeth — cargo-mutants refuses survivors in logical-db"
 needs = ["stack-position", "change-scope"]
 condition = "success()"
 timeout_minutes = 25
@@ -330,7 +330,7 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo mutants -p ldb-kernel'''
+cargo mutants -p logical-db'''
 
 [[job]]
 id = "mcdc-coverage"

@@ -4,10 +4,10 @@
 //! keep the production store exactly equal to an independently written
 //! in-memory reference through every read path (INV-SM-REFERENCE).
 
-use ldb_kernel::memkv::MemKv;
-use ldb_kernel::model::{Class, Op, Row};
-use ldb_kernel::port::ClockPort;
-use ldb_kernel::store::{Ldb, Mutation};
+use logical_db::memkv::MemKv;
+use logical_db::model::{Class, Op, Row};
+use logical_db::port::ClockPort;
+use logical_db::store::{Ldb, Mutation};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;

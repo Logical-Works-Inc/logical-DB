@@ -1,7 +1,7 @@
 <!-- GENERATED from repo-map.json by scripts/repo-map.mjs — DO NOT EDIT BY HAND. -->
 # REPO MAP
 
-Rendered view of `repo-map.json`. Canon: **ADR-001 (canonical DB-model authority)**. Updated: 2026-08-21.
+Rendered view of `repo-map.json`. Canon: **ADR-001 (canonical DB-model authority)**. Updated: 2026-08-25.
 Reconcile with `node scripts/repo-map.mjs check`.
 
 ## Repos (cross-repo)
@@ -24,9 +24,9 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, property gauntlet, Kani proofs, cargo-mutants teeth, MC/DC slot (keel#480), ci-plan-current, eval-log, cleanup. |
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
-| `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. |
-| `kernel/` | kernel | DB-A spine (issue #1): ldb-kernel crate — row model, KvPort/ClockPort, MemKv, framed CRC32 journal, BLAKE3 content ids, Ldb store. G2…G6 land here next. (ADR-001) |
-| `organs/` | kernel | Donor-engine dump: fjall, redb, arroy+heed, fst, petgraph, memmap2, half — one functional smoke each; cleanup pass deletes what we do not graft. |
+| `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC. |
+| `docs/FORMAT.md` | spec | v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), what is not yet stable, benchmark results schema and algorithmic gates. |
+| `kernel/` | kernel | The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/ClockPort, MemKv default backend, framed CRC32 journal, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite. (ADR-001) |
 
 ## META — agent/process tooling
 
