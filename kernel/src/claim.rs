@@ -100,8 +100,7 @@ impl<S: KvPort, C: ClockPort> MemClaimIndex<S, C> {
     }
 
     fn scan_index(&self, prefix: Vec<u8>) -> Result<Vec<Claim>> {
-        let mut full_prefix = model::class_prefix(Class::Claim);
-        full_prefix.extend_from_slice(&prefix);
+        let full_prefix = model::class_id_prefix(Class::Claim, &prefix);
         let raw = self.store.kv().scan_prefix(&full_prefix)?;
         let mut best: HashMap<Vec<u8>, Option<Claim>> = HashMap::new();
         for (key, stored) in raw {
