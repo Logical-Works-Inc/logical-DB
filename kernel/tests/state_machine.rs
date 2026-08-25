@@ -3,10 +3,13 @@
 //! byte ids, repeated writes inside one batch, reopen cycles — must
 //! keep the production store exactly equal to an independently written
 //! in-memory reference through every read path (INV-SM-REFERENCE).
+//! The identical workload runs on both backends: the journaled
+//! reference path and the durable redb backend (issue #6 §5 parity).
 
 use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op, Row};
-use logical_db::port::ClockPort;
+use logical_db::port::{ClockPort, KvPort};
+use logical_db::redb_backend::RedbBackend;
 use logical_db::store::{Ldb, Mutation};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -95,7 +98,9 @@ impl Reference {
 
 // ── Full-surface comparison ──────────────────────────────────
 
-fn assert_reference_holds(db: &Ldb<MemKv, SharedClock>, r: &Reference) {
+/// Backend-generic: the same read-path assertions bind whichever
+/// backend the store is opened over.
+fn assert_reference_holds<S: KvPort, C: ClockPort>(db: &Ldb<S, C>, r: &Reference) {
     for class in [
         Class::Record,
         Class::Term,
@@ -138,13 +143,11 @@ fn tmp_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ldb-sm-{}-{tag}.journal", std::process::id()))
 }
 
-#[test]
-fn generated_mixed_workload_stays_equal_to_the_reference_across_reopens() {
-    let mut rng = Xorshift(0x5EED_2026_0825);
-    let path = tmp_path("main");
-    let _ = std::fs::remove_file(&path);
-
-    let classes = [
+/// The one batch generator both backend suites drive — identical
+/// shapes so a backend difference can only be in the store, never in
+/// the workload.
+fn gen_batch(rng: &mut Xorshift) -> Vec<Mutation> {
+    const CLASSES: [Class; 5] = [
         Class::Record,
         Class::Term,
         Class::Edge,
@@ -158,25 +161,33 @@ fn generated_mixed_workload_stays_equal_to_the_reference_across_reopens() {
     ids.push(vec![0xFF]);
     ids.push(vec![0xFF, 0x00, 0xFF]);
 
+    let n = 1 + rng.below(4) as usize;
+    (0..n)
+        .map(|_| {
+            let id = ids[rng.below(ids.len() as u64) as usize].clone();
+            let class = CLASSES[rng.below(CLASSES.len() as u64) as usize];
+            if rng.below(5) == 0 {
+                Mutation::delete(class, id)
+            } else {
+                let len = rng.below(9) as usize;
+                Mutation::put(class, id, (0..len).map(|_| rng.next() as u8).collect())
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn generated_mixed_workload_stays_equal_to_the_reference_across_reopens() {
+    let mut rng = Xorshift(0x5EED_2026_0825);
+    let path = tmp_path("main");
+    let _ = std::fs::remove_file(&path);
+
     let clock = SharedClock::default();
     let mut reference = Reference::default();
     let mut db = Ldb::open(&path, MemKv::new(), clock.clone()).unwrap();
 
     for step in 0..40usize {
-        let n = 1 + rng.below(4) as usize;
-        let batch: Vec<Mutation> = (0..n)
-            .map(|_| {
-                let id = ids[rng.below(ids.len() as u64) as usize].clone();
-                let class = classes[rng.below(classes.len() as u64) as usize];
-                if rng.below(5) == 0 {
-                    Mutation::delete(class, id)
-                } else {
-                    let len = rng.below(9) as usize;
-                    Mutation::put(class, id, (0..len).map(|_| rng.next() as u8).collect())
-                }
-            })
-            .collect();
-
+        let batch = gen_batch(&mut rng);
         let ts = db.commit(&batch).unwrap();
         assert_eq!(ts, step as u64 + 1, "one tick per non-empty batch");
         reference.apply(&batch, ts);
@@ -187,6 +198,48 @@ fn generated_mixed_workload_stays_equal_to_the_reference_across_reopens() {
             // point is served from journal replay, not carried memory.
             let (_kv, _clock) = db.into_parts();
             db = Ldb::open(&path, MemKv::new(), clock.clone()).unwrap();
+            assert_reference_holds(&db, &reference);
+        }
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_durable_backend_serves_the_identical_workload_equal_to_the_reference() {
+    let mut rng = Xorshift(0x5EED_2026_0825); // same seed, same batches
+    let path = tmp_path("redb");
+    let _ = std::fs::remove_file(&path);
+
+    let clock = SharedClock::default();
+    let mut reference = Reference::default();
+    let reopen = |clock: SharedClock| -> Ldb<RedbBackend, SharedClock> {
+        Ldb::open_durable(RedbBackend::open(&path).unwrap(), clock).unwrap()
+    };
+    let mut db = reopen(clock.clone());
+    assert_eq!(
+        db.scan_class(Class::Record).unwrap(),
+        Vec::new(),
+        "a fresh durable store reads as empty"
+    );
+
+    for step in 0..40usize {
+        let batch = gen_batch(&mut rng);
+        let ts = db.commit(&batch).unwrap();
+        assert_eq!(ts, step as u64 + 1, "one tick per non-empty batch");
+        reference.apply(&batch, ts);
+        assert_reference_holds(&db, &reference);
+
+        if step % 7 == 6 {
+            // Reopen against the persisted file: every read after this
+            // point comes out of redb's own crash story, no journal.
+            drop(db);
+            db = reopen(clock.clone());
+            assert_eq!(
+                db.last_ts(),
+                ts,
+                "the committed version seeds committed time across reopen"
+            );
             assert_reference_holds(&db, &reference);
         }
     }

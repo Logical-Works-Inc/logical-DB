@@ -111,8 +111,12 @@ does not change this document.
   manifests; FTS5 A/B was not run).
 - **DB-D — Vec class — LANDED** for the quantized path (codes +
   centroid index + brute_scan top-K); exact fp32 baseline pending.
-- **DB-E — Outboard — PENDING**: redb production backend first (issue
-  #6 §5), then object-store tier + HelixDB interop + FDB adapter (§6).
+- **DB-E — Outboard — PARTIAL**: redb production backend LANDED (issue
+  #6 §5: `RedbBackend` behind `DurableKv`/`apply_batch`, one atomic
+  transaction per batch, version persisted with its batch, exclusive
+  open lock; the framed journal stays as reference/fault oracle — never
+  both writers on one store). Still PENDING: object-store tier +
+  HelixDB interop + FDB adapter (§6).
 
 Dependency order A→B→C→D→E; B/C can parallelize after A. §9's filesystem
 face and §10's packs ride on B–D; §8's GNN compute rides on D.

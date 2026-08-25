@@ -38,10 +38,11 @@ string-query surface, injection-class bugs structurally absent.
 ## The wall
 
 The honest wall, updated 2026-08-25: the kernel spine exists — row model,
-framed journal with kill-9 recovery proof, all five storage classes, a
-randomized state-machine suite, corruption negative tests, Kani proofs,
-and the benchmark suite (`docs/FORMAT.md`). What is still ahead of the
-thesis: the production redb backend behind KvPort (issue #6 §5), segment
+all five storage classes, a randomized state-machine suite run on both
+backends, corruption negative tests, Kani proofs, the benchmark suite
+(`docs/FORMAT.md`), and two durability paths with one crash story each:
+production redb (`RedbBackend`, issue #6 §5) plus the framed journal as
+reference and fault oracle. What is still ahead of the thesis: segment
 packing, mmap-first reads, hydration. Compute-fraction claims carry their
 mechanism today and their measurement in the benchmark artifact; the
 filesystem face (§9), packs (§10), and GNN compute (§8) are design intent
@@ -50,10 +51,10 @@ until their phases land. Trust state: FUNCTIONAL for the shipped surface.
 ## Sequence
 
 Landed: DB-A kernel spine → DB-B record+edge → DB-C term → DB-D vec →
-DB-E claim/metadata classes. Remaining for v0.1 done: the redb
-production backend + MemKv parity (issue #6 §5), then outboard adapters
-(HelixDB interop; FoundationDB adapter) per `docs/DB_PATHWAY.md` §5–§6.
-Filesystem and GNN faces ride on later phases.
+DB-E claim/metadata classes → the redb production backend + MemKv parity
+(issue #6 §5). Remaining: outboard adapters (HelixDB interop;
+FoundationDB adapter) per `docs/DB_PATHWAY.md` §5–§6. Filesystem and
+GNN faces ride on later phases.
 
 ## Day-1 invariants
 

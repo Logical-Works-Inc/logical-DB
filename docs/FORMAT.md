@@ -43,9 +43,12 @@ Frame payload is a sequence of rows (v1):
 
 ## 3. Not yet stable in v0.1
 
-- The production persistence backend (issue #6 §5: redb under the same
-  KvPort seam). MemKv + this journal is the shipped default until it
-  lands; the logical formats above do not change with it.
+- Two persistence paths ship, one crash story each (issue #6 §5):
+  production bytes go through redb only (`RedbBackend` behind the
+  `DurableKv` seam — its file format is redb's own, not specified
+  here); the §1 journal frames serve the MemKv reference path and act
+  as the fault oracle for replay/corruption behavior. Never write one
+  store's data through both.
 - Segment packing, mmap-first reads, and hydration are design intent
   (DB_PATHWAY §3), not shipped format.
 - No migration tooling exists yet. Any future change to §1/§2 ships a
@@ -54,8 +57,10 @@ Frame payload is a sequence of rows (v1):
 ## 4. Benchmark results format
 
 `cargo bench -p logical-db` runs `kernel/benches/ship_bench.rs` — a
-plain binary, no criterion dependency. It prints one JSON object per
-line on stdout:
+plain binary, no criterion dependency. Benches run the journaled MemKv
+reference path (the deterministic baseline); the redb backend carries
+the same semantic suite, not these numbers. It prints one JSON object
+per line on stdout:
 
     {"workload":"<name>","samples":N,"ops":N,
      "throughput_ops_per_s":F,"p50_ns":N,"p95_ns":N,"db_bytes":N}

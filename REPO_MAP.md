@@ -25,8 +25,8 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
 | `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC. |
-| `docs/FORMAT.md` | spec | v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), what is not yet stable, benchmark results schema and algorithmic gates. |
-| `kernel/` | kernel | The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/ClockPort, MemKv default backend, framed CRC32 journal, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite. (ADR-001) |
+| `docs/FORMAT.md` | spec | v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), two persistence paths with one crash story each (redb production / journaled reference), what is not yet stable, benchmark results schema and algorithmic gates. |
+| `kernel/` | kernel | The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5), MemKv reference backend, framed CRC32 journal as fault oracle, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine parity + kill-recovery (both backends) + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite. (ADR-001) |
 
 ## META — agent/process tooling
 

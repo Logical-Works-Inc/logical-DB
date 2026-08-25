@@ -51,11 +51,31 @@ impl Mutation {
 pub struct Ldb<S: KvPort, C: ClockPort> {
     kv: S,
     clock: C,
-    journal: BufWriter<File>,
+    /// The framed journal — the crash story of the reference path.
+    /// `None` on a [`DurableKv`](crate::port::DurableKv) backend, which
+    /// owns durability itself (INV-ONE-CRASH-STORY, issue #6 §5).
+    journal: Option<BufWriter<File>>,
     last_ts: u64,
 }
 
 impl<S: KvPort, C: ClockPort> Ldb<S, C> {
+    /// Opens the store over a self-durable backend: no journal file
+    /// exists and no frame is ever written — the backend's own
+    /// transactions are the one crash story. `last_ts` seeds from the
+    /// backend's persisted version so INV-TS-MONOTONIC holds across
+    /// reopen.
+    pub fn open_durable(kv: S, clock: C) -> Result<Self>
+    where
+        S: crate::port::DurableKv,
+    {
+        let last_ts = kv.committed_version()?;
+        Ok(Ldb {
+            kv,
+            clock,
+            journal: None,
+            last_ts,
+        })
+    }
     /// Opens (or creates) the journal at `path`, replays every intact
     /// frame into `kv`, and truncates any torn tail. A decode failure
     /// inside an intact frame aborts the open loudly — corruption is
@@ -93,14 +113,15 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
         Ok(Ldb {
             kv,
             clock,
-            journal: BufWriter::new(file),
+            journal: Some(BufWriter::new(file)),
             last_ts,
         })
     }
 
-    /// Commits `batch` at one clock tick: one frame, fsynced, then
-    /// applied to the KV. Returns the committed ts. An empty batch is a
-    /// no-op that consumes no tick.
+    /// Commits `batch` at one clock tick. Journaled stores write one
+    /// fsynced frame then apply; durable backends receive the whole
+    /// batch as one atomic transaction. Returns the committed ts. An
+    /// empty batch is a no-op that consumes no tick.
     pub fn commit(&mut self, batch: &[Mutation]) -> Result<u64> {
         if batch.is_empty() {
             return Ok(self.last_ts);
@@ -112,25 +133,38 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
                 got: ts,
             });
         }
-        let mut frame = Vec::new();
-        for m in batch {
-            model::encode_row(
-                &Row::new(m.class, m.id.clone(), ts, m.op.clone()),
-                &mut frame,
-            )?;
-        }
-        journal::append_frame(&mut self.journal, &frame)?;
-        self.journal.flush()?;
-        // INV-DURABLE-BEFORE-ACK: bytes are on disk before the KV
-        // changes. A crash before the apply loop replays from here.
-        self.journal.get_ref().sync_data()?;
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len());
         for m in batch {
             let key = model::point_key(m.class, &m.id, ts);
             let payload = m.op.payload();
             let mut stored = Vec::with_capacity(1 + payload.len());
             stored.push(m.op.wire_tag());
             stored.extend_from_slice(payload);
-            self.kv.put(key, stored)?;
+            entries.push((key, stored));
+        }
+        match &mut self.journal {
+            Some(j) => {
+                let mut frame = Vec::new();
+                for m in batch {
+                    model::encode_row(
+                        &Row::new(m.class, m.id.clone(), ts, m.op.clone()),
+                        &mut frame,
+                    )?;
+                }
+                journal::append_frame(j, &frame)?;
+                j.flush()?;
+                // INV-DURABLE-BEFORE-ACK: bytes are on disk before the
+                // KV changes. A crash before the apply replays from
+                // here.
+                j.get_ref().sync_data()?;
+                self.kv.apply_batch(&entries, ts)?;
+            }
+            None => {
+                // Durable backend: one transaction carries the batch
+                // and its version; redb syncs before commit returns,
+                // so an ack still implies durability.
+                self.kv.apply_batch(&entries, ts)?;
+            }
         }
         self.last_ts = ts;
         Ok(ts)
