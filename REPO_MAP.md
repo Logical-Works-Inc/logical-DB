@@ -18,7 +18,7 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `VISION.md` | spec | Thesis, the wall, sequence, day-1 invariants. |
 | `docs/DB_PATHWAY.md` | spec | Spec of record: evidence base, storage classes, compute fraction, phases DB-A…DB-E, axes (GNN §8, filesystem §9, packs §10, DiD §11). (ADR-001) |
 | `GOVERNANCE.md` | governance | Project constitution: authority model, invariants, decision process, proof ladder, licenses. |
-| `laws/governance/` | governance | Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards. Components: operating-model.md, definition-of-done.md, collaboration-standards.md, issue-template.md. |
+| `laws/governance/` | governance | Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards. Components: operating-model.md, definition-of-done.md, collaboration-standards.md, issue-template.md, decision-2026-08-25-ci-hermeticity.md. |
 | `laws/governance/adr-001-canonical-db-model-authority.md` | governance | PROPOSED: this repo owns the one DB model; constellation registration pending Director ratification. |
 | `scripts/spec-lint.py` | infra | 80-column prose contract over markdown; CI-enforced with teeth. |
 | `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, property gauntlet, Kani proofs, cargo-mutants teeth, MC/DC slot (keel#480), ci-plan-current, eval-log, cleanup. |
