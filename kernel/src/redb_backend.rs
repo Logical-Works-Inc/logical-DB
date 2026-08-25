@@ -7,7 +7,7 @@
 
 use std::ops::Bound;
 
-use redb::{Database, ReadableDatabase, TableDefinition, TableHandle};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 use crate::port::{DurableKv, KvPort};
 use crate::{KernelError, Result};
@@ -63,7 +63,9 @@ fn read_table(
 ) -> Result<Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>> {
     match rtxn.open_table(def) {
         Ok(t) => Ok(Some(t)),
-        Err(redb::TableError::TableDoesNotExist(name)) if name == def.name() => Ok(None),
+        // `open_table` only ever names the table it was asked for, so
+        // the payload carries nothing to double-check.
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
         Err(e) => Err(backend_err(e)),
     }
 }

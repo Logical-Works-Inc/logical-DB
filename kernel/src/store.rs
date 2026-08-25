@@ -154,12 +154,10 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
                 journal::append_frame(j, &frame)?;
                 j.flush()?;
                 // INV-DURABLE-BEFORE-ACK: bytes are on disk before the
-                // KV changes. A crash before the apply loop replays
-                // from here.
+                // KV changes. A crash before the apply replays from
+                // here.
                 j.get_ref().sync_data()?;
-                for (key, stored) in entries {
-                    self.kv.put(key, stored)?;
-                }
+                self.kv.apply_batch(&entries, ts)?;
             }
             None => {
                 // Durable backend: one transaction carries the batch
