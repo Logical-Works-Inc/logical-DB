@@ -80,8 +80,7 @@ impl<S: KvPort, C: ClockPort> MemTermIndex<S, C> {
     }
 
     fn corpus_stats(&self) -> Result<(usize, f64)> {
-        let mut prefix = model::class_prefix(Class::Term);
-        prefix.extend_from_slice(&model::composite_ns_prefix(MANIFEST_NS));
+        let prefix = model::class_id_prefix(Class::Term, &model::composite_ns_prefix(MANIFEST_NS));
         let raw = self.store.kv().scan_prefix(&prefix)?;
         let mut docs: HashMap<Vec<u8>, u32> = HashMap::new();
         for (key, stored) in &raw {
@@ -159,8 +158,7 @@ impl<S: KvPort, C: ClockPort> TermIndex for MemTermIndex<S, C> {
     }
 
     fn postings_for_term(&self, term: &[u8]) -> Result<Vec<Posting>> {
-        let mut key_prefix = model::class_prefix(Class::Term);
-        key_prefix.extend_from_slice(&posting_term_prefix(term)?);
+        let key_prefix = model::class_id_prefix(Class::Term, &posting_term_prefix(term)?);
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
         let mut best: HashMap<Vec<u8>, Option<Posting>> = HashMap::new();
         for (key, stored) in raw {

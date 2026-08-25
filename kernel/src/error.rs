@@ -22,6 +22,10 @@ pub enum KernelError {
     ComponentTooLong,
     /// An encoded composite key is truncated or malformed.
     MalformedCompositeKey,
+    /// INV-ID-PREFIX-DISJOINT violated at decode: a stored key's id
+    /// region breaks the escape framing (bare 0x00, missing
+    /// terminator) and cannot be trusted.
+    MalformedKey,
     /// Attempted to store NaN or infinite confidence.
     InvalidConfidence,
 }
@@ -43,6 +47,9 @@ impl fmt::Display for KernelError {
             }
             KernelError::MalformedCompositeKey => {
                 write!(f, "composite key is truncated or malformed")
+            }
+            KernelError::MalformedKey => {
+                write!(f, "stored key breaks the id escape framing")
             }
             KernelError::InvalidConfidence => {
                 write!(f, "confidence must be finite (no NaN or infinity)")
@@ -96,6 +103,10 @@ mod tests {
         assert_eq!(
             KernelError::MalformedCompositeKey.to_string(),
             "composite key is truncated or malformed"
+        );
+        assert_eq!(
+            KernelError::MalformedKey.to_string(),
+            "stored key breaks the id escape framing"
         );
         assert_eq!(
             KernelError::InvalidConfidence.to_string(),

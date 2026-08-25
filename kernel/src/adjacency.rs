@@ -81,8 +81,7 @@ impl<S: KvPort, C: ClockPort> MemAdjacency<S, C> {
         kv_prefix: Vec<u8>,
         parse: impl Fn(&[u8]) -> Result<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Vec<EdgeRow>> {
-        let mut full_prefix = model::class_prefix(Class::Edge);
-        full_prefix.extend_from_slice(&kv_prefix);
+        let full_prefix = model::class_id_prefix(Class::Edge, &kv_prefix);
         let raw = self.store.kv().scan_prefix(&full_prefix)?;
         let mut latest: HashMap<Vec<u8>, EdgeState> = HashMap::new();
         for (key, stored) in raw {

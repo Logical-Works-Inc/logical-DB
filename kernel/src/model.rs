@@ -99,32 +99,60 @@ impl Row {
         Self::new(class, id, ts, Op::Delete)
     }
 
-    /// KV primary-index key: `[tag][id][ts BE]`. Big-endian ts makes
-    /// same-id versions sort in commit order inside one scan.
+    /// KV primary-index key: one version of one entity under the
+    /// module's framed layout; big-endian ts makes same-id versions
+    /// sort in commit order inside one scan.
     pub fn key(&self) -> Vec<u8> {
-        let mut k = Vec::with_capacity(1 + self.id.len() + 8);
-        k.push(self.class.tag());
-        k.extend_from_slice(&self.id);
-        k.extend_from_slice(&self.ts.to_be_bytes());
-        k
+        point_key(self.class, &self.id, self.ts)
     }
 }
 
 // ── Key layout ───────────────────────────────────────────────
+//
+// Point keys are `[tag][escaped(id)][0x00 0x00][ts BE]`. Inside the id,
+// a literal 0x00 is escaped as `0x00 0xFF`; the pair `0x00 0x00` can
+// therefore only ever be the terminator (INV-ID-PREFIX-DISJOINT). This
+// framing makes entity id spaces provably disjoint under prefix scans:
+// no id can be a byte-prefix extension of another and leak its rows
+// into that entity's history.
 
 /// `[tag]` — every key of one class shares this one-byte prefix.
 pub fn class_prefix(class: Class) -> Vec<u8> {
     vec![class.tag()]
 }
 
-/// `[tag][id]` — the full version history of one entity.
-pub fn history_prefix(class: Class, id: &[u8]) -> Vec<u8> {
+fn escape_id(id: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(id.len() + 2);
+    for &b in id {
+        if b == 0x00 {
+            out.extend_from_slice(&[0x00, 0xFF]);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Scan prefix over every key whose logical id starts with `id_bytes`
+/// — a full id or a prefix of one. Escaping is byte-local, so escaped
+/// streams diverge exactly where the raw ids diverge; no foreign row
+/// can enter the scan.
+pub fn class_id_prefix(class: Class, id_bytes: &[u8]) -> Vec<u8> {
     let mut p = class_prefix(class);
-    p.extend_from_slice(id);
+    p.extend_from_slice(&escape_id(id_bytes));
     p
 }
 
-/// `[tag][id][ts BE]` — one version of one entity.
+/// `[tag][escaped(id)][terminator]` — the full version history of one
+/// entity, disjoint from every other id's range.
+pub fn history_prefix(class: Class, id: &[u8]) -> Vec<u8> {
+    let mut p = class_id_prefix(class, id);
+    p.extend_from_slice(&[0x00, 0x00]);
+    p
+}
+
+/// `[tag][escaped(id)][terminator][ts BE]` — one version of one
+/// entity. Big-endian ts keeps same-id versions in commit order.
 pub fn point_key(class: Class, id: &[u8], ts: u64) -> Vec<u8> {
     let mut k = history_prefix(class, id);
     k.extend_from_slice(&ts.to_be_bytes());
@@ -132,17 +160,43 @@ pub fn point_key(class: Class, id: &[u8], ts: u64) -> Vec<u8> {
 }
 
 /// The inverse of [`point_key`]; keeps all key-layout knowledge here.
+/// Rejects any key whose id region breaks the escape framing instead
+/// of guessing at field boundaries. Parsing walks slice patterns, not
+/// indices: there is no offset arithmetic to drift.
 pub fn split_key(key: &[u8]) -> Result<(Class, Vec<u8>, u64)> {
-    if key.len() < 1 + 8 {
+    if key.len() < 1 + 2 + 8 {
         return Err(KernelError::TruncatedRow);
     }
-    let class = Class::from_tag(key[0])?;
-    let id = key[1..key.len() - 8].to_vec();
-    let tail = &key[key.len() - 8..];
-    let ts = u64::from_be_bytes([
-        tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7],
-    ]);
-    Ok((class, id, ts))
+    let (tag, rest) = key.split_first().ok_or(KernelError::TruncatedRow)?;
+    let class = Class::from_tag(*tag)?;
+    let (escaped, tail) =
+        rest.split_at(rest.len().checked_sub(8).ok_or(KernelError::TruncatedRow)?);
+    // The id region must close on the two-byte terminator `[0x00 0x00]`;
+    // anything else is not a key this crate wrote.
+    match escaped.split_last() {
+        Some((0x00, body)) if body.last() == Some(&0x00) => {
+            let mut id = Vec::with_capacity(body.len());
+            let mut cursor = &body[..body.len() - 1];
+            while let Some((byte, rest)) = cursor.split_first() {
+                match byte {
+                    0x00 => match rest.split_first() {
+                        Some((0xFF, after_escape)) => {
+                            id.push(0x00);
+                            cursor = after_escape;
+                        }
+                        _ => return Err(KernelError::MalformedKey),
+                    },
+                    plain => {
+                        id.push(*plain);
+                        cursor = rest;
+                    }
+                }
+            }
+            let ts = u64::from_be_bytes(tail.try_into().expect("tail is exactly 8 bytes"));
+            Ok((class, id, ts))
+        }
+        _ => Err(KernelError::MalformedKey),
+    }
 }
 
 // ── Wire codec ───────────────────────────────────────────────
@@ -389,16 +443,43 @@ mod tests {
 
     #[test]
     fn minimal_key_with_empty_id_roundtrips_and_short_keys_are_rejected() {
-        // tag + ts with a zero-length id is the smallest legal key: the
-        // length guard must accept exactly this shape and nothing below.
+        // tag + terminator + ts with a zero-length id is the smallest
+        // legal key: exactly 11 bytes, and nothing below parses.
         let key = point_key(Class::Claim, b"", 5);
-        assert_eq!(key.len(), 9);
+        assert_eq!(key.len(), 11);
         let (class, id, ts) = split_key(&key).unwrap();
         assert_eq!(class, Class::Claim);
         assert!(id.is_empty());
         assert_eq!(ts, 5);
+        assert!(split_key(&key[..10]).is_err(), "10 bytes is not a key");
         assert!(split_key(&key[..8]).is_err(), "8 bytes is not a key");
         assert!(split_key(&[]).is_err());
+    }
+
+    #[test]
+    fn nested_ids_never_alias_through_the_framed_layout() {
+        // 0xFF is a raw byte-prefix of 0xFF 0x00 0xFF, and 0xFF 0x00
+        // nests past the would-be terminator; under the old unframed
+        // layout their scans bled into each other. The framed layout
+        // must keep every pair disjoint (INV-ID-PREFIX-DISJOINT).
+        let short = history_prefix(Class::Record, &[0xFF]);
+        assert!(!point_key(Class::Record, &[0xFF, 0x00, 0xFF], 1).starts_with(&short));
+        assert!(!point_key(Class::Record, &[0xFF, 0x00], 1).starts_with(&short));
+        let empty = history_prefix(Class::Record, b"");
+        assert!(!point_key(Class::Record, &[0x00], 1).starts_with(&empty));
+        for id in [
+            &b"\xFF"[..],
+            &b"\xFF\x00\xFF"[..],
+            &b"\x00"[..],
+            &b"\x00\xFF"[..],
+            &b"\x00\x00"[..],
+            b"",
+        ] {
+            let (class, back, ts) = split_key(&point_key(Class::Record, id, 7)).unwrap();
+            assert_eq!(class, Class::Record);
+            assert_eq!(back, id);
+            assert_eq!(ts, 7);
+        }
     }
 
     #[test]
@@ -408,6 +489,52 @@ mod tests {
         assert!(Op::Delete.is_delete());
         assert!(!Op::Put(vec![]).is_delete());
         assert!(Op::Delete.payload().is_empty());
+    }
+
+    #[test]
+    fn point_key_bytes_are_pinned_exactly() {
+        // Byte-exact layout pins: tag, escape pairs, terminator, and
+        // big-endian ts must each sit exactly where the layout says.
+        assert_eq!(
+            point_key(Class::Record, b"", 0),
+            [0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            point_key(Class::Record, &[0xFF], 1),
+            [0x01, 0xFF, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            point_key(Class::Record, &[0x00, 0xFF], 2),
+            [0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 2]
+        );
+        assert_eq!(history_prefix(Class::Claim, b"x"), [0x05, b'x', 0x00, 0x00]);
+    }
+
+    #[test]
+    fn malformed_framing_is_rejected_strictly() {
+        let good = point_key(Class::Record, &[0xFF], 9);
+        assert_eq!(good.len(), 12);
+        assert!(split_key(&good).is_ok());
+
+        // Terminator's second byte corrupted: the key no longer closes.
+        let mut bad_term = good.clone();
+        bad_term[2] = 0xFF;
+        assert!(matches!(
+            split_key(&bad_term),
+            Err(KernelError::MalformedKey)
+        ));
+
+        // Bare 0x00 inside the id region, not followed by 0xFF: an
+        // escaped zero must always come in pairs.
+        let mut bare = point_key(Class::Record, &[0xAB, 0xCD], 9);
+        bare[2] = 0x00;
+        assert!(matches!(split_key(&bare), Err(KernelError::MalformedKey)));
+
+        // Below the minimum framed length (tag + terminator + ts).
+        assert!(matches!(
+            split_key(&good[..10]),
+            Err(KernelError::TruncatedRow)
+        ));
     }
 
     #[test]

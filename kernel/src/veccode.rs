@@ -152,8 +152,8 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
     }
 
     fn scan_centroid(&self, centroid_id_val: u32) -> Result<Vec<VecEntry>> {
-        let mut key_prefix = model::class_prefix(Class::VecCode);
-        key_prefix.extend_from_slice(&centroid_scan_prefix(centroid_id_val)?);
+        let key_prefix =
+            model::class_id_prefix(Class::VecCode, &centroid_scan_prefix(centroid_id_val)?);
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
         let mut best: HashMap<Vec<u8>, Option<VecEntry>> = HashMap::new();
         for (key, stored) in raw {
@@ -165,8 +165,8 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
     }
 
     fn brute_scan(&self, query_code: &[u8], k: usize) -> Result<Vec<(Vec<u8>, u32)>> {
-        let mut key_prefix = model::class_prefix(Class::VecCode);
-        key_prefix.extend_from_slice(&model::composite_ns_prefix(MAIN_NS));
+        let key_prefix =
+            model::class_id_prefix(Class::VecCode, &model::composite_ns_prefix(MAIN_NS));
         let raw = self.store.kv().scan_prefix(&key_prefix)?;
 
         let mut latest: HashMap<Vec<u8>, VecEntry> = HashMap::new();
