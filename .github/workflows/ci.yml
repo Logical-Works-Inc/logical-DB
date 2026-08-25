@@ -120,6 +120,10 @@ jobs:
     needs: ["stack-position"]
     timeout-minutes: 2
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Self-test the lint gate (proves it can still fail)"
         run: |
           set -e
@@ -153,6 +157,10 @@ jobs:
     needs: ["stack-position", "change-scope"]
     timeout-minutes: 15
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Run every workspace suite"
         if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
         run: |
@@ -176,6 +184,10 @@ jobs:
     needs: ["stack-position"]
     timeout-minutes: 3
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Self-test the fmt gate (proves it can still fail)"
         run: |
           set -e
@@ -214,6 +226,10 @@ jobs:
     needs: ["stack-position", "change-scope"]
     timeout-minutes: 10
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Clippy with warnings denied"
         if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
         run: |
@@ -237,6 +253,10 @@ jobs:
     needs: ["stack-position", "change-scope"]
     timeout-minutes: 5
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Crash gauntlet: every byte cut recovers an exact batch prefix"
         if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
         run: |
@@ -260,6 +280,10 @@ jobs:
     needs: ["stack-position", "change-scope"]
     timeout-minutes: 20
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Prove the proof gate can fail (keel self-test)"
         run: |
           set -e
@@ -293,6 +317,10 @@ jobs:
     needs: ["stack-position", "change-scope"]
     timeout-minutes: 25
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Refuse survived or indeterminate mutants"
         if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
         run: |
@@ -308,7 +336,16 @@ jobs:
             echo "SKIP no workspace yet — activates with DB-A kernel/."
             exit 0
           fi
-          cargo mutants -p logical-db
+          cargo mutants -p logical-db | tee "$RUNNER_TEMP/mutants.out"
+          # INV-MUTANTS-NONVACUOUS: cargo-mutants exits 0 when the package filter
+          # matches nothing ("Found 0 mutants", run 32824022656) — a wrong-tree or
+          # renamed workspace would pass as green teeth. Refuse any zero count.
+          found="$(sed -n 's/^Found \([0-9][0-9]*\) mutants to test.*/\1/p' \
+            "$RUNNER_TEMP/mutants.out" | tail -1)"
+          if [ -z "$found" ] || [ "$found" -eq 0 ]; then
+            echo "FAIL cargo-mutants found ${found:-no} mutants — vacuous teeth." >&2
+            exit 1
+          fi
 
   mcdc-coverage:
     name: "Coverage — MC/DC awaits the keel consumer contract (keel#480)"
@@ -335,6 +372,10 @@ jobs:
     needs: ["stack-position"]
     timeout-minutes: 2
     steps:
+      - name: "unnamed"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Regenerate and byte-check GitHub Actions"
         run: |
           set -e
@@ -382,17 +423,17 @@ jobs:
           export KEEL_GATE_BIN="$HOME/.local/bin/keel"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           cat > "$KEEL_EVIDENCE_DIR/eval.jsonl" <<'KEEL_EVAL'
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"4983cdf02598959373fec17cb2d74d85f92602a657570072779639c94cc15a4a","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"138bb9b3802cda1427944cab05164b9bf5d04c4522ffe90008e2811be63cbff4","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
           KEEL_EVAL
           local_eval="$HOME/.keel-ci/eval/$KEEL_HEAD_SHA.jsonl"
           if [ ! -f "$local_eval" ]; then
