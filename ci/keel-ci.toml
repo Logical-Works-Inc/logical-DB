@@ -11,6 +11,15 @@
 #   cp "$root/.github/workflows/ci.yml" .github/workflows/ci.yml
 # The `ci-plan-current` job below enforces exactly this byte-equality in CI.
 #
+# INV-HERMETIC-CHECKOUT (2026-08-25, run 32824022656): the runner exposes ONE
+# shared _work worktree to every job of every run, so a tree-reading job with
+# no checkout of its own silently verifies whatever another run left behind —
+# a backlogged run flipped the tree mid-run to a pre-rename sha and six jobs
+# certified it. Every job that reads tree bytes therefore pins its own
+# checkout; keel renders ref as the run's own head sha when none is declared.
+# Jobs that touch no tree bytes (stack-position, mcdc-coverage) and cleanup
+# carry none by design.
+#
 # Gates reference ONLY things that exist in this repository today (markdown
 # spec + governance docs + scripts/spec-lint.py) plus the installed keel
 # binary's portable tools (differential, differential-selftest). Cargo jobs
@@ -158,6 +167,11 @@ working_directory = "."
 runner = ["self-hosted"]
 evidence = ["log", "status"]
 [[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
+[[job.step]]
 name = "Self-test the lint gate (proves it can still fail)"
 condition = "success()"
 kind = "run"
@@ -190,6 +204,11 @@ evidence = ["log", "status"]
 [job.runtime_env]
 CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
+[[job.step]]
 name = "Run every workspace suite"
 condition = "needs.change-scope.outputs.code_changed == 'yes'"
 kind = "run"
@@ -210,6 +229,11 @@ cost = "deterministic"
 working_directory = "."
 runner = ["self-hosted"]
 evidence = ["log", "status"]
+[[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
 [[job.step]]
 name = "Self-test the fmt gate (proves it can still fail)"
 condition = "success()"
@@ -248,6 +272,11 @@ evidence = ["log", "status"]
 [job.runtime_env]
 CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
+[[job.step]]
 name = "Clippy with warnings denied"
 condition = "needs.change-scope.outputs.code_changed == 'yes'"
 kind = "run"
@@ -271,6 +300,11 @@ evidence = ["log", "status"]
 [job.runtime_env]
 CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
+[[job.step]]
 name = "Crash gauntlet: every byte cut recovers an exact batch prefix"
 condition = "needs.change-scope.outputs.code_changed == 'yes'"
 kind = "run"
@@ -293,6 +327,11 @@ runner = ["self-hosted"]
 evidence = ["log", "status"]
 [job.runtime_env]
 CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
+[[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
 [[job.step]]
 name = "Prove the proof gate can fail (keel self-test)"
 condition = "success()"
@@ -322,6 +361,11 @@ evidence = ["log", "status"]
 [job.runtime_env]
 CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
+[[job.step]]
 name = "Refuse survived or indeterminate mutants"
 condition = "needs.change-scope.outputs.code_changed == 'yes'"
 kind = "run"
@@ -330,7 +374,17 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo mutants -p logical-db'''
+cargo mutants -p logical-db | tee "$RUNNER_TEMP/mutants.out"
+# INV-MUTANTS-NONVACUOUS: cargo-mutants exits 0 when the package filter
+# matches nothing ("Found 0 mutants", run 32824022656) — a wrong-tree or
+# renamed workspace would pass as green teeth. Refuse any zero count.
+found="$(sed -n 's/^Found \([0-9][0-9]*\) mutants to test.*/\1/p' \
+  "$RUNNER_TEMP/mutants.out" | tail -1)"
+if [ -z "$found" ] || [ "$found" -eq 0 ]; then
+  echo "FAIL cargo-mutants found ${found:-no} mutants — vacuous teeth." >&2
+  exit 1
+fi
+'''
 
 [[job]]
 id = "mcdc-coverage"
@@ -362,6 +416,11 @@ cost = "deterministic"
 working_directory = "."
 runner = ["self-hosted"]
 evidence = ["log", "status"]
+[[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
 [[job.step]]
 name = "Regenerate and byte-check GitHub Actions"
 condition = "success()"
