@@ -63,11 +63,21 @@ fn centroid_scan_prefix(centroid: u32) -> Result<Vec<u8>> {
     model::composite_prefix(CENTROID_NS, &centroid_bytes)
 }
 
-fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
-    a.iter()
+fn hamming_distance(a: &[u8], b: &[u8]) -> Result<u32> {
+    // INV-CODE-LENGTH-EQUAL: the distance between different-length
+    // codes is undefined, so a mismatch is an error — never a
+    // silently truncated zip (FORMAT.md §1: corrupt input is a hard
+    // error, never skipped).
+    if a.len() != b.len() {
+        return Err(KernelError::CodeLengthMismatch {
+            expected: a.len(),
+            got: b.len(),
+        });
+    }
+    Ok(a.iter()
         .zip(b.iter())
         .map(|(&x, &y)| (x ^ y).count_ones())
-        .sum()
+        .sum())
 }
 
 fn deserialize_entry(stored: &[u8]) -> Result<Option<VecEntry>> {
@@ -104,6 +114,12 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
         norm: f32,
         centroid_id_val: u32,
     ) -> Result<u64> {
+        // Same rule as Claim.confidence (KernelError::InvalidConfidence):
+        // a non-finite norm would serialize to JSON `null` and the row
+        // could never be read back.
+        if !norm.is_finite() {
+            return Err(KernelError::InvalidNorm);
+        }
         let entry = VecEntry {
             vector_id: vector_id.to_vec(),
             code,
@@ -127,13 +143,19 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
         let mid = main_id(vector_id)?;
         let current = self.store.latest_with_op(Class::VecCode, &mid)?;
         let mut batch = vec![Mutation::delete(Class::VecCode, mid)];
+        // INV-VECCODE-DUAL-KEY covers the corrupt-payload case too: a
+        // main row whose entry cannot be decoded must fail the removal
+        // loudly, because silently deleting only the main row would
+        // strand its centroid index row forever (FORMAT.md §1: a
+        // decodable-format violation is a hard error, never skipped).
         if let Some((_, Op::Put(payload))) = current {
-            if let Ok(entry) = lgwks_std::json::from_slice::<VecEntry>(&payload) {
-                batch.push(Mutation::delete(
-                    Class::VecCode,
-                    centroid_index_id(entry.centroid_id, vector_id)?,
-                ));
-            }
+            let entry: VecEntry = lgwks_std::json::from_slice(&payload).map_err(|e| {
+                KernelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            batch.push(Mutation::delete(
+                Class::VecCode,
+                centroid_index_id(entry.centroid_id, vector_id)?,
+            ));
         }
         self.store.commit(&batch)
     }
@@ -184,11 +206,8 @@ impl<S: KvPort, C: ClockPort> VectorCodes for MemVectorCodes<S, C> {
 
         let mut distances: Vec<(Vec<u8>, u32)> = latest
             .into_values()
-            .map(|e| {
-                let dist = hamming_distance(query_code, &e.code);
-                (e.vector_id, dist)
-            })
-            .collect();
+            .map(|e| hamming_distance(query_code, &e.code).map(|dist| (e.vector_id, dist)))
+            .collect::<Result<Vec<_>>>()?;
         distances.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         distances.truncate(k);
         Ok(distances)
@@ -303,9 +322,61 @@ mod tests {
 
     #[test]
     fn hamming_distance_is_correct() {
-        assert_eq!(hamming_distance(&[0xFF], &[0x00]), 8);
-        assert_eq!(hamming_distance(&[0xFF], &[0xFF]), 0);
-        assert_eq!(hamming_distance(&[0xFF], &[0xFE]), 1);
-        assert_eq!(hamming_distance(&[0xFF, 0x00], &[0x00, 0xFF]), 16);
+        assert_eq!(hamming_distance(&[0xFF], &[0x00]).unwrap(), 8);
+        assert_eq!(hamming_distance(&[0xFF], &[0xFF]).unwrap(), 0);
+        assert_eq!(hamming_distance(&[0xFF], &[0xFE]).unwrap(), 1);
+        assert_eq!(hamming_distance(&[0xFF, 0x00], &[0x00, 0xFF]).unwrap(), 16);
+    }
+
+    #[test]
+    fn a_non_finite_norm_is_rejected_at_insert() {
+        let (mut vc, path) = make_vc("nan-norm");
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = vc.insert_vec(b"v", vec![0x01], bad, 0).unwrap_err();
+            assert!(matches!(err, KernelError::InvalidNorm));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn brute_scan_refuses_length_mismatched_codes_instead_of_truncating() {
+        let (mut vc, path) = make_vc("len-mix");
+        vc.insert_vec(b"one", vec![0xFF], 1.0, 0).unwrap();
+        vc.insert_vec(b"two", vec![0xFF, 0x00], 1.0, 0).unwrap();
+        let err = vc.brute_scan(&[0xFF], 10).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KernelError::CodeLengthMismatch {
+                    expected: 1,
+                    got: 2
+                }
+            ),
+            "got {err:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn removing_a_vec_with_an_undecodable_main_row_fails_loudly() {
+        // INV-VECCODE-DUAL-KEY under corruption: a main row whose
+        // payload no longer decodes must abort the removal — silently
+        // deleting only the main row would strand the centroid row.
+        let (mut vc, path) = make_vc("corrupt-rm");
+        vc.insert_vec(b"v", vec![0x01], 1.0, 7).unwrap();
+        let mut store = vc.into_store();
+        let mid = model::encode_composite(0x01, &[&b"v"[..]]).unwrap();
+        // Plant a fresh main version whose payload no longer decodes,
+        // through the store's own commit path.
+        store
+            .commit(&[Mutation::put(Class::VecCode, mid, b"{not json".to_vec())])
+            .unwrap();
+        let mut vc = MemVectorCodes::new(store);
+        let err = vc.remove_vec(b"v").unwrap_err();
+        assert!(
+            matches!(err, KernelError::Io(_)),
+            "corrupt payload must fail the removal, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

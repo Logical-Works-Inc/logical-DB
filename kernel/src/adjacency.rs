@@ -7,7 +7,7 @@
 //! - Forward: namespace 0x01: `[0x01][len(src) u16 BE][src][len(dst) u16 BE][dst]`
 //! - Reverse: namespace 0x02: `[0x02][len(dst) u16 BE][dst][len(src) u16 BE][src]`
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,7 +83,10 @@ impl<S: KvPort, C: ClockPort> MemAdjacency<S, C> {
     ) -> Result<Vec<EdgeRow>> {
         let full_prefix = model::class_id_prefix(Class::Edge, &kv_prefix);
         let raw = self.store.kv().scan_prefix(&full_prefix)?;
-        let mut latest: HashMap<Vec<u8>, EdgeState> = HashMap::new();
+        // BTreeMap keeps the newest version per composite id and hands
+        // the live edges back in ascending key order — deterministic
+        // reference order (DB_PATHWAY §4).
+        let mut latest: BTreeMap<Vec<u8>, EdgeState> = BTreeMap::new();
         for (key, stored) in raw {
             let (_, id, ts) = model::split_key(&key)?;
             let op = if !stored.is_empty() && stored[0] == 2 {
@@ -164,7 +167,10 @@ impl<S: KvPort, C: ClockPort> Adjacency for MemAdjacency<S, C> {
     }
 
     fn neighbors_k_hop(&self, src: &[u8], k: usize, budget: usize) -> Result<Vec<Vec<u8>>> {
-        let mut visited = HashSet::new();
+        // BTreeSet makes the returned neighbor order deterministic —
+        // ascending by id on both exit paths (budget cut and full
+        // traversal alike).
+        let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
         let mut result_count = 0usize;
         visited.insert(src.to_vec());
@@ -284,6 +290,27 @@ mod tests {
         adj.link(b"a", b"d", vec![]).unwrap();
         let results = adj.neighbors_k_hop(b"a", 1, 2).unwrap();
         assert_eq!(results.len(), 2, "budget caps the result set");
+        // Exact order on the budget-cut path too: ascending by id.
+        assert_eq!(results, [b"b".to_vec(), b"c".to_vec()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn outgoing_edges_come_back_in_ascending_dst_order() {
+        let (mut adj, path) = make_adj("order");
+        for other in ["zeta", "alpha", "mid"] {
+            adj.link(b"n", other.as_bytes(), vec![]).unwrap();
+            adj.link(other.as_bytes(), b"n", vec![]).unwrap();
+        }
+        let edges = adj.outgoing(b"n").unwrap();
+        // Order is ascending composite-key order — length-prefix first,
+        // so shorter dsts sort before longer ones. Deterministic either
+        // way; this pins it.
+        let dsts: Vec<_> = edges.iter().map(|e| e.dst.as_slice()).collect();
+        assert_eq!(dsts, [&b"mid"[..], b"zeta", b"alpha"]);
+        let inc = adj.incoming(b"n").unwrap();
+        let srcs: Vec<_> = inc.iter().map(|e| e.src.as_slice()).collect();
+        assert_eq!(srcs, [&b"mid"[..], b"zeta", b"alpha"]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -320,13 +347,13 @@ mod tests {
         adj.link(b"a", b"c", vec![]).unwrap();
         adj.link(b"b", b"c", vec![]).unwrap();
         adj.unlink(b"a", b"c").unwrap();
-        let out_a: HashSet<Vec<u8>> = adj
+        let out_a: BTreeSet<Vec<u8>> = adj
             .outgoing(b"a")
             .unwrap()
             .into_iter()
             .map(|e| e.dst)
             .collect();
-        let inc_b: HashSet<Vec<u8>> = adj
+        let inc_b: BTreeSet<Vec<u8>> = adj
             .incoming(b"b")
             .unwrap()
             .into_iter()
@@ -338,7 +365,7 @@ mod tests {
             "unlinked edge gone from forward"
         );
         assert!(inc_b.contains(b"a".as_slice()));
-        let inc_c: HashSet<Vec<u8>> = adj
+        let inc_c: BTreeSet<Vec<u8>> = adj
             .incoming(b"c")
             .unwrap()
             .into_iter()

@@ -9,7 +9,7 @@
 //! - Subject:   namespace 0x02: `[0x02][len(subject) u16 BE][subject][len(claim_id) u16 BE][claim_id]`
 //! - Predicate: namespace 0x03: `[0x03][len(predicate) u16 BE][predicate][len(claim_id) u16 BE][claim_id]`
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -102,16 +102,17 @@ impl<S: KvPort, C: ClockPort> MemClaimIndex<S, C> {
     fn scan_index(&self, prefix: Vec<u8>) -> Result<Vec<Claim>> {
         let full_prefix = model::class_id_prefix(Class::Claim, &prefix);
         let raw = self.store.kv().scan_prefix(&full_prefix)?;
-        let mut best: HashMap<Vec<u8>, Option<Claim>> = HashMap::new();
+        // BTreeMap keeps one entry per composite id and hands them back
+        // in ascending key order — the deterministic reference order.
+        // An index row whose payload no longer decodes is a hard error
+        // (FORMAT.md §1), never a silently skipped result.
+        let mut best: BTreeMap<Vec<u8>, Option<Claim>> = BTreeMap::new();
         for (key, stored) in raw {
             let (_, id, _) = model::split_key(&key)?;
             if stored.is_empty() || stored[0] == 2 {
                 best.insert(id, None);
             } else {
-                let payload = &stored[1..];
-                if let Ok(claim) = deserialize_claim(payload) {
-                    best.insert(id, Some(claim));
-                }
+                best.insert(id, Some(deserialize_claim(&stored[1..])?));
             }
         }
         Ok(best.into_values().flatten().collect())
@@ -142,16 +143,19 @@ impl<S: KvPort, C: ClockPort> ClaimIndex for MemClaimIndex<S, C> {
         let current = self.store.latest_with_op(Class::Claim, &mid)?;
         let mut batch = vec![Mutation::delete(Class::Claim, mid)];
         if let Some((_, Op::Put(payload))) = current {
-            if let Ok(claim) = deserialize_claim(&payload) {
-                batch.push(Mutation::delete(
-                    Class::Claim,
-                    subject_id(&claim.subject, claim_id)?,
-                ));
-                batch.push(Mutation::delete(
-                    Class::Claim,
-                    predicate_id(&claim.predicate, claim_id)?,
-                ));
-            }
+            // INV-CLAIM-TRIPLE-KEY covers corruption too: a main row
+            // that no longer decodes must fail the retraction loudly —
+            // silently deleting only the main row would strand the
+            // subject and predicate index rows forever.
+            let claim = deserialize_claim(&payload)?;
+            batch.push(Mutation::delete(
+                Class::Claim,
+                subject_id(&claim.subject, claim_id)?,
+            ));
+            batch.push(Mutation::delete(
+                Class::Claim,
+                predicate_id(&claim.predicate, claim_id)?,
+            ));
         }
         self.store.commit(&batch)
     }
@@ -248,9 +252,33 @@ mod tests {
             .unwrap();
         let alice = ci.claims_by_subject(b"alice").unwrap();
         assert_eq!(alice.len(), 2);
-        let ids: Vec<_> = alice.iter().map(|c| c.claim_id.clone()).collect();
-        assert!(ids.contains(&b"c1".to_vec()));
-        assert!(ids.contains(&b"c2".to_vec()));
+        // Exact order, not just membership: the scan returns claim ids
+        // in ascending composite-key order, deterministically.
+        let ids: Vec<_> = alice.iter().map(|c| c.claim_id.as_slice()).collect();
+        assert_eq!(ids, [&b"c1"[..], &b"c2"[..]]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_undecodable_main_row_fails_retraction_loudly() {
+        // INV-CLAIM-TRIPLE-KEY under corruption: silently deleting only
+        // the main row would strand the subject and predicate rows.
+        let (mut ci, path) = make_ci("corrupt-rm");
+        ci.assert_claim(&test_claim(b"c1", b"alice", b"knows"))
+            .unwrap();
+        let mut store = ci.into_store();
+        let mid = model::encode_composite(0x01, &[&b"c1"[..]]).unwrap();
+        // Plant a fresh main version whose payload no longer decodes,
+        // through the store's own commit path.
+        store
+            .commit(&[Mutation::put(Class::Claim, mid, b"{not json".to_vec())])
+            .unwrap();
+        let mut ci = MemClaimIndex::new(store);
+        let err = ci.retract_claim(b"c1").unwrap_err();
+        assert!(
+            matches!(err, KernelError::Io(_)),
+            "corrupt payload must fail the retraction, got {err:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
