@@ -6,6 +6,8 @@
 //! once against the journaled reference path, once against the durable
 //! redb backend whose own transactions are the crash story (issue #6 §5).
 
+#[cfg(feature = "fdb")]
+use logical_db::fdb::FdbBackend;
 use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op};
 use logical_db::port::ClockPort;
@@ -23,6 +25,8 @@ const CHILD_ENV: &str = "LDB_KILL_ROLE";
 const PATH_ENV: &str = "LDB_KILL_JOURNAL";
 const ROLE_WRITER: &str = "writer";
 const ROLE_WRITER_REDB: &str = "writer-redb";
+#[cfg(feature = "fdb")]
+const ROLE_WRITER_FDB: &str = "writer-fdb";
 const ITERATIONS: usize = 12;
 /// Batch `k` plants `batch/{k:05}` plus its `/pair` sibling in one
 /// commit; both present or both absent proves batch atomicity.
@@ -174,6 +178,18 @@ fn observe_redb(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
     fold_observation(latest_by_id)
 }
 
+#[cfg(feature = "fdb")]
+fn observe_fdb(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
+    let db = Ldb::open_durable(FdbBackend::open(path).unwrap(), CountingClock::default()).unwrap();
+    let latest_by_id: BTreeMap<Vec<u8>, Op> = db
+        .scan_class(Class::Record)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.id, row.op))
+        .collect();
+    fold_observation(latest_by_id)
+}
+
 // ── Harness ──────────────────────────────────────────────────
 
 /// Which crash story the child writes through.
@@ -181,8 +197,11 @@ fn observe_redb(path: &PathBuf) -> (u64, BTreeMap<Vec<u8>, Vec<u8>>) {
 enum Backend {
     /// Framed journal in front of MemKv — the reference path.
     Journal,
-    /// redb's own transactions; no journal ever exists.
+    /// redb's own transactions; no journal ever exists (retired).
     Redb,
+    /// FDB shim via redb file; canonical durable path (ADR-002).
+    #[cfg(feature = "fdb")]
+    Fdb,
 }
 
 impl Backend {
@@ -190,6 +209,8 @@ impl Backend {
         match self {
             Backend::Journal => ROLE_WRITER,
             Backend::Redb => ROLE_WRITER_REDB,
+            #[cfg(feature = "fdb")]
+            Backend::Fdb => ROLE_WRITER_FDB,
         }
     }
 }
@@ -207,6 +228,8 @@ fn kill_once(
     let ext = match backend {
         Backend::Journal => "journal",
         Backend::Redb => "redb",
+        #[cfg(feature = "fdb")]
+        Backend::Fdb => "fdb",
     };
     let path =
         std::env::temp_dir().join(format!("ldb-kill-{}-{iteration}.{ext}", std::process::id()));
@@ -233,6 +256,8 @@ fn kill_once(
             // A fresh redb file already carries header pages, so size
             // proves nothing; the child plants a sentinel instead.
             Backend::Redb => ready.exists(),
+            #[cfg(feature = "fdb")]
+            Backend::Fdb => ready.exists(),
         };
         if signaled {
             break;
@@ -253,6 +278,8 @@ fn kill_once(
     let (batches, live) = match backend {
         Backend::Journal => observe(&path),
         Backend::Redb => observe_redb(&path),
+        #[cfg(feature = "fdb")]
+        Backend::Fdb => observe_fdb(&path),
     };
     if batches == 0 {
         assert!(live.is_empty(), "no durable batch but data appeared");
@@ -345,6 +372,43 @@ fn process_kill_recovery_on_the_durable_backend_never_leaves_a_partial_batch() {
         total_survived += kill_once(
             "process_kill_recovery_on_the_durable_backend_never_leaves_a_partial_batch",
             Backend::Redb,
+            iteration,
+            &mut rng,
+            &exe,
+        );
+    }
+
+    assert!(
+        total_survived >= ITERATIONS as u64,
+        "harness went vacuous: {total_survived} batches survived across {ITERATIONS} kills"
+    );
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn process_kill_recovery_on_the_fdb_backend_never_leaves_a_partial_batch() {
+    if std::env::var(CHILD_ENV).as_deref() == Ok(ROLE_WRITER_FDB) {
+        let path = std::env::var(PATH_ENV).expect("child needs a database path");
+        let mut db =
+            Ldb::open_durable(FdbBackend::open(&path).unwrap(), CountingClock::default()).unwrap();
+        for k in 1..=CHILD_BATCH_CAP {
+            db.commit(&batch_for(k)).unwrap();
+            if k == 1 {
+                std::fs::write(format!("{}.ready", path), b"1").unwrap();
+            }
+            std::thread::sleep(Duration::from_micros(300));
+        }
+        return;
+    }
+
+    let mut rng = parent_rng();
+    let exe = std::env::current_exe().unwrap();
+
+    let mut total_survived = 0u64;
+    for iteration in 0..ITERATIONS {
+        total_survived += kill_once(
+            "process_kill_recovery_on_the_fdb_backend_never_leaves_a_partial_batch",
+            Backend::Fdb,
             iteration,
             &mut rng,
             &exe,
