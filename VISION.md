@@ -37,24 +37,29 @@ string-query surface, injection-class bugs structurally absent.
 
 ## The wall
 
-The honest wall, updated 2026-08-25: the kernel spine exists — row model,
+The honest wall, updated 2026-08-26: the kernel spine exists — row model,
 all five storage classes, a randomized state-machine suite run on both
 backends, corruption negative tests, Kani proofs, the benchmark suite
 (`docs/FORMAT.md`), and two durability paths with one crash story each:
 production redb (`RedbBackend`, issue #6 §5) plus the framed journal as
-reference and fault oracle. What is still ahead of the thesis: segment
-packing, mmap-first reads, hydration. Compute-fraction claims carry their
-mechanism today and their measurement in the benchmark artifact; the
-filesystem face (§9), packs (§10), and GNN compute (§8) are design intent
-until their phases land. Trust state: FUNCTIONAL for the shipped surface.
+reference and fault oracle. ADR-002 ratifies FoundationDB as canonical
+substrate after parity (INV-PARITY-BEFORE-DELETE); F0 hermetic recipe
+ships (`scripts/local-fdb-cluster.sh`); runtime split: device=redb,
+cloud=FDB. What is still ahead: segment packing, mmap-first reads,
+hydration. Compute-fraction claims carry mechanism and measurement in
+the benchmark artifact; filesystem (§9), packs (§10), GNN (§8) remain
+design intent until their phases land. Trust state: FUNCTIONAL for the
+shipped surface.
 
 ## Sequence
 
 Landed: DB-A kernel spine → DB-B record+edge → DB-C term → DB-D vec →
 DB-E claim/metadata classes → the redb production backend + MemKv parity
-(issue #6 §5). Remaining: outboard adapters (HelixDB interop;
-FoundationDB adapter) per `docs/DB_PATHWAY.md` §5–§6. Filesystem and
-GNN faces ride on later phases.
+(issue #6 §5). Next: FDB canonical migration F0 (recipe ships) → F1
+native surface → F2 subspaces/tuple keys → F3 admitted envelope → F4
+parity + redb retirement per `docs/DB_PATHWAY.md` §5–§6 and ADR-002.
+HelixDB interop remains outboard. Filesystem and GNN faces ride on
+later phases.
 
 ## Day-1 invariants
 

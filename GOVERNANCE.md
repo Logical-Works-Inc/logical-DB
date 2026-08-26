@@ -107,6 +107,8 @@ The security surface is deliberately small and fail-closed:
 | Decision | Owner | Status |
 |---|---|---|
 | Workspace license | Director | open |
-| Constellation registration of authorities | Director | open — ADR-001 |
-| FUSE backend choice | Director | open — post redb backend |
+| Constellation registration | Director | open — ADR-001 |
+| FUSE backend choice | Director | open — post redb parity |
 | HelixDB adapter scope | Director | settled 2026-08-21 — survives |
+| FDB canonical substrate | Director | settled 2026-08-26 — ADR-002 |
+| FDB runtime split | Director | settled — device=redb, cloud=FDB |

@@ -16,8 +16,11 @@ MemKv as the deterministic reference and fault oracle. Both backends
 pass the same randomized state-machine suite and the same process-kill
 recovery proof; planted-corruption negative tests and Kani property
 proofs cover the codec; `docs/FORMAT.md` carries the §9 benchmark suite.
-Trust state: FUNCTIONAL — every claim above traces to a test or a
-benchmark artifact.
+ADR-002 ratifies FoundationDB as canonical substrate after parity
+(INV-PARITY-BEFORE-DELETE); F0 hermetic recipe ships
+(`scripts/local-fdb-cluster.sh`); runtime split: device=redb,
+cloud=FDB. Trust state: FUNCTIONAL — every claim above traces to a test
+or a benchmark artifact.
 
 ## Try it
 

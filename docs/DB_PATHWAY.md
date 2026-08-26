@@ -99,7 +99,7 @@ does not change this document.
 - HelixDB remains an outboard engine; the kernel must be functional WITHOUT
   it (fail-closed out-of-box rule).
 
-## 5. Pathway phases (status 2026-08-25)
+## 5. Pathway phases (status 2026-08-26)
 
 - **DB-A — Kernel spine — LANDED** (row model, framed CRC32 journal,
   MemKv default backend, kill-9 recovery proof; segment packing and
@@ -115,8 +115,11 @@ does not change this document.
   #6 §5: `RedbBackend` behind `DurableKv`/`apply_batch`, one atomic
   transaction per batch, version persisted with its batch, exclusive
   open lock; the framed journal stays as reference/fault oracle — never
-  both writers on one store). Still PENDING: object-store tier +
-  HelixDB interop + FDB adapter (§6).
+  both writers on one store). ADR-002 supersedes: FoundationDB is
+  canonical after parity; F0 hermetic recipe ships
+  (`scripts/local-fdb-cluster.sh`, INV-FDB-PIN/SCRATCH); F1 native
+  surface, F2 subspaces/tuple keys, F3 admitted envelope, F4 parity +
+  redb retirement remain. HelixDB interop stays outboard.
 
 Dependency order A→B→C→D→E; B/C can parallelize after A. §9's filesystem
 face and §10's packs ride on B–D; §8's GNN compute rides on D.
@@ -143,20 +146,29 @@ violates the fail-closed out-of-box rule. And the compute-fraction story is
 client-side math (quantized scans + rescore); the KV underneath changes
 operational weight and the transactional spine, not the vector arithmetic.
 
-Verdict: FDB is the scale-out spine, not the embedded default. Concretely,
-inside the mouldability contract (§4):
+Verdict (amended by ADR-002 2026-08-26): FDB is the canonical
+substrate after parity, not merely scale-out. Runtime split: device
+uses embedded redb (zero daemons, pure Rust) for local authoritative
+state; cloud/enterprise uses FDB for distributed serializable
+transactions, replication, and fault tolerance. Keys/namespaces stay
+byte-compatible across the split so a local world can migrate/sync
+without semantic change. Concretely, inside the mouldability
+contract (§4):
 
-- DB-A ships the four storage classes over a `KvPort` trait with a pure-Rust
-  embedded backend as default (redb/fjall-class, zero daemons).
-- DB-E gains an FDB adapter as the first outboard `KvPort` engine, next to
-  HelixDB: same kernel, strictly serializable multi-node transactions when
-  the corpus outgrows one machine.
-- Steal FDB's discipline even where we don't ship its code: DB-A's journal
-  and compaction state machine gets a deterministic simulator harness with
-  seeded schedules as its regression suite (INV-SIMULATE-THE-SPINE).
+- DB-A ships the four storage classes over a `KvPort` trait with a
+  pure-Rust embedded backend as default (redb/fjall-class, zero
+  daemons) — the device profile.
+- DB-E now stages F1–F4: FDB canonical migration (F0 recipe ships), not
+  just an optional outboard; HelixDB remains outboard. Same kernel,
+  strictly serializable multi-node transactions when the corpus outgrows
+  one machine via the cloud profile.
+- Steal FDB's discipline even where we don't ship its code: DB-A's
+  journal and compaction state machine gets a deterministic simulator
+  harness with seeded schedules as its regression suite
+  (INV-SIMULATE-THE-SPINE).
 
 This keeps "our own" true: the kernel, classes, and semantics are ours;
-FDB is one swappable engine beneath a port we own.
+FDB is the canonical engine after parity, behind the port we own.
 
 ## 7. Rejected alternatives (named reasons)
 
