@@ -43,6 +43,8 @@ cmd_verify() {
     # is verified in place so byte-tampering is detectable.
     if [ ! -f "$SCRATCH/$name" ] || [ "${FDB_REFETCH:-0}" = 1 ]; then
         fetch "$SCRATCH/$name" "$name"
+    fi
+    if [ ! -f "$SCRATCH/$name.sha256" ] || [ "${FDB_REFETCH:-0}" = 1 ]; then
         fetch "$SCRATCH/$name.sha256" "$name.sha256"
     fi
     (
@@ -54,7 +56,8 @@ cmd_verify() {
 stage() {
     [ -x "$BIN/fdbserver" ] && return 0
     mkdir -p "$BIN"
-    pkgutil --expand-full "$SCRATCH/pkg" "$SCRATCH/expanded"
+    local pkg="FoundationDB-${FDB_VERSION}_arm64.pkg"
+    pkgutil --expand-full "$SCRATCH/$pkg" "$SCRATCH/expanded" || die "pkg expand failed (INV-FDB-PIN)"
     cp "$SCRATCH/expanded/FoundationDB-server.pkg/Payload/usr/local/libexec/fdbserver" "$BIN/"
     cp "$SCRATCH/expanded/FoundationDB-clients.pkg/Payload/usr/local/bin/fdbcli" "$BIN/"
     cp "$SCRATCH/expanded/FoundationDB-clients.pkg/Payload/usr/local/lib/libfdb_c.dylib" "$BIN/"
@@ -76,8 +79,12 @@ cmd_up() {
     echo $! > "$PIDFILE"
     wait_available
     if [ ! -f "$SCRATCH/.configured" ]; then
-        cli 'configure new single memory'
-        touch "$SCRATCH/.configured"
+        if [ -n "$(find "$SCRATCH/data" -maxdepth 1 -type f 2>/dev/null | head -n1)" ]; then
+            touch "$SCRATCH/.configured"
+        else
+            cli 'configure new single memory'
+            touch "$SCRATCH/.configured"
+        fi
     fi
     echo "up: pid $(cat "$PIDFILE") cluster $CLUSTER bin $BIN"
 }
