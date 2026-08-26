@@ -25,6 +25,7 @@ pub mod record;
 pub mod redb_backend;
 pub mod store;
 pub mod term;
+pub mod tuple;
 pub mod veccode;
 #[cfg(kani)]
 mod verify;

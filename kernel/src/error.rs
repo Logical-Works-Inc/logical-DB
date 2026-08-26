@@ -41,6 +41,10 @@ pub enum KernelError {
     TransactionTooLarge { size: usize, limit: usize },
     /// FDB transaction exceeded the explicit time limit (issue #10 F1).
     TransactionTimedOut { elapsed_ms: u64, limit_ms: u64 },
+    /// A tuple encoding is truncated or malformed (fail-closed, F2).
+    MalformedTuple,
+    /// A subspace or tenant prefix was violated (INV-TENANT-PREFIX, F2).
+    TenantPrefixViolation,
 }
 
 impl fmt::Display for KernelError {
@@ -88,6 +92,10 @@ impl fmt::Display for KernelError {
                 f,
                 "fdb transaction timed out: {elapsed_ms} ms exceeds limit {limit_ms} ms"
             ),
+            KernelError::MalformedTuple => write!(f, "tuple is truncated or malformed"),
+            KernelError::TenantPrefixViolation => {
+                write!(f, "tenant prefix violation")
+            }
         }
     }
 }
@@ -177,6 +185,14 @@ mod tests {
             }
             .to_string(),
             "fdb transaction timed out: 5000 ms exceeds limit 1000 ms"
+        );
+        assert_eq!(
+            KernelError::MalformedTuple.to_string(),
+            "tuple is truncated or malformed"
+        );
+        assert_eq!(
+            KernelError::TenantPrefixViolation.to_string(),
+            "tenant prefix violation"
         );
     }
 
