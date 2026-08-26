@@ -3,15 +3,14 @@
 //! byte ids, repeated writes inside one batch, reopen cycles — must
 //! keep the production store exactly equal to an independently written
 //! in-memory reference through every read path (INV-SM-REFERENCE).
-//! The identical workload runs on both backends: the journaled
-//! reference path and the durable redb backend (issue #6 §5 parity).
+//! The identical workload runs on the journaled reference path and
+//! the durable FDB backend (ADR-002, retired redb).
 
 #[cfg(feature = "fdb")]
 use logical_db::fdb::FdbBackend;
 use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op, Row};
 use logical_db::port::{ClockPort, KvPort};
-use logical_db::redb_backend::RedbBackend;
 use logical_db::store::{Ldb, Mutation};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -200,48 +199,6 @@ fn generated_mixed_workload_stays_equal_to_the_reference_across_reopens() {
             // point is served from journal replay, not carried memory.
             let (_kv, _clock) = db.into_parts();
             db = Ldb::open(&path, MemKv::new(), clock.clone()).unwrap();
-            assert_reference_holds(&db, &reference);
-        }
-    }
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn the_durable_backend_serves_the_identical_workload_equal_to_the_reference() {
-    let mut rng = Xorshift(0x5EED_2026_0825); // same seed, same batches
-    let path = tmp_path("redb");
-    let _ = std::fs::remove_file(&path);
-
-    let clock = SharedClock::default();
-    let mut reference = Reference::default();
-    let reopen = |clock: SharedClock| -> Ldb<RedbBackend, SharedClock> {
-        Ldb::open_durable(RedbBackend::open(&path).unwrap(), clock).unwrap()
-    };
-    let mut db = reopen(clock.clone());
-    assert_eq!(
-        db.scan_class(Class::Record).unwrap(),
-        Vec::new(),
-        "a fresh durable store reads as empty"
-    );
-
-    for step in 0..40usize {
-        let batch = gen_batch(&mut rng);
-        let ts = db.commit(&batch).unwrap();
-        assert_eq!(ts, step as u64 + 1, "one tick per non-empty batch");
-        reference.apply(&batch, ts);
-        assert_reference_holds(&db, &reference);
-
-        if step % 7 == 6 {
-            // Reopen against the persisted file: every read after this
-            // point comes out of redb's own crash story, no journal.
-            drop(db);
-            db = reopen(clock.clone());
-            assert_eq!(
-                db.last_ts(),
-                ts,
-                "the committed version seeds committed time across reopen"
-            );
             assert_reference_holds(&db, &reference);
         }
     }
