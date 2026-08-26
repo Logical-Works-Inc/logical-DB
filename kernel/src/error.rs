@@ -36,6 +36,11 @@ pub enum KernelError {
     /// The durable backend (issue #6 §5) refused an operation; the
     /// message names the backend-level cause.
     Backend(String),
+    /// FDB transaction exceeded the explicit size limit (issue #10 F1).
+    /// Returned BEFORE the binding sees the op (INV-FDB-PIN).
+    TransactionTooLarge { size: usize, limit: usize },
+    /// FDB transaction exceeded the explicit time limit (issue #10 F1).
+    TransactionTimedOut { elapsed_ms: u64, limit_ms: u64 },
 }
 
 impl fmt::Display for KernelError {
@@ -72,6 +77,17 @@ impl fmt::Display for KernelError {
                 )
             }
             KernelError::Backend(msg) => write!(f, "durable backend: {msg}"),
+            KernelError::TransactionTooLarge { size, limit } => write!(
+                f,
+                "fdb transaction too large: {size} bytes exceeds limit {limit}"
+            ),
+            KernelError::TransactionTimedOut {
+                elapsed_ms,
+                limit_ms,
+            } => write!(
+                f,
+                "fdb transaction timed out: {elapsed_ms} ms exceeds limit {limit_ms} ms"
+            ),
         }
     }
 }
@@ -145,6 +161,22 @@ mod tests {
         assert_eq!(
             KernelError::Backend("lock held".into()).to_string(),
             "durable backend: lock held"
+        );
+        assert_eq!(
+            KernelError::TransactionTooLarge {
+                size: 5_000_000,
+                limit: 1_000_000
+            }
+            .to_string(),
+            "fdb transaction too large: 5000000 bytes exceeds limit 1000000"
+        );
+        assert_eq!(
+            KernelError::TransactionTimedOut {
+                elapsed_ms: 5000,
+                limit_ms: 1000
+            }
+            .to_string(),
+            "fdb transaction timed out: 5000 ms exceeds limit 1000 ms"
         );
     }
 

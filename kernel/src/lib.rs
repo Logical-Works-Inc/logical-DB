@@ -15,6 +15,8 @@ pub mod address;
 pub mod adjacency;
 pub mod claim;
 pub mod error;
+#[cfg(feature = "fdb")]
+pub mod fdb;
 pub mod journal;
 pub mod memkv;
 pub mod model;

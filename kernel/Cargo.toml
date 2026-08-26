@@ -13,6 +13,23 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 lgwks_std = { workspace = true }
 redb = "4.2.0"
 serde = { workspace = true }
+foundationdb = { version = "=0.11.0", optional = true }
+
+[features]
+# FDB pivot (ADR-002, issue #10 F1): native transaction surface behind a
+# feature flag. No second transaction abstraction; fdb-7_3 is the pinned
+# API surface (INV-FDB-PIN). Zero regression without the flag.
+# embedded-fdb-include vendors the C headers so `cargo check --features fdb`
+# works without a local `libfdb_c` install (CI hermetic lane still pins
+# the runtime via scripts/local-fdb-cluster.sh).
+fdb = [
+    "dep:foundationdb",
+    "foundationdb/fdb-7_3",
+    "foundationdb/embedded-fdb-include",
+]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 # Plain-binary benchmark suite (issue #6 §9): stdlib timing, JSONL
 # results on stdout — no criterion dependency.
