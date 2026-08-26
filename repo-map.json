@@ -1,9 +1,9 @@
 {
   "$schema": "./repo-map.schema.json",
   "schema_version": "1.0.0",
-  "updated": "2026-08-25",
-  "canon": "ADR-001 (canonical DB-model authority)",
-  "note": "One storage kernel for every repo. v0.1 RC: the logical-db crate ships row model, five storage classes, proof triad, benches, and the redb production backend (issue #6 §5) beside the journaled reference path.",
+  "updated": "2026-08-26",
+  "canon": "ADR-001 + ADR-002 (FDB substrate)",
+  "note": "One storage kernel for every repo. v0.1 RC ships row model + five classes over redb/journal; ADR-002 ratifies FDB as canonical substrate (F0 recipe ships, runtime split device=redb cloud=FDB, parity-before-delete F1-F4).",
   "statuses": {
     "live": "exists and is authoritative today",
     "meta": "agent/process tooling, not product surface",
@@ -49,6 +49,8 @@
     { "id": "runtime-entry", "path": "CLAUDE.md", "status": "meta", "pillar": "governance", "kind": "doc", "summary": "Runtime entry & agent contract; AGENTS.md symlinks here." },
     { "id": "governance-process", "path": "laws/governance/", "status": "live", "pillar": "governance", "kind": "dir", "summary": "Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards.", "components": ["operating-model.md", "definition-of-done.md", "collaboration-standards.md", "issue-template.md", "decision-2026-08-25-ci-hermeticity.md"] },
     { "id": "adr-001", "path": "laws/governance/adr-001-canonical-db-model-authority.md", "status": "live", "pillar": "governance", "kind": "adr", "summary": "PROPOSED: this repo owns the one DB model; constellation registration pending Director ratification." },
+    { "id": "adr-002", "path": "laws/governance/adr-002-foundationdb-substrate.md", "status": "live", "pillar": "governance", "kind": "adr", "summary": "ACCEPTED: FDB is canonical substrate; add-pin-vet, parity-before-delete, F0-F4." },
+    { "id": "fdb-recipe", "path": "scripts/local-fdb-cluster.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Hermetic one-process FDB dev cluster (INV-FDB-PIN, INV-FDB-SCRATCH); F0 falsifier." },
     { "id": "repo-map", "path": "repo-map.json", "status": "meta", "pillar": "infra", "kind": "data", "summary": "Declarative structure source of truth (this file)." },
     { "id": "repo-map-script", "path": "scripts/repo-map.mjs", "status": "meta", "pillar": "infra", "kind": "tool", "summary": "Validates repo-map.json against its schema and renders REPO_MAP.md; check detects drift." },
     { "id": "spec-lint", "path": "scripts/spec-lint.py", "status": "live", "pillar": "infra", "kind": "tool", "summary": "80-column prose contract over markdown; CI-enforced with teeth." },
@@ -57,13 +59,15 @@
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
     { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC." },
     { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), two persistence paths with one crash story each (redb production / journaled reference), what is not yet stable, benchmark results schema and algorithmic gates." },
-    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5), MemKv reference backend, framed CRC32 journal as fault oracle, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine parity + kill-recovery (both backends) + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite.", "adrs": ["ADR-001"] }
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (issues #1, #5, #6, ADR-002 F0-F4): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5) + MemKv reference + framed journal oracle, Ldb store, five storage classes, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite; FDB becomes canonical after parity (INV-PARITY-BEFORE-DELETE).", "adrs": ["ADR-001", "ADR-002"] }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },
     { "from": "local-ci", "rel": "depends_on", "to": "ci-plan" },
     { "from": "spec-lint", "rel": "governs", "to": "pathway" },
     { "from": "adr-001", "rel": "governs", "to": "kernel" },
+    { "from": "adr-002", "rel": "governs", "to": "kernel" },
+    { "from": "fdb-recipe", "rel": "depends_on", "to": "ci-plan" },
     { "from": "constitution", "rel": "governs", "to": "governance-process" },
     { "from": "frankenstein", "rel": "governs", "to": "kernel" },
     { "from": "kernel", "rel": "depends_on", "to": "pathway" },

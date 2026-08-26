@@ -22,6 +22,7 @@ process files; among these files, `operating-model.md` dictates precedence.
 | ADR | Domain | Decision Summary |
 |-----|--------|------------------|
 | **ADR-001** | Authority | PROPOSED — owns the one model. |
+| **ADR-002** | Substrate | ACCEPTED — FDB canonical; parity-before-delete. |
 
 ## Process lineage
 
