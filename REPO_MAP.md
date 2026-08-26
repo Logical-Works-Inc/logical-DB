@@ -1,7 +1,7 @@
 <!-- GENERATED from repo-map.json by scripts/repo-map.mjs — DO NOT EDIT BY HAND. -->
 # REPO MAP
 
-Rendered view of `repo-map.json`. Canon: **ADR-001 (canonical DB-model authority)**. Updated: 2026-08-25.
+Rendered view of `repo-map.json`. Canon: **ADR-001 + ADR-002 (FDB substrate)**. Updated: 2026-08-26.
 Reconcile with `node scripts/repo-map.mjs check`.
 
 ## Repos (cross-repo)
@@ -20,13 +20,15 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `GOVERNANCE.md` | governance | Project constitution: authority model, invariants, decision process, proof ladder, licenses. |
 | `laws/governance/` | governance | Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards. Components: operating-model.md, definition-of-done.md, collaboration-standards.md, issue-template.md, decision-2026-08-25-ci-hermeticity.md. |
 | `laws/governance/adr-001-canonical-db-model-authority.md` | governance | PROPOSED: this repo owns the one DB model; constellation registration pending Director ratification. |
+| `laws/governance/adr-002-foundationdb-substrate.md` | governance | ACCEPTED: FDB is canonical substrate; add-pin-vet, parity-before-delete, F0-F4. |
+| `scripts/local-fdb-cluster.sh` | infra | Hermetic one-process FDB dev cluster (INV-FDB-PIN, INV-FDB-SCRATCH); F0 falsifier. |
 | `scripts/spec-lint.py` | infra | 80-column prose contract over markdown; CI-enforced with teeth. |
 | `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, property gauntlet, Kani proofs, cargo-mutants teeth, MC/DC slot (keel#480), ci-plan-current, eval-log, cleanup. |
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
 | `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC. |
 | `docs/FORMAT.md` | spec | v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), two persistence paths with one crash story each (redb production / journaled reference), what is not yet stable, benchmark results schema and algorithmic gates. |
-| `kernel/` | kernel | The kernel crate logical-db (issues #1, #5, #6): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5), MemKv reference backend, framed CRC32 journal as fault oracle, Ldb store, five storage classes (record/term/edge/vec-code/claim), state-machine parity + kill-recovery (both backends) + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite. (ADR-001) |
+| `kernel/` | kernel | The kernel crate logical-db (issues #1, #5, #6, ADR-002 F0-F4): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5) + MemKv reference + framed journal oracle, Ldb store, five storage classes, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite; FDB becomes canonical after parity (INV-PARITY-BEFORE-DELETE). (ADR-001, ADR-002) |
 
 ## META — agent/process tooling
 
