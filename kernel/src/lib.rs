@@ -13,6 +13,8 @@ pub use lgwks_std;
 
 pub mod address;
 pub mod adjacency;
+#[cfg(feature = "fdb")]
+pub mod admitted;
 pub mod claim;
 pub mod error;
 #[cfg(feature = "fdb")]

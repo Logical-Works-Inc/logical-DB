@@ -45,6 +45,10 @@ pub enum KernelError {
     MalformedTuple,
     /// A subspace or tenant prefix was violated (INV-TENANT-PREFIX, F2).
     TenantPrefixViolation,
+    /// INV-AUTHORITY-SCOPE violated: authority does not cover namespace or effect (F3).
+    AuthorityScopeViolation,
+    /// INV-JUSTIFICATION-FRESH violated: stale justification bound version does not match snapshot/frontier (F3).
+    StaleJustification { expected: u64, got: u64 },
 }
 
 impl fmt::Display for KernelError {
@@ -95,6 +99,18 @@ impl fmt::Display for KernelError {
             KernelError::MalformedTuple => write!(f, "tuple is truncated or malformed"),
             KernelError::TenantPrefixViolation => {
                 write!(f, "tenant prefix violation")
+            }
+            KernelError::AuthorityScopeViolation => {
+                write!(
+                    f,
+                    "authority scope does not cover namespace or declared effect"
+                )
+            }
+            KernelError::StaleJustification { expected, got } => {
+                write!(
+                    f,
+                    "stale justification: expected version {expected}, got {got}"
+                )
             }
         }
     }
@@ -193,6 +209,18 @@ mod tests {
         assert_eq!(
             KernelError::TenantPrefixViolation.to_string(),
             "tenant prefix violation"
+        );
+        assert_eq!(
+            KernelError::AuthorityScopeViolation.to_string(),
+            "authority scope does not cover namespace or declared effect"
+        );
+        assert_eq!(
+            KernelError::StaleJustification {
+                expected: 5,
+                got: 3
+            }
+            .to_string(),
+            "stale justification: expected version 5, got 3"
         );
     }
 

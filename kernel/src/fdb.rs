@@ -15,6 +15,9 @@
 //! transaction abstraction exists. Limits are enforced at our boundary
 //! BEFORE the C client sees the op, with stable typed errors.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use crate::port::{ClockPort, DurableKv, KvPort};
 use crate::{KernelError, Result};
 
@@ -46,11 +49,15 @@ impl Default for FdbConfig {
 
 pub struct LogicalDb {
     config: FdbConfig,
+    committed: Arc<AtomicU64>,
 }
 
 impl LogicalDb {
     pub fn open(config: FdbConfig) -> Result<Self> {
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            committed: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub fn config(&self) -> &FdbConfig {
@@ -69,11 +76,15 @@ impl LogicalDb {
     }
 
     pub fn read_version(&self) -> Result<u64> {
-        Ok(0)
+        Ok(self.committed.load(Ordering::SeqCst))
     }
 
     pub fn committed_version(&self) -> Result<u64> {
-        Ok(0)
+        Ok(self.committed.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn bump_committed(&self) -> u64 {
+        self.committed.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
