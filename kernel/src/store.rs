@@ -37,12 +37,24 @@ impl Mutation {
         }
     }
 
+    /// K,V shorthand — `put_record` defaults `Class::Record` so the
+    /// novice job "store a value at a key" is one token, not three
+    /// (`Class` + `id` + `payload`). The `x` (ts) is assigned by the
+    /// store's clock; no `x` to supply.
+    pub fn put_record(id: impl Into<Vec<u8>>, payload: Vec<u8>) -> Self {
+        Self::put(Class::Record, id, payload)
+    }
+
     pub fn delete(class: Class, id: impl Into<Vec<u8>>) -> Self {
         Mutation {
             class,
             id: id.into(),
             op: model::Op::Delete,
         }
+    }
+
+    pub fn delete_record(id: impl Into<Vec<u8>>) -> Self {
+        Self::delete(Class::Record, id)
     }
 }
 
@@ -273,6 +285,38 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
 
     pub fn into_parts(self) -> (S, C) {
         (self.kv, self.clock)
+    }
+
+    // ── 1-click K,V ergonomic surface ────────────────────────────
+
+    /// `put` without naming `Class` — defaults to `Record`. The `x`
+    /// (version) is the store's clock, not a caller-supplied arg.
+    pub fn put_record(&mut self, id: impl Into<Vec<u8>>, payload: Vec<u8>) -> Result<u64> {
+        self.commit(&[Mutation::put_record(id, payload)])
+    }
+
+    pub fn delete_record(&mut self, id: impl Into<Vec<u8>>) -> Result<u64> {
+        self.commit(&[Mutation::delete_record(id)])
+    }
+
+    pub fn get_record(&self, id: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.latest(Class::Record, id)?.map(|(_, v)| v))
+    }
+}
+
+// ── 1-click open_at ──────────────────────────────────────────
+
+impl Ldb<crate::memkv::MemKv, crate::port::MonotonicClock> {
+    /// 1-click open — collapses `Ldb::open(&path, MemKv::new(),
+    /// Seq(Cell::new(0)))` (3 layers: path+Kv+Clock) to `Ldb::open_at(&path)`.
+    /// Journal still at `path`; `MonotonicClock` replaces the 10-line
+    /// `Seq` copy-paste. Advanced callers keep the 3-arg `open`.
+    pub fn open_at(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(
+            path,
+            crate::memkv::MemKv::new(),
+            crate::port::MonotonicClock::default(),
+        )
     }
 }
 

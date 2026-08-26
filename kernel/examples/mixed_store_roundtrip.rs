@@ -2,23 +2,8 @@
 //! txn → query → close/reopen → verify. A fresh clone runs this with
 //! zero external services (GOVERNANCE §2 out-of-box rule).
 
-use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op};
-use logical_db::port::ClockPort;
 use logical_db::store::{Ldb, Mutation};
-use std::cell::Cell;
-
-// ── Clock ────────────────────────────────────────────────────
-
-/// One tick per commit; strictly monotonic by construction.
-struct Seq(Cell<u64>);
-
-impl ClockPort for Seq {
-    fn now(&self) -> u64 {
-        self.0.set(self.0.get() + 1);
-        self.0.get()
-    }
-}
 
 // ── Journey ──────────────────────────────────────────────────
 
@@ -28,12 +13,13 @@ fn main() {
     let _ = std::fs::remove_file(&path);
 
     // Open: one journal file, zero daemons.
-    let mut db = Ldb::open(&path, MemKv::new(), Seq(Cell::new(0))).unwrap();
+    // 1-click K,V — `open_at` collapses the 3-layer (path+Kv+Clock) to
+    // just a path; `put_record` collapses `Class::Record + id + payload`
+    // (K,V,x) to `K,V`. Advanced callers still use `Ldb::open`+`Mutation::put`.
+    let mut db = Ldb::open_at(&path).unwrap();
 
-    // Seed then delete inside one batch: explicit deletion is part of
-    // the model, not an afterthought.
-    db.commit(&[Mutation::put(Class::Record, "doc/tmp", b"scratch".to_vec())])
-        .unwrap();
+    // K,V in one token — no Class, no x to supply (ts is the store's clock)
+    db.put_record("doc/tmp", b"scratch".to_vec()).unwrap();
 
     // Mixed write txn: four classes in one atomic commit.
     let ts = db
@@ -51,17 +37,13 @@ fn main() {
         .unwrap();
     println!("committed mixed batch at ts {ts}");
 
-    // Query through the read surface: scans expose full version
-    // history; latest() collapses it to live state.
+    // Query: `get_record` is the 1-click read (no Class, no ts)
+    assert_eq!(db.get_record(b"doc/tmp").unwrap(), None);
+    let payload = db.get_record(b"doc/1").unwrap().unwrap();
+    assert_eq!(payload, br#"{"title":"hello"}"#.to_vec());
+    // Full history still available when you need it
     let history = db.scan_class(Class::Record).unwrap();
     assert_eq!(history.len(), 3, "two versions of doc/tmp + one of doc/1");
-    assert_eq!(
-        db.latest(Class::Record, b"doc/tmp").unwrap(),
-        None,
-        "the tombstoned id must not read"
-    );
-    let (_, payload) = db.latest(Class::Record, b"doc/1").unwrap().unwrap();
-    assert_eq!(payload, br#"{"title":"hello"}"#.to_vec());
     let (row_ts, vec_payload) = db.latest(Class::VecCode, b"vec/1").unwrap().unwrap();
     assert_eq!(row_ts, ts);
     assert_eq!(vec_payload, vec![0b1011_0001]);
@@ -74,7 +56,7 @@ fn main() {
         .map(|&c| (c, db.scan_class(c).unwrap()))
         .collect();
     let (_kv, _clock) = db.into_parts();
-    let reopened = Ldb::open(&path, MemKv::new(), Seq(Cell::new(0))).unwrap();
+    let reopened = Ldb::open_at(&path).unwrap();
     for (class, rows) in &before {
         assert_eq!(
             &reopened.scan_class(*class).unwrap(),

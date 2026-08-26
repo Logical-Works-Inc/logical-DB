@@ -59,3 +59,30 @@ pub trait DurableKv: KvPort {
 pub trait ClockPort {
     fn now(&self) -> u64;
 }
+
+/// Monotonic logical clock — the 1-click default for `Ldb::open_at`.
+/// Replaces the 10-line `Seq(Cell<u64>)` copy-pasted across every
+/// example and test. `Cell` is single-threaded, matching the `Ldb`
+/// single-owner contract; `Default` starts at `0` so first `now()`
+/// returns `1`, preserving `last_ts` seeding.
+pub struct MonotonicClock(std::cell::Cell<u64>);
+
+impl MonotonicClock {
+    pub fn new(start: u64) -> Self {
+        Self(std::cell::Cell::new(start))
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self(std::cell::Cell::new(0))
+    }
+}
+
+impl ClockPort for MonotonicClock {
+    fn now(&self) -> u64 {
+        let n = self.0.get() + 1;
+        self.0.set(n);
+        n
+    }
+}
