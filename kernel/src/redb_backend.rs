@@ -77,6 +77,10 @@ fn backend_err<E: std::fmt::Display>(e: E) -> KernelError {
 // ── KvPort ───────────────────────────────────────────────────
 
 impl KvPort for RedbBackend {
+    fn is_durable(&self) -> bool {
+        true
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let rtxn = self.db.begin_read().map_err(backend_err)?;
         match read_table(&rtxn, ROWS)? {

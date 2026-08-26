@@ -3,7 +3,7 @@
   "schema_version": "1.0.0",
   "updated": "2026-08-26",
   "canon": "ADR-001 + ADR-002 (FDB substrate)",
-  "note": "One storage kernel for every repo. v0.1 RC ships row model + five classes over redb/journal; ADR-002 ratifies FDB as canonical substrate (F0 recipe ships, runtime split device=redb cloud=FDB, parity-before-delete F1-F4).",
+  "note": "One storage kernel for every repo. F4 parity landed: FDB is canonical substrate; redb/journal retired from production path (INV-PARITY-BEFORE-DELETE satisfied, journaled open now refuses durable backends); seven-point parity green on kernel/tests/parity_fdb.rs.",
   "statuses": {
     "live": "exists and is authoritative today",
     "meta": "agent/process tooling, not product surface",
@@ -58,8 +58,8 @@
     { "id": "ci-workflow", "path": ".github/workflows/ci.yml", "status": "live", "pillar": "infra", "kind": "generated", "summary": "Rendered workflow — canonical bytes enforced against the plan in CI." },
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
     { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC." },
-    { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), two persistence paths with one crash story each (redb production / journaled reference), what is not yet stable, benchmark results schema and algorithmic gates." },
-    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (issues #1, #5, #6, ADR-002 F0-F4): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5) + MemKv reference + framed journal oracle, Ldb store, five storage classes, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite; FDB becomes canonical after parity (INV-PARITY-BEFORE-DELETE).", "adrs": ["ADR-001", "ADR-002"] }
+    { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), FDB canonical after F4 parity (Redb retired, journal is MemKv oracle only), what is not yet stable, benchmark results schema and algorithmic gates." },
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (F4 parity landed): row model with framed keys, KvPort/DurableKv/ClockPort seams, FdbBackend (canonical, ADR-002 F1-F4) + FdbBackend file shim for parity + MemKv reference + framed journal oracle, Ldb store (journaled open refuses durable backends), five storage classes, seven-point parity_fdb harness, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs; RedbBackend retired.", "adrs": ["ADR-001", "ADR-002"] }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },

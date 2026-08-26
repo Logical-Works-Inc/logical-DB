@@ -81,6 +81,11 @@ impl<S: KvPort, C: ClockPort> Ldb<S, C> {
     /// inside an intact frame aborts the open loudly — corruption is
     /// never silently cut off.
     pub fn open(path: impl AsRef<Path>, mut kv: S, clock: C) -> Result<Self> {
+        if kv.is_durable() {
+            return Err(KernelError::Backend(
+                "journaled open refuses durable backend".into(),
+            ));
+        }
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)

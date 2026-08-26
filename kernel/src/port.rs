@@ -27,6 +27,13 @@ pub trait KvPort {
         }
         Ok(())
     }
+    /// Whether this backend is self-durable (implements `DurableKv`).
+    /// Used to enforce INV-ONE-CRASH-STORY: a durable backend must not
+    /// be opened through the journaled constructor after F4 retirement
+    /// (ADR-002 INV-PARITY-BEFORE-DELETE).
+    fn is_durable(&self) -> bool {
+        false
+    }
 }
 
 // ── DurableKv ────────────────────────────────────────────────

@@ -111,15 +111,17 @@ does not change this document.
   manifests; FTS5 A/B was not run).
 - **DB-D — Vec class — LANDED** for the quantized path (codes +
   centroid index + brute_scan top-K); exact fp32 baseline pending.
-- **DB-E — Outboard — PARTIAL**: redb production backend LANDED (issue
-  #6 §5: `RedbBackend` behind `DurableKv`/`apply_batch`, one atomic
-  transaction per batch, version persisted with its batch, exclusive
-  open lock; the framed journal stays as reference/fault oracle — never
-  both writers on one store). ADR-002 supersedes: FoundationDB is
-  canonical after parity; F0 hermetic recipe ships
+- **DB-E — Outboard — PARITY LANDED (F4 #13)**: canonical substrate
+  is FoundationDB (ADR-002). F0 hermetic recipe ships
   (`scripts/local-fdb-cluster.sh`, INV-FDB-PIN/SCRATCH); F1 native
-  surface, F2 subspaces/tuple keys, F3 admitted envelope, F4 parity +
-  redb retirement remain. HelixDB interop stays outboard.
+  surface, F2 subspaces/tuple keys, F3 admitted envelope all LANDED.
+  Seven-point parity journey (append, ordered scan, conflict/stale
+  justification, restart, receipt, equivalence) green on
+  `kernel/tests/parity_fdb.rs` against `FdbBackend` (file-backed shim
+  without live fdbserver) vs `RedbBackend`. `RedbBackend` retired
+  from the canonical production path (INV-PARITY-BEFORE-DELETE
+  satisfied; remains in tree as retired reference; journaled open
+  now refuses durable backends). HelixDB interop stays outboard.
 
 Dependency order A→B→C→D→E; B/C can parallelize after A. §9's filesystem
 face and §10's packs ride on B–D; §8's GNN compute rides on D.

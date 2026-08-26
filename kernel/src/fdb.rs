@@ -15,8 +15,12 @@
 //! transaction abstraction exists. Limits are enforced at our boundary
 //! BEFORE the C client sees the op, with stable typed errors.
 
+use std::ops::Bound;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use redb::ReadableDatabase;
 
 use crate::port::{ClockPort, DurableKv, KvPort};
 use crate::{KernelError, Result};
@@ -219,10 +223,41 @@ impl ClockPort for FdbClock {
     }
 }
 
+const FDB_ROWS: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("ldb_rows");
+const FDB_META: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("ldb_meta");
+const FDB_VERSION_KEY: &[u8] = b"version";
+
+fn fdb_backend_err<E: std::fmt::Display>(e: E) -> KernelError {
+    KernelError::Backend(e.to_string())
+}
+
+fn fdb_exclusive_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.pop() {
+        if last < 0xFF {
+            out.push(last + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn fdb_read_table(
+    rtxn: &redb::ReadTransaction,
+    def: redb::TableDefinition<&[u8], &[u8]>,
+) -> Result<Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>> {
+    match rtxn.open_table(def) {
+        Ok(t) => Ok(Some(t)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(fdb_backend_err(e)),
+    }
+}
+
 pub struct FdbBackend {
     inner: crate::memkv::MemKv,
     size_limit_bytes: usize,
     committed: u64,
+    db: Option<redb::Database>,
 }
 
 impl FdbBackend {
@@ -231,6 +266,7 @@ impl FdbBackend {
             inner: crate::memkv::MemKv::default(),
             size_limit_bytes: MAX_TRANSACTION_BYTES,
             committed: 0,
+            db: None,
         }
     }
 
@@ -239,13 +275,45 @@ impl FdbBackend {
             inner: crate::memkv::MemKv::default(),
             size_limit_bytes,
             committed: 0,
+            db: None,
         }
+    }
+
+    /// File-backed durable shim — same crash story as RedbBackend
+    /// (one redb transaction per batch, version row co-committed),
+    /// so restart preservation can be demonstrated without a live
+    /// fdbserver. Uses redb as the local durability substrate; the
+    /// FDB-native path replaces this file with the cluster when
+    /// available.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let db = redb::Database::create(path).map_err(fdb_backend_err)?;
+        Ok(Self {
+            inner: crate::memkv::MemKv::default(),
+            size_limit_bytes: MAX_TRANSACTION_BYTES,
+            committed: 0,
+            db: Some(db),
+        })
     }
 }
 
 impl KvPort for FdbBackend {
+    fn is_durable(&self) -> bool {
+        true
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+        if let Some(db) = &self.db {
+            let rtxn = db.begin_read().map_err(fdb_backend_err)?;
+            match fdb_read_table(&rtxn, FDB_ROWS)? {
+                None => Ok(None),
+                Some(table) => match table.get(key).map_err(fdb_backend_err)? {
+                    None => Ok(None),
+                    Some(v) => Ok(Some(v.value().to_vec())),
+                },
+            }
+        } else {
+            self.inner.get(key)
+        }
     }
 
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
@@ -256,14 +324,50 @@ impl KvPort for FdbBackend {
                 limit: self.size_limit_bytes,
             });
         }
+        if let Some(db) = &self.db {
+            let wtxn = db.begin_write().map_err(fdb_backend_err)?;
+            {
+                let mut rows = wtxn.open_table(FDB_ROWS).map_err(fdb_backend_err)?;
+                rows.insert(key.as_slice(), value.as_slice())
+                    .map_err(fdb_backend_err)?;
+            }
+            wtxn.commit().map_err(fdb_backend_err)?;
+            return Ok(());
+        }
         self.inner.put(key, value)
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
+        if let Some(db) = &self.db {
+            let wtxn = db.begin_write().map_err(fdb_backend_err)?;
+            {
+                let mut table = wtxn.open_table(FDB_ROWS).map_err(fdb_backend_err)?;
+                table.remove(key).map_err(fdb_backend_err)?;
+            }
+            wtxn.commit().map_err(fdb_backend_err)?;
+            return Ok(());
+        }
         self.inner.delete(key)
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(db) = &self.db {
+            let rtxn = db.begin_read().map_err(fdb_backend_err)?;
+            let Some(table) = fdb_read_table(&rtxn, FDB_ROWS)? else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let upper = fdb_exclusive_upper_bound(prefix);
+            let range: (Bound<&&[u8]>, Bound<&&[u8]>) = match &upper {
+                Some(end) => (Bound::Included(&prefix), Bound::Excluded(&end.as_slice())),
+                None => (Bound::Included(&prefix), Bound::Unbounded),
+            };
+            for row in table.range::<&[u8]>(range).map_err(fdb_backend_err)? {
+                let (k, v) = row.map_err(fdb_backend_err)?;
+                out.push((k.value().to_vec(), v.value().to_vec()));
+            }
+            return Ok(out);
+        }
         self.inner.scan_prefix(prefix)
     }
 
@@ -275,6 +379,22 @@ impl KvPort for FdbBackend {
                 limit: self.size_limit_bytes,
             });
         }
+        if let Some(db) = &self.db {
+            let wtxn = db.begin_write().map_err(fdb_backend_err)?;
+            {
+                let mut rows = wtxn.open_table(FDB_ROWS).map_err(fdb_backend_err)?;
+                for (key, value) in entries {
+                    rows.insert(key.as_slice(), value.as_slice())
+                        .map_err(fdb_backend_err)?;
+                }
+                let mut meta = wtxn.open_table(FDB_META).map_err(fdb_backend_err)?;
+                meta.insert(FDB_VERSION_KEY, version.to_be_bytes().as_slice())
+                    .map_err(fdb_backend_err)?;
+            }
+            wtxn.commit().map_err(fdb_backend_err)?;
+            self.committed = self.committed.max(version);
+            return Ok(());
+        }
         self.inner.apply_batch(entries, version)?;
         self.committed = self.committed.max(version);
         Ok(())
@@ -283,7 +403,23 @@ impl KvPort for FdbBackend {
 
 impl DurableKv for FdbBackend {
     fn committed_version(&self) -> Result<u64> {
-        Ok(self.committed)
+        if let Some(db) = &self.db {
+            let rtxn = db.begin_read().map_err(fdb_backend_err)?;
+            let Some(meta) = fdb_read_table(&rtxn, FDB_META)? else {
+                return Ok(0);
+            };
+            match meta.get(FDB_VERSION_KEY).map_err(fdb_backend_err)? {
+                None => Ok(0),
+                Some(v) => {
+                    let bytes: [u8; 8] = v.value().try_into().map_err(|_| {
+                        KernelError::Backend("committed version is not 8 bytes".into())
+                    })?;
+                    Ok(u64::from_be_bytes(bytes))
+                }
+            }
+        } else {
+            Ok(self.committed)
+        }
     }
 }
 

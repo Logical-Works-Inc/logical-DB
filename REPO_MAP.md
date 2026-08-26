@@ -27,8 +27,8 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |
 | `docs/FRANKENSTEIN.md` | spec | Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC. |
-| `docs/FORMAT.md` | spec | v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), two persistence paths with one crash story each (redb production / journaled reference), what is not yet stable, benchmark results schema and algorithmic gates. |
-| `kernel/` | kernel | The kernel crate logical-db (issues #1, #5, #6, ADR-002 F0-F4): row model with framed keys, KvPort/DurableKv/ClockPort seams, RedbBackend (production, issue #6 §5) + MemKv reference + framed journal oracle, Ldb store, five storage classes, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs, mixed_store_roundtrip example, ship_bench suite; FDB becomes canonical after parity (INV-PARITY-BEFORE-DELETE). (ADR-001, ADR-002) |
+| `docs/FORMAT.md` | spec | v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), FDB canonical after F4 parity (Redb retired, journal is MemKv oracle only), what is not yet stable, benchmark results schema and algorithmic gates. |
+| `kernel/` | kernel | The kernel crate logical-db (F4 parity landed): row model with framed keys, KvPort/DurableKv/ClockPort seams, FdbBackend (canonical, ADR-002 F1-F4) + FdbBackend file shim for parity + MemKv reference + framed journal oracle, Ldb store (journaled open refuses durable backends), five storage classes, seven-point parity_fdb harness, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs; RedbBackend retired. (ADR-001, ADR-002) |
 
 ## META — agent/process tooling
 

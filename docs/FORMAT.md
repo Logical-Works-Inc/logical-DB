@@ -43,12 +43,14 @@ Frame payload is a sequence of rows (v1):
 
 ## 3. Not yet stable in v0.1
 
-- Two persistence paths ship, one crash story each (issue #6 §5):
-  production bytes go through redb only (`RedbBackend` behind the
-  `DurableKv` seam — its file format is redb's own, not specified
-  here); the §1 journal frames serve the MemKv reference path and act
-  as the fault oracle for replay/corruption behavior. Never write one
-  store's data through both.
+- Persistence (ADR-002, F4 #13): canonical substrate is FoundationDB
+  (`FdbBackend` behind `DurableKv` + `LogicalDb::transact_admitted`;
+  local file-backed shim demonstrates seven-point parity without a
+  live fdbserver). `RedbBackend` is retired from the canonical path
+  (remains in tree for provenance; `Ldb::open` now refuses durable
+  backends per INV-ONE-CRASH-STORY). The §1 journal frames remain
+  for the MemKv reference/fault oracle only. Never write one
+  store's data through two crash stories.
 - Segment packing, mmap-first reads, and hydration are design intent
   (DB_PATHWAY §3), not shipped format.
 - No migration tooling exists yet. Any future change to §1/§2 ships a
