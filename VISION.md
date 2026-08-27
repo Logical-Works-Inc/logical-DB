@@ -49,9 +49,9 @@ backends per INV-ONE-CRASH-STORY). F2 tuple namespaces
 opaque `contains_many` (bounded batch, deterministic dedup/order,
 continuation, tenant-isolated) are landed for kernel#804. ADR-002
 ratifies FDB as canonical after parity; F0 recipe ships
-(`scripts/local-fdb-cluster.sh` — verified 2026-08-27 host
- `/tmp/fdb-f0` arm64 7.3.79 + `foundationdb/build:rockylinux9_arm64-latest`
- with `~/Downloads/foundationdb-7.3.77` source). What is still
+ (`scripts/local-fdb-cluster.sh` — verified 2026-08-27 host
+ `/tmp/fdb-f0` arm64 7.3.79; source at `~/Downloads/foundationdb-7.3.77`,
+ linux runtime `foundationdb/foundationdb:7.3.x`). What is still
  ahead: LEM tape parity (logic-os-kernel#804) — live `FdbBackend`
  `get/set/clear + ordered range` already proven in
  `kernel/tests/fdb_live.rs:live_fdb_cluster_roundtrip`; remaining

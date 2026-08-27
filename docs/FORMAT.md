@@ -59,8 +59,10 @@ Frame payload is a sequence of rows (v1):
   `/tmp/fdb-f0/macbin/libfdb_c.dylib`, test
   `kernel/tests/fdb_live.rs:live_fdb_cluster_roundtrip`
   `get/set/clear + ordered range`); linux lane uses the same
-  `libfdb_c` via `foundationdb/build:rockylinux9_arm64-latest`
-  and the source tree at `~/Downloads/foundationdb-7.3.77`.
+  `libfdb_c` built from the source tree at
+  `~/Downloads/foundationdb-7.3.77` (runtime
+  `foundationdb/foundationdb:7.3.x`, not the 18.9GB
+  `foundationdb/build` compiler farm).
 - Opaque key wire: `kernel/src/tuple.rs` estate/subspace/tenant
   prefix + order-preserving tuple codec and
   `kernel/src/contains.rs` `contains_many` (bounded batch: exact
