@@ -55,6 +55,14 @@ pub enum KernelError {
     KeyTooLarge { len: usize, limit: usize },
     /// A continuation token is malformed or does not correspond to a valid resume point.
     InvalidContinuation(String),
+    /// FDB transaction conflict: read set invalidated by a concurrent
+    /// committed write (retryable, F1).
+    TransactionConflict,
+    /// A watch was cancelled because the transaction or database shut down.
+    WatchCancelled,
+    /// An atomic operation violated its precondition (e.g. non-integer
+    /// operand for add).
+    AtomicOpViolation(String),
 }
 
 impl fmt::Display for KernelError {
@@ -126,6 +134,13 @@ impl fmt::Display for KernelError {
             }
             KernelError::InvalidContinuation(reason) => {
                 write!(f, "invalid continuation: {reason}")
+            }
+            KernelError::TransactionConflict => {
+                write!(f, "fdb transaction conflict: retryable")
+            }
+            KernelError::WatchCancelled => write!(f, "watch cancelled"),
+            KernelError::AtomicOpViolation(reason) => {
+                write!(f, "atomic op violation: {reason}")
             }
         }
     }
@@ -252,6 +267,15 @@ mod tests {
         assert_eq!(
             KernelError::InvalidContinuation("not found".into()).to_string(),
             "invalid continuation: not found"
+        );
+        assert_eq!(
+            KernelError::TransactionConflict.to_string(),
+            "fdb transaction conflict: retryable"
+        );
+        assert_eq!(KernelError::WatchCancelled.to_string(), "watch cancelled");
+        assert_eq!(
+            KernelError::AtomicOpViolation("bad operand".into()).to_string(),
+            "atomic op violation: bad operand"
         );
     }
 

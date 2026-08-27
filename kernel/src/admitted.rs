@@ -357,13 +357,18 @@ impl LogicalDb {
             return Err(KernelError::AuthorityScopeViolation);
         }
 
-        let mut tx = FdbTransaction::new(
+        // Snapshot must be taken at envelope version; use backend snapshot
+        let snapshot = self.backend.lock().unwrap().snapshot_map();
+        let mut tx = FdbTransaction::new_with_snapshot(
             self.config().transaction_size_limit_bytes,
             self.config().transaction_timeout_ms,
+            envelope.snapshot_version,
+            snapshot,
         );
         let result = f(&mut tx)?;
 
-        let committed_version = self.bump_committed();
+        self.try_commit(tx).await?;
+        let committed_version = self.committed_version()?;
         let receipt = Receipt {
             committed_version,
             operation_id: envelope.operation_id,
