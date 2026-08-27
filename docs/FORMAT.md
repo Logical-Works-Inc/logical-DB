@@ -45,15 +45,22 @@ Frame payload is a sequence of rows (v1):
 
 - Persistence (ADR-002, F4 #13): canonical substrate is
   FoundationDB (`FdbBackend` behind `DurableKv` +
-  `LogicalDb::transact_admitted`; file-backed shim today,
-  delegates to `foundationdb` binding when `libfdb_c` is present).
-  `RedbBackend` is retired from the canonical path (remains in
-  tree for provenance; `Ldb::open` now refuses durable backends
-  per INV-ONE-CRASH-STORY). The §1 journal frames remain for the
-  MemKv reference/fault oracle only. Never write one store's data
-  through two crash stories. MemKv + `FdbBackend` file shim are
-  the two tested crash stories; live FDB cluster parity is still
-  ahead.
+  `LogicalDb::transact_admitted`; file-backed shim + `MemKv`
+  oracle are the two tested crash stories; the same shim
+  delegates to the `foundationdb` crate (`libfdb_c`) when the
+  library is present). `RedbBackend` is retired from the
+  canonical path (remains in tree for provenance; `Ldb::open`
+  now refuses durable backends per INV-ONE-CRASH-STORY). The §1
+  journal frames remain for the MemKv reference/fault oracle
+  only. Never write one store's data through two crash stories.
+  Live FDB cluster verified 2026-08-27 on host
+  `/tmp/fdb-f0` (arm64, `fdbserver` 7.3.79, `fdbcli status
+  minimal` `available`, `DYLD_FALLBACK_LIBRARY_PATH` →
+  `/tmp/fdb-f0/macbin/libfdb_c.dylib`, test
+  `kernel/tests/fdb_live.rs:live_fdb_cluster_roundtrip`
+  `get/set/clear + ordered range`); linux lane uses the same
+  `libfdb_c` via `foundationdb/build:rockylinux9_arm64-latest`
+  and the source tree at `~/Downloads/foundationdb-7.3.77`.
 - Opaque key wire: `kernel/src/tuple.rs` estate/subspace/tenant
   prefix + order-preserving tuple codec and
   `kernel/src/contains.rs` `contains_many` (bounded batch: exact
@@ -71,12 +78,13 @@ Frame payload is a sequence of rows (v1):
 ## 4. Benchmark results format
 
 `cargo bench -p logical-db` runs `kernel/benches/ship_bench.rs` — a
-plain binary, no criterion dependency. Benches run the journaled
-MemKv reference path (the deterministic baseline); the `FdbBackend`
-file shim carries the same semantic suite, not these numbers. Real
-FDB cluster numbers still need a live cluster; the shim proves the
-crash story without `fdbserver`. It prints one JSON object per line
-on stdout:
+ plain binary, no criterion dependency. Benches run the journaled
+ MemKv reference path (the deterministic baseline); the `FdbBackend`
+ file shim carries the same semantic suite, not these numbers; live
+ FDB numbers come from the same harness against
+ `/tmp/fdb-f0/fdb.cluster` (`cargo test --features fdb --test
+ fdb_live`). The shim proves the crash story without `fdbserver`.
+ It prints one JSON object per line on stdout:
 
     {"workload":"<name>","samples":N,"ops":N,
      "throughput_ops_per_s":F,"p50_ns":N,"p95_ns":N,"db_bytes":N}
