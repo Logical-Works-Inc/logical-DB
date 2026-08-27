@@ -7,20 +7,26 @@ scans + top-K rescore instead of fp32 brute force — the compute-fraction
 mechanism is named in `docs/DB_PATHWAY.md` §3 and its measured surface
 in `docs/FORMAT.md`.
 
-**Status:** v0.1 release candidate. The kernel crate (`logical-db`) ships
-the row model, all five storage classes (record, term, edge, vec-code,
-claim), and two durability paths with one crash story each: production
-persistence through redb (`RedbBackend`, issue #6 §5 — one atomic
-transaction per batch, no journal), plus the framed CRC32 journal over
-MemKv as the deterministic reference and fault oracle. Both backends
-pass the same randomized state-machine suite and the same process-kill
-recovery proof; planted-corruption negative tests and Kani property
-proofs cover the codec; `docs/FORMAT.md` carries the §9 benchmark suite.
-ADR-002 ratifies FoundationDB as canonical substrate after parity
-(INV-PARITY-BEFORE-DELETE); F0 hermetic recipe ships
-(`scripts/local-fdb-cluster.sh`); runtime split: device=redb,
-cloud=FDB. Trust state: FUNCTIONAL — every claim above traces to a test
-or a benchmark artifact.
+**Status:** v0.1 release candidate. The kernel crate (`logical-db`)
+ships the row model, all five storage classes (record, term, edge,
+vec-code, claim), and two crash stories with one crash story each:
+canonical `FdbBackend` (file shim today, native `foundationdb` binding
+when `libfdb_c` present) plus the framed CRC32 journal over MemKv as
+the deterministic reference and fault oracle (journaled open refuses
+durable backends per INV-ONE-CRASH-STORY). Both the `FdbBackend` shim
+and MemKv pass the same randomized state-machine suite and the same
+process-kill recovery proof; `contains_many` (bounded batch, dedup,
+continuation) and `cross_tenant_isolated` are covered, and
+planted-corruption negative tests and Kani property proofs cover the
+codec; `docs/FORMAT.md` carries the §4 benchmark suite. F2 tuple
+namespaces, F3 admitted envelope typestate, and #16 opaque
+`contains_many` for kernel#804 are landed and wire-stable; F0 recipe
+ships (`scripts/local-fdb-cluster.sh`). What is still ahead: live FDB
+cluster parity via the LEM tape consumer (logic-os-kernel#804) — not a
+second F4 doc bump before receipt — plus segment packing, mmap-first
+reads, and hydration. No `Cid`/Braid type is claimed here; integrity
+is storage-internal. Trust state: FUNCTIONAL for the shipped surface
+— every claim above traces to a test or a benchmark artifact.
 
 ## Try it
 

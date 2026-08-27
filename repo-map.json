@@ -1,9 +1,9 @@
 {
   "$schema": "./repo-map.schema.json",
   "schema_version": "1.0.0",
-  "updated": "2026-08-26",
-  "canon": "ADR-001 + ADR-002 (FDB substrate)",
-  "note": "One storage kernel for every repo. F4 parity landed: FDB is canonical substrate; redb/journal retired from production path (INV-PARITY-BEFORE-DELETE satisfied, journaled open now refuses durable backends); seven-point parity green on kernel/tests/parity_fdb.rs.",
+  "updated": "2026-08-27",
+  "canon": "ADR-001 + ADR-002 (FDB substrate) + #16 opaque contains_many",
+  "note": "One storage kernel for every repo. F4 parity landed: FDB is canonical substrate; redb/journal retired from production path (INV-PARITY-BEFORE-DELETE satisfied, journaled open now refuses durable backends); seven-point parity green on kernel/tests/parity_fdb.rs. F2 tuple namespaces (cross_tenant_isolated) + F3 admitted envelope (typestate) + #16 opaque contains_many (bounded batch, deterministic dedup/order, continuation, tenant-isolated) landed for kernel#804; remaining measured step is parity via LEM tape, not a second F4 doc bump.",
   "statuses": {
     "live": "exists and is authoritative today",
     "meta": "agent/process tooling, not product surface",
@@ -59,7 +59,10 @@
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
     { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC." },
     { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), FDB canonical after F4 parity (Redb retired, journal is MemKv oracle only), what is not yet stable, benchmark results schema and algorithmic gates." },
-    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (F4 parity landed): row model with framed keys, KvPort/DurableKv/ClockPort seams, FdbBackend (canonical, ADR-002 F1-F4) + FdbBackend file shim for parity + MemKv reference + framed journal oracle, Ldb store (journaled open refuses durable backends), five storage classes, seven-point parity_fdb harness, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs; RedbBackend retired.", "adrs": ["ADR-001", "ADR-002"] }
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (F4 parity landed): row model with framed keys, KvPort/DurableKv/ClockPort seams, FdbBackend canonical (file shim today, native binding when libfdb_c present, ADR-002 F1-F4) + MemKv reference + framed journal oracle, Ldb store (journaled open refuses durable backends per INV-ONE-CRASH-STORY), five storage classes, seven-point parity harness, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs; RedbBackend retired.", "adrs": ["ADR-001", "ADR-002"] },
+    { "id": "contains", "path": "kernel/src/contains.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Opaque bounded batch existence contains_many: exact present/missing with budget, deterministic dedup+ordering, continuation, tenant-isolated via tuple subspaces (F2); supports kernel#804 missing-set. (ADR-002, #16)" },
+    { "id": "tuple", "path": "kernel/src/tuple.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Canonical tuple/subspace layer (F2): estate/subspace/tenant prefix + order-preserving codec; INV-TENANT-PREFIX, cross_tenant_isolated property." },
+    { "id": "admitted", "path": "kernel/src/admitted.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Admitted envelope typestate (F3): Safe/Authority/Justification proofs, INV-UNKNOWN-NEVER-WRITES + INV-JUSTIFICATION-FRESH, receipt capture." }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },

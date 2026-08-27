@@ -49,6 +49,12 @@ pub enum KernelError {
     AuthorityScopeViolation,
     /// INV-JUSTIFICATION-FRESH violated: stale justification bound version does not match snapshot/frontier (F3).
     StaleJustification { expected: u64, got: u64 },
+    /// Contains budget is zero or exceeds hard caps (issue #16 §3).
+    ContainsBudgetInvalid(String),
+    /// A single opaque key exceeds `max_key_bytes` (issue #16 §3).
+    KeyTooLarge { len: usize, limit: usize },
+    /// A continuation token is malformed or does not correspond to a valid resume point.
+    InvalidContinuation(String),
 }
 
 impl fmt::Display for KernelError {
@@ -111,6 +117,15 @@ impl fmt::Display for KernelError {
                     f,
                     "stale justification: expected version {expected}, got {got}"
                 )
+            }
+            KernelError::ContainsBudgetInvalid(reason) => {
+                write!(f, "contains budget invalid: {reason}")
+            }
+            KernelError::KeyTooLarge { len, limit } => {
+                write!(f, "key too large: {len} bytes exceeds limit {limit}")
+            }
+            KernelError::InvalidContinuation(reason) => {
+                write!(f, "invalid continuation: {reason}")
             }
         }
     }
@@ -221,6 +236,22 @@ mod tests {
             }
             .to_string(),
             "stale justification: expected version 5, got 3"
+        );
+        assert_eq!(
+            KernelError::ContainsBudgetInvalid("max_keys must be > 0".into()).to_string(),
+            "contains budget invalid: max_keys must be > 0"
+        );
+        assert_eq!(
+            KernelError::KeyTooLarge {
+                len: 100,
+                limit: 10
+            }
+            .to_string(),
+            "key too large: 100 bytes exceeds limit 10"
+        );
+        assert_eq!(
+            KernelError::InvalidContinuation("not found".into()).to_string(),
+            "invalid continuation: not found"
         );
     }
 

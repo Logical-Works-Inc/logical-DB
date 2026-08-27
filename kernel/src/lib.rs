@@ -16,6 +16,7 @@ pub mod adjacency;
 #[cfg(feature = "fdb")]
 pub mod admitted;
 pub mod claim;
+pub mod contains;
 pub mod error;
 #[cfg(feature = "fdb")]
 pub mod fdb;

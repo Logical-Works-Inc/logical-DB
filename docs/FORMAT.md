@@ -43,26 +43,40 @@ Frame payload is a sequence of rows (v1):
 
 ## 3. Not yet stable in v0.1
 
-- Persistence (ADR-002, F4 #13): canonical substrate is FoundationDB
-  (`FdbBackend` behind `DurableKv` + `LogicalDb::transact_admitted`;
-  local file-backed shim demonstrates seven-point parity without a
-  live fdbserver). `RedbBackend` is retired from the canonical path
-  (remains in tree for provenance; `Ldb::open` now refuses durable
-  backends per INV-ONE-CRASH-STORY). The §1 journal frames remain
-  for the MemKv reference/fault oracle only. Never write one
-  store's data through two crash stories.
-- Segment packing, mmap-first reads, and hydration are design intent
-  (DB_PATHWAY §3), not shipped format.
-- No migration tooling exists yet. Any future change to §1/§2 ships a
-  version marker plus an upgrader or a documented dead-end.
+- Persistence (ADR-002, F4 #13): canonical substrate is
+  FoundationDB (`FdbBackend` behind `DurableKv` +
+  `LogicalDb::transact_admitted`; file-backed shim today,
+  delegates to `foundationdb` binding when `libfdb_c` is present).
+  `RedbBackend` is retired from the canonical path (remains in
+  tree for provenance; `Ldb::open` now refuses durable backends
+  per INV-ONE-CRASH-STORY). The §1 journal frames remain for the
+  MemKv reference/fault oracle only. Never write one store's data
+  through two crash stories. MemKv + `FdbBackend` file shim are
+  the two tested crash stories; live FDB cluster parity is still
+  ahead.
+- Opaque key wire: `kernel/src/tuple.rs` estate/subspace/tenant
+  prefix + order-preserving tuple codec and
+  `kernel/src/contains.rs` `contains_many` (bounded batch: exact
+  present/missing, deterministic dedup+ordering, continuation,
+  tenant-isolated via `cross_tenant_isolated` property) are
+  wire-stable for opaque bytes. No `Cid`/Braid type is defined or
+  advertised here; integrity framing (§1 CRC32, §2 codec) is
+  storage-internal, not a Braid CID.
+- Segment packing, mmap-first reads, and hydration are design
+  intent (DB_PATHWAY §3), not shipped format.
+- No migration tooling exists yet. Any future change to §1/§2
+  ships a version marker plus an upgrader or a documented
+  dead-end.
 
 ## 4. Benchmark results format
 
 `cargo bench -p logical-db` runs `kernel/benches/ship_bench.rs` — a
-plain binary, no criterion dependency. Benches run the journaled MemKv
-reference path (the deterministic baseline); the redb backend carries
-the same semantic suite, not these numbers. It prints one JSON object
-per line on stdout:
+plain binary, no criterion dependency. Benches run the journaled
+MemKv reference path (the deterministic baseline); the `FdbBackend`
+file shim carries the same semantic suite, not these numbers. Real
+FDB cluster numbers still need a live cluster; the shim proves the
+crash story without `fdbserver`. It prints one JSON object per line
+on stdout:
 
     {"workload":"<name>","samples":N,"ops":N,
      "throughput_ops_per_s":F,"p50_ns":N,"p95_ns":N,"db_bytes":N}

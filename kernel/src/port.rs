@@ -71,6 +71,10 @@ impl MonotonicClock {
     pub fn new(start: u64) -> Self {
         Self(std::cell::Cell::new(start))
     }
+
+    pub(crate) fn sync_to(&self, v: u64) {
+        self.0.set(v);
+    }
 }
 
 impl Default for MonotonicClock {

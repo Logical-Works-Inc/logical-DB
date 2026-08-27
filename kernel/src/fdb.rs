@@ -379,6 +379,12 @@ impl KvPort for FdbBackend {
                 limit: self.size_limit_bytes,
             });
         }
+        if entries.len() > MAX_TRANSACTION_KEYS {
+            return Err(KernelError::TransactionTooLarge {
+                size: entries.len(),
+                limit: MAX_TRANSACTION_KEYS,
+            });
+        }
         if let Some(db) = &self.db {
             let wtxn = db.begin_write().map_err(fdb_backend_err)?;
             {

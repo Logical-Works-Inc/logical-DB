@@ -37,29 +37,39 @@ string-query surface, injection-class bugs structurally absent.
 
 ## The wall
 
-The honest wall, updated 2026-08-26: the kernel spine exists — row model,
-all five storage classes, a randomized state-machine suite run on both
-backends, corruption negative tests, Kani proofs, the benchmark suite
-(`docs/FORMAT.md`), and two durability paths with one crash story each:
-production redb (`RedbBackend`, issue #6 §5) plus the framed journal as
-reference and fault oracle. ADR-002 ratifies FoundationDB as canonical
-substrate after parity (INV-PARITY-BEFORE-DELETE); F0 hermetic recipe
-ships (`scripts/local-fdb-cluster.sh`); runtime split: device=redb,
-cloud=FDB. What is still ahead: segment packing, mmap-first reads,
-hydration. Compute-fraction claims carry mechanism and measurement in
-the benchmark artifact; filesystem (§9), packs (§10), GNN (§8) remain
-design intent until their phases land. Trust state: FUNCTIONAL for the
-shipped surface.
+The honest wall, updated 2026-08-27: the kernel spine exists — row
+model, all five storage classes, randomized state-machine suite run on
+`FdbBackend` file shim vs MemKv oracle, corruption negative tests,
+Kani proofs, benchmark suite (`docs/FORMAT.md`), and two crash
+stories with one crash story each: `FdbBackend` canonical (file shim
+today, native `foundationdb` binding when `libfdb_c` present) plus the
+framed journal as MemKv oracle (journaled open refuses durable
+backends per INV-ONE-CRASH-STORY). F2 tuple namespaces
+(`cross_tenant_isolated`), F3 admitted envelope typestate, and #16
+opaque `contains_many` (bounded batch, deterministic dedup/order,
+continuation, tenant-isolated) are landed for kernel#804. ADR-002
+ratifies FDB as canonical after parity; F0 recipe ships
+(`scripts/local-fdb-cluster.sh`). What is still ahead: live FDB
+cluster parity via LEM tape (logic-os-kernel#804), segment packing,
+mmap-first reads, hydration. Compute-fraction claims carry mechanism
+and measurement in the benchmark artifact; filesystem (§9), packs
+(§10), GNN (§8) remain design intent until their phases land. No
+`Cid`/Braid type is claimed here; integrity is storage-internal.
+Trust state: FUNCTIONAL for the shipped surface.
 
 ## Sequence
 
 Landed: DB-A kernel spine → DB-B record+edge → DB-C term → DB-D vec →
-DB-E claim/metadata classes → the redb production backend + MemKv parity
-(issue #6 §5). Next: FDB canonical migration F0 (recipe ships) → F1
-native surface → F2 subspaces/tuple keys → F3 admitted envelope → F4
-parity + redb retirement per `docs/DB_PATHWAY.md` §5–§6 and ADR-002.
-HelixDB interop remains outboard. Filesystem and GNN faces ride on
-later phases.
+DB-E claim/metadata → redb production backend + MemKv parity
+(issue #6 §5) → FDB canonical migration F0 recipe (ships) → F1
+`FdbBackend` file shim → F2 tuple namespaces
+(`cross_tenant_isolated`) → F3 admitted envelope typestate → #16
+opaque `contains_many` (bounded batch, continuation, tenant-isolated)
+for kernel#804. Next: parity via LEM tape on a live FDB cluster
+(logic-os-kernel#804 / #801) — not a second F4 doc bump before
+receipt — then segment packing, mmap, hydration per
+`docs/DB_PATHWAY.md` §5–§6 and ADR-002. HelixDB interop stays
+outboard. Filesystem and GNN faces ride on later phases.
 
 ## Day-1 invariants
 

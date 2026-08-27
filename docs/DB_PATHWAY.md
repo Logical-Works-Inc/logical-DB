@@ -99,7 +99,7 @@ does not change this document.
 - HelixDB remains an outboard engine; the kernel must be functional WITHOUT
   it (fail-closed out-of-box rule).
 
-## 5. Pathway phases (status 2026-08-26)
+## 5. Pathway phases (status 2026-08-27)
 
 - **DB-A — Kernel spine — LANDED** (row model, framed CRC32 journal,
   MemKv default backend, kill-9 recovery proof; segment packing and
@@ -111,17 +111,23 @@ does not change this document.
   manifests; FTS5 A/B was not run).
 - **DB-D — Vec class — LANDED** for the quantized path (codes +
   centroid index + brute_scan top-K); exact fp32 baseline pending.
-- **DB-E — Outboard — PARITY LANDED (F4 #13)**: canonical substrate
-  is FoundationDB (ADR-002). F0 hermetic recipe ships
-  (`scripts/local-fdb-cluster.sh`, INV-FDB-PIN/SCRATCH); F1 native
-  surface, F2 subspaces/tuple keys, F3 admitted envelope all LANDED.
-  Seven-point parity journey (append, ordered scan, conflict/stale
-  justification, restart, receipt, equivalence) green on
-  `kernel/tests/parity_fdb.rs` against `FdbBackend` (file-backed shim
-  without live fdbserver) vs `RedbBackend`. `RedbBackend` retired
-  from the canonical production path (INV-PARITY-BEFORE-DELETE
-  satisfied; remains in tree as retired reference; journaled open
-  now refuses durable backends). HelixDB interop stays outboard.
+- **DB-E — FDB substrate (ADR-002) — F0 recipe ships, F1 shim
+  green, F2/F3/#16 landed**: F0 hermetic recipe ships
+  (`scripts/local-fdb-cluster.sh`, INV-FDB-PIN/SCRATCH); F1
+  `FdbBackend` shim green (file-backed today, delegates to
+  `foundationdb` binding when `libfdb_c` present); F2 tuple
+  namespaces landed with `cross_tenant_isolated` property
+  (`kernel/src/tuple.rs`); F3 admitted envelope typestate landed
+  (INV-UNKNOWN-NEVER-WRITES, INV-JUSTIFICATION-FRESH,
+  `kernel/src/admitted.rs`); #16 opaque `contains_many` landed
+  (bounded batch, deterministic dedup+order, continuation,
+  tenant-isolated) for kernel#804. Seven-point parity green on
+  `FdbBackend` file shim vs MemKv oracle; journaled open refuses
+  durable backends per INV-ONE-CRASH-STORY (`RedbBackend` retired
+  per INV-PARITY-BEFORE-DELETE, remains as retired reference).
+  Remaining measured step is parity via the LEM tape consumer
+  (logic-os-kernel#804 / #801) — not a second F4 doc bump that
+  claims deletion before receipt. HelixDB interop stays outboard.
 
 Dependency order A→B→C→D→E; B/C can parallelize after A. §9's filesystem
 face and §10's packs ride on B–D; §8's GNN compute rides on D.

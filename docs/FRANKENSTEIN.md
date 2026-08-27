@@ -36,6 +36,15 @@ GOVERNANCE §6 (Apache/MIT donors only land on default paths).
   publish-under-lock closes TOCTOU → kernel/port.rs ClockPort (DB-A).
 - u64-packed tree keys — arroy `src/key.rs:9,140`: whole node key
   bit-packs into one u64 for the KV → DB-B vec-code packing.
+- FDB shim (no vendored engine) — `kernel/src/fdb.rs` is a
+  redb-backed durable shim that delegates to the pinned
+  `foundationdb` 0.11.0 / fdb-7_3 binding when `libfdb_c` is present
+  → F1; the binary has zero new vendored engine, only the port we
+  own.
+- Opaque tuple/contains — `kernel/src/tuple.rs` estate/subspace
+  codec + `kernel/src/contains.rs` bounded `contains_many` → F2/#16;
+  integrity framing is storage-internal (§1 CRC32, tuple codec),
+  never a Braid CID.
 
 ## Internal donors (the constellation's own)
 
@@ -54,8 +63,12 @@ The donor engines now compile and run under `organs/src/dump.rs`, one
 functional smoke each: fjall 3, redb 4, arroy 0.8 (+heed), fst,
 petgraph, memmap2, half. INV-ORGANS-COMPILE-AND-RUN: a donor that
 cannot pass here is recorded below, never silently dropped.
-Blocked: `foundationdb` crate needs `libfdb_c` on the host (brew
-install foundationdb) before it can link — G5 unblocks it.
+`foundationdb` 0.11.0 (fdb-7_3) is pinned but `libfdb_c` is not
+vendored; `FdbBackend` file shim proves the crash story without a
+live `fdbserver`, delegating to the native binding when the host
+provides `libfdb_c`. No new engine was vendored for #16 — the shim
+reuses redb pages locally; integrity framing stays storage-internal,
+not a Braid CID.
 
 ## Sync-layer donors (web-grounded)
 
@@ -87,7 +100,8 @@ install foundationdb) before it can link — G5 unblocks it.
   segments per qdrant; fjall-style rotation.
 - G4 txns + savepoints (DB-D): FDB conflict window, redb tracker, the
   durable-before-restore invariant, INV-SIMULATE-THE-SPINE harness.
-- G5 scale-out adapter (DB-D/E): KvPort implemented over FoundationDB;
-  clustering stays outboard — nothing embedded by default.
+- G5 scale-out adapter (DB-D/E): `FdbBackend` file shim LANDED (F1);
+  live FDB cluster parity via LEM tape (kernel#804) is the measured
+  remainder; clustering stays outboard — nothing embedded by default.
 - G6 sync layer (DB-E): zone prefixes, ts-watermark tokens, versionstamp
   op log, snapshot+replay restore, three-way merge. The iCloud-style face.

@@ -633,4 +633,116 @@ mod tests {
             "justification binding must match snapshot at construction"
         );
     }
+
+    #[tokio::test]
+    async fn authority_must_cover_namespace() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let ns_a = Namespace::kernel(TenantId::new(b"tenant-a".to_vec()));
+        let ns_b = Namespace::kernel(TenantId::new(b"tenant-b".to_vec()));
+        let ns_lem = Namespace::lem(TenantId::new(b"tenant-a".to_vec()));
+        let v0 = db.read_version().unwrap();
+        let (safe, authority, justification) = make_proofs(&ns_a, v0);
+        // authority only covers ns_a Put/Delete — using ns_b must fail at construction
+        let bad_ns = AdmittedTxn::new(
+            v0,
+            safe.clone(),
+            authority.clone(),
+            justification.clone(),
+            ns_b.clone(),
+            vec![Effect::Put],
+            OperationId::new("op-foreign-tenant"),
+        );
+        assert!(
+            matches!(bad_ns, Err(KernelError::AuthorityScopeViolation)),
+            "foreign tenant namespace must be rejected at envelope construction"
+        );
+        // same tenant but different subspace must also fail
+        let bad_subspace = AdmittedTxn::new(
+            v0,
+            safe.clone(),
+            authority.clone(),
+            justification.clone(),
+            ns_lem.clone(),
+            vec![Effect::Put],
+            OperationId::new("op-foreign-subspace"),
+        );
+        assert!(
+            matches!(bad_subspace, Err(KernelError::AuthorityScopeViolation)),
+            "foreign subspace must be rejected"
+        );
+        // effect not covered must fail
+        let bad_effect = AdmittedTxn::new(
+            v0,
+            safe.clone(),
+            authority.clone(),
+            justification.clone(),
+            ns_a.clone(),
+            vec![Effect::Scan],
+            OperationId::new("op-bad-effect"),
+        );
+        assert!(
+            matches!(bad_effect, Err(KernelError::AuthorityScopeViolation)),
+            "uncovered effect must be rejected"
+        );
+        // foreign namespace reuse at commit boundary is also defense-in-depth:
+        // a valid envelope cannot be retargeted — re-check covers+justification
+        let valid = AdmittedTxn::new(
+            v0,
+            safe,
+            authority,
+            justification,
+            ns_a.clone(),
+            vec![Effect::Put],
+            OperationId::new("op-valid"),
+        )
+        .unwrap();
+        // transact with a closure that would touch a foreign namespace is not
+        // expressible without forging — the envelope's namespace is fixed and
+        // re-checked at commit. Verify the happy path still commits.
+        let ((), receipt) = db
+            .transact_admitted(valid, |tx| {
+                tx.set(b"k".to_vec(), b"v".to_vec())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.namespace, ns_a);
+    }
+
+    #[tokio::test]
+    async fn foreign_namespace_reuse_is_authority_violation() {
+        // Direct negative journey: authority scoped to kernel/tenant-a
+        // reused against cairn/tenant-a or kernel/tenant-b must error
+        // with typed AuthorityScopeViolation, never a silent write.
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let ns_kernel_a = Namespace::kernel(TenantId::new(b"tenant-a".to_vec()));
+        let ns_cairn_a = Namespace::cairn(TenantId::new(b"tenant-a".to_vec()));
+        let ns_kernel_b = Namespace::kernel(TenantId::new(b"tenant-b".to_vec()));
+        let v0 = db.read_version().unwrap();
+        let safe = SafeProofRef::new("safe-foreign");
+        let auth_kernel_a = AuthorityProofRef::new(
+            "auth-kernel-a",
+            vec![ns_kernel_a.clone()],
+            vec![Effect::Put],
+        );
+        let just = JustificationProofRef::new("just-foreign", v0);
+        for (label, foreign_ns) in [
+            ("cairn-same-tenant", ns_cairn_a),
+            ("kernel-foreign-tenant", ns_kernel_b),
+        ] {
+            let res = AdmittedTxn::new(
+                v0,
+                safe.clone(),
+                auth_kernel_a.clone(),
+                just.clone(),
+                foreign_ns,
+                vec![Effect::Put],
+                OperationId::new(format!("op-{label}")),
+            );
+            assert!(
+                matches!(res, Err(KernelError::AuthorityScopeViolation)),
+                "{label} must be AuthorityScopeViolation"
+            );
+        }
+    }
 }
