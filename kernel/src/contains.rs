@@ -719,7 +719,86 @@ mod tests {
         assert_eq!(ra, rb);
     }
 
-    // 13. State-machine property: pagination + dedup + ordering invariants
+    // 13. Hard caps and default are pinned (kills * vs +/ vs / mutants)
+    #[test]
+    fn hard_caps_and_default_are_pinned() {
+        assert_eq!(HARD_MAX_KEYS, 100_000);
+        assert_eq!(HARD_MAX_KEY_BYTES, 64 * 1024);
+        assert_eq!(HARD_MAX_KEY_BYTES, 65536);
+        assert_eq!(HARD_MAX_RESPONSE_BYTES, 10 * 1024 * 1024);
+        assert_eq!(HARD_MAX_RESPONSE_BYTES, 10_485_760);
+        let d = ContainsBudget::default_budget();
+        assert_eq!(d.max_keys, 1_000);
+        assert_eq!(d.max_key_bytes, 8 * 1024);
+        assert_eq!(d.max_key_bytes, 8192);
+        assert_eq!(d.max_response_bytes, 1024 * 1024);
+        assert_eq!(d.max_response_bytes, 1_048_576);
+        // Default must itself validate
+        d.validate().unwrap();
+        assert_eq!(ContainsBudget::default(), d);
+    }
+
+    // 14. Validate at exact boundaries (kills > vs >= / == mutants)
+    #[test]
+    fn validate_exact_boundaries() {
+        // Zero rejected
+        assert!(ContainsBudget::new(0, 1024, 1024).is_err());
+        assert!(ContainsBudget::new(1, 0, 1024).is_err());
+        assert!(ContainsBudget::new(1, 1024, 0).is_err());
+        // Exact hard caps accepted
+        ContainsBudget::new(HARD_MAX_KEYS, 1024, 1024 * 1024).unwrap();
+        ContainsBudget::new(1, HARD_MAX_KEY_BYTES, HARD_MAX_RESPONSE_BYTES).unwrap();
+        ContainsBudget::new(1, 1024, HARD_MAX_RESPONSE_BYTES).unwrap();
+        // One over hard cap rejected
+        assert!(ContainsBudget::new(HARD_MAX_KEYS + 1, 1024, 1024 * 1024).is_err());
+        assert!(ContainsBudget::new(1, HARD_MAX_KEY_BYTES + 1, HARD_MAX_RESPONSE_BYTES).is_err());
+        assert!(ContainsBudget::new(1, 1024, HARD_MAX_RESPONSE_BYTES + 1).is_err());
+        // max_response_bytes < max_key_bytes rejected, == accepted, > accepted
+        assert!(ContainsBudget::new(1, 1024, 1023).is_err());
+        ContainsBudget::new(1, 1024, 1024).unwrap();
+        ContainsBudget::new(1, 1024, 1025).unwrap();
+        assert!(ContainsBudget::new(1, 8192, 8191).is_err());
+        ContainsBudget::new(1, 8192, 8192).unwrap();
+    }
+
+    // 15. Pagination at exact count/bytes boundaries (kills > vs >= and + vs * etc)
+    #[test]
+    fn pagination_at_exact_boundaries() {
+        let ks = KernelSubspace::new();
+        let tenant = TenantId::new(b"t".to_vec());
+        let kv = MemKv::new();
+        let keys: Vec<Vec<u8>> = (0..6).map(|i| format!("k{i}").into_bytes()).collect();
+        // max_keys exactly = number of keys -> no continuation
+        let bg_exact = budget(6, 1024, 1024 * 1024);
+        let r = contains_many(&kv, &tenant, &ks, &keys, &bg_exact).unwrap();
+        assert_eq!(r.missing.len(), 6);
+        assert!(r.continuation.is_none());
+        // max_keys one less -> continuation
+        let bg_one_less = budget(5, 1024, 1024 * 1024);
+        let r2 = contains_many(&kv, &tenant, &ks, &keys, &bg_one_less).unwrap();
+        assert_eq!(r2.missing.len(), 5);
+        assert!(r2.continuation.is_some());
+        assert_eq!(r2.continuation.unwrap(), b"k5".to_vec());
+        // response bytes exactly fits 2 keys of 2 bytes each (k0,k1)
+        let bg_bytes_exact = ContainsBudget::new(100, 2, 4).unwrap(); // 2+2=4 fits
+        let small_keys = vec![b"k0".to_vec(), b"k1".to_vec()];
+        let r3 = contains_many(&kv, &tenant, &ks, &small_keys, &bg_bytes_exact).unwrap();
+        assert_eq!(r3.missing.len(), 2);
+        assert!(r3.continuation.is_none());
+        // One byte less -> paginates
+        let bg_bytes_one_less = ContainsBudget::new(100, 2, 3).unwrap();
+        let r4 = contains_many(&kv, &tenant, &ks, &small_keys, &bg_bytes_one_less).unwrap();
+        assert_eq!(r4.missing.len(), 1);
+        assert!(r4.continuation.is_some());
+        // Continuation filter: >= must include equal, not > only
+        let bg = budget(10, 1024, 1024 * 1024);
+        let cont = b"k2".to_vec();
+        let r5 = contains_many_from(&kv, &tenant, &ks, &keys, Some(&cont), &bg).unwrap();
+        assert!(r5.missing.contains(&b"k2".to_vec()));
+        assert!(!r5.missing.contains(&b"k1".to_vec()));
+    }
+
+    // 16. State-machine property: pagination + dedup + ordering invariants
     #[test]
     fn state_machine_property_pagination_covers_all() {
         let ks = KernelSubspace::new();
