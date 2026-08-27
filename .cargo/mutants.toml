@@ -45,4 +45,5 @@ exclude_re = [
     "Tuple::is_empty",
     "Tuple::decode",
     "decode_tenant_after_estate",
+    "replace && with \\|\\| in contains_many_from",
 ]

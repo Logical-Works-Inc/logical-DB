@@ -237,9 +237,7 @@ where
     let mut response_bytes: usize = 0;
     let mut continuation_out: Option<Vec<u8>> = None;
 
-    for idx in start_idx..sorted.len() {
-        let key = &sorted[idx];
-
+    for key in &sorted[start_idx..] {
         // Check if adding this key would exceed max_keys or response budget.
         let would_be_count = present.len() + missing.len() + 1;
         let would_be_bytes = response_bytes + key.len();
@@ -268,44 +266,6 @@ where
             missing.push(key.clone());
         }
         response_bytes = would_be_bytes;
-
-        // If there are more keys after this one, check if next would exceed —
-        // but the check at loop top handles it. Also, if this was the last
-        // allowed by count/bytes, set continuation to next key if any remain.
-        if (present.len() + missing.len() == budget.max_keys
-            || response_bytes >= budget.max_response_bytes)
-            && idx + 1 < sorted.len()
-        {
-            continuation_out = Some(sorted[idx + 1].clone());
-            break;
-        }
-        // If sorted exhausted, continuation stays None. However, if we filled
-        // exactly to limit and there are remaining keys, next iteration's
-        // would_be check will produce continuation. The explicit check above
-        // handles the case where we exactly hit the limit on this key.
-        if idx + 1 < sorted.len()
-            && (present.len() + missing.len() >= budget.max_keys
-                || response_bytes >= budget.max_response_bytes)
-        {
-            continuation_out = Some(sorted[idx + 1].clone());
-            break;
-        }
-    }
-
-    // If we stopped because we hit a budget boundary but not yet at end,
-    // continuation_out is set. Otherwise, check if there are unprocessed keys
-    // beyond what we emitted (should be none if loop completed).
-    if continuation_out.is_none() {
-        let processed = present.len() + missing.len();
-        let total_after_start = sorted.len() - start_idx;
-        if processed < total_after_start {
-            // We exited loop without pagination but still have residue — set
-            // continuation to next unprocessed key.
-            let next_idx = start_idx + processed;
-            if next_idx < sorted.len() {
-                continuation_out = Some(sorted[next_idx].clone());
-            }
-        }
     }
 
     Ok(ContainsResult {
@@ -798,7 +758,71 @@ mod tests {
         assert!(!r5.missing.contains(&b"k1".to_vec()));
     }
 
-    // 16. State-machine property: pagination + dedup + ordering invariants
+    // 16. Hard cap per-key at exact bytes (kills > vs == / >= at 190)
+    #[test]
+    fn hard_cap_per_key_at_exact_bytes() {
+        let ks = KernelSubspace::new();
+        let tenant = TenantId::new(b"t".to_vec());
+        let kv = MemKv::new();
+        // Budget allows up to hard cap
+        let bg = ContainsBudget::new(HARD_MAX_KEYS, HARD_MAX_KEY_BYTES, HARD_MAX_RESPONSE_BYTES)
+            .unwrap();
+        // Exactly at hard cap (64 KiB) must be accepted
+        let at_cap = vec![0u8; HARD_MAX_KEY_BYTES];
+        let r = contains_many(&kv, &tenant, &ks, core::slice::from_ref(&at_cap), &bg).unwrap();
+        assert_eq!(r.missing.len(), 1);
+        // One over hard cap must be rejected before KV work, regardless of budget
+        let over = vec![0u8; HARD_MAX_KEY_BYTES + 1];
+        let err = contains_many(&kv, &tenant, &ks, core::slice::from_ref(&over), &bg).unwrap_err();
+        assert!(
+            matches!(err, KernelError::KeyTooLarge { len, limit } if len == HARD_MAX_KEY_BYTES + 1 && limit == HARD_MAX_KEY_BYTES)
+        );
+        // Also with smaller budget the per-key hard cap still wins over budget check
+        let small_bg = budget(10, 1024, 1024 * 1024);
+        let err2 = contains_many(&kv, &tenant, &ks, core::slice::from_ref(&at_cap), &small_bg)
+            .unwrap_err();
+        // at_cap 65536 > small budget 1024, so budget KeyTooLarge with limit 1024
+        assert!(matches!(err2, KernelError::KeyTooLarge { limit: 1024, .. }));
+    }
+
+    // 17. Mixed present/missing counts distinguish + vs * (kills 244: + with *)
+    #[test]
+    fn mixed_present_missing_counts_distinguish_sum_vs_product() {
+        let ks = KernelSubspace::new();
+        let tenant = TenantId::new(b"t".to_vec());
+        let mut kv = MemKv::new();
+        // a and c present, b and d missing
+        put_opaque(&mut kv, &ks, &tenant, b"a");
+        put_opaque(&mut kv, &ks, &tenant, b"c");
+        let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
+        // max_keys=2 must paginate after exactly 2 (a present + b missing)
+        // sum=2, product=0 or 1 — mutant * would miscount
+        let bg2 = budget(2, 1024, 1024 * 1024);
+        let r1 = contains_many(&kv, &tenant, &ks, &keys, &bg2).unwrap();
+        assert_eq!(r1.present, vec![b"a".to_vec()]);
+        assert_eq!(r1.missing, vec![b"b".to_vec()]);
+        assert_eq!(r1.continuation, Some(b"c".to_vec()));
+        // Next page must resume at c, not b, and contain c present + d missing
+        let r2 = contains_many_from(&kv, &tenant, &ks, &keys, Some(b"c"), &bg2).unwrap();
+        assert_eq!(r2.present, vec![b"c".to_vec()]);
+        assert_eq!(r2.missing, vec![b"d".to_vec()]);
+        assert!(r2.continuation.is_none());
+
+        // Also test off-by-one from second + ( +1 vs *1 ): budget 3 with 3 keys should fit all
+        let bg3 = budget(3, 1024, 1024 * 1024);
+        let keys3 = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        // c is present, so after a,b,c with budget 3, no continuation
+        let r3 = contains_many(&kv, &tenant, &ks, &keys3, &bg3).unwrap();
+        assert_eq!(r3.present.len(), 2); // a,c
+        assert_eq!(r3.missing.len(), 1); // b
+        assert!(r3.continuation.is_none());
+        // One less must paginate
+        let r4 = contains_many(&kv, &tenant, &ks, &keys3, &budget(2, 1024, 1024 * 1024)).unwrap();
+        assert_eq!(r4.present.len() + r4.missing.len(), 2);
+        assert!(r4.continuation.is_some());
+    }
+
+    // 18. State-machine property: pagination + dedup + ordering invariants
     #[test]
     fn state_machine_property_pagination_covers_all() {
         let ks = KernelSubspace::new();
