@@ -3,22 +3,36 @@
 //! monotonicity, and journal prefix consistency.
 
 use crate::journal::{crc32, scan_intact_frames, HEADER_LEN};
-use crate::model::{decode_row, encode_row, point_key, split_key, Class, Op, Row};
+use crate::model::{decode_row, encode_row, point_key, split_key, Class, Row};
 
 // ── Conjunct 2 - codec totality ──────────────────────────────
 
 #[kani::proof]
 #[kani::unwind(32)]
 fn decode_is_total_and_reencode_reproduces_the_input() {
-    let buf: [u8; 14] = kani::any();
+    // The minimum valid row is 18 bytes: class + op + empty id length +
+    // timestamp + empty payload length.  The previous 14-byte arbitrary
+    // buffer could never decode successfully, so its round-trip branch was
+    // vacuous while CBMC still explored symbolic allocation-error paths.
+    // Keep every semantic header field symbolic while fixing both lengths at
+    // zero.  Valid class/op combinations must now reach the success branch.
+    let class_tag: u8 = kani::any();
+    let op_tag: u8 = kani::any();
+    let ts: u64 = kani::any();
+    kani::assume((1..=5).contains(&class_tag));
+    kani::assume(op_tag == 1 || op_tag == 2);
+    let mut buf = [0u8; 18];
+    buf[0] = class_tag;
+    buf[1] = op_tag;
+    buf[6..14].copy_from_slice(&ts.to_le_bytes());
+
     let mut cursor: &[u8] = &buf;
-    if let Ok(row) = decode_row(&mut cursor) {
-        let consumed = buf.len() - cursor.len();
-        let mut out = Vec::new();
-        encode_row(&row, &mut out).unwrap();
-        assert_eq!(consumed, out.len());
-        assert_eq!(&buf[..consumed], out.as_slice());
-    }
+    let row = decode_row(&mut cursor).expect("minimum valid row must decode");
+    let consumed = buf.len() - cursor.len();
+    let mut out = Vec::new();
+    encode_row(&row, &mut out).unwrap();
+    assert_eq!(consumed, out.len());
+    assert_eq!(&buf[..consumed], out.as_slice());
 }
 
 #[kani::proof]
