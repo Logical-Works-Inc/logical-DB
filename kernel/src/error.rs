@@ -60,6 +60,9 @@ pub enum KernelError {
     TransactionConflict,
     /// A watch was cancelled because the transaction or database shut down.
     WatchCancelled,
+    /// A process panic poisoned a shared FDB shim state lock. The caller
+    /// receives a typed failure instead of inheriting a second panic.
+    StateLockPoisoned { lock: &'static str },
     /// An atomic operation violated its precondition (e.g. non-integer
     /// operand for add).
     AtomicOpViolation(String),
@@ -139,6 +142,9 @@ impl fmt::Display for KernelError {
                 write!(f, "fdb transaction conflict: retryable")
             }
             KernelError::WatchCancelled => write!(f, "watch cancelled"),
+            KernelError::StateLockPoisoned { lock } => {
+                write!(f, "fdb state lock poisoned: {lock}")
+            }
             KernelError::AtomicOpViolation(reason) => {
                 write!(f, "atomic op violation: {reason}")
             }
@@ -273,6 +279,10 @@ mod tests {
             "fdb transaction conflict: retryable"
         );
         assert_eq!(KernelError::WatchCancelled.to_string(), "watch cancelled");
+        assert_eq!(
+            KernelError::StateLockPoisoned { lock: "backend" }.to_string(),
+            "fdb state lock poisoned: backend"
+        );
         assert_eq!(
             KernelError::AtomicOpViolation("bad operand".into()).to_string(),
             "atomic op violation: bad operand"

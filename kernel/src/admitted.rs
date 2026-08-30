@@ -337,7 +337,7 @@ impl LogicalDb {
     where
         F: FnOnce(&mut FdbTransaction) -> Result<T>,
     {
-        let current = self.read_version()?;
+        let (current, snapshot) = self.versioned_snapshot()?;
         if envelope.snapshot_version != current {
             return Err(KernelError::StaleJustification {
                 expected: current,
@@ -357,18 +357,17 @@ impl LogicalDb {
             return Err(KernelError::AuthorityScopeViolation);
         }
 
-        // Snapshot must be taken at envelope version; use backend snapshot
-        let snapshot = self.backend.lock().unwrap().snapshot_map();
+        // Version and snapshot come from the same backend critical section.
         let mut tx = FdbTransaction::new_with_snapshot(
             self.config().transaction_size_limit_bytes,
             self.config().transaction_timeout_ms,
             envelope.snapshot_version,
             snapshot,
         );
+        tx.require_exact_read_version();
         let result = f(&mut tx)?;
 
-        self.try_commit(tx).await?;
-        let committed_version = self.committed_version()?;
+        let committed_version = self.try_commit(tx).await?;
         let receipt = Receipt {
             committed_version,
             operation_id: envelope.operation_id,
@@ -637,6 +636,66 @@ mod tests {
             ),
             "justification binding must match snapshot at construction"
         );
+    }
+
+    #[tokio::test]
+    async fn justification_staling_between_closure_and_commit_never_writes() {
+        let db = std::sync::Arc::new(LogicalDb::open(FdbConfig::default()).unwrap());
+        let namespace = test_namespace();
+        let version = db.read_version().unwrap();
+        let (safe, authority, justification) = make_proofs(&namespace, version);
+        let envelope = AdmittedTxn::new(
+            version,
+            safe,
+            authority,
+            justification,
+            namespace,
+            vec![Effect::Put],
+            OperationId::new("op-interleaved-stale"),
+        )
+        .unwrap();
+
+        let closure_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let concurrent_done = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_db = std::sync::Arc::clone(&db);
+        let writer_ready = std::sync::Arc::clone(&closure_ready);
+        let writer_done = std::sync::Arc::clone(&concurrent_done);
+        let writer = std::thread::spawn(move || {
+            writer_ready.wait();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime
+                .block_on(writer_db.transact(|tx| {
+                    tx.set(b"concurrent".to_vec(), b"committed".to_vec())?;
+                    Ok(())
+                }))
+                .unwrap();
+            writer_done.wait();
+        });
+
+        let result = db
+            .transact_admitted(envelope, |tx| {
+                tx.set(b"must-not-land".to_vec(), b"stale".to_vec())?;
+                closure_ready.wait();
+                concurrent_done.wait();
+                Ok(())
+            })
+            .await;
+        writer.join().unwrap();
+
+        assert!(matches!(
+            result,
+            Err(KernelError::StaleJustification {
+                expected: 1,
+                got: 0
+            })
+        ));
+        let (concurrent, refused) = db
+            .transact(|tx| Ok((tx.get(b"concurrent")?, tx.get(b"must-not-land")?)))
+            .await
+            .unwrap();
+        assert_eq!(concurrent, Some(b"committed".to_vec()));
+        assert_eq!(refused, None);
+        assert_eq!(db.committed_version().unwrap(), 1);
     }
 
     #[tokio::test]

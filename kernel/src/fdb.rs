@@ -18,8 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use redb::{ReadableDatabase, ReadableTable};
 
@@ -106,10 +105,10 @@ impl Watch {
 
 type WatchSenders = Vec<tokio::sync::oneshot::Sender<()>>;
 type WatchMap = HashMap<Vec<u8>, WatchSenders>;
+type SnapshotMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
 pub struct LogicalDb {
     config: FdbConfig,
-    committed: Arc<AtomicU64>,
     pub(crate) backend: Arc<Mutex<FdbBackend>>,
     #[allow(clippy::type_complexity)]
     pub(crate) watches: Arc<Mutex<WatchMap>>,
@@ -120,7 +119,6 @@ impl LogicalDb {
         let backend = FdbBackend::new_mem_shim();
         Ok(Self {
             config,
-            committed: Arc::new(AtomicU64::new(0)),
             backend: Arc::new(Mutex::new(backend)),
             watches: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -131,10 +129,11 @@ impl LogicalDb {
     /// rehearsal without a live fdbserver.
     pub fn open_at(path: impl AsRef<Path>, config: FdbConfig) -> Result<Self> {
         let backend = FdbBackend::open(path)?;
-        let committed = backend.committed_version().unwrap_or(0);
+        // Validate durable metadata before exposing the handle. Corruption is
+        // not a fresh database and must never be reset to version zero.
+        backend.committed_version()?;
         Ok(Self {
             config,
-            committed: Arc::new(AtomicU64::new(committed)),
             backend: Arc::new(Mutex::new(backend)),
             watches: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -154,11 +153,7 @@ impl LogicalDb {
     {
         let mut attempts = 0usize;
         loop {
-            let read_version = self.committed.load(Ordering::SeqCst);
-            let snapshot = {
-                let be = self.backend.lock().unwrap();
-                be.snapshot_map()
-            };
+            let (read_version, snapshot) = self.versioned_snapshot()?;
             let mut tx = FdbTransaction::new_with_snapshot(
                 self.config.transaction_size_limit_bytes,
                 self.config.transaction_timeout_ms,
@@ -168,7 +163,7 @@ impl LogicalDb {
             let result = f(&mut tx);
             match result {
                 Ok(val) => match self.try_commit(tx).await {
-                    Ok(()) => return Ok(val),
+                    Ok(_) => return Ok(val),
                     Err(KernelError::TransactionConflict) if attempts < MAX_RETRY_ATTEMPTS => {
                         attempts += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempts as u64))
@@ -196,7 +191,11 @@ impl LogicalDb {
         self.transact(f).await
     }
 
-    pub(crate) async fn try_commit(&self, mut tx: FdbTransaction) -> Result<()> {
+    /// Commit `tx` and return the exact version represented by the result.
+    /// A mutating transaction returns its newly committed version. A
+    /// read-only transaction returns its original read version because it
+    /// creates no new durable version.
+    pub(crate) async fn try_commit(&self, mut tx: FdbTransaction) -> Result<u64> {
         // Timeout check at commit boundary as well.
         let elapsed = tx.start.elapsed().as_millis() as u64;
         if elapsed > tx.timeout_ms {
@@ -205,38 +204,27 @@ impl LogicalDb {
                 limit_ms: tx.timeout_ms,
             });
         }
-        // Conflict check: if any read_conflict_range overlaps a key
-        // that was written since our read_version, signal conflict.
-        // Shim heuristic: if backend committed_version advanced since
-        // read_version and we have any read_conflict_range, check
-        // whether any buffered key falls in that range and a newer
-        // committed key also exists in backend snapshot delta.
-        // Simplified: if committed advanced and we have read ranges,
-        // conflict if any buffered write key overlaps read range and
-        // backend has that key with different value than snapshot.
-        let current_committed = self.committed.load(Ordering::SeqCst);
+        // The backend lock is the single serialization boundary for reading
+        // the committed version, conflict validation, and durable commit.
+        // Releasing it between these operations lets two stale writers pass
+        // the same check and both commit.
+        let mut be = self.lock_backend()?;
+        let current_committed = be.committed_version()?;
+        if tx.requires_exact_read_version && current_committed != tx.read_version {
+            return Err(KernelError::StaleJustification {
+                expected: current_committed,
+                got: tx.read_version,
+            });
+        }
+        let current_map = be.snapshot_map()?;
         if current_committed != tx.read_version && !tx.read_conflict_ranges.is_empty() {
-            let be = self.backend.lock().unwrap();
-            let current_map = be.snapshot_map();
             for (r_begin, r_end) in &tx.read_conflict_ranges {
-                for (k, v) in &tx.buffer {
-                    if k >= r_begin && k < r_end {
-                        let snap_val = tx.backend_snapshot.get(k);
-                        let cur_val = current_map.get(k);
-                        if snap_val != cur_val || (snap_val.is_none() && cur_val.is_some()) {
-                            return Err(KernelError::TransactionConflict);
-                        }
-                        // Also if any other committed key in range changed
-                        for (ck, cv) in &current_map {
-                            if ck >= r_begin
-                                && ck < r_end
-                                && tx.backend_snapshot.get(ck) != Some(cv)
-                            {
-                                return Err(KernelError::TransactionConflict);
-                            }
-                        }
-                        let _ = v;
-                    }
+                if tx
+                    .backend_snapshot
+                    .range(r_begin.clone()..r_end.clone())
+                    .ne(current_map.range(r_begin.clone()..r_end.clone()))
+                {
+                    return Err(KernelError::TransactionConflict);
                 }
             }
         }
@@ -247,7 +235,9 @@ impl LogicalDb {
                 .buffer
                 .get(&op.key)
                 .and_then(|v| v.as_ref())
-                .or_else(|| tx.backend_snapshot.get(&op.key))
+                // Atomic operations linearize at commit and therefore resolve
+                // against current committed state, not the stale read image.
+                .or_else(|| current_map.get(&op.key))
                 .cloned();
             let new_val = apply_atomic_op(&op, existing.as_deref())?;
             // atomic ops count as a key+bytes against limits (check)
@@ -261,11 +251,37 @@ impl LogicalDb {
             tx.buffer.insert(op.key, Some(new_val));
         }
 
+        // A range clear applies to the state at serialization time, not only
+        // to keys visible in the transaction's original snapshot. Preserve a
+        // later point write in the same transaction by filling only keys that
+        // do not already have a buffered final operation.
+        for (begin, end) in &tx.clear_ranges {
+            let current_keys: Vec<Vec<u8>> = current_map
+                .range(begin.clone()..end.clone())
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in current_keys {
+                if !tx.buffer.contains_key(&key) {
+                    tx.check_limits(key.len())?;
+                    tx.total_bytes += key.len();
+                    tx.total_keys += 1;
+                    tx.buffer.insert(key, None);
+                }
+            }
+        }
+
         // Resolve versionstamped writes
-        let new_version = current_committed + 1;
-        for vs in std::mem::take(&mut tx.versionstamped_writes) {
-            let (k, v) = resolve_versionstamp(vs, new_version)?;
-            tx.buffer.insert(k, Some(v));
+        let versionstamped_writes = std::mem::take(&mut tx.versionstamped_writes);
+        let mut next_version = None;
+        if !versionstamped_writes.is_empty() {
+            let version = current_committed
+                .checked_add(1)
+                .ok_or_else(|| KernelError::Backend("committed version overflow".into()))?;
+            next_version = Some(version);
+            for vs in versionstamped_writes {
+                let (k, v) = resolve_versionstamp(vs, version)?;
+                tx.buffer.insert(k, Some(v));
+            }
         }
 
         // Collect entries for apply_batch: buffer Some -> put, None -> delete.
@@ -280,49 +296,32 @@ impl LogicalDb {
             }
         }
 
-        // Apply via backend
-        {
-            let mut be = self.backend.lock().unwrap();
-            // First apply puts
-            if !puts.is_empty() {
-                be.apply_batch(&puts, new_version)?;
+        let has_writes = !puts.is_empty() || !deletes.is_empty();
+        let committed_version = if has_writes {
+            match next_version {
+                Some(version) => version,
+                None => current_committed
+                    .checked_add(1)
+                    .ok_or_else(|| KernelError::Backend("committed version overflow".into()))?,
             }
-            // Apply deletes
-            for k in &deletes {
-                be.delete(k)?;
-            }
-            // If only deletes or watch-only, still bump version if we had writes
-            if puts.is_empty() && !deletes.is_empty() {
-                let _ = be.committed_version();
-                be.committed = be.committed.max(new_version);
-                if let Some(db) = &be.db {
-                    let wtxn = db.begin_write().map_err(fdb_backend_err)?;
-                    {
-                        let mut meta = wtxn.open_table(FDB_META).map_err(fdb_backend_err)?;
-                        meta.insert(FDB_VERSION_KEY, new_version.to_be_bytes().as_slice())
-                            .map_err(fdb_backend_err)?;
-                    }
-                    wtxn.commit().map_err(fdb_backend_err)?;
-                }
-            }
-            if !puts.is_empty()
-                || !deletes.is_empty()
-                || !tx.versionstamped_writes.is_empty()
-                || !tx.atomic_ops.is_empty()
-            {
-                // already bumped via apply_batch
-            } else if !tx.watches.is_empty()
-                || !tx.read_conflict_ranges.is_empty()
-                || !tx.write_conflict_ranges.is_empty()
-            {
-                // read-only watches/conflict ranges don't bump version
-            }
-        }
+        } else {
+            tx.read_version
+        };
+        // Acquire watch state before the durable mutation so poison cannot
+        // turn a successful commit into an error response.
+        let mut watches = if has_writes || !tx.watches.is_empty() {
+            Some(self.lock_watches()?)
+        } else {
+            None
+        };
 
-        if !puts.is_empty() || !deletes.is_empty() {
-            self.committed.store(new_version, Ordering::SeqCst);
-            // Notify watches
-            let mut watches = self.watches.lock().unwrap();
+        if has_writes {
+            let watches = watches
+                .as_mut()
+                .ok_or_else(|| KernelError::Backend("write watch state unavailable".into()))?;
+            be.apply_transaction(&puts, &deletes, committed_version)?;
+
+            // Notify watches only after durability succeeds.
             let mut to_notify: Vec<Vec<u8>> = Vec::new();
             for (k, _) in &puts {
                 if watches.contains_key(k) {
@@ -345,26 +344,40 @@ impl LogicalDb {
 
         // Persist watch registrations
         if !tx.watches.is_empty() {
-            let mut wmap = self.watches.lock().unwrap();
+            let wmap = watches.as_mut().ok_or_else(|| {
+                KernelError::Backend("watch registration state unavailable".into())
+            })?;
             for (key, sender) in tx.watches {
                 wmap.entry(key).or_default().push(sender);
             }
         }
 
-        Ok(())
+        Ok(committed_version)
     }
 
     pub fn read_version(&self) -> Result<u64> {
-        Ok(self.committed.load(Ordering::SeqCst))
+        self.committed_version()
     }
 
     pub fn committed_version(&self) -> Result<u64> {
-        Ok(self.committed.load(Ordering::SeqCst))
+        self.lock_backend()?.committed_version()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn bump_committed(&self) -> u64 {
-        self.committed.fetch_add(1, Ordering::SeqCst) + 1
+    pub(crate) fn versioned_snapshot(&self) -> Result<(u64, SnapshotMap)> {
+        let backend = self.lock_backend()?;
+        Ok((backend.committed_version()?, backend.snapshot_map()?))
+    }
+
+    fn lock_backend(&self) -> Result<MutexGuard<'_, FdbBackend>> {
+        self.backend
+            .lock()
+            .map_err(|_| KernelError::StateLockPoisoned { lock: "backend" })
+    }
+
+    fn lock_watches(&self) -> Result<MutexGuard<'_, WatchMap>> {
+        self.watches
+            .lock()
+            .map_err(|_| KernelError::StateLockPoisoned { lock: "watches" })
     }
 }
 
@@ -512,6 +525,8 @@ pub struct FdbTransaction {
     buffer: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     read_conflict_ranges: Vec<(Vec<u8>, Vec<u8>)>,
     write_conflict_ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    clear_ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    requires_exact_read_version: bool,
     watches: Vec<(Vec<u8>, tokio::sync::oneshot::Sender<()>)>,
     atomic_ops: Vec<AtomicOp>,
     versionstamped_writes: Vec<VersionstampedWrite>,
@@ -539,6 +554,8 @@ impl FdbTransaction {
             buffer: BTreeMap::new(),
             read_conflict_ranges: Vec::new(),
             write_conflict_ranges: Vec::new(),
+            clear_ranges: Vec::new(),
+            requires_exact_read_version: false,
             watches: Vec::new(),
             atomic_ops: Vec::new(),
             versionstamped_writes: Vec::new(),
@@ -614,9 +631,15 @@ impl FdbTransaction {
 
     pub fn clear_range(&mut self, begin: &[u8], end: &[u8]) -> Result<()> {
         self.check_timeout()?;
+        if begin > end {
+            return Err(KernelError::Backend(
+                "clear range begin must not exceed end".into(),
+            ));
+        }
         // Record write conflict range and expand deletes for snapshot keys in range
         self.write_conflict_ranges
             .push((begin.to_vec(), end.to_vec()));
+        self.clear_ranges.push((begin.to_vec(), end.to_vec()));
         // Estimate cost: number of keys in range * average key len (charge per delete)
         let keys_in_range: Vec<Vec<u8>> = self
             .backend_snapshot
@@ -760,6 +783,10 @@ impl FdbTransaction {
 
     pub fn get_read_version(&self) -> Result<u64> {
         self.read_version()
+    }
+
+    pub(crate) fn require_exact_read_version(&mut self) {
+        self.requires_exact_read_version = true;
     }
 
     // ── Versionstamp ────────────────────────────────────────
@@ -961,6 +988,24 @@ fn fdb_read_table(
     }
 }
 
+fn fdb_committed_version(db: &redb::Database) -> Result<u64> {
+    let rtxn = db.begin_read().map_err(fdb_backend_err)?;
+    let Some(meta) = fdb_read_table(&rtxn, FDB_META)? else {
+        return Ok(0);
+    };
+    let version = match meta.get(FDB_VERSION_KEY).map_err(fdb_backend_err)? {
+        None => 0,
+        Some(value) => {
+            let bytes: [u8; 8] = value
+                .value()
+                .try_into()
+                .map_err(|_| KernelError::Backend("committed version is not 8 bytes".into()))?;
+            u64::from_be_bytes(bytes)
+        }
+    };
+    Ok(version)
+}
+
 pub struct FdbBackend {
     inner: crate::memkv::MemKv,
     size_limit_bytes: usize,
@@ -995,31 +1040,112 @@ impl FdbBackend {
     /// available.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = redb::Database::create(path).map_err(fdb_backend_err)?;
+        let committed = fdb_committed_version(&db)?;
         Ok(Self {
             inner: crate::memkv::MemKv::default(),
             size_limit_bytes: MAX_TRANSACTION_BYTES,
-            committed: 0,
+            committed,
             db: Some(db),
         })
     }
 
-    pub(crate) fn snapshot_map(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    pub(crate) fn snapshot_map(&self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         if let Some(db) = &self.db {
-            if let Ok(rtxn) = db.begin_read() {
-                if let Ok(Some(table)) = fdb_read_table(&rtxn, FDB_ROWS) {
-                    let mut out = BTreeMap::new();
-                    for (k, v) in table.iter().unwrap().flatten() {
-                        out.insert(k.value().to_vec(), v.value().to_vec());
-                    }
-                    return out;
-                }
+            let rtxn = db.begin_read().map_err(fdb_backend_err)?;
+            let Some(table) = fdb_read_table(&rtxn, FDB_ROWS)? else {
+                return Ok(BTreeMap::new());
+            };
+            let mut out = BTreeMap::new();
+            for row in table.iter().map_err(fdb_backend_err)? {
+                let (key, value) = row.map_err(fdb_backend_err)?;
+                out.insert(key.value().to_vec(), value.value().to_vec());
             }
+            return Ok(out);
         }
         let mut out = BTreeMap::new();
-        for (k, v) in self.inner.scan_prefix(&[]).unwrap_or_default() {
+        for (k, v) in self.inner.scan_prefix(&[])? {
             out.insert(k, v);
         }
-        out
+        Ok(out)
+    }
+
+    /// Applies data mutations and their committed version as one backend
+    /// transaction. This is the only primitive used by `LogicalDb` commit;
+    /// callers cannot accidentally split puts, deletes, and metadata.
+    fn apply_transaction(
+        &mut self,
+        puts: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+        version: u64,
+    ) -> Result<()> {
+        if version < self.committed {
+            return Err(KernelError::TsRegression {
+                last: self.committed,
+                got: version,
+            });
+        }
+        let put_bytes = puts.iter().try_fold(0usize, |total, (key, value)| {
+            total.checked_add(key.len() + value.len()).ok_or({
+                KernelError::TransactionTooLarge {
+                    size: usize::MAX,
+                    limit: self.size_limit_bytes,
+                }
+            })
+        })?;
+        let total = deletes.iter().try_fold(put_bytes, |total, key| {
+            total
+                .checked_add(key.len())
+                .ok_or(KernelError::TransactionTooLarge {
+                    size: usize::MAX,
+                    limit: self.size_limit_bytes,
+                })
+        })?;
+        if total > self.size_limit_bytes {
+            return Err(KernelError::TransactionTooLarge {
+                size: total,
+                limit: self.size_limit_bytes,
+            });
+        }
+        let key_count = puts.len().checked_add(deletes.len()).ok_or({
+            KernelError::TransactionTooLarge {
+                size: usize::MAX,
+                limit: MAX_TRANSACTION_KEYS,
+            }
+        })?;
+        if key_count > MAX_TRANSACTION_KEYS {
+            return Err(KernelError::TransactionTooLarge {
+                size: key_count,
+                limit: MAX_TRANSACTION_KEYS,
+            });
+        }
+
+        if let Some(db) = &self.db {
+            let wtxn = db.begin_write().map_err(fdb_backend_err)?;
+            {
+                let mut rows = wtxn.open_table(FDB_ROWS).map_err(fdb_backend_err)?;
+                for (key, value) in puts {
+                    rows.insert(key.as_slice(), value.as_slice())
+                        .map_err(fdb_backend_err)?;
+                }
+                for key in deletes {
+                    rows.remove(key.as_slice()).map_err(fdb_backend_err)?;
+                }
+                let mut meta = wtxn.open_table(FDB_META).map_err(fdb_backend_err)?;
+                meta.insert(FDB_VERSION_KEY, version.to_be_bytes().as_slice())
+                    .map_err(fdb_backend_err)?;
+            }
+            wtxn.commit().map_err(fdb_backend_err)?;
+        } else {
+            // MemKv's point operations are infallible after the checks above.
+            for (key, value) in puts {
+                self.inner.put(key.clone(), value.clone())?;
+            }
+            for key in deletes {
+                self.inner.delete(key)?;
+            }
+        }
+        self.committed = self.committed.max(version);
+        Ok(())
     }
 }
 
@@ -1099,57 +1225,14 @@ impl KvPort for FdbBackend {
     }
 
     fn apply_batch(&mut self, entries: &[(Vec<u8>, Vec<u8>)], version: u64) -> Result<()> {
-        let total: usize = entries.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total > self.size_limit_bytes {
-            return Err(KernelError::TransactionTooLarge {
-                size: total,
-                limit: self.size_limit_bytes,
-            });
-        }
-        if entries.len() > MAX_TRANSACTION_KEYS {
-            return Err(KernelError::TransactionTooLarge {
-                size: entries.len(),
-                limit: MAX_TRANSACTION_KEYS,
-            });
-        }
-        if let Some(db) = &self.db {
-            let wtxn = db.begin_write().map_err(fdb_backend_err)?;
-            {
-                let mut rows = wtxn.open_table(FDB_ROWS).map_err(fdb_backend_err)?;
-                for (key, value) in entries {
-                    rows.insert(key.as_slice(), value.as_slice())
-                        .map_err(fdb_backend_err)?;
-                }
-                let mut meta = wtxn.open_table(FDB_META).map_err(fdb_backend_err)?;
-                meta.insert(FDB_VERSION_KEY, version.to_be_bytes().as_slice())
-                    .map_err(fdb_backend_err)?;
-            }
-            wtxn.commit().map_err(fdb_backend_err)?;
-            self.committed = self.committed.max(version);
-            return Ok(());
-        }
-        self.inner.apply_batch(entries, version)?;
-        self.committed = self.committed.max(version);
-        Ok(())
+        self.apply_transaction(entries, &[], version)
     }
 }
 
 impl DurableKv for FdbBackend {
     fn committed_version(&self) -> Result<u64> {
         if let Some(db) = &self.db {
-            let rtxn = db.begin_read().map_err(fdb_backend_err)?;
-            let Some(meta) = fdb_read_table(&rtxn, FDB_META)? else {
-                return Ok(0);
-            };
-            match meta.get(FDB_VERSION_KEY).map_err(fdb_backend_err)? {
-                None => Ok(0),
-                Some(v) => {
-                    let bytes: [u8; 8] = v.value().try_into().map_err(|_| {
-                        KernelError::Backend("committed version is not 8 bytes".into())
-                    })?;
-                    Ok(u64::from_be_bytes(bytes))
-                }
-            }
+            fdb_committed_version(db)
         } else {
             Ok(self.committed)
         }
@@ -1159,6 +1242,17 @@ impl DurableKv for FdbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn durable_test_path(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "logical-db-fdb-{tag}-{}-{nonce}.redb",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn fdb_config_defaults_are_pinned() {
@@ -1245,7 +1339,7 @@ mod tests {
             .unwrap();
         assert_eq!(v, Some(b"v".to_vec()));
         // committed read outside tx
-        let v2 = db.transact(|tx| Ok(tx.get(b"k")?)).await.unwrap();
+        let v2 = db.transact(|tx| tx.get(b"k")).await.unwrap();
         assert_eq!(v2, Some(b"v".to_vec()));
     }
 
@@ -1307,10 +1401,7 @@ mod tests {
             .await;
         assert!(res.is_ok());
         // Verify the write landed
-        let v = db
-            .transact(|tx| Ok(tx.get(b"conflict-key2")?))
-            .await
-            .unwrap();
+        let v = db.transact(|tx| tx.get(b"conflict-key2")).await.unwrap();
         assert_eq!(v, Some(b"v2".to_vec()));
     }
 
@@ -1355,11 +1446,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let v = db
-            .transact(|tx| Ok(tx.get(b"counter")?))
-            .await
-            .unwrap()
-            .unwrap();
+        let v = db.transact(|tx| tx.get(b"counter")).await.unwrap().unwrap();
         assert_eq!(i64::from_le_bytes(v.try_into().unwrap()), 3);
     }
 
@@ -1405,5 +1492,282 @@ mod tests {
         let remaining = db.transact(|tx| tx.get_range(b"")).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].0, b"b:1".to_vec());
+    }
+
+    #[test]
+    fn failed_mixed_put_delete_leaves_file_and_version_unchanged() {
+        let path = durable_test_path("mixed-failure");
+        let mut backend = FdbBackend::open(&path).unwrap();
+        backend
+            .apply_transaction(&[(b"old".to_vec(), b"value".to_vec())], &[], 1)
+            .unwrap();
+
+        backend.size_limit_bytes = 4;
+        let error = backend
+            .apply_transaction(
+                &[(b"new".to_vec(), b"value".to_vec())],
+                &[b"old".to_vec()],
+                2,
+            )
+            .unwrap_err();
+        assert!(matches!(error, KernelError::TransactionTooLarge { .. }));
+        drop(backend);
+
+        let reopened = FdbBackend::open(&path).unwrap();
+        assert_eq!(reopened.get(b"old").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reopened.get(b"new").unwrap(), None);
+        assert_eq!(reopened.committed_version().unwrap(), 1);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn regressing_batch_version_preserves_file_state_across_restart() {
+        let path = durable_test_path("version-regression");
+        let mut backend = FdbBackend::open(&path).unwrap();
+        backend
+            .apply_batch(&[(b"stable".to_vec(), b"v5".to_vec())], 5)
+            .unwrap();
+
+        let error = backend
+            .apply_batch(&[(b"must-not-land".to_vec(), b"v3".to_vec())], 3)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KernelError::TsRegression { last: 5, got: 3 }
+        ));
+        drop(backend);
+
+        let reopened = FdbBackend::open(&path).unwrap();
+        assert_eq!(reopened.committed_version().unwrap(), 5);
+        assert_eq!(reopened.get(b"stable").unwrap(), Some(b"v5".to_vec()));
+        assert_eq!(reopened.get(b"must-not-land").unwrap(), None);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_commit_restart_preserves_exact_state_and_version() {
+        let path = durable_test_path("mixed-restart");
+        {
+            let db = LogicalDb::open_at(&path, FdbConfig::default()).unwrap();
+            db.transact(|tx| {
+                tx.set(b"delete-me".to_vec(), b"old".to_vec())?;
+                tx.set(b"keep".to_vec(), b"stable".to_vec())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            db.transact(|tx| {
+                tx.clear(b"delete-me")?;
+                tx.set(b"new".to_vec(), b"committed".to_vec())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(db.committed_version().unwrap(), 2);
+        }
+
+        let reopened = LogicalDb::open_at(&path, FdbConfig::default()).unwrap();
+        assert_eq!(reopened.committed_version().unwrap(), 2);
+        let rows = reopened.transact(|tx| tx.get_range(b"")).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"keep".to_vec(), b"stable".to_vec()),
+                (b"new".to_vec(), b"committed".to_vec()),
+            ]
+        );
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_conflicting_file_writers_cannot_both_commit() {
+        let path = durable_test_path("stale-conflict");
+        let db = LogicalDb::open_at(&path, FdbConfig::default()).unwrap();
+        db.transact(|tx| {
+            tx.set(b"key".to_vec(), b"initial".to_vec())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (version, snapshot) = db.versioned_snapshot().unwrap();
+        let mut first = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            version,
+            snapshot.clone(),
+        );
+        first
+            .add_read_conflict_range(b"key".to_vec(), b"kez".to_vec())
+            .unwrap();
+        first.set(b"key".to_vec(), b"first".to_vec()).unwrap();
+        let mut second = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            version,
+            snapshot,
+        );
+        second
+            .add_read_conflict_range(b"key".to_vec(), b"kez".to_vec())
+            .unwrap();
+        second.set(b"key".to_vec(), b"second".to_vec()).unwrap();
+
+        let (first_result, second_result) =
+            tokio::join!(db.try_commit(first), db.try_commit(second));
+        assert!(first_result.is_ok() ^ second_result.is_ok());
+        assert!(matches!(
+            first_result.as_ref().err().or(second_result.as_ref().err()),
+            Some(KernelError::TransactionConflict)
+        ));
+        assert_eq!(db.committed_version().unwrap(), 2);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_atomic_adds_resolve_against_serialized_state() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        db.transact(|tx| {
+            tx.set(b"counter".to_vec(), 0i64.to_le_bytes().to_vec())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (version, snapshot) = db.versioned_snapshot().unwrap();
+        let mut first = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            version,
+            snapshot.clone(),
+        );
+        first
+            .atomic_add(b"counter".to_vec(), 1i64.to_le_bytes().to_vec())
+            .unwrap();
+        let mut second = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            version,
+            snapshot,
+        );
+        second
+            .atomic_add(b"counter".to_vec(), 1i64.to_le_bytes().to_vec())
+            .unwrap();
+
+        let (first_result, second_result) =
+            tokio::join!(db.try_commit(first), db.try_commit(second));
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        let value = db.transact(|tx| tx.get(b"counter")).await.unwrap().unwrap();
+        assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 2);
+        assert_eq!(db.committed_version().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn read_only_commit_reports_its_snapshot_without_global_conflict() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let (read_version, snapshot) = db.versioned_snapshot().unwrap();
+        let read_only = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            read_version,
+            snapshot,
+        );
+
+        db.transact(|tx| {
+            tx.set(b"later".to_vec(), b"write".to_vec())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(db.try_commit(read_only).await.unwrap(), read_version);
+        assert_eq!(read_version, 0);
+        assert_eq!(db.committed_version().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_range_removes_keys_inserted_after_its_snapshot() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        db.transact(|tx| {
+            tx.set(b"a:old".to_vec(), b"old".to_vec())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (read_version, snapshot) = db.versioned_snapshot().unwrap();
+        let mut clear = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            read_version,
+            snapshot,
+        );
+        clear.clear_range(b"a:", b"a;").unwrap();
+        clear
+            .set(b"a:survivor".to_vec(), b"after-clear".to_vec())
+            .unwrap();
+
+        db.transact(|tx| {
+            tx.set(b"a:phantom".to_vec(), b"concurrent".to_vec())?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(db.try_commit(clear).await.unwrap(), 3);
+        let remaining = db.transact(|tx| tx.get_range(b"a:")).await.unwrap();
+        assert_eq!(
+            remaining,
+            vec![(b"a:survivor".to_vec(), b"after-clear".to_vec())]
+        );
+    }
+
+    #[test]
+    fn corrupted_committed_version_fails_open() {
+        let path = durable_test_path("corrupt-version");
+        {
+            let mut backend = FdbBackend::open(&path).unwrap();
+            backend
+                .apply_transaction(&[(b"key".to_vec(), b"value".to_vec())], &[], 1)
+                .unwrap();
+        }
+        {
+            let raw = redb::Database::create(&path).unwrap();
+            let write = raw.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(FDB_META).unwrap();
+                meta.insert(FDB_VERSION_KEY, b"bad".as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let error = match LogicalDb::open_at(&path, FdbConfig::default()) {
+            Ok(_) => panic!("corrupted version metadata must fail open"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            KernelError::Backend(message) if message == "committed version is not 8 bytes"
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn poisoned_backend_lock_returns_typed_error() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let backend = Arc::clone(&db.backend);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = backend.lock().unwrap();
+            panic!("plant backend lock poison");
+        });
+
+        assert!(matches!(
+            db.committed_version(),
+            Err(KernelError::StateLockPoisoned { lock: "backend" })
+        ));
     }
 }
