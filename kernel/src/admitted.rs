@@ -1458,6 +1458,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_copy_uses_the_admitted_batch_and_preserves_value() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let account = scope(b"account-a");
+        let legacy = crate::migration::LegacyV1Point::decode(&crate::model::point_key(
+            crate::model::Class::Claim,
+            b"legacy-id",
+            u64::MAX,
+        ))
+        .unwrap();
+        let write = envelope(0, account.clone(), b"legacy-copy");
+        let mut batch = write.write_batch();
+        legacy
+            .copy_into(&mut batch, b"legacy-value".to_vec())
+            .unwrap();
+        db.commit_admitted(write, batch).await.unwrap();
+
+        let read = envelope(1, account, b"legacy-read");
+        assert_eq!(
+            db.get_admitted(read, KeyFamily::Record, &legacy.destination_tuple())
+                .await
+                .unwrap(),
+            Some(b"legacy-value".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_hybrid_entry_point_survives_app_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "logical-db-hybrid-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let account = scope(b"embedded-app");
+        let object = Tuple::new(vec![Element::Bytes(b"document".to_vec())]);
+        {
+            let db = HybridDb::embedded_at(&path, FdbConfig::default()).unwrap();
+            let write = envelope(0, account.clone(), b"app-write");
+            let mut batch = write.write_batch();
+            batch
+                .set(KeyFamily::Record, &object, b"durable".to_vec())
+                .unwrap();
+            assert!(matches!(
+                db.commit_admitted(write, batch).await.unwrap(),
+                AdmittedOutcome::Applied { .. }
+            ));
+        }
+        {
+            let reopened = HybridDb::embedded_at(&path, FdbConfig::default()).unwrap();
+            assert_eq!(reopened.read_version().await.unwrap(), 1);
+            assert_eq!(
+                reopened
+                    .get_admitted(
+                        envelope(1, account, b"app-read"),
+                        KeyFamily::Record,
+                        &object,
+                    )
+                    .await
+                    .unwrap(),
+                Some(b"durable".to_vec())
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn zone_change_feed_is_durable_bounded_and_token_resumable() {
         let db = LogicalDb::open(FdbConfig::default()).unwrap();
         let account = scope(b"account-a");

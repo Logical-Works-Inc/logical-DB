@@ -291,6 +291,29 @@ fi
 cargo clippy --workspace --all-targets -- -D warnings'''
 
 [[job]]
+id = "fdb-check"
+name = "Native client — compile the complete FDB feature graph"
+needs = ["stack-position", "change-scope"]
+condition = "success()"
+timeout_minutes = 10
+cost = "expensive"
+working_directory = "."
+runner = ["self-hosted"]
+evidence = ["log", "status"]
+[job.runtime_env]
+CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
+[[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@v4"
+local_action = "checkout"
+[[job.step]]
+name = "Compile embedded and official FDB client profiles"
+condition = "needs.change-scope.outputs.code_changed == 'yes'"
+kind = "run"
+run = '''cargo check --workspace --all-targets --features fdb'''
+
+[[job]]
 id = "property-verify"
 name = "Property — replay equals the committed-prefix fold"
 needs = ["stack-position", "change-scope"]
@@ -386,7 +409,7 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo mutants -p logical-db | tee "$RUNNER_TEMP/mutants.out"
+cargo mutants -p logical-db --jobs 4 | tee "$RUNNER_TEMP/mutants.out"
 # INV-MUTANTS-NONVACUOUS: cargo-mutants exits 0 when the package filter
 # matches nothing ("Found 0 mutants", run 32824022656) — a wrong-tree or
 # renamed workspace would pass as green teeth. Refuse any zero count.
@@ -460,8 +483,8 @@ echo "OK   generated workflow is byte-current with ci/keel-ci.toml."
 id = "eval-log"
 name = "Eval Log — compiled run observability"
 needs = ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy",
-         "property-verify", "kani-verify", "mutation-test-verify", "mcdc-coverage",
-         "ci-plan-current"]
+         "fdb-check", "property-verify", "kani-verify", "mutation-test-verify",
+         "mcdc-coverage", "ci-plan-current"]
 condition = "always()"
 timeout_minutes = 1
 cost = "epilogue"

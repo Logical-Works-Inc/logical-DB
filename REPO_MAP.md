@@ -24,7 +24,7 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `laws/governance/adr-003-hybrid-client-embedding-braid.md` | governance | ACCEPTED: one scoped admitted API runs embedded or outboard and consumes real Braid runnable proofs. |
 | `scripts/local-fdb-cluster.sh` | infra | Hermetic one-process FDB dev cluster (INV-FDB-PIN, INV-FDB-SCRATCH); F0 falsifier. |
 | `scripts/spec-lint.py` | infra | 80-column prose contract over markdown; CI-enforced with teeth. |
-| `ci/keel-ci.toml` | infra | Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, property gauntlet, Kani proofs, cargo-mutants teeth, MC/DC slot (keel#480), ci-plan-current, eval-log, cleanup. |
+| `ci/keel-ci.toml` | infra | Keel CI plan: scope and prose gates, tests/fmt/clippy, complete FDB feature compilation, property and Kani proof lanes, four-worker cargo-mutants teeth, generated-plan lock, eval log, and cleanup. |
 | `.github/workflows/ci.yml` | infra | Rendered workflow — canonical bytes enforced against the plan in CI. |
 | `rust-toolchain.toml` | infra | Rust 1.98.0, clippy, and rustfmt are pinned for the Braid-enabled product graph. |
 | `.wwfd/local-ci.sh` | infra | Local CI exec boundary; writes the spend-guard receipt and eval cache on green. |

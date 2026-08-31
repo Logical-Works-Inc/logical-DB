@@ -4,11 +4,12 @@
 # - kernel/src/verify.rs holds only #[cfg(kani)] proof harnesses: the
 #   kani-verify tier is their verifier, and unit tests never execute
 #   them, so no mutant there can produce a test-visible kill.
-# - kernel/src/admitted.rs and kernel/src/fdb.rs are #[cfg(feature="fdb")]
-#   — cargo-mutants runs without that feature (default cargo test), so
-#   no test can observe those mutants; the FDB tier (feature-gated tests
-#   + property/kani) covers them when enabled. Exclude until mutants is
-#   run with --features fdb (keel#TODO).
+# - The default graph now includes the admitted layer and embedded transaction
+#   driver. They are deliberately mutation-tested. Only functions individually
+#   compiled behind `feature = "fdb"` are narrowly excluded because the default
+#   mutant test binary cannot observe them. The `fdb-check` lane compiles that
+#   graph and the ignored live journey exercises it against the official client;
+#   never exclude the whole admitted source file again.
 # - `in encode_row` / `read_u64` length guards compare against
 #   u32::MAX / an indistinguishable truncation error: distinguishing
 #   them needs a 4 GiB allocation or yields the identical error variant,
@@ -26,10 +27,11 @@
 #   monotonicity and record roundtrip property).
 exclude_globs = [
     "kernel/src/verify.rs",
-    "kernel/src/admitted.rs",
-    "kernel/src/fdb.rs",
 ]
 exclude_re = [
+    "OutboardDb",
+    "HybridDb::outboard",
+    "native_",
     "replace > with == in encode_row",
     "replace > with >= in encode_row",
     "replace \\|\\| with && in encode_row",
