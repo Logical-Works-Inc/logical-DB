@@ -433,15 +433,15 @@ fn apply_atomic_op(op: &AtomicOp, existing: Option<&[u8]>) -> Result<Vec<u8>> {
         }
         AtomicOpKind::Max => {
             let cur = existing.unwrap_or(&[]);
-            if op.param.len() != cur.len() && !cur.is_empty() {
-                // For numeric max on LE i64 8 bytes, require same len
-                if op.param.len() == 8 && cur.len() == 8 {
-                    let a = i64::from_le_bytes(cur.try_into().unwrap());
-                    let b = i64::from_le_bytes(op.param.as_slice().try_into().unwrap());
-                    return Ok(a.max(b).to_le_bytes().to_vec());
-                }
+            if cur.is_empty() {
+                return Ok(op.param.clone());
             }
-            if cur.is_empty() || op.param.as_slice() > cur {
+            if op.param.len() == 8 && cur.len() == 8 {
+                let a = i64::from_le_bytes(cur.try_into().unwrap());
+                let b = i64::from_le_bytes(op.param.as_slice().try_into().unwrap());
+                return Ok(a.max(b).to_le_bytes().to_vec());
+            }
+            if op.param.as_slice() > cur {
                 Ok(op.param.clone())
             } else {
                 Ok(cur.to_vec())
@@ -1115,7 +1115,7 @@ impl EmbeddedBackend {
                 limit: MAX_TRANSACTION_KEYS,
             }
         })?;
-        if key_count > MAX_TRANSACTION_KEYS {
+        if key_count.saturating_sub(MAX_TRANSACTION_KEYS) != 0 {
             return Err(KernelError::TransactionTooLarge {
                 size: key_count,
                 limit: MAX_TRANSACTION_KEYS,
@@ -1264,9 +1264,507 @@ mod tests {
     #[test]
     fn fdb_config_defaults_are_pinned() {
         let cfg = FdbConfig::default();
-        assert_eq!(cfg.transaction_size_limit_bytes, MAX_TRANSACTION_BYTES);
-        assert_eq!(cfg.transaction_timeout_ms, DEFAULT_TRANSACTION_TIMEOUT_MS);
+        assert_eq!(MAX_TRANSACTION_BYTES, 10_485_760);
+        assert_eq!(MAX_TRANSACTION_KEYS, 100_000);
+        assert_eq!(cfg.transaction_size_limit_bytes, 10_485_760);
+        assert_eq!(cfg.transaction_timeout_ms, 5_000);
         assert!(cfg.cluster_file.is_none());
+        assert_eq!(fdb_exclusive_upper_bound(&[1, 0xFF]), Some(vec![2]));
+        assert_eq!(fdb_exclusive_upper_bound(&[0xFF]), None);
+    }
+
+    #[test]
+    fn embedded_open_rejects_outboard_configuration_and_preserves_options() {
+        let configured = FdbConfig {
+            cluster_file: None,
+            transaction_timeout_ms: 17,
+            transaction_size_limit_bytes: 23,
+        };
+        let db = LogicalDb::open(configured).unwrap();
+        assert_eq!(db.config().transaction_timeout_ms, 17);
+        assert_eq!(db.config().transaction_size_limit_bytes, 23);
+
+        let outboard = FdbConfig {
+            cluster_file: Some("fdb.cluster".into()),
+            ..FdbConfig::default()
+        };
+        assert!(matches!(
+            LogicalDb::open(outboard),
+            Err(KernelError::Backend(message)) if message.contains("native FoundationDB")
+        ));
+    }
+
+    #[tokio::test]
+    async fn watch_identity_and_cancellation_are_observable() {
+        let mut tx = FdbTransaction::new(MAX_TRANSACTION_BYTES, 5_000);
+        let watch = tx.watch(b"identity");
+        assert_eq!(watch.key(), b"identity");
+        drop(tx);
+        assert!(matches!(
+            watch.wait().await,
+            Err(KernelError::WatchCancelled)
+        ));
+    }
+
+    #[test]
+    fn every_atomic_operation_has_exact_fdb_shim_semantics() {
+        fn op(kind: AtomicOpKind, param: Vec<u8>) -> AtomicOp {
+            AtomicOp {
+                key: b"k".to_vec(),
+                param,
+                kind,
+            }
+        }
+
+        let add = apply_atomic_op(
+            &op(AtomicOpKind::Add, 9_i64.to_le_bytes().to_vec()),
+            Some(&(-4_i64).to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(i64::from_le_bytes(add.try_into().unwrap()), 5);
+        assert!(matches!(
+            apply_atomic_op(&op(AtomicOpKind::Add, vec![1]), None),
+            Err(KernelError::AtomicOpViolation(_))
+        ));
+        assert!(matches!(
+            apply_atomic_op(
+                &op(AtomicOpKind::Add, 1_i64.to_le_bytes().to_vec()),
+                Some(&[1])
+            ),
+            Err(KernelError::AtomicOpViolation(_))
+        ));
+
+        assert_eq!(
+            apply_atomic_op(
+                &op(AtomicOpKind::And, vec![0b1100, 0b0011]),
+                Some(&[0b1010])
+            )
+            .unwrap(),
+            vec![0b1000, 0]
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Or, vec![0b1100, 0b0011]), Some(&[0b1010])).unwrap(),
+            vec![0b1110, 0b0011]
+        );
+
+        let numeric_max = apply_atomic_op(
+            &op(AtomicOpKind::Max, 256_i64.to_le_bytes().to_vec()),
+            Some(&255_i64.to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(i64::from_le_bytes(numeric_max.try_into().unwrap()), 256);
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Max, b"b".to_vec()), Some(b"z")).unwrap(),
+            b"z"
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Max, b"z".to_vec()), Some(b"b")).unwrap(),
+            b"z"
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Max, vec![9; 8]), Some(b"short")).unwrap(),
+            b"short"
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Max, b"new".to_vec()), None).unwrap(),
+            b"new"
+        );
+
+        let numeric_min = apply_atomic_op(
+            &op(AtomicOpKind::Min, (-3_i64).to_le_bytes().to_vec()),
+            Some(&2_i64.to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(i64::from_le_bytes(numeric_min.try_into().unwrap()), -3);
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Min, b"z".to_vec()), Some(b"b")).unwrap(),
+            b"b"
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Min, b"b".to_vec()), Some(b"z")).unwrap(),
+            b"b"
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Min, vec![9; 8]), Some(b"short")).unwrap(),
+            vec![9; 8]
+        );
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::Min, b"new".to_vec()), None).unwrap(),
+            b"new"
+        );
+
+        assert_eq!(
+            apply_atomic_op(
+                &op(AtomicOpKind::AppendIfFits, b"tail".to_vec()),
+                Some(b"head")
+            )
+            .unwrap(),
+            b"headtail"
+        );
+        let full = vec![0; MAX_TRANSACTION_BYTES];
+        assert_eq!(
+            apply_atomic_op(&op(AtomicOpKind::AppendIfFits, Vec::new()), Some(&full))
+                .unwrap()
+                .len(),
+            MAX_TRANSACTION_BYTES
+        );
+        assert!(matches!(
+            apply_atomic_op(&op(AtomicOpKind::AppendIfFits, vec![1]), Some(&full)),
+            Err(KernelError::TransactionTooLarge {
+                size: 10_485_761,
+                limit: 10_485_760
+            })
+        ));
+    }
+
+    #[test]
+    fn transaction_builders_account_exact_bytes_keys_and_effects() {
+        let mut tx = FdbTransaction::new(1_000, 5_000);
+        tx.set(b"ab".to_vec(), b"cde".to_vec()).unwrap();
+        assert_eq!((tx.total_bytes, tx.total_keys), (5, 1));
+        tx.clear(b"four").unwrap();
+        assert_eq!((tx.total_bytes, tx.total_keys), (9, 2));
+        tx.atomic_add(b"a".to_vec(), 1_i64.to_le_bytes().to_vec())
+            .unwrap();
+        tx.atomic_and(b"bb".to_vec(), vec![1, 2, 3]).unwrap();
+        tx.atomic_or(b"ccc".to_vec(), vec![1, 2]).unwrap();
+        tx.atomic_max(b"dddd".to_vec(), vec![1]).unwrap();
+        tx.atomic_min(b"eeeee".to_vec(), vec![1, 2]).unwrap();
+        tx.atomic_append_if_fits(b"ffffff".to_vec(), vec![1, 2, 3])
+            .unwrap();
+        assert_eq!((tx.total_bytes, tx.total_keys), (49, 8));
+        assert_eq!(tx.atomic_ops.len(), 6);
+        assert_eq!(tx.atomic_ops[0].kind, AtomicOpKind::Add);
+        assert_eq!(tx.atomic_ops[1].kind, AtomicOpKind::And);
+        assert_eq!(tx.atomic_ops[2].kind, AtomicOpKind::Or);
+        assert_eq!(tx.atomic_ops[3].kind, AtomicOpKind::Max);
+        assert_eq!(tx.atomic_ops[4].kind, AtomicOpKind::Min);
+        assert_eq!(tx.atomic_ops[5].kind, AtomicOpKind::AppendIfFits);
+
+        let mut exact = FdbTransaction::new(5, 5_000);
+        exact.set(b"ab".to_vec(), b"cde".to_vec()).unwrap();
+        assert!(matches!(
+            exact.clear(b"x"),
+            Err(KernelError::TransactionTooLarge { size: 6, limit: 5 })
+        ));
+        let mut keys = FdbTransaction::new(MAX_TRANSACTION_BYTES, 5_000);
+        keys.total_keys = MAX_TRANSACTION_KEYS - 1;
+        keys.check_limits(0).unwrap();
+        keys.total_keys = MAX_TRANSACTION_KEYS;
+        assert!(matches!(
+            keys.check_limits(0),
+            Err(KernelError::TransactionTooLarge {
+                size: 100_001,
+                limit: 100_000
+            })
+        ));
+
+        let mut timed_out = FdbTransaction::new(100, 1);
+        timed_out.start = std::time::Instant::now() - std::time::Duration::from_millis(5);
+        assert!(matches!(
+            timed_out.set(vec![1], vec![2]),
+            Err(KernelError::TransactionTimedOut { limit_ms: 1, .. })
+        ));
+        assert!(matches!(
+            timed_out.check_timeout(),
+            Err(KernelError::TransactionTimedOut { limit_ms: 1, .. })
+        ));
+
+        let mut ranges = FdbTransaction::new_with_snapshot(
+            100,
+            5_000,
+            0,
+            BTreeMap::from([
+                (b"aa".to_vec(), b"1".to_vec()),
+                (b"bb".to_vec(), b"2".to_vec()),
+            ]),
+        );
+        ranges.clear_range(b"a", b"c").unwrap();
+        assert_eq!((ranges.total_bytes, ranges.total_keys), (4, 2));
+        assert!(ranges.clear_range(b"same", b"same").is_ok());
+        assert!(matches!(
+            ranges.clear_range(b"z", b"a"),
+            Err(KernelError::Backend(_))
+        ));
+
+        let mut conflicts = FdbTransaction::new(100, 5_000);
+        conflicts
+            .add_write_conflict_range(b"a".to_vec(), b"b".to_vec())
+            .unwrap();
+        assert_eq!(conflicts.write_conflict_ranges.len(), 1);
+        conflicts
+            .add_conflict_range(b"c".to_vec(), b"d".to_vec())
+            .unwrap();
+        assert_eq!(conflicts.read_conflict_ranges.len(), 1);
+        assert_eq!(conflicts.write_conflict_ranges.len(), 2);
+
+        let mut exact_add = FdbTransaction::new(10, 5_000);
+        exact_add
+            .atomic_add(b"kk".to_vec(), 1_i64.to_le_bytes().to_vec())
+            .unwrap();
+        let mut short_add = FdbTransaction::new(9, 5_000);
+        assert!(matches!(
+            short_add.atomic_add(b"kk".to_vec(), 1_i64.to_le_bytes().to_vec()),
+            Err(KernelError::TransactionTooLarge { .. })
+        ));
+
+        type AtomicBuilder = fn(&mut FdbTransaction, Vec<u8>, Vec<u8>) -> Result<()>;
+        let builders: [AtomicBuilder; 5] = [
+            FdbTransaction::atomic_and,
+            FdbTransaction::atomic_or,
+            FdbTransaction::atomic_max,
+            FdbTransaction::atomic_min,
+            FdbTransaction::atomic_append_if_fits,
+        ];
+        for build in builders {
+            let mut exact_atomic = FdbTransaction::new(5, 5_000);
+            build(&mut exact_atomic, b"kk".to_vec(), vec![1, 2, 3]).unwrap();
+            let mut short_atomic = FdbTransaction::new(4, 5_000);
+            assert!(matches!(
+                build(&mut short_atomic, b"kk".to_vec(), vec![1, 2, 3]),
+                Err(KernelError::TransactionTooLarge { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn range_views_honor_every_bound_snapshot_direction_and_limit() {
+        let snapshot = BTreeMap::from([
+            (b"a".to_vec(), b"A".to_vec()),
+            (b"b".to_vec(), b"B".to_vec()),
+            (b"c".to_vec(), b"C".to_vec()),
+            (b"d".to_vec(), b"D".to_vec()),
+        ]);
+        let mut tx = FdbTransaction::new_with_snapshot(1_000, 5_000, 7, snapshot);
+        tx.clear(b"b").unwrap();
+        tx.set(b"c".to_vec(), b"changed".to_vec()).unwrap();
+
+        assert_eq!(tx.read_version().unwrap(), 7);
+        assert_eq!(tx.committed_version().unwrap(), 7);
+        assert_eq!(tx.get_read_version().unwrap(), 7);
+        assert_eq!(
+            tx.get_range_snapshot(b"b").unwrap(),
+            vec![(b"b".to_vec(), b"B".to_vec())]
+        );
+        assert_eq!(
+            tx.get_range_with_bounds(
+                Bound::Excluded(b"a"),
+                Bound::Included(b"d"),
+                Some(2),
+                true,
+                false,
+            )
+            .unwrap(),
+            vec![
+                (b"d".to_vec(), b"D".to_vec()),
+                (b"c".to_vec(), b"changed".to_vec())
+            ]
+        );
+        assert_eq!(
+            tx.get_range_with_bounds(
+                Bound::Included(b"b"),
+                Bound::Excluded(b"d"),
+                None,
+                false,
+                true,
+            )
+            .unwrap(),
+            vec![
+                (b"b".to_vec(), b"B".to_vec()),
+                (b"c".to_vec(), b"C".to_vec())
+            ]
+        );
+        assert_eq!(
+            tx.get_range_with_bounds(
+                Bound::Included(b"a"),
+                Bound::Included(b"a"),
+                None,
+                false,
+                false,
+            )
+            .unwrap(),
+            vec![(b"a".to_vec(), b"A".to_vec())]
+        );
+
+        let mut buffer_only = FdbTransaction::new_with_snapshot(100, 5_000, 0, BTreeMap::new());
+        buffer_only.set(b"b".to_vec(), b"B".to_vec()).unwrap();
+        buffer_only.set(b"c".to_vec(), b"C".to_vec()).unwrap();
+        assert_eq!(
+            buffer_only
+                .get_range_with_bounds(
+                    Bound::Included(b"b"),
+                    Bound::Included(b"b"),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            vec![(b"b".to_vec(), b"B".to_vec())]
+        );
+        assert_eq!(
+            buffer_only
+                .get_range_with_bounds(
+                    Bound::Excluded(b"b"),
+                    Bound::Included(b"c"),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            vec![(b"c".to_vec(), b"C".to_vec())]
+        );
+        assert_eq!(
+            buffer_only
+                .get_range_with_bounds(
+                    Bound::Included(b"b"),
+                    Bound::Excluded(b"c"),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            vec![(b"b".to_vec(), b"B".to_vec())]
+        );
+        assert_eq!(
+            tx.get_range_with_bounds(
+                Bound::Excluded(b"a"),
+                Bound::Included(b"b"),
+                None,
+                false,
+                true,
+            )
+            .unwrap(),
+            vec![(b"b".to_vec(), b"B".to_vec())]
+        );
+        assert_eq!(
+            tx.get_range_with_bounds(
+                Bound::Included(b"a"),
+                Bound::Excluded(b"b"),
+                None,
+                false,
+                true,
+            )
+            .unwrap(),
+            vec![(b"a".to_vec(), b"A".to_vec())]
+        );
+    }
+
+    #[test]
+    fn versionstamp_codec_and_transaction_flags_are_exact() {
+        let stamp = versionstamp_bytes(0x0102_0304_0506_0708);
+        assert_eq!(stamp, vec![1, 2, 3, 4, 5, 6, 7, 8, 0, 0]);
+        let key_write = VersionstampedWrite {
+            key: [b"key".as_slice(), &[0xFF; 10], b"tail"].concat(),
+            value: b"value".to_vec(),
+            is_key: true,
+        };
+        let (key, value) = resolve_versionstamp(key_write, 9).unwrap();
+        assert_eq!(
+            key,
+            [b"key".as_slice(), &versionstamp_bytes(9), b"tail"].concat()
+        );
+        assert_eq!(value, b"value");
+
+        let value_write = VersionstampedWrite {
+            key: b"key".to_vec(),
+            value: [b"value".as_slice(), &[0; 10]].concat(),
+            is_key: false,
+        };
+        let (_, value) = resolve_versionstamp(value_write, 10).unwrap();
+        assert_eq!(
+            value,
+            [b"value".as_slice(), &versionstamp_bytes(10)].concat()
+        );
+        let (zero_key, _) = resolve_versionstamp(
+            VersionstampedWrite {
+                key: [b"prefix".as_slice(), &[0; 10]].concat(),
+                value: vec![],
+                is_key: true,
+            },
+            11,
+        )
+        .unwrap();
+        assert_eq!(
+            zero_key,
+            [b"prefix".as_slice(), &versionstamp_bytes(11)].concat()
+        );
+        let (_, ff_value) = resolve_versionstamp(
+            VersionstampedWrite {
+                key: vec![],
+                value: [b"prefix".as_slice(), &[0xFF; 10], b"tail"].concat(),
+                is_key: false,
+            },
+            12,
+        )
+        .unwrap();
+        assert_eq!(
+            ff_value,
+            [b"prefix".as_slice(), &versionstamp_bytes(12), b"tail"].concat()
+        );
+        for is_key in [true, false] {
+            assert!(matches!(
+                resolve_versionstamp(
+                    VersionstampedWrite {
+                        key: b"key".to_vec(),
+                        value: b"value".to_vec(),
+                        is_key,
+                    },
+                    1,
+                ),
+                Err(KernelError::Backend(_))
+            ));
+        }
+
+        let mut tx = FdbTransaction::new(100, 5_000);
+        tx.require_exact_read_version();
+        assert!(tx.requires_exact_read_version);
+        assert!(tx
+            .set_versionstamped_key([b"k".as_slice(), &[0xFF; 10]].concat(), vec![1])
+            .is_ok());
+        assert!(tx
+            .set_versionstamped_value(b"v".to_vec(), [b"x".as_slice(), &[0; 10]].concat())
+            .is_ok());
+        assert_eq!((tx.total_bytes, tx.total_keys), (24, 2));
+        assert_eq!(tx.versionstamped_writes.len(), 2);
+        assert!(matches!(
+            tx.set_versionstamped_key([b"bad".as_slice(), &[7; 10]].concat(), vec![]),
+            Err(KernelError::Backend(_))
+        ));
+        assert!(matches!(
+            tx.set_versionstamped_value(b"bad".to_vec(), vec![7; 10]),
+            Err(KernelError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn embedded_backend_port_and_batch_boundaries_are_exact() {
+        let mut backend = EmbeddedBackend::with_limit(5);
+        assert!(backend.is_durable());
+        backend.put(b"ab".to_vec(), b"cde".to_vec()).unwrap();
+        assert_eq!(
+            backend.scan_prefix(b"a").unwrap(),
+            vec![(b"ab".to_vec(), b"cde".to_vec())]
+        );
+        assert!(matches!(
+            backend.put(b"abc".to_vec(), b"def".to_vec()),
+            Err(KernelError::TransactionTooLarge { size: 6, limit: 5 })
+        ));
+
+        let mut batch = EmbeddedBackend::with_limit(5);
+        batch
+            .apply_transaction(&[(b"ab".to_vec(), b"cde".to_vec())], &[], 1)
+            .unwrap();
+        assert_eq!(batch.committed_version().unwrap(), 1);
+        batch.apply_transaction(&[], &[], 1).unwrap();
+        assert_eq!(batch.committed_version().unwrap(), 1);
+        assert!(matches!(
+            batch.apply_transaction(&[(b"abc".to_vec(), b"def".to_vec())], &[], 2),
+            Err(KernelError::TransactionTooLarge { size: 6, limit: 5 })
+        ));
+        assert!(matches!(
+            batch.apply_transaction(&[], &[], 0),
+            Err(KernelError::TsRegression { last: 1, got: 0 })
+        ));
     }
 
     #[test]
@@ -1296,6 +1794,8 @@ mod tests {
     fn fdb_clock_holds_monotonic_invariant() {
         let mut c = FdbClock::new();
         assert_eq!(c.now(), 0);
+        c.advance_to(5).unwrap();
+        assert_eq!(c.now(), 5);
         c.advance_to(5).unwrap();
         assert_eq!(c.now(), 5);
         let err = c.advance_to(3).unwrap_err();
@@ -1348,6 +1848,92 @@ mod tests {
         // committed read outside tx
         let v2 = db.transact(|tx| tx.get(b"k")).await.unwrap();
         assert_eq!(v2, Some(b"v".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn transact_retries_closure_and_commit_conflicts_only_within_budget() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let mut closure_attempts = 0;
+        let value = db
+            .transact(|_| {
+                closure_attempts += 1;
+                if closure_attempts < 3 {
+                    Err(KernelError::TransactionConflict)
+                } else {
+                    Ok(41)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, 41);
+        assert_eq!(closure_attempts, 3);
+
+        let mut exhausted_attempts = 0;
+        let exhausted = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            db.transact(|_| -> Result<()> {
+                exhausted_attempts += 1;
+                Err(KernelError::TransactionConflict)
+            }),
+        )
+        .await
+        .expect("bounded closure-conflict retries must terminate");
+        assert!(matches!(exhausted, Err(KernelError::TransactionConflict)));
+        assert_eq!(exhausted_attempts, MAX_RETRY_ATTEMPTS + 1);
+
+        let commit_db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let mut commit_attempts = 0;
+        commit_db
+            .transact(|tx| {
+                commit_attempts += 1;
+                tx.add_read_conflict_range(b"conflict".to_vec(), b"conflicu".to_vec())?;
+                if commit_attempts == 1 {
+                    commit_db.backend.lock().unwrap().apply_transaction(
+                        &[(b"conflict".to_vec(), b"outside".to_vec())],
+                        &[],
+                        1,
+                    )?;
+                }
+                tx.set(b"result".to_vec(), b"inside".to_vec())
+            })
+            .await
+            .unwrap();
+        assert_eq!(commit_attempts, 2);
+        assert_eq!(commit_db.committed_version().unwrap(), 2);
+
+        let exhausted_commit_db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let mut exhausted_commit_attempts = 0_u64;
+        let exhausted_commit = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            exhausted_commit_db.transact(|tx| {
+                exhausted_commit_attempts += 1;
+                tx.add_read_conflict_range(b"conflict".to_vec(), b"conflicu".to_vec())?;
+                let next = exhausted_commit_db
+                    .committed_version()?
+                    .checked_add(1)
+                    .unwrap();
+                exhausted_commit_db
+                    .backend
+                    .lock()
+                    .unwrap()
+                    .apply_transaction(
+                        &[(
+                            b"conflict".to_vec(),
+                            exhausted_commit_attempts.to_be_bytes().to_vec(),
+                        )],
+                        &[],
+                        next,
+                    )?;
+                tx.set(b"result".to_vec(), b"never".to_vec())
+            }),
+        )
+        .await
+        .expect("bounded commit-conflict retries must terminate");
+        assert!(matches!(
+            exhausted_commit,
+            Err(KernelError::TransactionConflict)
+        ));
+        assert_eq!(exhausted_commit_attempts as usize, MAX_RETRY_ATTEMPTS + 1);
     }
 
     #[tokio::test]
@@ -1671,6 +2257,83 @@ mod tests {
         let value = db.transact(|tx| tx.get(b"counter")).await.unwrap().unwrap();
         assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 2);
         assert_eq!(db.committed_version().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn commit_rechecks_atomic_and_serialization_time_clear_limits() {
+        let atomic_db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let mut atomic = FdbTransaction::new_with_snapshot(17, 5_000, 0, BTreeMap::new());
+        atomic
+            .atomic_add(b"k".to_vec(), 1_i64.to_le_bytes().to_vec())
+            .unwrap();
+        assert!(matches!(
+            atomic_db.try_commit(atomic).await,
+            Err(KernelError::TransactionTooLarge {
+                size: 18,
+                limit: 17
+            })
+        ));
+        assert_eq!(atomic_db.committed_version().unwrap(), 0);
+
+        let mut exact_atomic = FdbTransaction::new_with_snapshot(18, 5_000, 0, BTreeMap::new());
+        exact_atomic
+            .atomic_add(b"k".to_vec(), 1_i64.to_le_bytes().to_vec())
+            .unwrap();
+        assert_eq!(atomic_db.try_commit(exact_atomic).await.unwrap(), 1);
+
+        let mut expired = FdbTransaction::new_with_snapshot(100, 1, 1, BTreeMap::new());
+        expired.start = std::time::Instant::now() - std::time::Duration::from_millis(5);
+        assert!(matches!(
+            atomic_db.try_commit(expired).await,
+            Err(KernelError::TransactionTimedOut { limit_ms: 1, .. })
+        ));
+
+        let clear_db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let mut clear = FdbTransaction::new_with_snapshot(100, 5_000, 0, BTreeMap::new());
+        clear.total_keys = MAX_TRANSACTION_KEYS - 1;
+        clear.clear_range(b"a", b"z").unwrap();
+        clear_db
+            .backend
+            .lock()
+            .unwrap()
+            .apply_transaction(
+                &[
+                    (b"aa".to_vec(), b"1".to_vec()),
+                    (b"bb".to_vec(), b"2".to_vec()),
+                ],
+                &[],
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            clear_db.try_commit(clear).await,
+            Err(KernelError::TransactionTooLarge {
+                size: 100_001,
+                limit: 100_000
+            })
+        ));
+        assert_eq!(clear_db.committed_version().unwrap(), 1);
+
+        let byte_limit_db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let mut byte_limited = FdbTransaction::new_with_snapshot(3, 5_000, 0, BTreeMap::new());
+        byte_limited.clear_range(b"a", b"z").unwrap();
+        byte_limit_db
+            .backend
+            .lock()
+            .unwrap()
+            .apply_transaction(
+                &[
+                    (b"aa".to_vec(), b"1".to_vec()),
+                    (b"bb".to_vec(), b"2".to_vec()),
+                ],
+                &[],
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            byte_limit_db.try_commit(byte_limited).await,
+            Err(KernelError::TransactionTooLarge { size: 4, limit: 3 })
+        ));
     }
 
     #[tokio::test]

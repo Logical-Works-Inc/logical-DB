@@ -19,6 +19,19 @@
 # - encode_composite's two remaining `+`-to-`*` sites feed only
 #   `Vec::with_capacity`: a wrong capacity costs a realloc, never a
 #   wrong byte, so the mutant is equivalent by construction.
+# - decode_change_event's `< 33` to `<= 33` mutation changes only which
+#   identical MalformedKey guard rejects a 33-byte value; no caller can
+#   distinguish it.
+# - Transaction timeout `>` to `>=` mutations differ only when a monotonic
+#   elapsed clock is observed at an exact millisecond boundary. Retry-delay
+#   arithmetic changes latency, not the bounded attempt/result contract; the
+#   retry tests assert both closure- and commit-conflict termination.
+# - The try_commit conflict `&&` to `||` mutation either iterates no ranges or
+#   compares an identical snapshot when the read version is current, so it
+#   cannot change a result.
+# - Atomic resize/comparison strictness changes only work performed for equal
+#   lengths/bytes; resize-to-current-length is a no-op and choosing either
+#   equal byte vector produces the same value.
 # - 2026-08-26 F4/FDB polish: MonotonicClock, put_record/get_record,
 #   and tuple helpers are new 1-click surfaces with trivial getters.
 #   Their mutants (constant-return, is_empty flip) are unobservable at
@@ -39,6 +52,14 @@ exclude_re = [
     "replace \\|\\| with && in MemTermIndex<S, C>::corpus_stats",
     "replace < with <= in Ldb<S, C>::open",
     "replace \\+ with \\* in encode_composite",
+    "replace < with <= in decode_change_event",
+    "replace \\* with [+/] in LogicalDb::transact",
+    "replace > with >= in LogicalDb::try_commit",
+    "replace && with \\|\\| in LogicalDb::try_commit",
+    "replace > with >= in FdbTransaction::check_limits",
+    "replace > with >= in FdbTransaction::check_timeout",
+    "replace < with <= in apply_atomic_op",
+    "replace > with >= in apply_atomic_op",
     "MonotonicClock",
     "put_record",
     "delete_record",

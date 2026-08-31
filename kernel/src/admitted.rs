@@ -863,6 +863,9 @@ impl OutboardDb {
         }
     }
 
+    // Deliberate: explicit assignments keep the native selector fields
+    // observable to source-transform gates and the live-FDB receipt.
+    #[allow(clippy::field_reassign_with_default)]
     pub async fn changes_admitted(
         &self,
         envelope: AdmittedTxn,
@@ -896,12 +899,13 @@ impl OutboardDb {
                     if current < 0 || current as u64 != expected_version {
                         return Ok(NativeChangesAttempt::Stale(current));
                     }
-                    let options = foundationdb::RangeOption {
-                        begin,
-                        end: foundationdb::KeySelector::first_greater_or_equal(end),
-                        limit: Some(limit),
-                        ..foundationdb::RangeOption::default()
-                    };
+                    // Assign after construction so each required selector is
+                    // explicit even in source transforms used by the default
+                    // mutation lane (the live-FDB lane observes the values).
+                    let mut options = foundationdb::RangeOption::default();
+                    options.begin = begin;
+                    options.end = foundationdb::KeySelector::first_greater_or_equal(end);
+                    options.limit = Some(limit);
                     let values = transaction.get_range(&options, 1, false).await?;
                     let more = values.more();
                     let rows = values
@@ -1588,6 +1592,130 @@ mod tests {
     }
 
     #[test]
+    fn state_binding_reports_the_nonzero_version_it_proved() {
+        let (_, snapshot) = runnable(41);
+        let binding = StateBinding::new(41, &snapshot).unwrap();
+        assert_eq!(binding.database_version(), 41);
+        assert_eq!(binding.snapshot_cid(), snapshot.cid());
+    }
+
+    #[test]
+    fn batch_limits_are_exact_and_include_transaction_metadata() {
+        let account = scope(b"account-limits");
+        let transaction = envelope(0, account.clone(), b"limit-operation");
+
+        let mut charged = transaction.write_batch();
+        charged.encoded_bytes = crate::fdb::MAX_TRANSACTION_BYTES - 2;
+        charged.charge(2).unwrap();
+        assert_eq!(charged.encoded_bytes, crate::fdb::MAX_TRANSACTION_BYTES);
+        assert!(matches!(
+            charged.charge(1),
+            Err(KernelError::TransactionTooLarge { .. })
+        ));
+
+        let mut small_charge = transaction.write_batch();
+        small_charge.encoded_bytes = 2;
+        small_charge.charge(3).unwrap();
+        assert_eq!(small_charge.encoded_bytes, 5);
+
+        let placeholder = WriteMutation::Clear { key: vec![1] };
+        let mut keys = transaction.write_batch();
+        keys.mutations = vec![placeholder.clone(); crate::fdb::MAX_TRANSACTION_KEYS - 1];
+        keys.charge(0).unwrap();
+        keys.mutations.push(placeholder);
+        match keys.charge(0) {
+            Err(KernelError::TransactionTooLarge { size, limit }) => {
+                assert_eq!(size, crate::fdb::MAX_TRANSACTION_KEYS + 1);
+                assert_eq!(limit, crate::fdb::MAX_TRANSACTION_KEYS);
+            }
+            result => panic!("expected exact key-count rejection, got {result:?}"),
+        }
+
+        let batch = transaction.write_batch();
+        let change_mutations = batch.change_mutation_bytes();
+        let exact_total = batch.encoded_bytes
+            + operation_key(&transaction.scope, &transaction.operation_id).len()
+            + OPERATION_MARKER_BYTES
+            + 4
+            + invocation_key(&transaction).len()
+            + OPERATION_MARKER_BYTES
+            + 4
+            + embedded_change_key(&transaction.scope, &transaction.operation_id).len()
+            + 4
+            + change_value_len(&transaction.operation_id, &change_mutations);
+        batch.validate_for(&transaction, exact_total).unwrap();
+        assert!(matches!(
+            batch.validate_for(&transaction, exact_total - 1),
+            Err(KernelError::TransactionTooLarge { .. })
+        ));
+
+        let mut wrong_scope = batch.clone();
+        wrong_scope.scope = scope(b"other-account");
+        assert!(matches!(
+            wrong_scope.validate_for(&transaction, usize::MAX),
+            Err(KernelError::AuthorityScopeViolation)
+        ));
+        let mut wrong_effects = batch;
+        wrong_effects.effects = vec![Effect::Get];
+        assert!(matches!(
+            wrong_effects.validate_for(&transaction, usize::MAX),
+            Err(KernelError::AuthorityScopeViolation)
+        ));
+    }
+
+    #[tokio::test]
+    async fn hybrid_read_version_and_stale_or_revoked_envelopes_fail_closed() {
+        let db = HybridDb::embedded_memory(FdbConfig::default()).unwrap();
+        assert_eq!(db.read_version().await.unwrap(), 0);
+
+        let account = scope(b"account-validation");
+        let stale = envelope(1, account.clone(), b"stale");
+        assert!(matches!(
+            validate_fresh_envelope(&stale, 0),
+            Err(KernelError::StaleJustification {
+                expected: 0,
+                got: 1
+            })
+        ));
+
+        let mut revoked = envelope(0, account, b"revoked");
+        revoked.authority.allowed_scopes.clear();
+        assert!(matches!(
+            validate_envelope_authority(&revoked),
+            Err(KernelError::AuthorityScopeViolation)
+        ));
+    }
+
+    #[test]
+    fn change_codec_covers_prefix_size_and_clear_events() {
+        let account = scope(b"account-codec");
+        let prefix = change_prefix(&account);
+        assert_eq!(prefix, account.family_prefix(KeyFamily::Change));
+        assert_ne!(prefix, vec![0]);
+        assert_ne!(prefix, vec![1]);
+
+        let operation = OperationId::new(b"codec-operation".to_vec()).unwrap();
+        let tuple = Tuple::new(vec![Element::Bytes(b"record".to_vec())]);
+        let key = account.pack(KeyFamily::Record, &tuple);
+        let mut mutations = vec![2];
+        append_framed(&mut mutations, &key);
+        let fingerprint = Cid::compute(b"logical-db.test", b"codec");
+        let encoded = change_value(&operation, fingerprint, &mutations);
+        assert_eq!(change_value_len(&operation, &mutations), encoded.len());
+
+        let event = decode_change_event(
+            &account,
+            ChangeToken::from_bytes(vec![9]).unwrap(),
+            &encoded,
+        )
+        .unwrap();
+        assert!(matches!(
+            event.mutations.as_slice(),
+            [ChangeMutation::Clear { key: changed }] if changed.family == KeyFamily::Record
+        ));
+    }
+
+    #[test]
     fn native_marker_accepts_nonzero_fdb_batch_order() {
         let fingerprint = Cid::compute(b"logical-db.test", b"marker");
         let mut marker = operation_marker_template(fingerprint);
@@ -1621,6 +1749,173 @@ mod tests {
         assert!(matches!(
             batch.set(KeyFamily::Record, &Tuple::new(vec![]), vec![]),
             Err(KernelError::AuthorityScopeViolation)
+        ));
+    }
+
+    #[test]
+    fn admitted_contract_exposes_the_exact_braid_and_authority_binding() {
+        let account = scope(b"account-contract");
+        let transaction = envelope(0, account.clone(), b"contract-operation");
+
+        assert_eq!(transaction.state().database_version(), 0);
+        assert_eq!(
+            transaction.state().snapshot_cid(),
+            transaction.braid_proof().snapshot_cid
+        );
+        assert_eq!(transaction.scope(), &account);
+        assert_eq!(transaction.declared_effects(), &[Effect::Put, Effect::Get]);
+        assert_eq!(transaction.operation_id().as_bytes(), b"contract-operation");
+        assert_eq!(transaction.authority.id(), "kernel-capability-1");
+        assert_ne!(transaction.braid_proof().capsule_cid.0, [0; 32]);
+        assert_ne!(transaction.braid_proof().registry_cid.0, [0; 32]);
+        assert_ne!(transaction.braid_proof().authority_cid.0, [0; 32]);
+        assert_ne!(transaction.braid_proof().predicate_cid.0, [0; 32]);
+    }
+
+    #[test]
+    fn receipt_port_preserves_every_audit_dimension() {
+        let account = scope(b"account-receipt");
+        let transaction = envelope(0, account, b"receipt-operation");
+        let receipt = receipt_from(&transaction, 41);
+        let rendered = String::from_utf8(JsonReceiptPort.render(&receipt)).unwrap();
+
+        assert!(rendered.contains("\"committed_version\":41"));
+        assert!(rendered.contains("\"operation_id\":\"726563656970742d6f7065726174696f6e\""));
+        assert!(rendered.contains("\"authority_proof\":\"kernel-capability-1\""));
+        assert!(rendered.contains("\"effects\":[1,3]"));
+        assert!(rendered.contains(&receipt.braid.capsule_cid.to_hex()));
+        assert!(rendered.contains(&receipt.braid.registry_cid.to_hex()));
+        assert!(rendered.contains(&receipt.braid.authority_cid.to_hex()));
+        assert!(rendered.contains(&receipt.braid.snapshot_cid.to_hex()));
+        assert!(rendered.contains(&receipt.braid.predicate_cid.to_hex()));
+        assert_eq!(Effect::Delete.tag(), 2);
+        assert_eq!(Effect::Scan.tag(), 4);
+    }
+
+    #[test]
+    fn change_token_enforces_both_wire_bounds() {
+        assert!(matches!(
+            ChangeToken::from_bytes(Vec::new()),
+            Err(KernelError::MalformedKey)
+        ));
+        assert_eq!(ChangeToken::from_bytes(vec![7]).unwrap().as_bytes(), &[7]);
+        assert!(ChangeToken::from_bytes(vec![7; MAX_OPERATION_ID_BYTES + 12]).is_ok());
+        assert!(matches!(
+            ChangeToken::from_bytes(vec![7; MAX_OPERATION_ID_BYTES + 13]),
+            Err(KernelError::MalformedKey)
+        ));
+    }
+
+    #[test]
+    fn write_batch_accounts_for_set_clear_and_canonical_bytes() {
+        let account = scope(b"account-batch");
+        let (runnable, snapshot) = runnable(0);
+        let transaction = AdmittedTxn::new(
+            runnable,
+            StateBinding::new(0, &snapshot).unwrap(),
+            AuthorityProofRef::new(
+                "batch-authority",
+                vec![account.clone()],
+                vec![Effect::Put, Effect::Delete],
+            )
+            .unwrap(),
+            account,
+            vec![Effect::Delete, Effect::Put],
+            OperationId::new(b"batch-operation".to_vec()).unwrap(),
+        )
+        .unwrap();
+        let set_tuple = Tuple::new(vec![Element::Bytes(b"set".to_vec())]);
+        let clear_tuple = Tuple::new(vec![Element::Bytes(b"clear".to_vec())]);
+        let mut batch = transaction.write_batch();
+
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        batch
+            .set(KeyFamily::Record, &set_tuple, b"value".to_vec())
+            .unwrap();
+        batch.clear(KeyFamily::Index, &clear_tuple).unwrap();
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 2);
+
+        let set_key = transaction.scope.pack(KeyFamily::Record, &set_tuple);
+        let clear_key = transaction.scope.pack(KeyFamily::Index, &clear_tuple);
+        assert_eq!(
+            batch.encoded_bytes,
+            set_key.len() + b"value".len() + clear_key.len()
+        );
+        let mut expected = vec![1];
+        append_framed(&mut expected, &set_key);
+        append_framed(&mut expected, b"value");
+        expected.push(2);
+        append_framed(&mut expected, &clear_key);
+        assert_eq!(batch.canonical_bytes(), expected);
+    }
+
+    #[test]
+    fn change_request_and_page_fail_closed_at_each_boundary() {
+        let account = scope(b"account-change-boundary");
+        assert!(matches!(
+            validate_change_request(&envelope(0, account.clone(), b"not-scan"), 1),
+            Err(KernelError::AuthorityScopeViolation)
+        ));
+        assert!(matches!(
+            validate_change_request(&scan_envelope(0, account.clone(), b"zero"), 0),
+            Err(KernelError::RangeLimitInvalid { .. })
+        ));
+        assert!(validate_change_request(
+            &scan_envelope(0, account.clone(), b"maximum"),
+            MAX_PUBLIC_RANGE_ROWS
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_change_request(
+                &scan_envelope(0, account.clone(), b"too-many"),
+                MAX_PUBLIC_RANGE_ROWS + 1
+            ),
+            Err(KernelError::RangeLimitInvalid { .. })
+        ));
+
+        let token = ChangeToken::from_bytes(vec![1]).unwrap();
+        let operation = OperationId::new(b"change-operation".to_vec()).unwrap();
+        let fingerprint = Cid::compute(b"logical-db.test", b"change");
+        let tuple = Tuple::new(vec![Element::Bytes(b"record".to_vec())]);
+        let key = account.pack(KeyFamily::Record, &tuple);
+        let mutations = {
+            let mut bytes = vec![1];
+            append_framed(&mut bytes, &key);
+            bytes
+        };
+        let value = change_value(&operation, fingerprint, &mutations);
+        let mut physical_key = change_prefix(&account);
+        physical_key.extend_from_slice(token.as_bytes());
+        let page = change_page(&account, vec![(physical_key, value)], true).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_token, Some(token));
+        assert!(page.more);
+        assert_eq!(page.events[0].operation_id, operation);
+        assert_eq!(page.events[0].fingerprint, fingerprint);
+        assert!(matches!(
+            page.events[0].mutations.as_slice(),
+            [ChangeMutation::Set { key: changed }] if changed.family == KeyFamily::Record
+        ));
+
+        assert!(matches!(
+            decode_change_event(
+                &account,
+                ChangeToken::from_bytes(vec![2]).unwrap(),
+                &[1; 32]
+            ),
+            Err(KernelError::MalformedKey)
+        ));
+        let mut wrong_tag = vec![2];
+        wrong_tag.extend_from_slice(&[0; 32]);
+        assert!(matches!(
+            decode_change_event(
+                &account,
+                ChangeToken::from_bytes(vec![3]).unwrap(),
+                &wrong_tag
+            ),
+            Err(KernelError::MalformedKey)
         ));
     }
 }
