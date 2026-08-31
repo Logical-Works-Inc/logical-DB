@@ -33,6 +33,17 @@ adapter with
 `cargo check --workspace --all-targets --features fdb`; a live run additionally
 requires the FoundationDB C client, network guard, and cluster recipe.
 
+On macOS, the hermetic live-FDB journey is:
+
+    export FDB_SCRATCH=/tmp/fdb-f0
+    scripts/local-fdb-cluster.sh verify
+    scripts/local-fdb-cluster.sh up
+    export FDB_CLUSTER_FILE="$FDB_SCRATCH/fdb.cluster"
+    export RUSTFLAGS="-L native=$FDB_SCRATCH/macbin \
+    -C link-arg=-Wl,-rpath,$FDB_SCRATCH/macbin"
+    cargo test --features fdb --test fdb_live -- --ignored --nocapture
+    scripts/local-fdb-cluster.sh down
+
 ## The five axes
 
 1. **One model across every repo** — sentinel, logic-os-kernel, and

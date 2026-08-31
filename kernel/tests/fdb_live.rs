@@ -1,7 +1,8 @@
 //! Live FDB proof — host cluster at /tmp/fdb-f0 or docker foundationdb.
 //!
-//! Run: DYLD_FALLBACK_LIBRARY_PATH=/tmp/fdb-f0/macbin FDB_CLUSTER_FILE=/tmp/fdb-f0/fdb.cluster
-//!      cargo test --features fdb --test fdb_live -- --ignored --nocapture
+//! macOS: stage/start with `scripts/local-fdb-cluster.sh up`, then add its
+//! `macbin` to the native link path and executable rpath through `RUSTFLAGS`.
+//! The exact command is documented in the repository README.
 //! Docker alt: docker run --network host -v /tmp/fdb-f0/fdb.cluster:/etc/foundationdb/fdb.cluster
 //!           -v /tmp/fdb-f0/macbin/libfdb_c.so:/usr/lib/libfdb_c.so -v $PWD:/work -w /work
 //!           rust:bookworm cargo test --features fdb --test fdb_live -- --ignored --nocapture
@@ -17,8 +18,8 @@ use braid_ir::{
 use braid_run::{JustificationProof, RunnableInvocation};
 use foundationdb::{KeySelector, RangeOption};
 use logical_db::admitted::{
-    AdmittedOutcome, AdmittedTxn, AuthorityProofRef, Effect, OperationId, OutboardDb, StateBinding,
-    DATABASE_VERSION_FACT,
+    AdmittedOutcome, AdmittedTxn, AuthorityProofRef, Effect, HybridDb, OperationId, OutboardDb,
+    StateBinding, DATABASE_VERSION_FACT,
 };
 use logical_db::fdb::DatabaseOptions;
 use logical_db::tuple::{AccountId, ContainerId, Element, KeyFamily, Scope, Tuple, ZoneId};
@@ -192,35 +193,35 @@ async fn live_fdb_cluster_roundtrip() {
         ..DatabaseOptions::default()
     };
     let outboard = OutboardDb::from_database(db, options).expect("attach logical layer");
+    let db = HybridDb::outboard(outboard);
     let object = Tuple::new(vec![Element::Bytes(b"object-1".to_vec())]);
 
-    let write_version = outboard.read_version().await.expect("read version");
+    let write_version = db.read_version().await.expect("read version");
     let write = admitted(write_version, scope.clone(), Effect::Put, b"live-write-1");
     let mut batch = write.write_batch();
     batch
         .set(KeyFamily::Record, &object, b"hybrid-value".to_vec())
         .unwrap();
     assert!(matches!(
-        outboard.commit_admitted(write, batch).await.unwrap(),
+        db.commit_admitted(write, batch).await.unwrap(),
         AdmittedOutcome::Applied { .. }
     ));
 
-    let read_version = outboard.read_version().await.expect("post-write version");
+    let read_version = db.read_version().await.expect("post-write version");
     let read = admitted(read_version, scope.clone(), Effect::Get, b"live-read-1");
     assert_eq!(
-        outboard
-            .get_admitted(read, KeyFamily::Record, &object)
+        db.get_admitted(read, KeyFamily::Record, &object)
             .await
             .unwrap(),
         Some(b"hybrid-value".to_vec())
     );
 
-    let scan_version = outboard.read_version().await.expect("change version");
+    let scan_version = db.read_version().await.expect("change version");
     let scan = admitted(scan_version, scope.clone(), Effect::Scan, b"live-scan-1");
-    let changes = outboard.changes_admitted(scan, None, 10).await.unwrap();
+    let changes = db.changes_admitted(scan, None, 10).await.unwrap();
     assert_eq!(changes.events.len(), 1);
     assert_eq!(changes.events[0].operation_id.as_bytes(), b"live-write-1");
-    drop(outboard);
+    drop(db);
 
     let cleanup = foundationdb::Database::new(Some(cluster.as_str())).expect("reopen for cleanup");
     let scope_end = prefix_end(scope_prefix.clone());
