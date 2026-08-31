@@ -548,6 +548,52 @@ mod tests {
     }
 
     #[test]
+    fn tuple_wire_bytes_and_scope_component_boundaries_are_pinned() {
+        assert_eq!(Tuple::new(vec![]).encode(), Vec::<u8>::new());
+        assert_eq!(
+            Tuple::new(vec![Element::Bytes(b"a\0b".to_vec())]).encode(),
+            vec![CODE_BYTES, b'a', 0x00, 0xFF, b'b', 0x00]
+        );
+        assert_eq!(
+            Tuple::new(vec![Element::Int(0)]).encode(),
+            vec![CODE_INT, 0x80, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            Tuple::new(vec![Element::Bool(false), Element::Bool(true)]).encode(),
+            vec![CODE_BOOL_FALSE, CODE_BOOL_TRUE]
+        );
+
+        let empty = [0x00, 0x00];
+        let mut empty_cursor = empty.as_slice();
+        assert_eq!(
+            decode_component(&mut empty_cursor).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(empty_cursor.is_empty());
+
+        let mut exact = vec![b'x'; MAX_SCOPE_ID_BYTES];
+        exact.extend_from_slice(&[0x00, 0x00]);
+        let mut exact_cursor = exact.as_slice();
+        assert_eq!(
+            decode_component(&mut exact_cursor).unwrap(),
+            vec![b'x'; MAX_SCOPE_ID_BYTES]
+        );
+        assert!(exact_cursor.is_empty());
+
+        let mut oversized = vec![b'x'; MAX_SCOPE_ID_BYTES + 1];
+        oversized.extend_from_slice(&[0x00, 0x00]);
+        let mut oversized_cursor = oversized.as_slice();
+        assert!(matches!(
+            decode_component(&mut oversized_cursor),
+            Err(KernelError::ScopeIdInvalid {
+                axis: "encoded scope",
+                len,
+                limit: MAX_SCOPE_ID_BYTES
+            }) if len == MAX_SCOPE_ID_BYTES + 1
+        ));
+    }
+
+    #[test]
     fn account_is_the_leftmost_dynamic_axis() {
         let a = scope(b"account-a", b"same-container", b"same-zone");
         let b = scope(b"account-b", b"same-container", b"same-zone");

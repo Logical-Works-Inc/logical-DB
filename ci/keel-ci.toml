@@ -409,7 +409,8 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo mutants -p logical-db --jobs 8 | tee "$RUNNER_TEMP/mutants.out"
+cargo mutants -p logical-db --jobs 8 --minimum-test-timeout 60 \
+  | tee "$RUNNER_TEMP/mutants.out"
 # INV-MUTANTS-NONVACUOUS: cargo-mutants exits 0 when the package filter
 # matches nothing ("Found 0 mutants", run 32824022656) — a wrong-tree or
 # renamed workspace would pass as green teeth. Refuse any zero count.
