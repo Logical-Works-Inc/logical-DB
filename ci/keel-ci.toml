@@ -387,14 +387,11 @@ cost = "expensive"
 working_directory = "."
 runner = ["self-hosted"]
 evidence = ["log", "status"]
-[job.runtime_env]
-# INV-MUTANT-TARGET-ISOLATION (run 32893119128): cargo-mutants compiles
-# hundreds of body-mutated copies of the crate, and a later plain build
-# against the SAME target dir linked a mutant-era binary (Test finished in
-# 0.04s with unused-variable warnings and panic line numbers from mutated
-# sources). The mutants tier therefore owns a dedicated target dir that no
-# other job reads; cleanup deletes both.
-CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target-mutants"
+# INV-MUTANT-WORKER-ISOLATION: never set CARGO_TARGET_DIR for this job.
+# cargo-mutants gives each concurrently mutated source copy its own target;
+# overriding that path makes workers reuse one another's artifacts and can
+# report a killed mutant as a survivor. The job itself already runs in an
+# isolated checkout, and cargo-mutants removes its temporary copies.
 [[job.step]]
 condition = "success()"
 kind = "action"

@@ -571,9 +571,23 @@ impl LogicalDb {
     }
 }
 
-/// One app-facing database handle for both deployment profiles. The logical
-/// request model is identical; only the final transaction driver changes.
-pub enum HybridDb {
+/// One opaque app-facing database handle for both deployment profiles. The
+/// logical request model is identical; only the final transaction driver
+/// changes. Provider identity is deliberately private so an application cannot
+/// unwrap this handle and bypass the admitted transaction boundary.
+///
+/// ```compile_fail
+/// use logical_db::admitted::HybridDb;
+///
+/// fn unwrap_provider(db: HybridDb) {
+///     let HybridDb::Embedded(_) = db;
+/// }
+/// ```
+pub struct HybridDb {
+    provider: HybridProvider,
+}
+
+enum HybridProvider {
     Embedded(LogicalDb),
     #[cfg(feature = "fdb")]
     Outboard(OutboardDb),
@@ -583,7 +597,9 @@ impl HybridDb {
     /// Open a zero-daemon, process-local database. This is useful for tests and
     /// ephemeral app state; use [`Self::embedded_at`] for durable embedding.
     pub fn embedded_memory(options: crate::fdb::DatabaseOptions) -> Result<Self> {
-        Ok(Self::Embedded(LogicalDb::open(options)?))
+        Ok(Self {
+            provider: HybridProvider::Embedded(LogicalDb::open(options)?),
+        })
     }
 
     /// Open a durable database inside the application process. The admitted
@@ -592,32 +608,32 @@ impl HybridDb {
         path: impl AsRef<std::path::Path>,
         options: crate::fdb::DatabaseOptions,
     ) -> Result<Self> {
-        Ok(Self::Embedded(LogicalDb::open_at(path, options)?))
-    }
-
-    pub fn embedded(db: LogicalDb) -> Self {
-        Self::Embedded(db)
+        Ok(Self {
+            provider: HybridProvider::Embedded(LogicalDb::open_at(path, options)?),
+        })
     }
 
     #[cfg(feature = "fdb")]
     pub fn outboard(db: OutboardDb) -> Self {
-        Self::Outboard(db)
+        Self {
+            provider: HybridProvider::Outboard(db),
+        }
     }
 
     /// Open the thin native client after the host has started FoundationDB's
     /// one-per-process network thread and retained its guard.
     #[cfg(feature = "fdb")]
     pub fn outboard_after_network_boot(options: crate::fdb::DatabaseOptions) -> Result<Self> {
-        Ok(Self::Outboard(OutboardDb::open_after_network_boot(
-            options,
-        )?))
+        Ok(Self {
+            provider: HybridProvider::Outboard(OutboardDb::open_after_network_boot(options)?),
+        })
     }
 
     pub async fn read_version(&self) -> Result<u64> {
-        match self {
-            Self::Embedded(db) => db.read_version(),
+        match &self.provider {
+            HybridProvider::Embedded(db) => db.read_version(),
             #[cfg(feature = "fdb")]
-            Self::Outboard(db) => db.read_version().await,
+            HybridProvider::Outboard(db) => db.read_version().await,
         }
     }
 
@@ -626,10 +642,10 @@ impl HybridDb {
         envelope: AdmittedTxn,
         batch: WriteBatch,
     ) -> Result<AdmittedOutcome<()>> {
-        match self {
-            Self::Embedded(db) => db.commit_admitted(envelope, batch).await,
+        match &self.provider {
+            HybridProvider::Embedded(db) => db.commit_admitted(envelope, batch).await,
             #[cfg(feature = "fdb")]
-            Self::Outboard(db) => db.commit_admitted(envelope, batch).await,
+            HybridProvider::Outboard(db) => db.commit_admitted(envelope, batch).await,
         }
     }
 
@@ -639,10 +655,10 @@ impl HybridDb {
         family: KeyFamily,
         tuple: &Tuple,
     ) -> Result<Option<Vec<u8>>> {
-        match self {
-            Self::Embedded(db) => db.get_admitted(envelope, family, tuple).await,
+        match &self.provider {
+            HybridProvider::Embedded(db) => db.get_admitted(envelope, family, tuple).await,
             #[cfg(feature = "fdb")]
-            Self::Outboard(db) => db.get_admitted(envelope, family, tuple).await,
+            HybridProvider::Outboard(db) => db.get_admitted(envelope, family, tuple).await,
         }
     }
 
@@ -652,10 +668,10 @@ impl HybridDb {
         after: Option<&ChangeToken>,
         limit: usize,
     ) -> Result<ChangePage> {
-        match self {
-            Self::Embedded(db) => db.changes_admitted(envelope, after, limit).await,
+        match &self.provider {
+            HybridProvider::Embedded(db) => db.changes_admitted(envelope, after, limit).await,
             #[cfg(feature = "fdb")]
-            Self::Outboard(db) => db.changes_admitted(envelope, after, limit).await,
+            HybridProvider::Outboard(db) => db.changes_admitted(envelope, after, limit).await,
         }
     }
 }

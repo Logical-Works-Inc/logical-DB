@@ -615,6 +615,20 @@ mod tests {
         assert_ne!(record, other_container.pack(KeyFamily::Record, &tuple));
         assert_ne!(record, other_zone.pack(KeyFamily::Record, &tuple));
         assert_ne!(record, base.pack(KeyFamily::Revision, &tuple));
+
+        for family in [
+            KeyFamily::Record,
+            KeyFamily::Revision,
+            KeyFamily::Change,
+            KeyFamily::Index,
+            KeyFamily::BlobRef,
+            KeyFamily::Outbox,
+        ] {
+            let decoded = ScopedKey::decode(&base.pack(family, &tuple)).unwrap();
+            assert_eq!(decoded.scope, base);
+            assert_eq!(decoded.family, family);
+            assert_eq!(decoded.tuple, tuple);
+        }
     }
 
     #[test]
