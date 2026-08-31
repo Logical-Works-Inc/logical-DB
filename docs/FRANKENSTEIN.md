@@ -63,12 +63,10 @@ The donor engines now compile and run under `organs/src/dump.rs`, one
 functional smoke each: fjall 3, redb 4, arroy 0.8 (+heed), fst,
 petgraph, memmap2, half. INV-ORGANS-COMPILE-AND-RUN: a donor that
 cannot pass here is recorded below, never silently dropped.
-`foundationdb` 0.11.0 (fdb-7_3) is pinned but `libfdb_c` is not
-vendored; `FdbBackend` file shim proves the crash story without a
-live `fdbserver`, delegating to the native binding when the host
-provides `libfdb_c`. No new engine was vendored for #16 — the shim
-reuses redb pages locally; integrity framing stays storage-internal,
-not a Braid CID.
+`foundationdb` 0.11.0 (fdb-7_3) is pinned but `libfdb_c` is not vendored.
+`LogicalDb` is the redb-backed embedded profile; `OutboardDb` is the actual
+native client. They share the admitted request and key model rather than
+pretending one backend delegates to the other.
 
 ## Sync-layer donors (web-grounded)
 
@@ -84,10 +82,10 @@ not a Braid CID.
   overshoot the target, then replays LTX files in TXID order; a TXID gap
   fails the restore outright.
   Source: litestream.io/how-it-works
-- Our shape: zone ≈ scope prefix on `(class,id)`; change token ≈ a ts
-  watermark row; op log ≈ claim-class rows ordered by versionstamp-style
-  ts; restore ≈ base snapshot + replay with a Litestream-style gap check;
-  conflict ≈ CloudKit three-way merge resolved toward the server copy.
+- Our shape: account/container/zone is the scope prefix; each admitted commit
+  atomically writes an opaque, versionstamped zone change token. Tokens page a
+  bounded change feed and are persisted by the client. Record-level merge
+  policy and token retention remain explicit gaps.
 
 ## Gaps (closure order)
 
@@ -100,8 +98,8 @@ not a Braid CID.
   segments per qdrant; fjall-style rotation.
 - G4 txns + savepoints (DB-D): FDB conflict window, redb tracker, the
   durable-before-restore invariant, INV-SIMULATE-THE-SPINE harness.
-- G5 scale-out adapter (DB-D/E): `FdbBackend` file shim LANDED (F1);
-  live FDB cluster parity via LEM tape (kernel#804) is the measured
-  remainder; clustering stays outboard — nothing embedded by default.
-- G6 sync layer (DB-E): zone prefixes, ts-watermark tokens, versionstamp
-  op log, snapshot+replay restore, three-way merge. The iCloud-style face.
+- G5 scale-out adapter (DB-D/E): native `OutboardDb` compiles; live FDB and
+  LEM parity receipts remain.
+- G6 sync layer (DB-E): zone prefixes, opaque durable tokens, bounded change
+  pages, and atomic operation markers landed. Retention, notifications,
+  record merge policy, and restore remain.

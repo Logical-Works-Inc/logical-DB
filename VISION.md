@@ -37,44 +37,32 @@ string-query surface, injection-class bugs structurally absent.
 
 ## The wall
 
-The honest wall, updated 2026-08-27: the kernel spine exists — row
-model, all five storage classes, randomized state-machine suite run on
-`FdbBackend` file shim vs MemKv oracle, corruption negative tests,
-Kani proofs, benchmark suite (`docs/FORMAT.md`), and two crash
-stories with one crash story each: `FdbBackend` canonical (file shim
-today, native `foundationdb` binding when `libfdb_c` present) plus the
-framed journal as MemKv oracle (journaled open refuses durable
-backends per INV-ONE-CRASH-STORY). F2 tuple namespaces
-(`cross_tenant_isolated`), F3 admitted envelope typestate, and #16
-opaque `contains_many` (bounded batch, deterministic dedup/order,
-continuation, tenant-isolated) are landed for kernel#804. ADR-002
-ratifies FDB as canonical after parity; F0 recipe ships
- (`scripts/local-fdb-cluster.sh` — verified 2026-08-27 host
- `/tmp/fdb-f0` arm64 7.3.79; source at `~/Downloads/foundationdb-7.3.77`,
- linux runtime `foundationdb/foundationdb:7.3.x`). What is still
- ahead: LEM tape parity (logic-os-kernel#804) — live `FdbBackend`
- `get/set/clear + ordered range` already proven in
- `kernel/tests/fdb_live.rs:live_fdb_cluster_roundtrip`; remaining
- is the full FactStore consumer slice — segment packing,
-mmap-first reads, hydration. Compute-fraction claims carry mechanism
-and measurement in the benchmark artifact; filesystem (§9), packs
-(§10), GNN (§8) remain design intent until their phases land. No
-`Cid`/Braid type is claimed here; integrity is storage-internal.
-Trust state: FUNCTIONAL for the shipped surface.
+The honest wall, updated 2026-08-31: the row model, five compatibility
+classes, corruption tests, Kani proofs, and benchmark suite exist. Hybrid v2
+adds one app-facing layer over two transaction drivers: embedded redb and the
+native FoundationDB client. Account/container/zone is the ownership axis;
+record, revision, change, index, blob-reference, and outbox families are
+disjoint beneath it. Every admitted write consumes Braid's opaque
+`RunnableInvocation`, binds its snapshot to the exact read version, and
+atomically records both an idempotency marker and a resumable zone change.
+
+What is not yet proven is equally important. The native adapter compiles but
+has not passed the live cluster parity journey on this branch. The LEM adapter
+and its tape receipt do not exist here. Change-token retention/compaction,
+large-blob transfer, schema evolution, backup/export, and account erasure are
+contracts still to implement. The legacy migration primitive maps v1 rows
+losslessly into a chosen v2 scope, but a production migration runner and
+cutover receipt remain open. This is a real database kernel, not yet a complete
+iCloud or Drive service.
 
 ## Sequence
 
-Landed: DB-A kernel spine → DB-B record+edge → DB-C term → DB-D vec →
-DB-E claim/metadata → redb production backend + MemKv parity
-(issue #6 §5) → FDB canonical migration F0 recipe (ships) → F1
-`FdbBackend` file shim → F2 tuple namespaces
-(`cross_tenant_isolated`) → F3 admitted envelope typestate → #16
-opaque `contains_many` (bounded batch, continuation, tenant-isolated)
-for kernel#804. Next: parity via LEM tape on a live FDB cluster
-(logic-os-kernel#804 / #801) — not a second F4 doc bump before
-receipt — then segment packing, mmap, hydration per
-`docs/DB_PATHWAY.md` §5–§6 and ADR-002. HelixDB interop stays
-outboard. Filesystem and GNN faces ride on later phases.
+Landed locally: kernel spine → five compatibility classes → redb and MemKv
+recovery proofs → tuple namespaces → Braid-bound admitted batches → hybrid v2
+scope and key families → native FDB adapter → durable zone change tokens → v1
+copy primitive. Next: live FDB semantic parity, then the LEM consumer and tape
+receipt, then token retention, blob transfer, schema evolution, export/erase,
+and the later segment/mmap/hydration work in `docs/DB_PATHWAY.md`.
 
 ## Day-1 invariants
 

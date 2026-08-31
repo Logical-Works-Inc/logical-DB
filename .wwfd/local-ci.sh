@@ -13,13 +13,15 @@
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PLAN="$HOME/keel/keel-core/target/release/keel-ci-plan"
+PLAN="${KEEL_CI_PLAN_BIN:-$HOME/keel/keel-core/target/release/keel-ci-plan}"
 [ -x "$PLAN" ] || {
-  echo "FAIL keel-ci-plan binary missing at $PLAN — build keel first." >&2
+  echo "FAIL compatible keel-ci-plan binary missing at $PLAN." >&2
+  echo "     Set KEEL_CI_PLAN_BIN to the renderer locked in ci/keel-ci.toml." >&2
   exit 1
 }
 
 cd "$REPO_ROOT"
+"$PLAN" check
 if "$PLAN" run "${1:-@}" "${2:-origin/main}"; then
   printf '{"repo_root":"%s","branch":"%s","head":"%s","ts":"%s"}\n' \
     "$REPO_ROOT" \

@@ -45,6 +45,26 @@ pub enum KernelError {
     MalformedTuple,
     /// A subspace or tenant prefix was violated (INV-TENANT-PREFIX, F2).
     TenantPrefixViolation,
+    /// A hybrid scope axis was empty or exceeded its persistent-wire ceiling.
+    ScopeIdInvalid {
+        axis: &'static str,
+        len: usize,
+        limit: usize,
+    },
+    /// A key names a format revision this binary cannot safely interpret.
+    UnsupportedFormatVersion(u8),
+    /// Braid's runnable proof was prepared for a different state snapshot.
+    BraidSnapshotMismatch,
+    /// One Braid invocation identity was replayed as a different operation.
+    BraidInvocationConsumed,
+    /// The Braid snapshot does not carry the exact Logical-DB read version.
+    MissingDatabaseVersionFact,
+    /// The storage version cannot be represented by Braid's signed integer fact.
+    DatabaseVersionOutOfRange(u64),
+    /// A declared operation identifier was already committed with other bytes.
+    OperationIdConflict,
+    /// A bounded public range requested an invalid number of rows.
+    RangeLimitInvalid { requested: usize, limit: usize },
     /// INV-AUTHORITY-SCOPE violated: authority does not cover namespace or effect (F3).
     AuthorityScopeViolation,
     /// INV-JUSTIFICATION-FRESH violated: stale justification bound version does not match snapshot/frontier (F3).
@@ -117,6 +137,37 @@ impl fmt::Display for KernelError {
             KernelError::TenantPrefixViolation => {
                 write!(f, "tenant prefix violation")
             }
+            KernelError::ScopeIdInvalid { axis, len, limit } => write!(
+                f,
+                "{axis} id length {len} is outside the allowed range 1..={limit}"
+            ),
+            KernelError::UnsupportedFormatVersion(version) => {
+                write!(f, "unsupported logical-db format version {version:#04x}")
+            }
+            KernelError::BraidSnapshotMismatch => {
+                write!(f, "Braid runnable proof is bound to a different snapshot")
+            }
+            KernelError::BraidInvocationConsumed => {
+                write!(
+                    f,
+                    "Braid invocation was already consumed by another operation"
+                )
+            }
+            KernelError::MissingDatabaseVersionFact => write!(
+                f,
+                "Braid snapshot does not bind logical_db.read_version to the database version"
+            ),
+            KernelError::DatabaseVersionOutOfRange(version) => write!(
+                f,
+                "database version {version} exceeds Braid's signed integer fact range"
+            ),
+            KernelError::OperationIdConflict => {
+                write!(f, "operation id was already committed with different bytes")
+            }
+            KernelError::RangeLimitInvalid { requested, limit } => write!(
+                f,
+                "range limit {requested} is outside the allowed range 1..={limit}"
+            ),
             KernelError::AuthorityScopeViolation => {
                 write!(
                     f,

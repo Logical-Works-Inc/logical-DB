@@ -1,0 +1,5 @@
+[net]
+# Cargo's libgit2 transport cannot use the Director's SSH agent reliably.
+# The CLI path is the same authenticated path used by repository operations and
+# keeps exact-revision Braid dependencies reproducible in fresh workspaces.
+git-fetch-with-cli = true

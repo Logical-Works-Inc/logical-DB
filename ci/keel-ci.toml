@@ -1,13 +1,16 @@
 # logical-DB CI plan — rendered to .github/workflows/ci.yml by keel-ci-plan.
 #
 # Regenerate after ANY edit to this file (the rendered workflow is canonical).
-# keel-ci-plan needs ci/keel-ci.toml AND a keel-core/Cargo.toml marker in the
-# repo root; this repo deliberately has no keel-core crate yet. Stage a root:
+# Renderer source is locked to Keel commit
+# c129d042884ddcee09c855b6d3c13112bae3bd28, the last compatible compiled
+# ci-plan implementation before Keel retired that control plane. The plan and
+# rendered workflow remain byte-locked even if the executable is supplied via
+# KEEL_CI_PLAN_BIN. To regenerate without mutating the checkout, stage a root:
 #   root=$(mktemp -d)
 #   cp -R ci "$root/ci"; mkdir "$root/keel-core"
 #   printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' \
 #     > "$root/keel-core/Cargo.toml"
-#   (cd "$root" && "$HOME/keel/keel-core/target/release/keel-ci-plan" generate)
+#   (cd "$root" && "$KEEL_CI_PLAN_BIN" generate)
 #   cp "$root/.github/workflows/ci.yml" .github/workflows/ci.yml
 # The `ci-plan-current` job below enforces exactly this byte-equality in CI.
 #
@@ -346,7 +349,10 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo kani -p logical-db'''
+# Kani 0.67 is pinned to Rust 1.93. Prove the storage codec/journal graph
+# without the Rust-1.98 Braid integration; normal test/clippy lanes compile
+# and exercise the default Braid surface.
+cargo kani -p logical-db --no-default-features'''
 
 [[job]]
 id = "mutation-test-verify"
@@ -432,9 +438,9 @@ name = "Regenerate and byte-check GitHub Actions"
 condition = "success()"
 kind = "run"
 run = '''set -eu
-plan_bin="$HOME/keel/keel-core/target/release/keel-ci-plan"
+plan_bin="${KEEL_CI_PLAN_BIN:-$HOME/keel/keel-core/target/release/keel-ci-plan}"
 if [ ! -x "$plan_bin" ]; then
-  echo "FAIL keel-ci-plan binary not found at $plan_bin — build keel first." >&2
+  echo "FAIL compatible keel-ci-plan binary not found at $plan_bin." >&2
   exit 1
 fi
 root="$(mktemp -d)"

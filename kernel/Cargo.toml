@@ -12,12 +12,21 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # and JSON serialization come from it rather than as direct deps. serde
 # stays direct solely because derive expansion requires it (see root).
 lgwks_std = { workspace = true }
+braid-ir = { workspace = true, optional = true }
+braid-flow-plan = { workspace = true, optional = true }
+braid-run = { workspace = true, optional = true }
 redb = "4.2.0"
 serde = { workspace = true }
 foundationdb = { version = "=0.11.0", optional = true }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "rt-multi-thread"] }
 
 [features]
+default = ["embedded", "braid"]
+# The same processing/key/admission layer runs against an in-process redb file
+# or an outboard FDB client. `embedded` names the zero-daemon deployment, not a
+# second logical model.
+embedded = []
+braid = ["dep:braid-flow-plan", "dep:braid-ir", "dep:braid-run"]
 # FDB pivot (ADR-002, issue #10 F1): native transaction surface behind a
 # feature flag. No second transaction abstraction; fdb-7_3 is the pinned
 # API surface (INV-FDB-PIN). Zero regression without the flag.
@@ -31,6 +40,10 @@ fdb = [
 ]
 
 [dev-dependencies]
+braid-capability = { workspace = true }
+braid-flow-ir = { workspace = true }
+braid-flow-plan = { workspace = true }
+braid-verify = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 # Plain-binary benchmark suite (issue #6 §9): stdlib timing, JSONL

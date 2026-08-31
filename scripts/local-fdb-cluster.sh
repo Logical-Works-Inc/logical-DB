@@ -28,10 +28,20 @@ cli() { "$BIN/fdbcli" -C "$CLUSTER" --exec "$1"; }
 
 wait_available() {
     for _ in $(seq 1 60); do
-        cli 'status minimal' 2>/dev/null | grep -q available && return 0
+        cli 'status minimal' 2>/dev/null \
+            | grep -Fxq 'The database is available.' && return 0
         sleep 1
     done
     die "server not available within 60s"
+}
+
+wait_coordinator() {
+    for _ in $(seq 1 60); do
+        cli 'status minimal' 2>/dev/null \
+            | grep -Fq 'The database is' && return 0
+        sleep 1
+    done
+    die "coordinator not reachable within 60s"
 }
 
 # ── verify ───────────────────────────────────────────────────────
@@ -54,7 +64,8 @@ cmd_verify() {
 }
 
 stage() {
-    [ -x "$BIN/fdbserver" ] && return 0
+    [ -x "$BIN/fdbserver" ] && [ -x "$BIN/fdbcli" ] \
+        && [ -f "$BIN/libfdb_c.dylib" ] && return 0
     mkdir -p "$BIN"
     local pkg="FoundationDB-${FDB_VERSION}_arm64.pkg"
     pkgutil --expand-full "$SCRATCH/$pkg" "$SCRATCH/expanded" || die "pkg expand failed (INV-FDB-PIN)"
@@ -77,7 +88,7 @@ cmd_up() {
         -d "$SCRATCH/data" -L "$SCRATCH/logs" \
         >"$SCRATCH/server.out" 2>&1 &
     echo $! > "$PIDFILE"
-    wait_available
+    wait_coordinator
     if [ ! -f "$SCRATCH/.configured" ]; then
         if [ -n "$(find "$SCRATCH/data" -maxdepth 1 -type f 2>/dev/null | head -n1)" ]; then
             touch "$SCRATCH/.configured"
@@ -86,6 +97,7 @@ cmd_up() {
             touch "$SCRATCH/.configured"
         fi
     fi
+    wait_available
     echo "up: pid $(cat "$PIDFILE") cluster $CLUSTER bin $BIN"
 }
 

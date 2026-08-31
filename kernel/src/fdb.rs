@@ -1,19 +1,10 @@
-//! FDB native surface — issue #10 F1, ADR-002.
+//! Embedded transactional driver and compatibility FDB-shaped primitives.
 //!
-//! Tiny boring wrapper over the pinned `foundationdb` binding (0.11.0,
-//! fdb-7_3 API). This is the post-parity canonical port: ordered
-//! transactional KV, MVCC conflicts, durability, and versionstamps come
-//! from Apple FDB; Logical-DB owns only the namespace/typed-error
-//! boundary. `KvPort::apply_batch` shape cannot carry watches, snapshot
-//! reads, or conflict ranges without pollution — this surface replaces
-//! it after parity, kept behind the `fdb` feature so `--no-default`
-//! builds have zero regression.
-//!
-//! INV-FDB-PIN: the binding version and fdb-7_3 API surface are pinned
-//! via `kernel/Cargo.toml`; bumps happen on a named upstream commit
-//! only. INV-FDB-SINGLE-SURFACE: after F4 retirement no second
-//! transaction abstraction exists. Limits are enforced at our boundary
-//! BEFORE the C client sees the op, with stable typed errors.
+//! [`LogicalDb`] runs in-process over memory or redb and is the zero-daemon
+//! deployment profile. The native FoundationDB driver is [`crate::admitted::OutboardDb`]
+//! behind the `fdb` feature. Both are reached through the admitted hybrid API;
+//! a configured cluster path is rejected here rather than silently opening an
+//! embedded database.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
@@ -25,8 +16,8 @@ use redb::{ReadableDatabase, ReadableTable};
 use crate::port::{ClockPort, DurableKv, KvPort};
 use crate::{KernelError, Result};
 
-// Re-export the pinned crate so `cargo tree --features fdb` proves the
-// pin; the crate itself owns the unsafe C-client boundary.
+// Keep the pinned binding in this feature graph; admitted::OutboardDb owns the
+// actual client calls and the crate owns the unsafe C-client boundary.
 #[cfg(feature = "fdb")]
 use foundationdb as _;
 
@@ -37,13 +28,13 @@ const MAX_RETRY_ATTEMPTS: usize = 5;
 const VERSIONSTAMP_PLACEHOLDER_LEN: usize = 10;
 
 #[derive(Debug, Clone)]
-pub struct FdbConfig {
+pub struct DatabaseOptions {
     pub cluster_file: Option<String>,
     pub transaction_timeout_ms: u64,
     pub transaction_size_limit_bytes: usize,
 }
 
-impl Default for FdbConfig {
+impl Default for DatabaseOptions {
     fn default() -> Self {
         Self {
             cluster_file: None,
@@ -52,6 +43,10 @@ impl Default for FdbConfig {
         }
     }
 }
+
+/// Compatibility name for callers written before ADR-003. A cluster path is
+/// never silently treated as an embedded database; see [`LogicalDb::open`].
+pub type FdbConfig = DatabaseOptions;
 
 // ── Atomic op ──────────────────────────────────────────────────
 
@@ -108,15 +103,18 @@ type WatchMap = HashMap<Vec<u8>, WatchSenders>;
 type SnapshotMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
 pub struct LogicalDb {
-    config: FdbConfig,
-    pub(crate) backend: Arc<Mutex<FdbBackend>>,
+    config: DatabaseOptions,
+    pub(crate) backend: Arc<Mutex<EmbeddedBackend>>,
     #[allow(clippy::type_complexity)]
     pub(crate) watches: Arc<Mutex<WatchMap>>,
 }
 
 impl LogicalDb {
-    pub fn open(config: FdbConfig) -> Result<Self> {
-        let backend = FdbBackend::new_mem_shim();
+    /// In-memory processing profile. Supplying an FDB cluster path is an
+    /// error: embedded execution must never masquerade as an outboard client.
+    pub fn open(config: DatabaseOptions) -> Result<Self> {
+        reject_outboard_config(&config)?;
+        let backend = EmbeddedBackend::new_mem_shim();
         Ok(Self {
             config,
             backend: Arc::new(Mutex::new(backend)),
@@ -124,11 +122,12 @@ impl LogicalDb {
         })
     }
 
-    /// File-backed durable open — same crash story as `FdbBackend::open`
+    /// File-backed durable open — same crash story as `EmbeddedBackend::open`
     /// (redb transaction per commit). Used for local-dev durability
     /// rehearsal without a live fdbserver.
-    pub fn open_at(path: impl AsRef<Path>, config: FdbConfig) -> Result<Self> {
-        let backend = FdbBackend::open(path)?;
+    pub fn open_at(path: impl AsRef<Path>, config: DatabaseOptions) -> Result<Self> {
+        reject_outboard_config(&config)?;
+        let backend = EmbeddedBackend::open(path)?;
         // Validate durable metadata before exposing the handle. Corruption is
         // not a fresh database and must never be reset to version zero.
         backend.committed_version()?;
@@ -139,14 +138,11 @@ impl LogicalDb {
         })
     }
 
-    pub fn config(&self) -> &FdbConfig {
+    pub fn config(&self) -> &DatabaseOptions {
         &self.config
     }
 
-    /// Async transact with retry loop delegated to FDB's transaction
-    /// error machinery. Retryable error is `TransactionConflict`; all
-    /// other errors are returned immediately. Limits are enforced
-    /// BEFORE the binding (INV-FDB-PIN).
+    /// Embedded transaction with bounded optimistic retries.
     pub async fn transact<F, T>(&self, mut f: F) -> Result<T>
     where
         F: FnMut(&mut FdbTransaction) -> Result<T>,
@@ -368,7 +364,7 @@ impl LogicalDb {
         Ok((backend.committed_version()?, backend.snapshot_map()?))
     }
 
-    fn lock_backend(&self) -> Result<MutexGuard<'_, FdbBackend>> {
+    fn lock_backend(&self) -> Result<MutexGuard<'_, EmbeddedBackend>> {
         self.backend
             .lock()
             .map_err(|_| KernelError::StateLockPoisoned { lock: "backend" })
@@ -378,6 +374,17 @@ impl LogicalDb {
         self.watches
             .lock()
             .map_err(|_| KernelError::StateLockPoisoned { lock: "watches" })
+    }
+}
+
+fn reject_outboard_config(config: &DatabaseOptions) -> Result<()> {
+    if config.cluster_file.is_some() {
+        Err(KernelError::Backend(
+            "cluster_file requires the native FoundationDB client profile; embedded open refuses fallback"
+                .into(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1006,14 +1013,14 @@ fn fdb_committed_version(db: &redb::Database) -> Result<u64> {
     Ok(version)
 }
 
-pub struct FdbBackend {
+pub struct EmbeddedBackend {
     inner: crate::memkv::MemKv,
     size_limit_bytes: usize,
     committed: u64,
     db: Option<redb::Database>,
 }
 
-impl FdbBackend {
+impl EmbeddedBackend {
     pub fn new_mem_shim() -> Self {
         Self {
             inner: crate::memkv::MemKv::default(),
@@ -1032,12 +1039,8 @@ impl FdbBackend {
         }
     }
 
-    /// File-backed durable shim — same crash story as RedbBackend
-    /// (one redb transaction per batch, version row co-committed),
-    /// so restart preservation can be demonstrated without a live
-    /// fdbserver. Uses redb as the local durability substrate; the
-    /// FDB-native path replaces this file with the cluster when
-    /// available.
+    /// File-backed embedded store: one redb transaction per batch with the
+    /// committed version in the same durability boundary.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = redb::Database::create(path).map_err(fdb_backend_err)?;
         let committed = fdb_committed_version(&db)?;
@@ -1149,7 +1152,7 @@ impl FdbBackend {
     }
 }
 
-impl KvPort for FdbBackend {
+impl KvPort for EmbeddedBackend {
     fn is_durable(&self) -> bool {
         true
     }
@@ -1229,7 +1232,7 @@ impl KvPort for FdbBackend {
     }
 }
 
-impl DurableKv for FdbBackend {
+impl DurableKv for EmbeddedBackend {
     fn committed_version(&self) -> Result<u64> {
         if let Some(db) = &self.db {
             fdb_committed_version(db)
@@ -1238,6 +1241,10 @@ impl DurableKv for FdbBackend {
         }
     }
 }
+
+/// Compatibility alias for the pre-ADR-003 name. This is a redb-backed
+/// embedded provider, not a FoundationDB client.
+pub type FdbBackend = EmbeddedBackend;
 
 #[cfg(test)]
 mod tests {

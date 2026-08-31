@@ -3,8 +3,18 @@ resolver = "2"
 members = ["kernel"]
 
 [workspace.dependencies]
-# Pinned to the Braid commit that declares the truthful MSRV 1.93
-# (INV-KANI-MSRV-BRIDGE) so the keel Proof tier can resolve this graph.
+# One exact Braid authority revision for primitives, admission, planning, and
+# execution binding. Consumers must never mix Cid/proof types from different
+# Braid revisions in one transaction boundary.
+braid-ir = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
+braid-run = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
+braid-verify = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
+braid-capability = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
+braid-flow-ir = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
+braid-flow-plan = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
+# The storage-only graph stays on Braid's MSRV bridge so Kani 0.67 can prove
+# it with Rust 1.93. Braid proof types above remain one exact 41c revision;
+# lgwks_std is not exchanged across that boundary.
 lgwks_std = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "5b5e1cd19bc2", features = [
   "hash",
   "json",

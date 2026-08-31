@@ -23,6 +23,7 @@ process files; among these files, `operating-model.md` dictates precedence.
 |-----|--------|------------------|
 | **ADR-001** | Authority | PROPOSED — owns the one model. |
 | **ADR-002** | Substrate | ACCEPTED — FDB canonical; parity-before-delete. |
+| **ADR-003** | Hybrid API | ACCEPTED — one admitted layer; redb or FDB. |
 
 ## Process lineage
 

@@ -1,0 +1,156 @@
+# Approved dependency edges — the semantic contract for INV-DEP-EDGE-OWNED.
+#
+# A crate reaches this file only after the ladder in `lgwks-gate tiers` has been
+# climbed and every rung above a dependency was rejected for a stated reason.
+# Adding a block here is an approval; the commit that adds it is the signature.
+#
+# ELIMINATE and CONSOLIDATE crates never appear here. They become a module in
+# `lgwks_std` instead, which is why `tier` admits only `boundary` and `vendor`.
+
+[policy]
+# Fail-closed. Set to false only while a repo is being brought onto the gate,
+# and only in a diff a human signed off — refusals then report as warnings.
+enforce = true
+# Canonical repository URL. A workspace member declaring a different repository
+# is a copied foreign crate and must be consumed as a released dependency.
+repository = "https://github.com/srinji-kaggss/logical-DB"
+
+[[approved]]
+crate = "braid-ir"
+tier = "boundary"
+version = "*"
+owner = "logical-db"
+capability = "braid.identity"
+source = "git"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal"
+reason = "Braid is the estate authority for CIDs and canonical invocation IR."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "laws/governance/adr-003-hybrid-client-embedding-braid.md"
+
+[[approved]]
+crate = "braid-run"
+tier = "boundary"
+version = "*"
+owner = "logical-db"
+capability = "braid.runnable-proof"
+source = "git"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal"
+reason = "Only Braid can construct the opaque runnable authority consumed here."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "laws/governance/adr-003-hybrid-client-embedding-braid.md"
+
+[[approved]]
+crate = "braid-flow-plan"
+tier = "boundary"
+version = "*"
+owner = "logical-db"
+capability = "braid.snapshot-binding"
+source = "git"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal,dev"
+reason = "Logical-DB binds writes to Braid's immutable Flow snapshot type."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "laws/governance/adr-003-hybrid-client-embedding-braid.md"
+
+[[approved]]
+crate = "braid-capability"
+tier = "boundary"
+version = "*"
+owner = "logical-db"
+capability = "braid.test-capability"
+source = "git"
+allowed_consumers = "logical-db"
+allowed_kinds = "dev"
+reason = "Tests must construct real Braid capability sets rather than fakes."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "kernel/src/admitted.rs"
+
+[[approved]]
+crate = "braid-flow-ir"
+tier = "boundary"
+version = "*"
+owner = "logical-db"
+capability = "braid.test-predicate"
+source = "git"
+allowed_consumers = "logical-db"
+allowed_kinds = "dev"
+reason = "Tests prove admission with Braid's real predicate language."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "kernel/src/admitted.rs"
+
+[[approved]]
+crate = "braid-verify"
+tier = "boundary"
+version = "*"
+owner = "logical-db"
+capability = "braid.test-admission"
+source = "git"
+allowed_consumers = "logical-db"
+allowed_kinds = "dev"
+reason = "Tests obtain admission proofs from Braid's verifier boundary."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "kernel/src/admitted.rs"
+
+[[approved]]
+crate = "foundationdb"
+tier = "boundary"
+version = "=0.11.0"
+owner = "logical-db"
+capability = "storage.outboard-fdb"
+source = "registry"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal"
+reason = "The FDB C API is the required distributed transaction boundary."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "laws/governance/adr-002-foundationdb-substrate.md"
+
+[[approved]]
+crate = "redb"
+tier = "boundary"
+version = "^4.2.0"
+owner = "logical-db"
+capability = "storage.embedded-redb"
+source = "registry"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal"
+reason = "redb supplies the crash-safe in-process transaction substrate."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "laws/governance/adr-003-hybrid-client-embedding-braid.md"
+
+[[approved]]
+crate = "serde"
+tier = "boundary"
+version = "^1"
+owner = "logical-db"
+capability = "wire.derive"
+source = "registry"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal"
+reason = "Derive-based compatibility codecs require compiler expansion."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "docs/FORMAT.md"
+
+[[approved]]
+crate = "tokio"
+tier = "boundary"
+version = "^1"
+owner = "logical-db"
+capability = "runtime.async-client"
+source = "registry"
+allowed_consumers = "logical-db"
+allowed_kinds = "normal,dev"
+reason = "Async FDB calls, watches, and bounded timers require an executor."
+approved_by = "Director"
+approved_on = "2026-08-31"
+review = "laws/governance/adr-003-hybrid-client-embedding-braid.md"

@@ -79,6 +79,73 @@ dependencies = [
 ]
 
 [[package]]
+name = "braid-capability"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "braid-flow-ir"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "braid-ir",
+]
+
+[[package]]
+name = "braid-flow-plan"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "braid-flow-ir",
+ "braid-flow-verify",
+ "braid-ir",
+]
+
+[[package]]
+name = "braid-flow-verify"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "braid-flow-ir",
+ "braid-ir",
+]
+
+[[package]]
+name = "braid-ir"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "blake3",
+ "braid-capability",
+]
+
+[[package]]
+name = "braid-run"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "braid-capability",
+ "braid-flow-ir",
+ "braid-flow-plan",
+ "braid-ir",
+ "braid-verify",
+ "lgwks_std 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "braid-verify"
+version = "0.1.0"
+source = "git+https://github.com/srinji-kaggss/Braid.git?rev=41c1a9cf2299abefd1573fecc50a2622ee41b326#41c1a9cf2299abefd1573fecc50a2622ee41b326"
+dependencies = [
+ "blake3",
+ "braid-capability",
+ "braid-ir",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -355,6 +422,12 @@ dependencies = [
 [[package]]
 name = "lgwks_std"
 version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a0efb0e7bb1bab681311540040d80a2d9fae5a1c4a1ef4af8f916774c039c44"
+
+[[package]]
+name = "lgwks_std"
+version = "0.5.1"
 source = "git+https://github.com/srinji-kaggss/Braid.git?rev=5b5e1cd19bc2#5b5e1cd19bc21a93ca4af691864cd7a135a19f47"
 dependencies = [
  "blake3",
@@ -388,8 +461,14 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "logical-db"
 version = "0.1.0"
 dependencies = [
+ "braid-capability",
+ "braid-flow-ir",
+ "braid-flow-plan",
+ "braid-ir",
+ "braid-run",
+ "braid-verify",
  "foundationdb",
- "lgwks_std",
+ "lgwks_std 0.5.1 (git+https://github.com/srinji-kaggss/Braid.git?rev=5b5e1cd19bc2)",
  "redb",
  "serde",
  "tokio",

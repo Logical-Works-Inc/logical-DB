@@ -11,17 +11,18 @@
 
 pub use lgwks_std;
 
+#[cfg(feature = "braid")]
 pub mod address;
 pub mod adjacency;
-#[cfg(feature = "fdb")]
+#[cfg(feature = "braid")]
 pub mod admitted;
 pub mod claim;
 pub mod contains;
 pub mod error;
-#[cfg(feature = "fdb")]
 pub mod fdb;
 pub mod journal;
 pub mod memkv;
+pub mod migration;
 pub mod model;
 pub mod port;
 pub mod record;
