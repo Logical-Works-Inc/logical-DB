@@ -12,9 +12,14 @@ released. The default build supports in-memory and durable embedded profiles.
 feature adds `OutboardDb`, which drives the pinned FoundationDB 7.3 client
 without giving applications a raw database handle. `HybridDb` exposes the common
 `read_version`, `commit_admitted`, `get_admitted`, and `changes_admitted`
-surface. Effectful operations consume a real Braid `RunnableInvocation`;
-namespace authority remains external and scope-bound. Every commit writes its
-data, operation marker, and ordered change row atomically.
+surface. Effectful operations consume a real Braid `RunnableInvocation`; its
+snapshot and predicate prove the canonical CID of the exact database request.
+`BraidExecutionBinding::inspect` also derives the exact Logical-DB capability
+set and strongest effect from the capsule and registry; read, delete, and
+unrelated write capsules cannot authorize a put request.
+Namespace authority remains external and scope-bound. Every commit atomically
+writes its data, private markers, zone conflict frontier, and ordered change
+row.
 
 The older five-class journal model remains available as a compatibility and
 fault-oracle layer. It is not the hybrid app API. Migration begins with the
@@ -22,6 +27,30 @@ lossless `LegacyV1Point` copy primitive and follows copy, verify, cutover;
 source deletion is deliberately outside that primitive. The live native-FDB
 test exercises the hybrid API; a green remote Linux receipt and an LEM
 consumer receipt are still required before this branch is production-ready.
+
+## Embedding contract
+
+Applications do not receive a raw KV or provider handle. They first build a
+bounded logical request from `Scope`, a public `KeyFamily`, `Tuple`,
+`OperationId`, and, for writes, `WriteBatch`. That request yields a
+`RequestBinding`. Braid puts its CID in `logical_db.request_cid`, proves exact
+equality in the justification, and snapshots `logical_db.read_version`. The
+trusted host inspects the capsule and registry into a
+`BraidExecutionBinding`, then moves the `AdmittedTxn` and exact request into
+`HybridDb`.
+
+`HybridDb::embedded_at` executes the layer in the app process over redb.
+`HybridDb::outboard` executes the identical layer beside the official FDB
+client. A future CloudKit-shaped HTTP or device-sync adapter belongs above this
+boundary and must reconstruct these request bytes rather than add a second
+database model. Internal change/outbox families and raw transactions are
+sealed; `legacy-raw` is an explicit migration escape hatch.
+
+Both providers enforce the configured timeout before storage work begins.
+FoundationDB additionally enforces it inside the native transaction. Embedded
+execution will not report a timeout after durable mutation has started; it
+returns the real commit outcome. Native uncertainty is a typed
+`CommitOutcomeUnknown` and requires retrying the same operation ID and bytes.
 
 ## Try it
 

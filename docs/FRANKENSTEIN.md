@@ -98,8 +98,8 @@ pretending one backend delegates to the other.
   segments per qdrant; fjall-style rotation.
 - G4 txns + savepoints (DB-D): FDB conflict window, redb tracker, the
   durable-before-restore invariant, INV-SIMULATE-THE-SPINE harness.
-- G5 scale-out adapter (DB-D/E): native `OutboardDb` compiles; live FDB and
-  LEM parity receipts remain.
+- G5 scale-out adapter (DB-D/E): native `OutboardDb` compiles and the local
+  FDB 7.3 hybrid journey passes; remote Linux and LEM parity receipts remain.
 - G6 sync layer (DB-E): zone prefixes, opaque durable tokens, bounded change
   pages, and atomic operation markers landed. Retention, notifications,
   record merge policy, and restore remain.

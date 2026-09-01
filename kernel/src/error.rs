@@ -36,6 +36,19 @@ pub enum KernelError {
     /// The durable backend (issue #6 §5) refused an operation; the
     /// message names the backend-level cause.
     Backend(String),
+    /// Database options violate a provider-neutral deployment invariant.
+    ConfigurationInvalid(&'static str),
+    /// The native provider cancelled an in-flight operation.
+    BackendCancelled,
+    /// The native provider is temporarily unavailable.
+    BackendUnavailable { code: i32 },
+    /// The client/server API or protocol versions cannot interoperate.
+    BackendVersionSkew { code: i32 },
+    /// The native provider reported a timeout before a logical receipt existed.
+    BackendTimedOut { code: i32 },
+    /// The native provider cannot determine whether a commit became durable.
+    /// Callers must retry the exact same operation identifier and request.
+    CommitOutcomeUnknown { code: i32 },
     /// FDB transaction exceeded the explicit size limit (issue #10 F1).
     /// Returned BEFORE the binding sees the op (INV-FDB-PIN).
     TransactionTooLarge { size: usize, limit: usize },
@@ -59,6 +72,16 @@ pub enum KernelError {
     BraidInvocationConsumed,
     /// The Braid snapshot does not carry the exact Logical-DB read version.
     MissingDatabaseVersionFact,
+    /// The Braid snapshot does not carry a canonical Logical-DB request CID.
+    MissingDatabaseRequestFact,
+    /// The Braid justification predicate does not prove the request CID fact.
+    BraidRequestPredicateMismatch,
+    /// The runnable capsule or registry differs from the inspected Braid plan.
+    BraidExecutionBindingMismatch,
+    /// The runnable capsule's strongest effect does not cover the DB request.
+    BraidEffectMismatch,
+    /// The request executed by Logical-DB differs from the Braid-bound plan.
+    RequestPlanMismatch,
     /// The storage version cannot be represented by Braid's signed integer fact.
     DatabaseVersionOutOfRange(u64),
     /// A declared operation identifier was already committed with other bytes.
@@ -73,6 +96,8 @@ pub enum KernelError {
     ContainsBudgetInvalid(String),
     /// A single opaque key exceeds `max_key_bytes` (issue #16 §3).
     KeyTooLarge { len: usize, limit: usize },
+    /// A single value exceeds FoundationDB's provider-neutral value ceiling.
+    ValueTooLarge { len: usize, limit: usize },
     /// A continuation token is malformed or does not correspond to a valid resume point.
     InvalidContinuation(String),
     /// FDB transaction conflict: read set invalidated by a concurrent
@@ -122,6 +147,23 @@ impl fmt::Display for KernelError {
                 )
             }
             KernelError::Backend(msg) => write!(f, "durable backend: {msg}"),
+            KernelError::ConfigurationInvalid(reason) => {
+                write!(f, "database configuration invalid: {reason}")
+            }
+            KernelError::BackendCancelled => write!(f, "native database operation cancelled"),
+            KernelError::BackendUnavailable { code } => {
+                write!(f, "native database unavailable (error {code})")
+            }
+            KernelError::BackendVersionSkew { code } => {
+                write!(f, "native database version skew (error {code})")
+            }
+            KernelError::BackendTimedOut { code } => {
+                write!(f, "native database operation timed out (error {code})")
+            }
+            KernelError::CommitOutcomeUnknown { code } => write!(
+                f,
+                "native commit outcome is unknown (error {code}); retry the exact same operation id"
+            ),
             KernelError::TransactionTooLarge { size, limit } => write!(
                 f,
                 "fdb transaction too large: {size} bytes exceeds limit {limit}"
@@ -157,6 +199,26 @@ impl fmt::Display for KernelError {
                 f,
                 "Braid snapshot does not bind logical_db.read_version to the database version"
             ),
+            KernelError::MissingDatabaseRequestFact => write!(
+                f,
+                "Braid snapshot does not bind logical_db.request_cid to a canonical request"
+            ),
+            KernelError::BraidRequestPredicateMismatch => write!(
+                f,
+                "Braid justification predicate does not prove logical_db.request_cid"
+            ),
+            KernelError::BraidExecutionBindingMismatch => write!(
+                f,
+                "Braid runnable capsule or registry differs from its inspected execution binding"
+            ),
+            KernelError::BraidEffectMismatch => write!(
+                f,
+                "Braid runnable effect does not match the executed Logical-DB effect"
+            ),
+            KernelError::RequestPlanMismatch => write!(
+                f,
+                "executed Logical-DB request differs from the Braid-bound request plan"
+            ),
             KernelError::DatabaseVersionOutOfRange(version) => write!(
                 f,
                 "database version {version} exceeds Braid's signed integer fact range"
@@ -185,6 +247,9 @@ impl fmt::Display for KernelError {
             }
             KernelError::KeyTooLarge { len, limit } => {
                 write!(f, "key too large: {len} bytes exceeds limit {limit}")
+            }
+            KernelError::ValueTooLarge { len, limit } => {
+                write!(f, "value too large: {len} bytes exceeds limit {limit}")
             }
             KernelError::InvalidContinuation(reason) => {
                 write!(f, "invalid continuation: {reason}")

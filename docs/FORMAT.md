@@ -52,8 +52,10 @@ Every app key is ordered account-first:
     [family u8][tuple]
 
 Scope components escape a literal zero as `00 FF`; empty values and values over
-1024 bytes are rejected. Family tags are Record=10, Revision=11, Change=12,
-Index=13, BlobRef=14, and Outbox=15. The F2 format byte cannot alias the older
+1024 bytes are rejected. Public family tags are Record=10, Revision=11,
+Index=13, and BlobRef=14. Change=12, Outbox=15, and Frontier=16 are
+storage-internal tags; apps cannot construct them. The frontier serializes
+same-zone writes across providers. The F2 format byte cannot alias the older
 product-subspace tags 01 through 05.
 
 Tuple values support bytes, signed i64, and bool. Their encoding preserves the
@@ -63,12 +65,18 @@ and FDB receive the exact bytes produced here.
 
 Effectful requests consume a Braid `RunnableInvocation` and an external
 scope-bound authority assertion. A bounded `WriteBatch` contains only logical
-family/tuple operations. Its full mutation bytes are hashed with Braid proof
-identities into an outbox marker. Reusing an operation ID with other bytes
-fails closed. A second marker consumes the content-addressed Braid invocation,
-so the same proof cannot authorize a different operation. The same transaction
-writes one ordered Change row. Change tokens are opaque zone-local key
-suffixes; callers must persist and replay them, never parse them as timestamps.
+family/tuple operations. Before Braid planning, the complete request is hashed
+into `logical_db.request_cid`; the snapshot carries that fact and the
+justification predicate proves exact equality. Logical-DB recomputes the CID
+from the executed write, point read, or bounded change request and fails closed
+on drift. Mutation bytes and Braid identities also bind the private outbox
+marker. Reusing an operation ID with other bytes fails closed. A second private
+marker consumes the content-addressed Braid invocation. The same transaction
+writes one ordered Change row and advances the zone frontier. Before admission,
+the capsule and registry are inspected; their content identities, strongest
+Braid effect, and exact Logical-DB capabilities must match the runnable and
+database request. Change tokens are opaque and bound to their zone; callers
+persist and replay them, never parse them as timestamps.
 
 Legacy v1 row keys remain readable through the compatibility model.
 `LegacyV1Point` maps each `(class,id,u64 timestamp)` losslessly into a chosen

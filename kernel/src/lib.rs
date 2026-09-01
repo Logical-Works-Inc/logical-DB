@@ -9,6 +9,12 @@
 //! The older five-class model, storage ports, and framed journal remain public
 //! only as migration compatibility and deterministic fault oracles. They are
 //! not the canonical application API and must not acquire new product meaning.
+//!
+//! Raw transaction internals are deliberately sealed:
+//!
+//! ```compile_fail
+//! use logical_db::fdb::LogicalDb;
+//! ```
 #![forbid(unsafe_code)]
 
 pub use lgwks_std;
@@ -21,7 +27,10 @@ pub mod admitted;
 pub mod claim;
 pub mod contains;
 pub mod error;
-pub mod fdb;
+// The pre-ADR-003 transaction shim remains compiled for migration tests but is
+// not reachable by product callers unless they explicitly opt into legacy-raw.
+#[cfg_attr(not(feature = "legacy-raw"), allow(dead_code))]
+mod fdb;
 pub mod journal;
 pub mod memkv;
 pub mod migration;
@@ -36,4 +45,7 @@ pub mod veccode;
 mod verify;
 
 pub use error::KernelError;
+pub use fdb::DatabaseOptions;
+#[cfg(feature = "legacy-raw")]
+pub use fdb::FdbBackend;
 pub type Result<T> = std::result::Result<T, KernelError>;

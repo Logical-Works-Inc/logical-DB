@@ -134,10 +134,24 @@ impl Scope {
     /// Pack one logical family key. Physical providers receive only these
     /// bytes; embedded and outboard profiles therefore cannot drift in scope
     /// or ordering semantics.
-    pub fn pack(&self, family: KeyFamily, tuple: &Tuple) -> Vec<u8> {
+    pub fn try_pack(&self, family: KeyFamily, tuple: &Tuple) -> Result<Vec<u8>> {
         let mut out = self.family_prefix(family);
+        let encoded_len = tuple.encoded_len();
+        let packed_len = out.len().saturating_add(encoded_len);
+        if packed_len > crate::fdb::MAX_KEY_BYTES {
+            return Err(KernelError::KeyTooLarge {
+                len: packed_len,
+                limit: crate::fdb::MAX_KEY_BYTES,
+            });
+        }
         out.extend_from_slice(&tuple.encode());
-        out
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pack(&self, family: KeyFamily, tuple: &Tuple) -> Vec<u8> {
+        self.try_pack(family, tuple)
+            .expect("internal hybrid key components are bounded")
     }
 
     pub(crate) fn family_prefix(&self, family: KeyFamily) -> Vec<u8> {
@@ -145,18 +159,30 @@ impl Scope {
         out.push(family.tag());
         out
     }
+
+    pub(crate) fn system_prefix(&self, family: SystemFamily) -> Vec<u8> {
+        let mut out = self.zone_prefix();
+        out.push(family.tag());
+        out
+    }
+
+    pub(crate) fn pack_system(&self, family: SystemFamily, tuple: &Tuple) -> Vec<u8> {
+        let mut out = self.system_prefix(family);
+        // Every system tuple is assembled from already-bounded scope,
+        // operation, and proof identifiers inside admitted orchestration.
+        out.extend_from_slice(&tuple.encode());
+        out
+    }
 }
 
-/// Independent key families under one zone. Current state, history, change
-/// feed, indexes, large-content references, and idempotency never alias.
+/// App-owned data families under one zone. Change rows and idempotency markers
+/// are deliberately absent: only admitted orchestration can name them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyFamily {
     Record,
     Revision,
-    Change,
     Index,
     BlobRef,
-    Outbox,
 }
 
 impl KeyFamily {
@@ -164,10 +190,8 @@ impl KeyFamily {
         match self {
             Self::Record => 0x10,
             Self::Revision => 0x11,
-            Self::Change => 0x12,
             Self::Index => 0x13,
             Self::BlobRef => 0x14,
-            Self::Outbox => 0x15,
         }
     }
 
@@ -175,11 +199,26 @@ impl KeyFamily {
         match tag {
             0x10 => Ok(Self::Record),
             0x11 => Ok(Self::Revision),
-            0x12 => Ok(Self::Change),
             0x13 => Ok(Self::Index),
             0x14 => Ok(Self::BlobRef),
-            0x15 => Ok(Self::Outbox),
             _ => Err(KernelError::MalformedKey),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SystemFamily {
+    Change,
+    Outbox,
+    Frontier,
+}
+
+impl SystemFamily {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Change => 0x12,
+            Self::Outbox => 0x15,
+            Self::Frontier => 0x16,
         }
     }
 }
@@ -193,6 +232,7 @@ pub struct ScopedKey {
 
 impl ScopedKey {
     pub fn decode(key: &[u8]) -> Result<Self> {
+        crate::fdb::validate_key(key)?;
         if !key.starts_with(HYBRID_V2_PREFIX) {
             let version = key.get(ESTATE_PREFIX.len()).copied().unwrap_or_default();
             return if key.starts_with(ESTATE_PREFIX) {
@@ -276,6 +316,19 @@ impl Tuple {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.0.iter().fold(0usize, |total, element| {
+            let element_len = match element {
+                Element::Bytes(bytes) => 2usize
+                    .saturating_add(bytes.len())
+                    .saturating_add(bytes.iter().filter(|byte| **byte == 0).count()),
+                Element::Int(_) => 9,
+                Element::Bool(_) => 1,
+            };
+            total.saturating_add(element_len)
+        })
     }
 
     /// Order-preserving encode. Each element is self-delimiting:
@@ -619,15 +672,24 @@ mod tests {
         for family in [
             KeyFamily::Record,
             KeyFamily::Revision,
-            KeyFamily::Change,
             KeyFamily::Index,
             KeyFamily::BlobRef,
-            KeyFamily::Outbox,
         ] {
             let decoded = ScopedKey::decode(&base.pack(family, &tuple)).unwrap();
             assert_eq!(decoded.scope, base);
             assert_eq!(decoded.family, family);
             assert_eq!(decoded.tuple, tuple);
+        }
+        for family in [
+            SystemFamily::Change,
+            SystemFamily::Outbox,
+            SystemFamily::Frontier,
+        ] {
+            let system_key = base.pack_system(family, &tuple);
+            assert!(matches!(
+                ScopedKey::decode(&system_key),
+                Err(KernelError::MalformedKey)
+            ));
         }
     }
 

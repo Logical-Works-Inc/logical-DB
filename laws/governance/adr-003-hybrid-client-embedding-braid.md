@@ -47,6 +47,16 @@ set identity, and snapshot-bound justification. Effectful Logical-DB writes
 consume a real `braid_run::RunnableInvocation`; string proof references are
 forbidden. Logical-DB additionally enforces the external namespace capability
 supplied by its caller, because a Braid capability name is not tenant scope.
+The logical request is canonicalized before planning. Its CID is a snapshot
+fact and the Braid justification predicate proves exact equality. Logical-DB
+recomputes it from the executed write, point read, or bounded change request,
+so a generic runnable cannot be reused for different database work.
+The host also constructs an unforgeable execution binding by inspecting the
+exact capsule and pinned registry. Logical-DB compares those content identities
+with the runnable and requires the capsule's strongest Braid effect to match
+the database request. Every declared database operation must also have its
+exact Logical-DB capability in the inspected graph. Read, delete, and unrelated
+reversible-write capsules therefore cannot authorize a put.
 
 ## Trust and failure boundaries
 
@@ -55,13 +65,22 @@ supplied by its caller, because a Braid capability name is not tenant scope.
 - Transaction conflicts and stale snapshot bindings fail closed and require a
   new Braid invocation. Invocation identity is atomically consumed with its
   operation; only an exact operation retry can reuse it for deduplication.
+- Every native write reads and writes one private per-zone frontier key. Two
+  disjoint writes prepared at the same version therefore conflict exactly as
+  they do under the embedded commit lock; only one can commit.
 - Operation IDs are scoped and bounded. Duplicate successful operations return
   the original outcome; the same ID with different bytes is an integrity
   error.
 - Keys, values, batches, ranges, retries, and response materialization have
   explicit ceilings. There is no unbounded scan in the hybrid public surface.
-- Embedded I/O failure, remote unavailability, timeout, cancellation, version
-  skew, and malformed input remain distinguishable errors.
+- Change/outbox families and provider transactions are internal. The default
+  crate surface cannot erase deduplication markers or inject change rows.
+- The configured deadline bounds embedded admission before the durable
+  critical section and is enforced by FDB inside native transactions.
+  Embedded work already mutating storage returns its real outcome instead of a
+  false timeout. Native may-have-committed errors remain typed and require an
+  exact operation retry. I/O failure, unavailability, cancellation, version
+  skew, and malformed input remain distinguishable.
 
 ## Format and migration
 
@@ -95,6 +114,8 @@ duplicate operation IDs, conflicting duplicate payloads, concurrent stale
 versions, consumed/stale Braid invocations, process restart, and identical
 logical outcomes over embedded and outboard providers. A mock may supplement
 but cannot replace the redb and live-FDB journeys.
+The live FDB journey must race two same-version writers in one zone and prove
+that one applies while the other is rejected as stale.
 
 ## Consequences
 

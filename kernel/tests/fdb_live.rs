@@ -9,7 +9,6 @@
 
 #![cfg(feature = "fdb")]
 use braid_capability::Capability;
-use braid_flow_ir::Predicate;
 use braid_flow_plan::{CompletionMap, FlowSnapshot};
 use braid_ir::{
     Braid, Capsule, ConfirmPolicy, EffectClass, Exposure, Strand, TermRegistry, TermSpec, TypeTag,
@@ -18,15 +17,22 @@ use braid_ir::{
 use braid_run::{JustificationProof, RunnableInvocation};
 use foundationdb::{KeySelector, RangeOption};
 use logical_db::admitted::{
-    AdmittedOutcome, AdmittedTxn, AuthorityProofRef, Effect, HybridDb, OperationId, OutboardDb,
-    StateBinding, DATABASE_VERSION_FACT,
+    AdmittedOutcome, AdmittedTxn, AuthorityProofRef, BraidExecutionBinding, Effect, HybridDb,
+    OperationId, OutboardDb, RequestBinding, StateBinding, WriteBatch, DATABASE_VERSION_FACT,
 };
-use logical_db::fdb::DatabaseOptions;
 use logical_db::tuple::{AccountId, ContainerId, Element, KeyFamily, Scope, Tuple, ZoneId};
+use logical_db::{DatabaseOptions, KernelError};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-fn admitted(version: u64, scope: Scope, effect: Effect, operation: &[u8]) -> AdmittedTxn {
+fn admitted(
+    version: u64,
+    scope: Scope,
+    effect: Effect,
+    operation: OperationId,
+    binding: RequestBinding,
+) -> AdmittedTxn {
     let capability = Capability::new(match effect {
         Effect::Put => "logical-db.record.write",
         Effect::Delete => "logical-db.record.delete",
@@ -66,17 +72,18 @@ fn admitted(version: u64, scope: Scope, effect: Effect, operation: &[u8]) -> Adm
         confirm: ConfirmPolicy::None,
         evidence: vec![],
     };
-    let snapshot = FlowSnapshot::new(BTreeMap::from([(
-        DATABASE_VERSION_FACT.into(),
-        Value::Int(i64::try_from(version).unwrap()),
-    )]));
-    let justification = JustificationProof::prove(
-        &capsule,
-        &Predicate::Const(true),
-        &snapshot,
-        &CompletionMap::new(),
-    )
-    .unwrap();
+    let execution = BraidExecutionBinding::inspect(&capsule, &registry).unwrap();
+    let (request_name, request_value) = binding.snapshot_fact();
+    let snapshot = FlowSnapshot::new(BTreeMap::from([
+        (
+            DATABASE_VERSION_FACT.into(),
+            Value::Int(i64::try_from(version).unwrap()),
+        ),
+        (request_name.into(), request_value),
+    ]));
+    let predicate = binding.predicate().unwrap();
+    let justification =
+        JustificationProof::prove(&capsule, &predicate, &snapshot, &CompletionMap::new()).unwrap();
     let ambient = vec![capability];
     let admission = braid_verify::admit(&capsule.to_bytes(), &registry, &ambient).unwrap();
     let runnable = RunnableInvocation::prepare(
@@ -91,10 +98,11 @@ fn admitted(version: u64, scope: Scope, effect: Effect, operation: &[u8]) -> Adm
     AdmittedTxn::new(
         runnable,
         StateBinding::new(version, &snapshot).unwrap(),
+        execution,
         AuthorityProofRef::new("live-fdb-authority", vec![scope.clone()], vec![effect]).unwrap(),
         scope,
         vec![effect],
-        OperationId::new(operation.to_vec()).unwrap(),
+        operation,
     )
     .unwrap()
 }
@@ -114,10 +122,10 @@ fn prefix_end(mut prefix: Vec<u8>) -> Vec<u8> {
 async fn live_fdb_cluster_roundtrip() {
     let cluster =
         std::env::var("FDB_CLUSTER_FILE").unwrap_or_else(|_| "/tmp/fdb-f0/fdb.cluster".into());
-    if !std::path::Path::new(&cluster).exists() {
-        eprintln!("SKIP live_fdb: no cluster at {cluster}");
-        return;
-    }
+    assert!(
+        std::path::Path::new(&cluster).exists(),
+        "live FDB proof requires a cluster at {cluster}; run scripts/local-fdb-cluster.sh up"
+    );
     // SAFETY: boot spawns network thread; fdb_select_api_version once per process.
     let _net = unsafe { foundationdb::boot() };
     let db = foundationdb::Database::new(Some(cluster.as_str())).expect("open database");
@@ -193,22 +201,44 @@ async fn live_fdb_cluster_roundtrip() {
         ..DatabaseOptions::default()
     };
     let outboard = OutboardDb::from_database(db, options).expect("attach logical layer");
-    let db = HybridDb::outboard(outboard);
+    let db = Arc::new(HybridDb::outboard(outboard));
     let object = Tuple::new(vec![Element::Bytes(b"object-1".to_vec())]);
 
     let write_version = db.read_version().await.expect("read version");
-    let write = admitted(write_version, scope.clone(), Effect::Put, b"live-write-1");
-    let mut batch = write.write_batch();
+    let write_operation = OperationId::new(b"live-write-1".to_vec()).unwrap();
+    let mut batch = WriteBatch::new(scope.clone(), vec![Effect::Put]).unwrap();
     batch
         .set(KeyFamily::Record, &object, b"hybrid-value".to_vec())
         .unwrap();
+    let write = admitted(
+        write_version,
+        scope.clone(),
+        Effect::Put,
+        write_operation.clone(),
+        batch.request_binding(&write_operation),
+    );
     assert!(matches!(
         db.commit_admitted(write, batch).await.unwrap(),
         AdmittedOutcome::Applied { .. }
     ));
 
     let read_version = db.read_version().await.expect("post-write version");
-    let read = admitted(read_version, scope.clone(), Effect::Get, b"live-read-1");
+    let read_operation = OperationId::new(b"live-read-1".to_vec()).unwrap();
+    let read_binding = RequestBinding::for_get(
+        &scope,
+        &[Effect::Get],
+        &read_operation,
+        KeyFamily::Record,
+        &object,
+    )
+    .unwrap();
+    let read = admitted(
+        read_version,
+        scope.clone(),
+        Effect::Get,
+        read_operation,
+        read_binding,
+    );
     assert_eq!(
         db.get_admitted(read, KeyFamily::Record, &object)
             .await
@@ -217,10 +247,57 @@ async fn live_fdb_cluster_roundtrip() {
     );
 
     let scan_version = db.read_version().await.expect("change version");
-    let scan = admitted(scan_version, scope.clone(), Effect::Scan, b"live-scan-1");
+    let scan_operation = OperationId::new(b"live-scan-1".to_vec()).unwrap();
+    let scan_binding =
+        RequestBinding::for_changes(&scope, &[Effect::Scan], &scan_operation, None, 10).unwrap();
+    let scan = admitted(
+        scan_version,
+        scope.clone(),
+        Effect::Scan,
+        scan_operation,
+        scan_binding,
+    );
     let changes = db.changes_admitted(scan, None, 10).await.unwrap();
     assert_eq!(changes.events.len(), 1);
     assert_eq!(changes.events[0].operation_id.as_bytes(), b"live-write-1");
+
+    // Two independently admitted writes prepared against the same zone state
+    // race at the real FDB boundary. The zone frontier permits exactly one;
+    // the loser must re-plan against fresh state.
+    let concurrent_version = db.read_version().await.expect("concurrent version");
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for index in 0_u8..2 {
+        let concurrent_object = Tuple::new(vec![Element::Bytes(vec![b'c', index])]);
+        let operation = OperationId::new(vec![b'c', b'o', index]).unwrap();
+        let mut concurrent_batch = WriteBatch::new(scope.clone(), vec![Effect::Put]).unwrap();
+        concurrent_batch
+            .set(KeyFamily::Record, &concurrent_object, vec![b'v', index])
+            .unwrap();
+        let envelope = admitted(
+            concurrent_version,
+            scope.clone(),
+            Effect::Put,
+            operation.clone(),
+            concurrent_batch.request_binding(&operation),
+        );
+        let task_db = Arc::clone(&db);
+        let task_gate = Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            task_gate.wait().await;
+            task_db.commit_admitted(envelope, concurrent_batch).await
+        }));
+    }
+    let mut applied = 0;
+    let mut stale = 0;
+    for task in tasks {
+        match task.await.expect("concurrent writer task") {
+            Ok(AdmittedOutcome::Applied { .. }) => applied += 1,
+            Err(KernelError::StaleJustification { .. }) => stale += 1,
+            outcome => panic!("unexpected concurrent writer outcome: {outcome:?}"),
+        }
+    }
+    assert_eq!((applied, stale), (1, 1));
     drop(db);
 
     let cleanup = foundationdb::Database::new(Some(cluster.as_str())).expect("reopen for cleanup");

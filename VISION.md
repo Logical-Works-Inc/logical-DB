@@ -42,13 +42,15 @@ classes, corruption tests, Kani proofs, and benchmark suite exist. Hybrid v2
 adds one app-facing layer over two transaction drivers: embedded redb and the
 native FoundationDB client. Account/container/zone is the ownership axis;
 record, revision, change, index, blob-reference, and outbox families are
-disjoint beneath it. Every admitted write consumes Braid's opaque
-`RunnableInvocation`, binds its snapshot to the exact read version, and
-atomically records both an idempotency marker and a resumable zone change.
+disjoint beneath it. Every admitted operation consumes Braid's opaque
+`RunnableInvocation`, binds its snapshot to the exact read version and request
+CID, and proves that CID in its predicate. Writes atomically record both an
+idempotency marker and a resumable zone change.
 
-What is not yet proven is equally important. The native adapter compiles but
-has not passed the live cluster parity journey on this branch. The LEM adapter
-and its tape receipt do not exist here. Change-token retention/compaction,
+What is not yet proven is equally important. The native adapter passed the
+local FDB 7.3 hybrid journey; a remote Linux receipt is still required. The LEM
+adapter and its tape receipt do not exist here. Change-token retention and
+compaction,
 large-blob transfer, schema evolution, backup/export, and account erasure are
 contracts still to implement. The legacy migration primitive maps v1 rows
 losslessly into a chosen v2 scope, but a production migration runner and
@@ -60,8 +62,9 @@ iCloud or Drive service.
 Landed locally: kernel spine → five compatibility classes → redb and MemKv
 recovery proofs → tuple namespaces → Braid-bound admitted batches → hybrid v2
 scope and key families → native FDB adapter → durable zone change tokens → v1
-copy primitive. Next: live FDB semantic parity, then the LEM consumer and tape
-receipt, then token retention, blob transfer, schema evolution, export/erase,
+copy primitive → exact Braid request binding → sealed provider/system keys.
+Next: the LEM consumer and tape receipt, then remote Linux parity, token
+retention, blob transfer, schema evolution, export/erase,
 and the later segment/mmap/hydration work in `docs/DB_PATHWAY.md`.
 
 ## Day-1 invariants

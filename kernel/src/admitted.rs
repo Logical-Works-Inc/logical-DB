@@ -5,25 +5,31 @@
 //! binds their immutable Flow snapshot to the exact database read version,
 //! scopes every physical key, and durably deduplicates operation identifiers.
 
-use std::ops::Bound;
-
+use braid_flow_ir::{FactRef, Predicate, ValueExpr};
 use braid_flow_plan::FlowSnapshot;
-use braid_ir::{Cid, Value};
+use braid_ir::{Capsule, Cid, EffectClass, TermRegistry, Value};
 use braid_run::RunnableInvocation;
 
-use crate::fdb::{FdbTransaction, LogicalDb};
-use crate::tuple::{Element, KeyFamily, Scope, Tuple};
+use crate::fdb::LogicalDb;
+use crate::port::DurableKv;
+use crate::tuple::{Element, KeyFamily, Scope, SystemFamily, Tuple};
 use crate::{KernelError, Result};
 
 pub const DATABASE_VERSION_FACT: &str = "logical_db.read_version";
+pub const DATABASE_REQUEST_FACT: &str = "logical_db.request_cid";
 pub const MAX_PROOF_ID_BYTES: usize = 1_024;
 pub const MAX_OPERATION_ID_BYTES: usize = 1_024;
 pub const MAX_DECLARED_EFFECTS: usize = 16;
 pub const MAX_AUTHORITY_SCOPES: usize = 128;
-pub const MAX_PUBLIC_RANGE_ROWS: usize = 10_000;
+pub const MAX_PUBLIC_RANGE_ROWS: usize = 100;
+pub const MAX_CHANGE_PAGE_BYTES: usize =
+    MAX_PUBLIC_RANGE_ROWS * (crate::fdb::MAX_KEY_BYTES + crate::fdb::MAX_VALUE_BYTES);
 
 const OPERATION_DOMAIN: &[u8] = b"lw.logical-db.operation.v2";
+const REQUEST_DOMAIN: &[u8] = b"lw.logical-db.request.v2";
+const BRAID_PREDICATE_DOMAIN: &[u8] = b"lw.braid.justification.predicate.v0";
 const VERSIONSTAMP_BYTES: usize = 10;
+const TOKEN_SCOPE_BYTES: usize = 32;
 const OPERATION_MARKER_BYTES: usize = 32 + VERSIONSTAMP_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -45,9 +51,48 @@ impl Effect {
     }
 }
 
+/// Inspection proof for the exact Braid capsule and registry that produced a
+/// runnable invocation. Its fields are private so callers cannot assert an
+/// effect independently of Braid's content-addressed graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BraidExecutionBinding {
+    capsule_cid: Cid,
+    registry_cid: Cid,
+    strongest_effect: EffectClass,
+    capabilities: Vec<String>,
+}
+
+impl BraidExecutionBinding {
+    pub fn inspect(capsule: &Capsule, registry: &TermRegistry) -> Result<Self> {
+        if capsule.registry_cid != registry.cid() {
+            return Err(KernelError::BraidExecutionBindingMismatch);
+        }
+        let mut strongest_effect = EffectClass::Pure;
+        let mut capabilities = Vec::new();
+        for strand in &capsule.braid.strands {
+            let spec = registry
+                .get(&strand.term)
+                .ok_or(KernelError::BraidExecutionBindingMismatch)?;
+            strongest_effect = strongest_effect.max(spec.effect);
+            if let Some(capability) = &spec.capability {
+                capabilities.push(capability.as_str().to_owned());
+            }
+        }
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        Ok(Self {
+            capsule_cid: capsule.cid(),
+            registry_cid: registry.cid(),
+            strongest_effect,
+            capabilities,
+        })
+    }
+}
+
 /// External namespace authorization remains owned by Kernel/Secure Authority.
 /// This value is a scoped assertion consumed at the DB boundary, not a new
-/// principal or capability-token authority.
+/// principal or capability-token authority. Construct it only from a trusted
+/// in-process authority decision; never deserialize one from an app request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityProofRef {
     id: String,
@@ -145,6 +190,7 @@ impl BraidProofBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateBinding {
     database_version: u64,
+    request_cid: Cid,
     snapshot_cid: Cid,
 }
 
@@ -152,13 +198,24 @@ impl StateBinding {
     pub fn new(database_version: u64, snapshot: &FlowSnapshot) -> Result<Self> {
         let fact_version = i64::try_from(database_version)
             .map_err(|_| KernelError::DatabaseVersionOutOfRange(database_version))?;
-        match snapshot.get_by_str(DATABASE_VERSION_FACT) {
-            Some(Value::Int(version)) if *version == fact_version => Ok(Self {
-                database_version,
-                snapshot_cid: snapshot.cid(),
-            }),
-            _ => Err(KernelError::MissingDatabaseVersionFact),
+        if !matches!(
+            snapshot.get_by_str(DATABASE_VERSION_FACT),
+            Some(Value::Int(version)) if *version == fact_version
+        ) {
+            return Err(KernelError::MissingDatabaseVersionFact);
         }
+        let request_cid = match snapshot.get_by_str(DATABASE_REQUEST_FACT) {
+            Some(Value::Bytes(bytes)) => Cid(bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| KernelError::MissingDatabaseRequestFact)?),
+            _ => return Err(KernelError::MissingDatabaseRequestFact),
+        };
+        Ok(Self {
+            database_version,
+            request_cid,
+            snapshot_cid: snapshot.cid(),
+        })
     }
 
     pub fn database_version(&self) -> u64 {
@@ -167,6 +224,35 @@ impl StateBinding {
 
     pub fn snapshot_cid(&self) -> Cid {
         self.snapshot_cid
+    }
+
+    pub fn request_cid(&self) -> Cid {
+        self.request_cid
+    }
+}
+
+/// Canonical request identity that Braid must prove in its immutable snapshot.
+/// Build this before creating the `RunnableInvocation`; Logical-DB recomputes
+/// it from the actual request at execution and refuses any mismatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestBinding(Cid);
+
+impl RequestBinding {
+    pub fn cid(self) -> Cid {
+        self.0
+    }
+
+    pub fn snapshot_fact(self) -> (&'static str, Value) {
+        (DATABASE_REQUEST_FACT, Value::Bytes(self.0 .0.to_vec()))
+    }
+
+    pub fn predicate(self) -> Result<Predicate> {
+        let fact = FactRef::new(DATABASE_REQUEST_FACT)
+            .map_err(|error| KernelError::Backend(format!("request fact: {error}")))?;
+        Ok(Predicate::Eq(
+            ValueExpr::SnapshotFact(fact),
+            ValueExpr::Literal(Value::Bytes(self.0 .0.to_vec())),
+        ))
     }
 }
 
@@ -186,22 +272,38 @@ impl AdmittedTxn {
     pub fn new(
         runnable: RunnableInvocation,
         state: StateBinding,
+        execution: BraidExecutionBinding,
         authority: AuthorityProofRef,
         scope: Scope,
         mut declared_effects: Vec<Effect>,
         operation_id: OperationId,
     ) -> Result<Self> {
-        declared_effects.sort_unstable();
-        declared_effects.dedup();
-        if declared_effects.is_empty() || declared_effects.len() > MAX_DECLARED_EFFECTS {
-            return Err(KernelError::AuthorityScopeViolation);
-        }
+        normalize_effects(&mut declared_effects)?;
         if !authority.covers(&scope, &declared_effects) {
             return Err(KernelError::AuthorityScopeViolation);
         }
         let braid = BraidProofBinding::from_runnable(&runnable);
         if braid.snapshot_cid != state.snapshot_cid {
             return Err(KernelError::BraidSnapshotMismatch);
+        }
+        if braid.predicate_cid != request_predicate_cid(state.request_cid)? {
+            return Err(KernelError::BraidRequestPredicateMismatch);
+        }
+        if runnable.capsule_cid() != execution.capsule_cid
+            || runnable.registry_cid() != execution.registry_cid
+        {
+            return Err(KernelError::BraidExecutionBindingMismatch);
+        }
+        if execution.strongest_effect != required_braid_effect(&declared_effects) {
+            return Err(KernelError::BraidEffectMismatch);
+        }
+        if declared_effects.iter().any(|effect| {
+            execution
+                .capabilities
+                .binary_search(&database_capability(*effect).to_owned())
+                .is_err()
+        }) {
+            return Err(KernelError::BraidEffectMismatch);
         }
         Ok(Self {
             runnable,
@@ -235,6 +337,35 @@ impl AdmittedTxn {
     }
 }
 
+fn required_braid_effect(effects: &[Effect]) -> EffectClass {
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Put | Effect::Delete))
+    {
+        EffectClass::ReversibleWrite
+    } else {
+        EffectClass::Read
+    }
+}
+
+const fn database_capability(effect: Effect) -> &'static str {
+    match effect {
+        Effect::Put => "logical-db.record.write",
+        Effect::Delete => "logical-db.record.delete",
+        Effect::Get => "logical-db.record.read",
+        Effect::Scan => "logical-db.record.scan",
+    }
+}
+
+fn normalize_effects(effects: &mut Vec<Effect>) -> Result<()> {
+    effects.sort_unstable();
+    effects.dedup();
+    if effects.is_empty() || effects.len() > MAX_DECLARED_EFFECTS {
+        return Err(KernelError::AuthorityScopeViolation);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub committed_version: u64,
@@ -246,6 +377,7 @@ pub struct Receipt {
     pub declared_effects: Vec<Effect>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmittedOutcome<T> {
     Applied { value: T, receipt: Receipt },
     Duplicate { receipt: Receipt },
@@ -278,15 +410,51 @@ pub struct ChangeToken(Vec<u8>);
 
 impl ChangeToken {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        if bytes.is_empty() || bytes.len() > MAX_OPERATION_ID_BYTES + 12 {
+        if bytes.len() < TOKEN_SCOPE_BYTES + VERSIONSTAMP_BYTES + 3
+            || bytes.len() > TOKEN_SCOPE_BYTES + MAX_OPERATION_ID_BYTES + 12
+        {
             return Err(KernelError::MalformedKey);
         }
+        validate_change_suffix(&bytes[TOKEN_SCOPE_BYTES..])?;
         Ok(Self(bytes))
+    }
+
+    fn for_scope(scope: &Scope, suffix: &[u8]) -> Result<Self> {
+        validate_change_suffix(suffix)?;
+        let mut bytes = change_token_scope(scope).0.to_vec();
+        bytes.extend_from_slice(suffix);
+        Ok(Self(bytes))
+    }
+
+    fn suffix_for<'a>(&'a self, scope: &Scope) -> Result<&'a [u8]> {
+        if self.0[..TOKEN_SCOPE_BYTES] != change_token_scope(scope).0 {
+            return Err(KernelError::TenantPrefixViolation);
+        }
+        Ok(&self.0[TOKEN_SCOPE_BYTES..])
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+fn validate_change_suffix(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < VERSIONSTAMP_BYTES + 3 || bytes.len() > MAX_OPERATION_ID_BYTES + 12 {
+        return Err(KernelError::MalformedKey);
+    }
+    let operation_len = u16::from_be_bytes(
+        bytes[VERSIONSTAMP_BYTES..VERSIONSTAMP_BYTES + 2]
+            .try_into()
+            .map_err(|_| KernelError::MalformedKey)?,
+    ) as usize;
+    if operation_len == 0 || bytes.len() != VERSIONSTAMP_BYTES + 2 + operation_len {
+        return Err(KernelError::MalformedKey);
+    }
+    Ok(())
+}
+
+fn change_token_scope(scope: &Scope) -> Cid {
+    Cid::compute(b"lw.logical-db.change-token.scope.v2", &scope.zone_prefix())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,18 +478,27 @@ pub struct ChangePage {
     pub more: bool,
 }
 
-impl AdmittedTxn {
-    pub fn write_batch(&self) -> WriteBatch {
-        WriteBatch {
-            scope: self.scope.clone(),
-            effects: self.declared_effects.clone(),
+impl WriteBatch {
+    pub fn new(scope: Scope, mut effects: Vec<Effect>) -> Result<Self> {
+        normalize_effects(&mut effects)?;
+        Ok(Self {
+            scope,
+            effects,
             mutations: Vec::new(),
             encoded_bytes: 0,
-        }
+        })
     }
-}
 
-impl WriteBatch {
+    pub fn request_binding(&self, operation_id: &OperationId) -> RequestBinding {
+        RequestBinding(request_cid(
+            &self.scope,
+            &self.effects,
+            operation_id,
+            1,
+            &self.canonical_bytes(),
+        ))
+    }
+
     fn require(&self, effect: Effect) -> Result<()> {
         if self.effects.contains(&effect) {
             Ok(())
@@ -350,7 +527,8 @@ impl WriteBatch {
 
     pub fn set(&mut self, family: KeyFamily, tuple: &Tuple, value: Vec<u8>) -> Result<()> {
         self.require(Effect::Put)?;
-        let key = self.scope.pack(family, tuple);
+        crate::fdb::validate_value(&value)?;
+        let key = self.scope.try_pack(family, tuple)?;
         self.charge(key.len().saturating_add(value.len()))?;
         self.mutations.push(WriteMutation::Set { key, value });
         Ok(())
@@ -358,7 +536,7 @@ impl WriteBatch {
 
     pub fn clear(&mut self, family: KeyFamily, tuple: &Tuple) -> Result<()> {
         self.require(Effect::Delete)?;
-        let key = self.scope.pack(family, tuple);
+        let key = self.scope.try_pack(family, tuple)?;
         self.charge(key.len())?;
         self.mutations.push(WriteMutation::Clear { key });
         Ok(())
@@ -377,14 +555,22 @@ impl WriteBatch {
             return Err(KernelError::AuthorityScopeViolation);
         }
         let change_mutations = self.change_mutation_bytes();
+        let change_value_bytes = change_value_len(&envelope.operation_id, &change_mutations);
+        if change_value_bytes > crate::fdb::MAX_VALUE_BYTES {
+            return Err(KernelError::ValueTooLarge {
+                len: change_value_bytes,
+                limit: crate::fdb::MAX_VALUE_BYTES,
+            });
+        }
         let total = self
             .encoded_bytes
             .saturating_add(operation_key(&envelope.scope, &envelope.operation_id).len())
             .saturating_add(OPERATION_MARKER_BYTES + 4)
             .saturating_add(invocation_key(envelope).len())
             .saturating_add(OPERATION_MARKER_BYTES + 4)
+            .saturating_add(frontier_key(&envelope.scope).len() + 32)
             .saturating_add(embedded_change_key(&envelope.scope, &envelope.operation_id).len() + 4)
-            .saturating_add(change_value_len(&envelope.operation_id, &change_mutations));
+            .saturating_add(change_value_bytes);
         if total > backend_limit {
             return Err(KernelError::TransactionTooLarge {
                 size: total,
@@ -428,55 +614,117 @@ impl WriteBatch {
         }
         encoded
     }
+}
 
-    fn apply_embedded(&self, tx: &mut FdbTransaction) -> Result<()> {
-        for mutation in &self.mutations {
-            match mutation {
-                WriteMutation::Set { key, value } => tx.set(key.clone(), value.clone())?,
-                WriteMutation::Clear { key } => tx.clear(key)?,
-            }
+impl RequestBinding {
+    pub fn for_get(
+        scope: &Scope,
+        effects: &[Effect],
+        operation_id: &OperationId,
+        family: KeyFamily,
+        tuple: &Tuple,
+    ) -> Result<Self> {
+        let mut normalized = effects.to_vec();
+        normalize_effects(&mut normalized)?;
+        let key = scope.try_pack(family, tuple)?;
+        Ok(Self(request_cid(scope, &normalized, operation_id, 2, &key)))
+    }
+
+    pub fn for_changes(
+        scope: &Scope,
+        effects: &[Effect],
+        operation_id: &OperationId,
+        after: Option<&ChangeToken>,
+        limit: usize,
+    ) -> Result<Self> {
+        if limit == 0 || limit > MAX_PUBLIC_RANGE_ROWS {
+            return Err(KernelError::RangeLimitInvalid {
+                requested: limit,
+                limit: MAX_PUBLIC_RANGE_ROWS,
+            });
         }
-        Ok(())
+        let mut normalized = effects.to_vec();
+        normalize_effects(&mut normalized)?;
+        let mut payload = Vec::new();
+        match after {
+            Some(token) => append_framed(&mut payload, token.as_bytes()),
+            None => append_framed(&mut payload, &[]),
+        }
+        payload.extend_from_slice(&(limit as u64).to_be_bytes());
+        Ok(Self(request_cid(
+            scope,
+            &normalized,
+            operation_id,
+            3,
+            &payload,
+        )))
     }
 }
 
 pub trait ReceiptPort {
-    fn render(&self, receipt: &Receipt) -> Vec<u8>;
+    fn render(&self, receipt: &Receipt) -> Result<Vec<u8>>;
 }
 
 pub struct JsonReceiptPort;
 
 impl ReceiptPort for JsonReceiptPort {
-    fn render(&self, receipt: &Receipt) -> Vec<u8> {
+    fn render(&self, receipt: &Receipt) -> Result<Vec<u8>> {
+        #[derive(serde::Serialize)]
+        struct JsonReceipt<'a> {
+            committed_version: u64,
+            operation_id: String,
+            capsule_cid: String,
+            registry_cid: String,
+            braid_authority_cid: String,
+            snapshot_cid: String,
+            predicate_cid: String,
+            authority_proof: &'a str,
+            account: String,
+            container: String,
+            zone: String,
+            effects: Vec<u8>,
+        }
+
         let effects = receipt
             .declared_effects
             .iter()
-            .map(|effect| effect.tag().to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            concat!(
-                "{{\"committed_version\":{},\"operation_id\":\"{}\",",
-                "\"capsule_cid\":\"{}\",\"registry_cid\":\"{}\",",
-                "\"braid_authority_cid\":\"{}\",\"snapshot_cid\":\"{}\",",
-                "\"predicate_cid\":\"{}\",\"authority_proof\":\"{}\",",
-                "\"account\":\"{}\",\"container\":\"{}\",\"zone\":\"{}\",",
-                "\"effects\":[{}]}}"
-            ),
-            receipt.committed_version,
-            lgwks_std::hex::encode(receipt.operation_id.as_bytes()),
-            receipt.braid.capsule_cid.to_hex(),
-            receipt.braid.registry_cid.to_hex(),
-            receipt.braid.authority_cid.to_hex(),
-            receipt.braid.snapshot_cid.to_hex(),
-            receipt.braid.predicate_cid.to_hex(),
-            receipt.authority_proof_id,
-            lgwks_std::hex::encode(receipt.scope.account().as_bytes()),
-            lgwks_std::hex::encode(receipt.scope.container().as_bytes()),
-            lgwks_std::hex::encode(receipt.scope.zone().as_bytes()),
+            .map(|effect| effect.tag())
+            .collect();
+        lgwks_std::json::to_vec(&JsonReceipt {
+            committed_version: receipt.committed_version,
+            operation_id: lgwks_std::hex::encode(receipt.operation_id.as_bytes()),
+            capsule_cid: receipt.braid.capsule_cid.to_hex(),
+            registry_cid: receipt.braid.registry_cid.to_hex(),
+            braid_authority_cid: receipt.braid.authority_cid.to_hex(),
+            snapshot_cid: receipt.braid.snapshot_cid.to_hex(),
+            predicate_cid: receipt.braid.predicate_cid.to_hex(),
+            authority_proof: &receipt.authority_proof_id,
+            account: lgwks_std::hex::encode(receipt.scope.account().as_bytes()),
+            container: lgwks_std::hex::encode(receipt.scope.container().as_bytes()),
+            zone: lgwks_std::hex::encode(receipt.scope.zone().as_bytes()),
             effects,
-        )
-        .into_bytes()
+        })
+        .map_err(|error| KernelError::Backend(format!("receipt JSON: {error}")))
+    }
+}
+
+async fn lock_embedded_until_deadline(
+    db: &LogicalDb,
+) -> Result<std::sync::MutexGuard<'_, crate::fdb::EmbeddedBackend>> {
+    let started = std::time::Instant::now();
+    let limit_ms = db.config().transaction_timeout_ms;
+    loop {
+        if let Some(backend) = db.try_lock_backend()? {
+            return Ok(backend);
+        }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if elapsed_ms >= limit_ms {
+            return Err(KernelError::TransactionTimedOut {
+                elapsed_ms,
+                limit_ms,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -490,41 +738,47 @@ impl LogicalDb {
         batch: WriteBatch,
     ) -> Result<AdmittedOutcome<()>> {
         batch.validate_for(&envelope, self.config().transaction_size_limit_bytes)?;
-        let (current, snapshot) = self.versioned_snapshot()?;
+        validate_request_binding(&envelope, batch.request_binding(&envelope.operation_id))?;
         let marker_key = operation_key(&envelope.scope, &envelope.operation_id);
         let invocation_key = invocation_key(&envelope);
-        let existing_marker = snapshot.get(&marker_key).cloned();
         let mutation_bytes = batch.canonical_bytes();
         let change_mutations = batch.change_mutation_bytes();
         let fingerprint = operation_fingerprint(&envelope, &mutation_bytes);
+        // Embedded work is abandoned only before it enters the durable
+        // critical section. Once mutation begins, it always returns the real
+        // commit outcome and never manufactures a timeout after success.
+        let mut backend = lock_embedded_until_deadline(self).await?;
+        let current = backend.committed_version()?;
 
-        if let Some(marker) = existing_marker.as_deref() {
-            let committed_version = decode_operation_marker(marker, fingerprint)?;
+        if let Some(marker) = backend.get_point(&marker_key)? {
+            let committed_version = decode_operation_marker(&marker, fingerprint)?;
             return Ok(AdmittedOutcome::Duplicate {
                 receipt: receipt_from(&envelope, committed_version),
             });
         }
-        if snapshot.contains_key(&invocation_key) {
+        if backend.get_point(&invocation_key)?.is_some() {
             return Err(KernelError::BraidInvocationConsumed);
         }
         validate_fresh_envelope(&envelope, current)?;
-
-        let mut tx = FdbTransaction::new_with_snapshot(
-            self.config().transaction_size_limit_bytes,
-            self.config().transaction_timeout_ms,
-            envelope.state.database_version,
-            snapshot,
-        );
-        tx.require_exact_read_version();
-        batch.apply_embedded(&mut tx)?;
-        tx.set_versionstamped_key(
-            embedded_change_key(&envelope.scope, &envelope.operation_id),
+        let committed_version = current
+            .checked_add(1)
+            .ok_or_else(|| KernelError::Backend("committed version overflow".into()))?;
+        let mut puts = Vec::with_capacity(batch.mutations.len().saturating_add(3));
+        let mut deletes = Vec::new();
+        for mutation in batch.mutations {
+            match mutation {
+                WriteMutation::Set { key, value } => puts.push((key, value)),
+                WriteMutation::Clear { key } => deletes.push(key),
+            }
+        }
+        puts.push((
+            resolved_change_key(&envelope.scope, &envelope.operation_id, committed_version),
             change_value(&envelope.operation_id, fingerprint, &change_mutations),
-        )?;
-        tx.set_versionstamped_value(marker_key, operation_marker_template(fingerprint))?;
-        tx.set_versionstamped_value(invocation_key, operation_marker_template(fingerprint))?;
-
-        let committed_version = self.try_commit(tx).await?;
+        ));
+        let marker = resolved_operation_marker(fingerprint, committed_version);
+        puts.push((marker_key, marker.clone()));
+        puts.push((invocation_key, marker));
+        backend.apply_transaction(&puts, &deletes, committed_version)?;
         Ok(AdmittedOutcome::Applied {
             value: (),
             receipt: receipt_from(&envelope, committed_version),
@@ -540,9 +794,21 @@ impl LogicalDb {
         if !envelope.declared_effects.contains(&Effect::Get) {
             return Err(KernelError::AuthorityScopeViolation);
         }
-        let (current, snapshot) = self.versioned_snapshot()?;
+        validate_request_binding(
+            &envelope,
+            RequestBinding::for_get(
+                &envelope.scope,
+                &envelope.declared_effects,
+                &envelope.operation_id,
+                family,
+                tuple,
+            )?,
+        )?;
+        let key = envelope.scope.try_pack(family, tuple)?;
+        let backend = lock_embedded_until_deadline(self).await?;
+        let current = backend.committed_version()?;
         validate_fresh_envelope(&envelope, current)?;
-        Ok(snapshot.get(&envelope.scope.pack(family, tuple)).cloned())
+        backend.get_point(&key)
     }
 
     pub async fn changes_admitted(
@@ -552,19 +818,29 @@ impl LogicalDb {
         limit: usize,
     ) -> Result<ChangePage> {
         validate_change_request(&envelope, limit)?;
-        let (current, snapshot) = self.versioned_snapshot()?;
+        validate_request_binding(
+            &envelope,
+            RequestBinding::for_changes(
+                &envelope.scope,
+                &envelope.declared_effects,
+                &envelope.operation_id,
+                after,
+                limit,
+            )?,
+        )?;
+        let backend = lock_embedded_until_deadline(self).await?;
+        let current = backend.committed_version()?;
         validate_fresh_envelope(&envelope, current)?;
         let prefix = change_prefix(&envelope.scope);
         let end = exclusive_prefix_end(&prefix).ok_or(KernelError::MalformedKey)?;
-        let start_key = after.map(|token| physical_change_key(&prefix, token));
-        let start = start_key
+        let start_key = after
+            .map(|token| physical_change_key(&prefix, &envelope.scope, token))
+            .transpose()?;
+        let (start, exclusive) = start_key
             .as_deref()
-            .map_or(Bound::Included(prefix.as_slice()), Bound::Excluded);
-        let mut rows = snapshot
-            .range::<[u8], _>((start, Bound::Excluded(end.as_slice())))
-            .take(limit.saturating_add(1))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Vec<_>>();
+            .map_or((prefix.as_slice(), false), |key| (key, true));
+        let mut rows =
+            backend.scan_range_limited(start, exclusive, &end, limit.saturating_add(1))?;
         let more = rows.len() > limit;
         rows.truncate(limit);
         change_page(&envelope.scope, rows, more)
@@ -596,7 +872,7 @@ enum HybridProvider {
 impl HybridDb {
     /// Open a zero-daemon, process-local database. This is useful for tests and
     /// ephemeral app state; use [`Self::embedded_at`] for durable embedding.
-    pub fn embedded_memory(options: crate::fdb::DatabaseOptions) -> Result<Self> {
+    pub fn embedded_memory(options: crate::DatabaseOptions) -> Result<Self> {
         Ok(Self {
             provider: HybridProvider::Embedded(LogicalDb::open(options)?),
         })
@@ -606,7 +882,7 @@ impl HybridDb {
     /// processing and wire contracts are identical to the outboard profile.
     pub fn embedded_at(
         path: impl AsRef<std::path::Path>,
-        options: crate::fdb::DatabaseOptions,
+        options: crate::DatabaseOptions,
     ) -> Result<Self> {
         Ok(Self {
             provider: HybridProvider::Embedded(LogicalDb::open_at(path, options)?),
@@ -623,7 +899,7 @@ impl HybridDb {
     /// Open the thin native client after the host has started FoundationDB's
     /// one-per-process network thread and retained its guard.
     #[cfg(feature = "fdb")]
-    pub fn outboard_after_network_boot(options: crate::fdb::DatabaseOptions) -> Result<Self> {
+    pub fn outboard_after_network_boot(options: crate::DatabaseOptions) -> Result<Self> {
         Ok(Self {
             provider: HybridProvider::Outboard(OutboardDb::open_after_network_boot(options)?),
         })
@@ -679,7 +955,7 @@ impl HybridDb {
 #[cfg(feature = "fdb")]
 pub struct OutboardDb {
     database: std::sync::Arc<foundationdb::Database>,
-    options: crate::fdb::DatabaseOptions,
+    options: crate::DatabaseOptions,
 }
 
 #[cfg(feature = "fdb")]
@@ -689,16 +965,9 @@ impl OutboardDb {
     /// longer than this value.
     pub fn from_database(
         database: foundationdb::Database,
-        options: crate::fdb::DatabaseOptions,
+        options: crate::DatabaseOptions,
     ) -> Result<Self> {
-        if options.transaction_size_limit_bytes > crate::fdb::MAX_TRANSACTION_BYTES {
-            return Err(KernelError::TransactionTooLarge {
-                size: options.transaction_size_limit_bytes,
-                limit: crate::fdb::MAX_TRANSACTION_BYTES,
-            });
-        }
-        i32::try_from(options.transaction_timeout_ms)
-            .map_err(|_| KernelError::Backend("FDB timeout does not fit i32".into()))?;
+        crate::fdb::validate_database_options(&options)?;
         Ok(Self {
             database: std::sync::Arc::new(database),
             options,
@@ -707,9 +976,9 @@ impl OutboardDb {
 
     /// Open the configured cluster after the host has booted the FDB network.
     /// Logical-DB deliberately does not hide the unsafe global network guard.
-    pub fn open_after_network_boot(options: crate::fdb::DatabaseOptions) -> Result<Self> {
+    pub fn open_after_network_boot(options: crate::DatabaseOptions) -> Result<Self> {
         let database = foundationdb::Database::new(options.cluster_file.as_deref())
-            .map_err(native_backend_error)?;
+            .map_err(native_fdb_error)?;
         Self::from_database(database, options)
     }
 
@@ -736,12 +1005,14 @@ impl OutboardDb {
         batch: WriteBatch,
     ) -> Result<AdmittedOutcome<()>> {
         batch.validate_for(&envelope, self.options.transaction_size_limit_bytes)?;
+        validate_request_binding(&envelope, batch.request_binding(&envelope.operation_id))?;
         validate_envelope_authority(&envelope)?;
         let mutation_bytes = batch.canonical_bytes();
         let change_mutations = batch.change_mutation_bytes();
         let fingerprint = operation_fingerprint(&envelope, &mutation_bytes);
         let marker_key = operation_key(&envelope.scope, &envelope.operation_id);
         let invocation_key = invocation_key(&envelope);
+        let frontier_key = frontier_key(&envelope.scope);
         let change_key = native_change_key(&envelope.scope, &envelope.operation_id);
         let change_value = change_value(&envelope.operation_id, fingerprint, &change_mutations);
         let expected_version = envelope.state.database_version;
@@ -749,17 +1020,20 @@ impl OutboardDb {
         let batch = std::sync::Arc::new(batch);
         let retry_marker_key = std::sync::Arc::new(marker_key.clone());
         let retry_invocation_key = std::sync::Arc::new(invocation_key);
+        let retry_frontier_key = std::sync::Arc::new(frontier_key);
         let retry_change_key = std::sync::Arc::new(change_key);
         let retry_change_value = std::sync::Arc::new(change_value);
 
         let attempt = self
             .database
-            .run(move |transaction, _maybe_committed| {
+            .run(move |transaction, maybe_committed| {
                 let batch = std::sync::Arc::clone(&batch);
                 let marker_key = std::sync::Arc::clone(&retry_marker_key);
                 let invocation_key = std::sync::Arc::clone(&retry_invocation_key);
+                let frontier_key = std::sync::Arc::clone(&retry_frontier_key);
                 let change_key = std::sync::Arc::clone(&retry_change_key);
                 let change_value = std::sync::Arc::clone(&retry_change_value);
+                let retried_after_uncertain_commit: bool = maybe_committed.into();
                 async move {
                     transaction
                         .set_option(foundationdb::options::TransactionOption::Timeout(timeout))?;
@@ -776,6 +1050,10 @@ impl OutboardDb {
                     {
                         return Ok(NativeWriteAttempt::InvocationConsumed);
                     }
+                    // The read/write frontier makes every write in one zone
+                    // conflict with another write prepared at the same state.
+                    // This is the FDB equivalent of the embedded commit lock.
+                    let _frontier = transaction.get(frontier_key.as_slice(), false).await?;
                     let current = transaction.get_read_version().await?;
                     if current < 0 || current as u64 != expected_version {
                         return Ok(NativeWriteAttempt::Stale(current));
@@ -786,6 +1064,7 @@ impl OutboardDb {
                             WriteMutation::Clear { key } => transaction.clear(key),
                         }
                     }
+                    transaction.set(frontier_key.as_slice(), fingerprint.0.as_slice());
                     transaction.atomic_op(
                         change_key.as_slice(),
                         change_value.as_slice(),
@@ -801,6 +1080,10 @@ impl OutboardDb {
                         &native_marker_template(fingerprint),
                         foundationdb::options::MutationType::SetVersionstampedValue,
                     );
+                    // `Database::run` reports whether a prior commit may have
+                    // succeeded. The marker checks above resolve that state;
+                    // this read prevents the signal from being silently lost.
+                    let _ = retried_after_uncertain_commit;
                     Ok(NativeWriteAttempt::Applied)
                 }
             })
@@ -843,8 +1126,18 @@ impl OutboardDb {
         if !envelope.declared_effects.contains(&Effect::Get) {
             return Err(KernelError::AuthorityScopeViolation);
         }
+        validate_request_binding(
+            &envelope,
+            RequestBinding::for_get(
+                &envelope.scope,
+                &envelope.declared_effects,
+                &envelope.operation_id,
+                family,
+                tuple,
+            )?,
+        )?;
         validate_envelope_authority(&envelope)?;
-        let key = envelope.scope.pack(family, tuple);
+        let key = envelope.scope.try_pack(family, tuple)?;
         let expected_version = envelope.state.database_version;
         let timeout = native_timeout(&self.options)?;
         let attempt = self
@@ -889,14 +1182,26 @@ impl OutboardDb {
         limit: usize,
     ) -> Result<ChangePage> {
         validate_change_request(&envelope, limit)?;
+        validate_request_binding(
+            &envelope,
+            RequestBinding::for_changes(
+                &envelope.scope,
+                &envelope.declared_effects,
+                &envelope.operation_id,
+                after,
+                limit,
+            )?,
+        )?;
         validate_envelope_authority(&envelope)?;
         let scope = envelope.scope.clone();
         let prefix = change_prefix(&scope);
         let end = exclusive_prefix_end(&prefix).ok_or(KernelError::MalformedKey)?;
         let begin = after
             .map(|token| {
-                foundationdb::KeySelector::first_greater_than(physical_change_key(&prefix, token))
+                physical_change_key(&prefix, &scope, token)
+                    .map(foundationdb::KeySelector::first_greater_than)
             })
+            .transpose()?
             .unwrap_or_else(|| foundationdb::KeySelector::first_greater_or_equal(prefix.clone()));
         let expected_version = envelope.state.database_version;
         let timeout = native_timeout(&self.options)?;
@@ -922,6 +1227,7 @@ impl OutboardDb {
                     options.begin = begin;
                     options.end = foundationdb::KeySelector::first_greater_or_equal(end);
                     options.limit = Some(limit);
+                    options.target_bytes = MAX_CHANGE_PAGE_BYTES;
                     let values = transaction.get_range(&options, 1, false).await?;
                     let more = values.more();
                     let rows = values
@@ -989,9 +1295,9 @@ enum NativeChangesAttempt {
 }
 
 #[cfg(feature = "fdb")]
-fn native_timeout(options: &crate::fdb::DatabaseOptions) -> Result<i32> {
+fn native_timeout(options: &crate::DatabaseOptions) -> Result<i32> {
     i32::try_from(options.transaction_timeout_ms)
-        .map_err(|_| KernelError::Backend("FDB timeout does not fit i32".into()))
+        .map_err(|_| KernelError::ConfigurationInvalid("FDB timeout must fit i32"))
 }
 
 #[cfg(feature = "fdb")]
@@ -1001,8 +1307,27 @@ fn native_version(version: i64) -> Result<u64> {
 }
 
 #[cfg(feature = "fdb")]
-fn native_backend_error(error: impl std::fmt::Display) -> KernelError {
-    KernelError::Backend(format!("native FDB: {error}"))
+fn native_backend_error(error: foundationdb::FdbBindingError) -> KernelError {
+    match error.get_fdb_error() {
+        Some(error) => native_fdb_error(error),
+        None => KernelError::Backend(format!("native FDB binding: {error}")),
+    }
+}
+
+#[cfg(feature = "fdb")]
+fn native_fdb_error(error: foundationdb::FdbError) -> KernelError {
+    let code = error.code();
+    if error.is_maybe_committed() || matches!(code, 1021 | 1022 | 1030) {
+        return KernelError::CommitOutcomeUnknown { code };
+    }
+    match code {
+        1020 => KernelError::TransactionConflict,
+        1004 | 1031 => KernelError::BackendTimedOut { code },
+        1025 | 1101 => KernelError::BackendCancelled,
+        1000 | 1007 | 1037 | 1038 | 1510..=1515 | 2008 => KernelError::BackendUnavailable { code },
+        1039 | 2100 | 2200..=2203 => KernelError::BackendVersionSkew { code },
+        _ => KernelError::Backend(format!("native FDB error {code}: {error}")),
+    }
 }
 
 #[cfg(feature = "fdb")]
@@ -1013,7 +1338,14 @@ fn native_marker_template(fingerprint: Cid) -> Vec<u8> {
 }
 
 fn change_prefix(scope: &Scope) -> Vec<u8> {
-    scope.family_prefix(KeyFamily::Change)
+    scope.system_prefix(SystemFamily::Change)
+}
+
+fn frontier_key(scope: &Scope) -> Vec<u8> {
+    scope.pack_system(
+        SystemFamily::Frontier,
+        &Tuple::new(vec![Element::Bytes(b"zone-frontier".to_vec())]),
+    )
 }
 
 fn embedded_change_key(scope: &Scope, operation_id: &OperationId) -> Vec<u8> {
@@ -1022,6 +1354,26 @@ fn embedded_change_key(scope: &Scope, operation_id: &OperationId) -> Vec<u8> {
     key.extend_from_slice(&(operation_id.as_bytes().len() as u16).to_be_bytes());
     key.extend_from_slice(operation_id.as_bytes());
     key
+}
+
+fn resolved_change_key(scope: &Scope, operation_id: &OperationId, version: u64) -> Vec<u8> {
+    let mut key = change_prefix(scope);
+    key.extend_from_slice(&logical_versionstamp(version));
+    key.extend_from_slice(&(operation_id.as_bytes().len() as u16).to_be_bytes());
+    key.extend_from_slice(operation_id.as_bytes());
+    key
+}
+
+fn logical_versionstamp(version: u64) -> [u8; VERSIONSTAMP_BYTES] {
+    let mut stamp = [0; VERSIONSTAMP_BYTES];
+    stamp[..8].copy_from_slice(&version.to_be_bytes());
+    stamp
+}
+
+fn resolved_operation_marker(fingerprint: Cid, version: u64) -> Vec<u8> {
+    let mut marker = operation_marker_template(fingerprint);
+    marker[32..].copy_from_slice(&logical_versionstamp(version));
+    marker
 }
 
 #[cfg(feature = "fdb")]
@@ -1033,10 +1385,10 @@ fn native_change_key(scope: &Scope, operation_id: &OperationId) -> Vec<u8> {
     key
 }
 
-fn physical_change_key(prefix: &[u8], token: &ChangeToken) -> Vec<u8> {
+fn physical_change_key(prefix: &[u8], scope: &Scope, token: &ChangeToken) -> Result<Vec<u8>> {
     let mut key = prefix.to_vec();
-    key.extend_from_slice(token.as_bytes());
-    key
+    key.extend_from_slice(token.suffix_for(scope)?);
+    Ok(key)
 }
 
 fn exclusive_prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -1081,13 +1433,27 @@ fn validate_change_request(envelope: &AdmittedTxn, limit: usize) -> Result<()> {
 }
 
 fn change_page(scope: &Scope, rows: Vec<(Vec<u8>, Vec<u8>)>, more: bool) -> Result<ChangePage> {
+    let mut page_bytes = 0_usize;
+    for (key, value) in &rows {
+        crate::fdb::validate_key(key)?;
+        crate::fdb::validate_value(value)?;
+        page_bytes = page_bytes
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+    }
+    if page_bytes > MAX_CHANGE_PAGE_BYTES {
+        return Err(KernelError::TransactionTooLarge {
+            size: page_bytes,
+            limit: MAX_CHANGE_PAGE_BYTES,
+        });
+    }
     let prefix = change_prefix(scope);
     let mut events = Vec::with_capacity(rows.len());
     for (key, value) in rows {
         let suffix = key
             .strip_prefix(prefix.as_slice())
             .ok_or(KernelError::TenantPrefixViolation)?;
-        let token = ChangeToken::from_bytes(suffix.to_vec())?;
+        let token = ChangeToken::for_scope(scope, suffix)?;
         events.push(decode_change_event(scope, token, &value)?);
     }
     let next_token = events.last().map(|event| event.token.clone());
@@ -1169,8 +1535,8 @@ fn validate_envelope_authority(envelope: &AdmittedTxn) -> Result<()> {
 }
 
 fn operation_key(scope: &Scope, operation_id: &OperationId) -> Vec<u8> {
-    scope.pack(
-        KeyFamily::Outbox,
+    scope.pack_system(
+        SystemFamily::Outbox,
         &Tuple::new(vec![Element::Bytes(operation_id.as_bytes().to_vec())]),
     )
 }
@@ -1182,8 +1548,8 @@ fn invocation_key(envelope: &AdmittedTxn) -> Vec<u8> {
     identity.extend_from_slice(&envelope.braid.authority_cid.0);
     identity.extend_from_slice(&envelope.braid.snapshot_cid.0);
     identity.extend_from_slice(&envelope.braid.predicate_cid.0);
-    envelope.scope.pack(
-        KeyFamily::Outbox,
+    envelope.scope.pack_system(
+        SystemFamily::Outbox,
         &Tuple::new(vec![
             Element::Bytes(b"braid-invocation".to_vec()),
             Element::Bytes(identity),
@@ -1194,6 +1560,38 @@ fn invocation_key(envelope: &AdmittedTxn) -> Vec<u8> {
 fn append_framed(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
     bytes.extend_from_slice(value);
+}
+
+fn request_cid(
+    scope: &Scope,
+    effects: &[Effect],
+    operation_id: &OperationId,
+    request_tag: u8,
+    payload: &[u8],
+) -> Cid {
+    let mut bytes = scope.zone_prefix();
+    append_framed(&mut bytes, operation_id.as_bytes());
+    bytes.push(request_tag);
+    bytes.extend_from_slice(&(effects.len() as u16).to_be_bytes());
+    bytes.extend(effects.iter().map(|effect| effect.tag()));
+    append_framed(&mut bytes, payload);
+    Cid::compute(REQUEST_DOMAIN, &bytes)
+}
+
+fn request_predicate_cid(request: Cid) -> Result<Cid> {
+    let predicate = RequestBinding(request).predicate()?;
+    Ok(Cid::compute(
+        BRAID_PREDICATE_DOMAIN,
+        &braid_ir::encode(&predicate.to_canon()),
+    ))
+}
+
+fn validate_request_binding(envelope: &AdmittedTxn, actual: RequestBinding) -> Result<()> {
+    if envelope.state.request_cid == actual.cid() {
+        Ok(())
+    } else {
+        Err(KernelError::RequestPlanMismatch)
+    }
 }
 
 fn operation_fingerprint(envelope: &AdmittedTxn, mutation_bytes: &[u8]) -> Cid {
@@ -1250,7 +1648,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use braid_capability::Capability;
-    use braid_flow_ir::Predicate;
     use braid_flow_plan::{CompletionMap, FlowSnapshot};
     use braid_ir::{
         Braid, Capsule, ConfirmPolicy, EffectClass, Exposure, Strand, TermRegistry, TermSpec,
@@ -1270,54 +1667,89 @@ mod tests {
         )
     }
 
-    fn registry_and_capsule() -> (TermRegistry, Capsule, Vec<Capability>) {
-        let capability = Capability::new("logical-db.record.write");
+    fn registry_and_capsule_terms(
+        mut terms: Vec<(&'static str, EffectClass)>,
+    ) -> (TermRegistry, Capsule, Vec<Capability>) {
+        terms.sort_unstable_by_key(|(term, _)| *term);
         let mut registry = TermRegistry::new(1);
-        registry
-            .insert(TermSpec {
-                id: "logical-db.record.write".into(),
-                inputs: vec![],
-                output: TypeTag::Bool,
-                capability: Some(capability.clone()),
-                effect: EffectClass::ReversibleWrite,
-                source_exposure: Exposure::Public,
-                egress_ceiling: None,
-                cost: 1,
-            })
-            .unwrap();
+        let ambient: Vec<Capability> = terms
+            .iter()
+            .map(|(term, _)| Capability::new(*term))
+            .collect();
+        for ((_, effect), capability) in terms.iter().zip(&ambient) {
+            registry
+                .insert(TermSpec {
+                    id: capability.as_str().into(),
+                    inputs: vec![],
+                    output: TypeTag::Bool,
+                    capability: Some(capability.clone()),
+                    effect: *effect,
+                    source_exposure: Exposure::Public,
+                    egress_ceiling: None,
+                    cost: 1,
+                })
+                .unwrap();
+        }
         let capsule = Capsule {
             ir_version: IR_VERSION,
             vocab_version: registry.vocab_version,
             registry_cid: registry.cid(),
-            intent: "write one scoped logical-db record".into(),
-            grants: vec![capability.clone()],
+            intent: "execute one exact scoped logical-db request".into(),
+            grants: ambient.clone(),
             braid: Braid {
-                strands: vec![Strand {
-                    term: "logical-db.record.write".into(),
-                    inputs: vec![],
-                }],
-                outputs: vec![0],
+                strands: ambient
+                    .iter()
+                    .map(|capability| Strand {
+                        term: capability.as_str().into(),
+                        inputs: vec![],
+                    })
+                    .collect(),
+                outputs: (0..u32::try_from(ambient.len()).unwrap()).collect(),
             },
-            budget: 1,
+            budget: ambient.len() as u64,
             confirm: ConfirmPolicy::None,
             evidence: vec![],
         };
-        (registry, capsule, vec![capability])
+        (registry, capsule, ambient)
     }
 
-    fn runnable(version: u64) -> (RunnableInvocation, FlowSnapshot) {
-        let (registry, capsule, ambient) = registry_and_capsule();
-        let snapshot = FlowSnapshot::new(BTreeMap::from([(
-            DATABASE_VERSION_FACT.to_string(),
-            Value::Int(version as i64),
-        )]));
-        let justification = JustificationProof::prove(
-            &capsule,
-            &Predicate::Const(true),
-            &snapshot,
-            &CompletionMap::new(),
+    fn registry_and_capsule(effects: &[Effect]) -> (TermRegistry, Capsule, Vec<Capability>) {
+        registry_and_capsule_terms(
+            effects
+                .iter()
+                .map(|effect| {
+                    (
+                        database_capability(*effect),
+                        match effect {
+                            Effect::Put | Effect::Delete => EffectClass::ReversibleWrite,
+                            Effect::Get | Effect::Scan => EffectClass::Read,
+                        },
+                    )
+                })
+                .collect(),
         )
-        .unwrap();
+    }
+
+    fn prepare_runnable(
+        version: u64,
+        binding: RequestBinding,
+        registry: TermRegistry,
+        capsule: Capsule,
+        ambient: Vec<Capability>,
+    ) -> (RunnableInvocation, FlowSnapshot, BraidExecutionBinding) {
+        let execution = BraidExecutionBinding::inspect(&capsule, &registry).unwrap();
+        let (request_name, request_value) = binding.snapshot_fact();
+        let snapshot = FlowSnapshot::new(BTreeMap::from([
+            (
+                DATABASE_VERSION_FACT.to_string(),
+                Value::Int(version as i64),
+            ),
+            (request_name.to_string(), request_value),
+        ]));
+        let predicate = binding.predicate().unwrap();
+        let justification =
+            JustificationProof::prove(&capsule, &predicate, &snapshot, &CompletionMap::new())
+                .unwrap();
         let admission = braid_verify::admit(&capsule.to_bytes(), &registry, &ambient).unwrap();
         let runnable = RunnableInvocation::prepare(
             capsule,
@@ -1328,44 +1760,88 @@ mod tests {
             &snapshot,
         )
         .unwrap();
-        (runnable, snapshot)
+        (runnable, snapshot, execution)
+    }
+
+    fn runnable(
+        version: u64,
+        binding: RequestBinding,
+        effects: &[Effect],
+    ) -> (RunnableInvocation, FlowSnapshot, BraidExecutionBinding) {
+        let (registry, capsule, ambient) = registry_and_capsule(effects);
+        prepare_runnable(version, binding, registry, capsule, ambient)
+    }
+
+    fn admitted(
+        version: u64,
+        scope: Scope,
+        effects: Vec<Effect>,
+        operation: OperationId,
+        binding: RequestBinding,
+    ) -> AdmittedTxn {
+        let (runnable, snapshot, execution) = runnable(version, binding, &effects);
+        let state = StateBinding::new(version, &snapshot).unwrap();
+        let authority =
+            AuthorityProofRef::new("kernel-capability-1", vec![scope.clone()], effects.clone())
+                .unwrap();
+        AdmittedTxn::new(
+            runnable, state, execution, authority, scope, effects, operation,
+        )
+        .unwrap()
+    }
+
+    fn new_write_batch(scope: &Scope, effects: Vec<Effect>) -> WriteBatch {
+        WriteBatch::new(scope.clone(), effects).unwrap()
+    }
+
+    fn write_envelope(version: u64, batch: &WriteBatch, operation: &[u8]) -> AdmittedTxn {
+        let operation = OperationId::new(operation.to_vec()).unwrap();
+        admitted(
+            version,
+            batch.scope.clone(),
+            batch.effects.clone(),
+            operation.clone(),
+            batch.request_binding(&operation),
+        )
     }
 
     fn envelope(version: u64, scope: Scope, operation: &[u8]) -> AdmittedTxn {
-        let (runnable, snapshot) = runnable(version);
-        let state = StateBinding::new(version, &snapshot).unwrap();
-        let authority = AuthorityProofRef::new(
-            "kernel-capability-1",
-            vec![scope.clone()],
-            vec![Effect::Put, Effect::Get],
-        )
-        .unwrap();
-        AdmittedTxn::new(
-            runnable,
-            state,
-            authority,
-            scope,
-            vec![Effect::Put, Effect::Get],
-            OperationId::new(operation.to_vec()).unwrap(),
-        )
-        .unwrap()
+        let batch = new_write_batch(&scope, vec![Effect::Put, Effect::Get]);
+        write_envelope(version, &batch, operation)
     }
 
-    fn scan_envelope(version: u64, scope: Scope, operation: &[u8]) -> AdmittedTxn {
-        let (runnable, snapshot) = runnable(version);
-        let state = StateBinding::new(version, &snapshot).unwrap();
-        let authority =
-            AuthorityProofRef::new("kernel-scan-1", vec![scope.clone()], vec![Effect::Scan])
-                .unwrap();
-        AdmittedTxn::new(
-            runnable,
-            state,
-            authority,
-            scope,
-            vec![Effect::Scan],
-            OperationId::new(operation.to_vec()).unwrap(),
-        )
-        .unwrap()
+    fn read_envelope(
+        version: u64,
+        scope: Scope,
+        operation: &[u8],
+        family: KeyFamily,
+        tuple: &Tuple,
+    ) -> AdmittedTxn {
+        let operation = OperationId::new(operation.to_vec()).unwrap();
+        let effects = vec![Effect::Get];
+        let binding = RequestBinding::for_get(&scope, &effects, &operation, family, tuple).unwrap();
+        admitted(version, scope, effects, operation, binding)
+    }
+
+    fn scan_envelope(
+        version: u64,
+        scope: Scope,
+        operation: &[u8],
+        after: Option<&ChangeToken>,
+        limit: usize,
+    ) -> AdmittedTxn {
+        let operation = OperationId::new(operation.to_vec()).unwrap();
+        let effects = vec![Effect::Scan];
+        let binding =
+            RequestBinding::for_changes(&scope, &effects, &operation, after, limit).unwrap();
+        admitted(version, scope, effects, operation, binding)
+    }
+
+    fn change_token(scope: &Scope, operation: &[u8]) -> ChangeToken {
+        let mut suffix = vec![0; VERSIONSTAMP_BYTES];
+        suffix.extend_from_slice(&(operation.len() as u16).to_be_bytes());
+        suffix.extend_from_slice(operation);
+        ChangeToken::for_scope(scope, &suffix).unwrap()
     }
 
     #[tokio::test]
@@ -1373,11 +1849,11 @@ mod tests {
         let db = LogicalDb::open(FdbConfig::default()).unwrap();
         let account = scope(b"account-a");
         let object = Tuple::new(vec![Element::Bytes(b"object-1".to_vec())]);
-        let write = envelope(0, account.clone(), b"op-1");
-        let mut batch = write.write_batch();
+        let mut batch = new_write_batch(&account, vec![Effect::Put]);
         batch
             .set(KeyFamily::Record, &object, b"value".to_vec())
             .unwrap();
+        let write = write_envelope(0, &batch, b"op-1");
         let outcome = db.commit_admitted(write, batch).await.unwrap();
         match outcome {
             AdmittedOutcome::Applied { receipt, .. } => {
@@ -1387,9 +1863,13 @@ mod tests {
             AdmittedOutcome::Duplicate { .. } => panic!("first operation cannot be duplicate"),
         }
         assert_eq!(
-            db.get_admitted(envelope(1, account, b"read-1"), KeyFamily::Record, &object)
-                .await
-                .unwrap(),
+            db.get_admitted(
+                read_envelope(1, account, b"read-1", KeyFamily::Record, &object),
+                KeyFamily::Record,
+                &object,
+            )
+            .await
+            .unwrap(),
             Some(b"value".to_vec())
         );
     }
@@ -1399,22 +1879,22 @@ mod tests {
         let db = LogicalDb::open(FdbConfig::default()).unwrap();
         let account = scope(b"account-a");
         let object = Tuple::new(vec![Element::Bytes(b"object".to_vec())]);
-        let first_envelope = envelope(0, account.clone(), b"same-op");
-        let mut first_batch = first_envelope.write_batch();
+        let mut first_batch = new_write_batch(&account, vec![Effect::Put]);
         first_batch
             .set(KeyFamily::Record, &object, b"value".to_vec())
             .unwrap();
+        let first_envelope = write_envelope(0, &first_batch, b"same-op");
         let first = db
             .commit_admitted(first_envelope, first_batch)
             .await
             .unwrap();
         assert!(matches!(first, AdmittedOutcome::Applied { .. }));
 
-        let retry_envelope = envelope(0, account, b"same-op");
-        let mut retry_batch = retry_envelope.write_batch();
+        let mut retry_batch = new_write_batch(&account, vec![Effect::Put]);
         retry_batch
             .set(KeyFamily::Record, &object, b"value".to_vec())
             .unwrap();
+        let retry_envelope = write_envelope(0, &retry_batch, b"same-op");
         let retry = db
             .commit_admitted(retry_envelope, retry_batch)
             .await
@@ -1432,18 +1912,18 @@ mod tests {
         let db = LogicalDb::open(FdbConfig::default()).unwrap();
         let account = scope(b"account-a");
         let object = Tuple::new(vec![Element::Bytes(b"object".to_vec())]);
-        let first = envelope(0, account.clone(), b"same-op");
-        let mut first_batch = first.write_batch();
+        let mut first_batch = new_write_batch(&account, vec![Effect::Put]);
         first_batch
             .set(KeyFamily::Record, &object, b"first".to_vec())
             .unwrap();
+        let first = write_envelope(0, &first_batch, b"same-op");
         db.commit_admitted(first, first_batch).await.unwrap();
 
-        let conflicting = envelope(0, account, b"same-op");
-        let mut conflicting_batch = conflicting.write_batch();
+        let mut conflicting_batch = new_write_batch(&account, vec![Effect::Put]);
         conflicting_batch
             .set(KeyFamily::Record, &object, b"second".to_vec())
             .unwrap();
+        let conflicting = write_envelope(0, &conflicting_batch, b"same-op");
         assert!(matches!(
             db.commit_admitted(conflicting, conflicting_batch).await,
             Err(KernelError::OperationIdConflict)
@@ -1451,30 +1931,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_braid_invocation_cannot_authorize_two_operations() {
+    async fn exact_braid_request_cannot_authorize_a_different_write_plan() {
         let db = LogicalDb::open(FdbConfig::default()).unwrap();
         let account = scope(b"account-a");
         let first_object = Tuple::new(vec![Element::Bytes(b"first".to_vec())]);
-        let first = envelope(0, account.clone(), b"operation-one");
-        let mut first_batch = first.write_batch();
+        let mut first_batch = new_write_batch(&account, vec![Effect::Put]);
         first_batch
             .set(KeyFamily::Record, &first_object, b"one".to_vec())
             .unwrap();
-        db.commit_admitted(first, first_batch).await.unwrap();
-
-        // The helper reconstructs the same content-addressed Braid invocation
-        // at version zero. A different operation ID must not turn that proof
-        // into a reusable bearer capability.
+        let first = write_envelope(0, &first_batch, b"operation-one");
         let second_object = Tuple::new(vec![Element::Bytes(b"second".to_vec())]);
-        let second = envelope(0, account, b"operation-two");
-        let mut second_batch = second.write_batch();
+        let mut second_batch = new_write_batch(&account, vec![Effect::Put]);
         second_batch
             .set(KeyFamily::Record, &second_object, b"two".to_vec())
             .unwrap();
         assert!(matches!(
-            db.commit_admitted(second, second_batch).await,
-            Err(KernelError::BraidInvocationConsumed)
+            db.commit_admitted(first, second_batch).await,
+            Err(KernelError::RequestPlanMismatch)
         ));
+    }
+
+    #[test]
+    fn foreign_braid_capabilities_cannot_authorize_a_put_request() {
+        let account = scope(b"effect-axis");
+        for (foreign, suffix) in [
+            (Effect::Get, b"read".as_slice()),
+            (Effect::Delete, b"delete"),
+        ] {
+            let operation =
+                OperationId::new([b"effect-axis-".as_slice(), suffix].concat()).unwrap();
+            let batch = new_write_batch(&account, vec![Effect::Put]);
+            let (runnable, snapshot, execution) =
+                runnable(0, batch.request_binding(&operation), &[foreign]);
+            let result = AdmittedTxn::new(
+                runnable,
+                StateBinding::new(0, &snapshot).unwrap(),
+                execution,
+                AuthorityProofRef::new(
+                    "effect-axis-authority",
+                    vec![account.clone()],
+                    vec![Effect::Put],
+                )
+                .unwrap(),
+                account.clone(),
+                vec![Effect::Put],
+                operation,
+            );
+            assert!(matches!(result, Err(KernelError::BraidEffectMismatch)));
+        }
+
+        let operation = OperationId::new(b"effect-axis-unrelated".to_vec()).unwrap();
+        let batch = new_write_batch(&account, vec![Effect::Put]);
+        let (registry, capsule, ambient) = registry_and_capsule_terms(vec![(
+            "filesystem.record.write",
+            EffectClass::ReversibleWrite,
+        )]);
+        let (runnable, snapshot, execution) = prepare_runnable(
+            0,
+            batch.request_binding(&operation),
+            registry,
+            capsule,
+            ambient,
+        );
+        let result = AdmittedTxn::new(
+            runnable,
+            StateBinding::new(0, &snapshot).unwrap(),
+            execution,
+            AuthorityProofRef::new(
+                "effect-axis-authority",
+                vec![account.clone()],
+                vec![Effect::Put],
+            )
+            .unwrap(),
+            account,
+            vec![Effect::Put],
+            operation,
+        );
+        assert!(matches!(result, Err(KernelError::BraidEffectMismatch)));
     }
 
     #[tokio::test]
@@ -1487,16 +2020,17 @@ mod tests {
             u64::MAX,
         ))
         .unwrap();
-        let write = envelope(0, account.clone(), b"legacy-copy");
-        let mut batch = write.write_batch();
+        let mut batch = new_write_batch(&account, vec![Effect::Put]);
         legacy
             .copy_into(&mut batch, b"legacy-value".to_vec())
             .unwrap();
+        let write = write_envelope(0, &batch, b"legacy-copy");
         db.commit_admitted(write, batch).await.unwrap();
 
-        let read = envelope(1, account, b"legacy-read");
+        let destination = legacy.destination_tuple();
+        let read = read_envelope(1, account, b"legacy-read", KeyFamily::Record, &destination);
         assert_eq!(
-            db.get_admitted(read, KeyFamily::Record, &legacy.destination_tuple())
+            db.get_admitted(read, KeyFamily::Record, &destination)
                 .await
                 .unwrap(),
             Some(b"legacy-value".to_vec())
@@ -1517,11 +2051,11 @@ mod tests {
         let object = Tuple::new(vec![Element::Bytes(b"document".to_vec())]);
         {
             let db = HybridDb::embedded_at(&path, FdbConfig::default()).unwrap();
-            let write = envelope(0, account.clone(), b"app-write");
-            let mut batch = write.write_batch();
+            let mut batch = new_write_batch(&account, vec![Effect::Put]);
             batch
                 .set(KeyFamily::Record, &object, b"durable".to_vec())
                 .unwrap();
+            let write = write_envelope(0, &batch, b"app-write");
             assert!(matches!(
                 db.commit_admitted(write, batch).await.unwrap(),
                 AdmittedOutcome::Applied { .. }
@@ -1533,7 +2067,7 @@ mod tests {
             assert_eq!(
                 reopened
                     .get_admitted(
-                        envelope(1, account, b"app-read"),
+                        read_envelope(1, account, b"app-read", KeyFamily::Record, &object,),
                         KeyFamily::Record,
                         &object,
                     )
@@ -1553,8 +2087,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let write = envelope(version as u64, account.clone(), name);
-            let mut batch = write.write_batch();
+            let mut batch = new_write_batch(&account, vec![Effect::Put]);
             batch
                 .set(
                     KeyFamily::Record,
@@ -1562,13 +2095,12 @@ mod tests {
                     name.to_vec(),
                 )
                 .unwrap();
+            let write = write_envelope(version as u64, &batch, name);
             db.commit_admitted(write, batch).await.unwrap();
         }
 
-        let first = db
-            .changes_admitted(scan_envelope(2, account.clone(), b"scan-1"), None, 1)
-            .await
-            .unwrap();
+        let first_envelope = scan_envelope(2, account.clone(), b"scan-1", None, 1);
+        let first = db.changes_admitted(first_envelope, None, 1).await.unwrap();
         assert_eq!(first.events.len(), 1);
         assert!(first.more);
         assert!(matches!(
@@ -1576,12 +2108,10 @@ mod tests {
             [ChangeMutation::Set { .. }]
         ));
 
+        let second_envelope =
+            scan_envelope(2, account.clone(), b"scan-2", first.next_token.as_ref(), 1);
         let second = db
-            .changes_admitted(
-                scan_envelope(2, account, b"scan-2"),
-                first.next_token.as_ref(),
-                1,
-            )
+            .changes_admitted(second_envelope, first.next_token.as_ref(), 1)
             .await
             .unwrap();
         assert_eq!(second.events.len(), 1);
@@ -1609,7 +2139,10 @@ mod tests {
 
     #[test]
     fn state_binding_reports_the_nonzero_version_it_proved() {
-        let (_, snapshot) = runnable(41);
+        let account = scope(b"binding");
+        let operation = OperationId::new(b"binding-op".to_vec()).unwrap();
+        let batch = new_write_batch(&account, vec![Effect::Put]);
+        let (_, snapshot, _) = runnable(41, batch.request_binding(&operation), &[Effect::Put]);
         let binding = StateBinding::new(41, &snapshot).unwrap();
         assert_eq!(binding.database_version(), 41);
         assert_eq!(binding.snapshot_cid(), snapshot.cid());
@@ -1618,9 +2151,10 @@ mod tests {
     #[test]
     fn batch_limits_are_exact_and_include_transaction_metadata() {
         let account = scope(b"account-limits");
-        let transaction = envelope(0, account.clone(), b"limit-operation");
+        let batch = new_write_batch(&account, vec![Effect::Put, Effect::Get]);
+        let transaction = write_envelope(0, &batch, b"limit-operation");
 
-        let mut charged = transaction.write_batch();
+        let mut charged = batch.clone();
         charged.encoded_bytes = crate::fdb::MAX_TRANSACTION_BYTES - 2;
         charged.charge(2).unwrap();
         assert_eq!(charged.encoded_bytes, crate::fdb::MAX_TRANSACTION_BYTES);
@@ -1629,13 +2163,13 @@ mod tests {
             Err(KernelError::TransactionTooLarge { .. })
         ));
 
-        let mut small_charge = transaction.write_batch();
+        let mut small_charge = batch.clone();
         small_charge.encoded_bytes = 2;
         small_charge.charge(3).unwrap();
         assert_eq!(small_charge.encoded_bytes, 5);
 
         let placeholder = WriteMutation::Clear { key: vec![1] };
-        let mut keys = transaction.write_batch();
+        let mut keys = batch.clone();
         keys.mutations = vec![placeholder.clone(); crate::fdb::MAX_TRANSACTION_KEYS - 1];
         keys.charge(0).unwrap();
         keys.mutations.push(placeholder);
@@ -1647,7 +2181,6 @@ mod tests {
             result => panic!("expected exact key-count rejection, got {result:?}"),
         }
 
-        let batch = transaction.write_batch();
         let change_mutations = batch.change_mutation_bytes();
         let exact_total = batch.encoded_bytes
             + operation_key(&transaction.scope, &transaction.operation_id).len()
@@ -1656,6 +2189,8 @@ mod tests {
             + invocation_key(&transaction).len()
             + OPERATION_MARKER_BYTES
             + 4
+            + frontier_key(&transaction.scope).len()
+            + 32
             + embedded_change_key(&transaction.scope, &transaction.operation_id).len()
             + 4
             + change_value_len(&transaction.operation_id, &change_mutations);
@@ -1706,7 +2241,7 @@ mod tests {
     fn change_codec_covers_prefix_size_and_clear_events() {
         let account = scope(b"account-codec");
         let prefix = change_prefix(&account);
-        assert_eq!(prefix, account.family_prefix(KeyFamily::Change));
+        assert_eq!(prefix, account.system_prefix(SystemFamily::Change));
         assert_ne!(prefix, vec![0]);
         assert_ne!(prefix, vec![1]);
 
@@ -1719,12 +2254,8 @@ mod tests {
         let encoded = change_value(&operation, fingerprint, &mutations);
         assert_eq!(change_value_len(&operation, &mutations), encoded.len());
 
-        let event = decode_change_event(
-            &account,
-            ChangeToken::from_bytes(vec![9]).unwrap(),
-            &encoded,
-        )
-        .unwrap();
+        let event =
+            decode_change_event(&account, change_token(&account, b"codec"), &encoded).unwrap();
         assert!(matches!(
             event.mutations.as_slice(),
             [ChangeMutation::Clear { key: changed }] if changed.family == KeyFamily::Record
@@ -1751,17 +2282,7 @@ mod tests {
     #[test]
     fn batch_cannot_use_an_undeclared_effect() {
         let account = scope(b"account");
-        let (runnable, snapshot) = runnable(0);
-        let write = AdmittedTxn::new(
-            runnable,
-            StateBinding::new(0, &snapshot).unwrap(),
-            AuthorityProofRef::new("auth", vec![account.clone()], vec![Effect::Get]).unwrap(),
-            account,
-            vec![Effect::Get],
-            OperationId::new(b"read-only".to_vec()).unwrap(),
-        )
-        .unwrap();
-        let mut batch = write.write_batch();
+        let mut batch = new_write_batch(&account, vec![Effect::Get]);
         assert!(matches!(
             batch.set(KeyFamily::Record, &Tuple::new(vec![]), vec![]),
             Err(KernelError::AuthorityScopeViolation)
@@ -1793,7 +2314,7 @@ mod tests {
         let account = scope(b"account-receipt");
         let transaction = envelope(0, account, b"receipt-operation");
         let receipt = receipt_from(&transaction, 41);
-        let rendered = String::from_utf8(JsonReceiptPort.render(&receipt)).unwrap();
+        let rendered = String::from_utf8(JsonReceiptPort.render(&receipt).unwrap()).unwrap();
 
         assert!(rendered.contains("\"committed_version\":41"));
         assert!(rendered.contains("\"operation_id\":\"726563656970742d6f7065726174696f6e\""));
@@ -1806,43 +2327,113 @@ mod tests {
         assert!(rendered.contains(&receipt.braid.predicate_cid.to_hex()));
         assert_eq!(Effect::Delete.tag(), 2);
         assert_eq!(Effect::Scan.tag(), 4);
+
+        let mut hostile = receipt;
+        hostile.authority_proof_id = "\"},\n\"forged\":true".into();
+        let encoded = JsonReceiptPort.render(&hostile).unwrap();
+        let value: lgwks_std::json::Value = lgwks_std::json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            value
+                .get("authority_proof")
+                .and_then(|value| value.as_str()),
+            Some(hostile.authority_proof_id.as_str())
+        );
+        assert!(value.get("forged").is_none());
     }
 
     #[test]
     fn change_token_enforces_both_wire_bounds() {
+        let account = scope(b"token-scope");
         assert!(matches!(
             ChangeToken::from_bytes(Vec::new()),
             Err(KernelError::MalformedKey)
         ));
-        assert_eq!(ChangeToken::from_bytes(vec![7]).unwrap().as_bytes(), &[7]);
-        assert!(ChangeToken::from_bytes(vec![7; MAX_OPERATION_ID_BYTES + 12]).is_ok());
+        let minimum = change_token(&account, b"x");
+        assert_eq!(
+            minimum.suffix_for(&account).unwrap().len(),
+            VERSIONSTAMP_BYTES + 3
+        );
+        let maximum = change_token(&account, &vec![7; MAX_OPERATION_ID_BYTES]);
+        assert!(ChangeToken::from_bytes(maximum.as_bytes().to_vec()).is_ok());
         assert!(matches!(
-            ChangeToken::from_bytes(vec![7; MAX_OPERATION_ID_BYTES + 13]),
+            ChangeToken::from_bytes(vec![7; TOKEN_SCOPE_BYTES + MAX_OPERATION_ID_BYTES + 13]),
             Err(KernelError::MalformedKey)
+        ));
+        assert!(matches!(
+            minimum.suffix_for(&scope(b"other-token-scope")),
+            Err(KernelError::TenantPrefixViolation)
+        ));
+        assert!(matches!(
+            physical_change_key(
+                &change_prefix(&scope(b"other-token-scope")),
+                &scope(b"other-token-scope"),
+                &minimum,
+            ),
+            Err(KernelError::TenantPrefixViolation)
+        ));
+    }
+
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn native_errors_preserve_actionable_categories() {
+        assert!(matches!(
+            native_fdb_error(foundationdb::FdbError::from_code(1020)),
+            KernelError::TransactionConflict
+        ));
+        assert!(matches!(
+            native_fdb_error(foundationdb::FdbError::from_code(1031)),
+            KernelError::BackendTimedOut { code: 1031 }
+        ));
+        assert!(matches!(
+            native_fdb_error(foundationdb::FdbError::from_code(2008)),
+            KernelError::BackendUnavailable { code: 2008 }
+        ));
+        assert!(matches!(
+            native_fdb_error(foundationdb::FdbError::from_code(2203)),
+            KernelError::BackendVersionSkew { code: 2203 }
+        ));
+        for code in [1021, 1022, 1030] {
+            assert!(matches!(
+                native_fdb_error(foundationdb::FdbError::from_code(code)),
+                KernelError::CommitOutcomeUnknown { code: actual } if actual == code
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_admitted_wait_honors_timeout_before_storage_begins() {
+        let options = FdbConfig {
+            transaction_timeout_ms: 1,
+            ..FdbConfig::default()
+        };
+        let db = LogicalDb::open(options).unwrap();
+        let account = scope(b"embedded-timeout");
+        let object = Tuple::new(vec![Element::Bytes(b"record".to_vec())]);
+        let read = read_envelope(0, account, b"blocked-read", KeyFamily::Record, &object);
+        let backend = std::sync::Arc::clone(&db.backend);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = backend.lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+        let result = db.get_admitted(read, KeyFamily::Record, &object).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(KernelError::TransactionTimedOut { limit_ms: 1, .. })
         ));
     }
 
     #[test]
     fn write_batch_accounts_for_set_clear_and_canonical_bytes() {
         let account = scope(b"account-batch");
-        let (runnable, snapshot) = runnable(0);
-        let transaction = AdmittedTxn::new(
-            runnable,
-            StateBinding::new(0, &snapshot).unwrap(),
-            AuthorityProofRef::new(
-                "batch-authority",
-                vec![account.clone()],
-                vec![Effect::Put, Effect::Delete],
-            )
-            .unwrap(),
-            account,
-            vec![Effect::Delete, Effect::Put],
-            OperationId::new(b"batch-operation".to_vec()).unwrap(),
-        )
-        .unwrap();
         let set_tuple = Tuple::new(vec![Element::Bytes(b"set".to_vec())]);
         let clear_tuple = Tuple::new(vec![Element::Bytes(b"clear".to_vec())]);
-        let mut batch = transaction.write_batch();
+        let mut batch = new_write_batch(&account, vec![Effect::Delete, Effect::Put]);
 
         assert!(batch.is_empty());
         assert_eq!(batch.len(), 0);
@@ -1853,8 +2444,8 @@ mod tests {
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
 
-        let set_key = transaction.scope.pack(KeyFamily::Record, &set_tuple);
-        let clear_key = transaction.scope.pack(KeyFamily::Index, &clear_tuple);
+        let set_key = account.pack(KeyFamily::Record, &set_tuple);
+        let clear_key = account.pack(KeyFamily::Index, &clear_tuple);
         assert_eq!(
             batch.encoded_bytes,
             set_key.len() + b"value".len() + clear_key.len()
@@ -1875,23 +2466,23 @@ mod tests {
             Err(KernelError::AuthorityScopeViolation)
         ));
         assert!(matches!(
-            validate_change_request(&scan_envelope(0, account.clone(), b"zero"), 0),
+            validate_change_request(&scan_envelope(0, account.clone(), b"zero", None, 1), 0,),
             Err(KernelError::RangeLimitInvalid { .. })
         ));
         assert!(validate_change_request(
-            &scan_envelope(0, account.clone(), b"maximum"),
+            &scan_envelope(0, account.clone(), b"maximum", None, MAX_PUBLIC_RANGE_ROWS,),
             MAX_PUBLIC_RANGE_ROWS
         )
         .is_ok());
         assert!(matches!(
             validate_change_request(
-                &scan_envelope(0, account.clone(), b"too-many"),
+                &scan_envelope(0, account.clone(), b"too-many", None, 1),
                 MAX_PUBLIC_RANGE_ROWS + 1
             ),
             Err(KernelError::RangeLimitInvalid { .. })
         ));
 
-        let token = ChangeToken::from_bytes(vec![1]).unwrap();
+        let token = change_token(&account, b"page");
         let operation = OperationId::new(b"change-operation".to_vec()).unwrap();
         let fingerprint = Cid::compute(b"logical-db.test", b"change");
         let tuple = Tuple::new(vec![Element::Bytes(b"record".to_vec())]);
@@ -1903,7 +2494,7 @@ mod tests {
         };
         let value = change_value(&operation, fingerprint, &mutations);
         let mut physical_key = change_prefix(&account);
-        physical_key.extend_from_slice(token.as_bytes());
+        physical_key.extend_from_slice(token.suffix_for(&account).unwrap());
         let page = change_page(&account, vec![(physical_key, value)], true).unwrap();
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.next_token, Some(token));
@@ -1916,21 +2507,13 @@ mod tests {
         ));
 
         assert!(matches!(
-            decode_change_event(
-                &account,
-                ChangeToken::from_bytes(vec![2]).unwrap(),
-                &[1; 32]
-            ),
+            decode_change_event(&account, change_token(&account, b"bad-short"), &[1; 32]),
             Err(KernelError::MalformedKey)
         ));
         let mut wrong_tag = vec![2];
         wrong_tag.extend_from_slice(&[0; 32]);
         assert!(matches!(
-            decode_change_event(
-                &account,
-                ChangeToken::from_bytes(vec![3]).unwrap(),
-                &wrong_tag
-            ),
+            decode_change_event(&account, change_token(&account, b"bad-tag"), &wrong_tag),
             Err(KernelError::MalformedKey)
         ));
     }

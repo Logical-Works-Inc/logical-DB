@@ -33,7 +33,7 @@ Reconcile with `node scripts/repo-map.mjs check`.
 | `kernel/` | kernel | The logical-db crate: hybrid v2 processing and key contract over embedded redb or native FDB, plus the legacy five-class model and recovery oracle. (ADR-001, ADR-002, ADR-003) |
 | `kernel/src/contains.rs` | kernel | Opaque bounded batch existence contains_many: exact present/missing with budget, deterministic dedup+ordering, continuation, tenant-isolated via tuple subspaces (F2); supports kernel#804 missing-set. (ADR-002, #16) |
 | `kernel/src/tuple.rs` | kernel | Account-first hybrid v2 scope, disjoint key families, and order-preserving tuple codec. |
-| `kernel/src/admitted.rs` | kernel | Real Braid RunnableInvocation consumption, bounded WriteBatch, embedded/native drivers, operation and invocation deduplication, receipts, and zone change tokens. |
+| `kernel/src/admitted.rs` | kernel | Exact-request Braid RunnableInvocation consumption, bounded WriteBatch, embedded/native drivers, private system families, receipts, and zone-bound change tokens. |
 | `kernel/src/migration.rs` | kernel | Lossless v1 row-key to scoped v2 copy primitive; never guesses scope or deletes source state. |
 
 ## META — agent/process tooling

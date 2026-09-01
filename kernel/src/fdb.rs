@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use redb::{ReadableDatabase, ReadableTable};
 
@@ -21,7 +21,12 @@ use crate::{KernelError, Result};
 #[cfg(feature = "fdb")]
 use foundationdb as _;
 
-pub const MAX_TRANSACTION_BYTES: usize = 10 * 1024 * 1024;
+/// FoundationDB's hard affected-data ceiling. This is decimal, not 10 MiB.
+pub const MAX_TRANSACTION_BYTES: usize = 10_000_000;
+/// FoundationDB's hard encoded-key ceiling, shared by both providers.
+pub const MAX_KEY_BYTES: usize = 10_000;
+/// FoundationDB's hard single-value ceiling, shared by both providers.
+pub const MAX_VALUE_BYTES: usize = 100_000;
 pub const MAX_TRANSACTION_KEYS: usize = 100_000;
 pub const DEFAULT_TRANSACTION_TIMEOUT_MS: u64 = 5_000;
 const MAX_RETRY_ATTEMPTS: usize = 5;
@@ -113,6 +118,7 @@ impl LogicalDb {
     /// In-memory processing profile. Supplying an FDB cluster path is an
     /// error: embedded execution must never masquerade as an outboard client.
     pub fn open(config: DatabaseOptions) -> Result<Self> {
+        validate_database_options(&config)?;
         reject_outboard_config(&config)?;
         let backend = EmbeddedBackend::new_mem_shim();
         Ok(Self {
@@ -126,6 +132,7 @@ impl LogicalDb {
     /// (redb transaction per commit). Used for local-dev durability
     /// rehearsal without a live fdbserver.
     pub fn open_at(path: impl AsRef<Path>, config: DatabaseOptions) -> Result<Self> {
+        validate_database_options(&config)?;
         reject_outboard_config(&config)?;
         let backend = EmbeddedBackend::open(path)?;
         // Validate durable metadata before exposing the handle. Corruption is
@@ -364,10 +371,23 @@ impl LogicalDb {
         Ok((backend.committed_version()?, backend.snapshot_map()?))
     }
 
-    fn lock_backend(&self) -> Result<MutexGuard<'_, EmbeddedBackend>> {
+    pub(crate) fn lock_backend(&self) -> Result<MutexGuard<'_, EmbeddedBackend>> {
         self.backend
             .lock()
             .map_err(|_| KernelError::StateLockPoisoned { lock: "backend" })
+    }
+
+    /// Try to enter the embedded transaction boundary without an unbounded
+    /// thread-blocking mutex wait. Admitted orchestration applies the configured
+    /// deadline while the transaction is still safe to abandon.
+    pub(crate) fn try_lock_backend(&self) -> Result<Option<MutexGuard<'_, EmbeddedBackend>>> {
+        match self.backend.try_lock() {
+            Ok(backend) => Ok(Some(backend)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                Err(KernelError::StateLockPoisoned { lock: "backend" })
+            }
+        }
     }
 
     fn lock_watches(&self) -> Result<MutexGuard<'_, WatchMap>> {
@@ -386,6 +406,31 @@ fn reject_outboard_config(config: &DatabaseOptions) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn validate_database_options(config: &DatabaseOptions) -> Result<()> {
+    if config.transaction_timeout_ms == 0 {
+        return Err(KernelError::ConfigurationInvalid(
+            "transaction_timeout_ms must be greater than zero",
+        ));
+    }
+    if config.transaction_timeout_ms > i32::MAX as u64 {
+        return Err(KernelError::ConfigurationInvalid(
+            "transaction_timeout_ms must fit FoundationDB's signed option field",
+        ));
+    }
+    if config.transaction_size_limit_bytes == 0 {
+        return Err(KernelError::ConfigurationInvalid(
+            "transaction_size_limit_bytes must be greater than zero",
+        ));
+    }
+    if config.transaction_size_limit_bytes > MAX_TRANSACTION_BYTES {
+        return Err(KernelError::TransactionTooLarge {
+            size: config.transaction_size_limit_bytes,
+            limit: MAX_TRANSACTION_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn apply_atomic_op(op: &AtomicOp, existing: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -620,6 +665,8 @@ impl FdbTransaction {
     }
 
     pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        validate_key(&key)?;
+        validate_value(&value)?;
         let additional = key.len() + value.len();
         self.check_limits(additional)?;
         self.total_bytes += additional;
@@ -629,6 +676,7 @@ impl FdbTransaction {
     }
 
     pub fn clear(&mut self, key: &[u8]) -> Result<()> {
+        validate_key(key)?;
         self.check_limits(key.len())?;
         self.total_bytes += key.len();
         self.total_keys += 1;
@@ -799,6 +847,8 @@ impl FdbTransaction {
     // ── Versionstamp ────────────────────────────────────────
 
     pub fn set_versionstamped_key(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        validate_key(&key)?;
+        validate_value(&value)?;
         if !key.windows(10).any(|w| w == [0xFF; 10] || w == [0u8; 10]) {
             return Err(KernelError::Backend(
                 "versionstamped key must contain 10-byte placeholder".into(),
@@ -817,6 +867,14 @@ impl FdbTransaction {
     }
 
     pub fn set_versionstamped_value(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        validate_key(&key)?;
+        // The four-byte offset suffix is client metadata and is not stored.
+        if value.len().saturating_sub(4) > MAX_VALUE_BYTES {
+            return Err(KernelError::ValueTooLarge {
+                len: value.len().saturating_sub(4),
+                limit: MAX_VALUE_BYTES,
+            });
+        }
         if !value.windows(10).any(|w| w == [0xFF; 10] || w == [0u8; 10]) {
             return Err(KernelError::Backend(
                 "versionstamped value must contain 10-byte placeholder".into(),
@@ -984,6 +1042,26 @@ fn fdb_exclusive_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+pub(crate) fn validate_key(key: &[u8]) -> Result<()> {
+    if key.len() > MAX_KEY_BYTES {
+        return Err(KernelError::KeyTooLarge {
+            len: key.len(),
+            limit: MAX_KEY_BYTES,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_value(value: &[u8]) -> Result<()> {
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(KernelError::ValueTooLarge {
+            len: value.len(),
+            limit: MAX_VALUE_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn fdb_read_table(
     rtxn: &redb::ReadTransaction,
     def: redb::TableDefinition<&[u8], &[u8]>,
@@ -1072,10 +1150,53 @@ impl EmbeddedBackend {
         Ok(out)
     }
 
+    pub(crate) fn get_point(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get(key)
+    }
+
+    pub(crate) fn scan_range_limited(
+        &self,
+        start: &[u8],
+        start_exclusive: bool,
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(db) = &self.db {
+            let rtxn = db.begin_read().map_err(fdb_backend_err)?;
+            let Some(table) = fdb_read_table(&rtxn, FDB_ROWS)? else {
+                return Ok(Vec::new());
+            };
+            let start_bound = if start_exclusive {
+                Bound::Excluded(&start)
+            } else {
+                Bound::Included(&start)
+            };
+            let end_bound = Bound::Excluded(&end);
+            let mut out = Vec::new();
+            for row in table
+                .range::<&[u8]>((start_bound, end_bound))
+                .map_err(fdb_backend_err)?
+                .take(limit)
+            {
+                let (key, value) = row.map_err(fdb_backend_err)?;
+                out.push((key.value().to_vec(), value.value().to_vec()));
+            }
+            return Ok(out);
+        }
+        let start_bound = if start_exclusive {
+            Bound::Excluded(start)
+        } else {
+            Bound::Included(start)
+        };
+        Ok(self
+            .inner
+            .scan_range_limited(start_bound, Bound::Excluded(end), limit))
+    }
+
     /// Applies data mutations and their committed version as one backend
     /// transaction. This is the only primitive used by `LogicalDb` commit;
     /// callers cannot accidentally split puts, deletes, and metadata.
-    fn apply_transaction(
+    pub(crate) fn apply_transaction(
         &mut self,
         puts: &[(Vec<u8>, Vec<u8>)],
         deletes: &[Vec<u8>],
@@ -1086,6 +1207,13 @@ impl EmbeddedBackend {
                 last: self.committed,
                 got: version,
             });
+        }
+        for (key, value) in puts {
+            validate_key(key)?;
+            validate_value(value)?;
+        }
+        for key in deletes {
+            validate_key(key)?;
         }
         let put_bytes = puts.iter().try_fold(0usize, |total, (key, value)| {
             total.checked_add(key.len() + value.len()).ok_or({
@@ -1264,9 +1392,9 @@ mod tests {
     #[test]
     fn fdb_config_defaults_are_pinned() {
         let cfg = FdbConfig::default();
-        assert_eq!(MAX_TRANSACTION_BYTES, 10_485_760);
+        assert_eq!(MAX_TRANSACTION_BYTES, 10_000_000);
         assert_eq!(MAX_TRANSACTION_KEYS, 100_000);
-        assert_eq!(cfg.transaction_size_limit_bytes, 10_485_760);
+        assert_eq!(cfg.transaction_size_limit_bytes, 10_000_000);
         assert_eq!(cfg.transaction_timeout_ms, 5_000);
         assert!(cfg.cluster_file.is_none());
         assert_eq!(fdb_exclusive_upper_bound(&[1, 0xFF]), Some(vec![2]));
@@ -1291,6 +1419,33 @@ mod tests {
         assert!(matches!(
             LogicalDb::open(outboard),
             Err(KernelError::Backend(message)) if message.contains("native FoundationDB")
+        ));
+
+        for invalid in [
+            FdbConfig {
+                transaction_timeout_ms: 0,
+                ..FdbConfig::default()
+            },
+            FdbConfig {
+                transaction_timeout_ms: i32::MAX as u64 + 1,
+                ..FdbConfig::default()
+            },
+            FdbConfig {
+                transaction_size_limit_bytes: 0,
+                ..FdbConfig::default()
+            },
+        ] {
+            assert!(matches!(
+                LogicalDb::open(invalid),
+                Err(KernelError::ConfigurationInvalid(_))
+            ));
+        }
+        assert!(matches!(
+            LogicalDb::open(FdbConfig {
+                transaction_size_limit_bytes: MAX_TRANSACTION_BYTES + 1,
+                ..FdbConfig::default()
+            }),
+            Err(KernelError::TransactionTooLarge { .. })
         ));
     }
 
@@ -1411,8 +1566,8 @@ mod tests {
         assert!(matches!(
             apply_atomic_op(&op(AtomicOpKind::AppendIfFits, vec![1]), Some(&full)),
             Err(KernelError::TransactionTooLarge {
-                size: 10_485_761,
-                limit: 10_485_760
+                size: 10_000_001,
+                limit: 10_000_000
             })
         ));
     }
@@ -1468,6 +1623,19 @@ mod tests {
         assert!(matches!(
             timed_out.check_timeout(),
             Err(KernelError::TransactionTimedOut { limit_ms: 1, .. })
+        ));
+
+        let mut provider_limits = FdbTransaction::new(MAX_TRANSACTION_BYTES, 5_000);
+        provider_limits
+            .set(vec![0; MAX_KEY_BYTES], vec![0; MAX_VALUE_BYTES])
+            .unwrap();
+        assert!(matches!(
+            provider_limits.set(vec![0; MAX_KEY_BYTES + 1], Vec::new()),
+            Err(KernelError::KeyTooLarge { .. })
+        ));
+        assert!(matches!(
+            provider_limits.set(Vec::new(), vec![0; MAX_VALUE_BYTES + 1]),
+            Err(KernelError::ValueTooLarge { .. })
         ));
 
         let mut ranges = FdbTransaction::new_with_snapshot(

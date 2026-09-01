@@ -5,12 +5,14 @@
 //! (INV-KILL-ALL-OR-NOTHING). Journaled reference path plus the
 //! durable FDB backend (ADR-002, retired redb).
 
-#[cfg(feature = "fdb")]
-use logical_db::fdb::FdbBackend;
+#![cfg(any(not(feature = "fdb"), feature = "legacy-raw"))]
+
 use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op};
 use logical_db::port::ClockPort;
 use logical_db::store::{Ldb, Mutation};
+#[cfg(all(feature = "fdb", feature = "legacy-raw"))]
+use logical_db::FdbBackend;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;

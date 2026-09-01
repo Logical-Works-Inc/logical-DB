@@ -38,8 +38,8 @@ impl LegacyV1Point {
         ])
     }
 
-    pub fn destination_key(&self, scope: &Scope) -> Vec<u8> {
-        scope.pack(KeyFamily::Record, &self.destination_tuple())
+    pub fn destination_key(&self, scope: &Scope) -> Result<Vec<u8>> {
+        scope.try_pack(KeyFamily::Record, &self.destination_tuple())
     }
 
     #[cfg(feature = "braid")]
@@ -77,7 +77,8 @@ mod tests {
         ] {
             let source = point_key(class, &[0, 0xFF, class.tag()], u64::MAX);
             let legacy = LegacyV1Point::decode(&source).unwrap();
-            let destination = ScopedKey::decode(&legacy.destination_key(&scope())).unwrap();
+            let destination =
+                ScopedKey::decode(&legacy.destination_key(&scope()).unwrap()).unwrap();
             assert_eq!(destination.scope, scope());
             assert_eq!(destination.family, KeyFamily::Record);
             assert_eq!(destination.tuple, legacy.destination_tuple());

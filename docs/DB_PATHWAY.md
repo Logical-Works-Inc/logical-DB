@@ -111,12 +111,14 @@ does not change this document.
   manifests; FTS5 A/B was not run).
 - **DB-D — Vec class — LANDED** for the quantized path (codes +
   centroid index + brute_scan top-K); exact fp32 baseline pending.
-- **DB-E — hybrid substrate (ADR-002/003) — IMPLEMENTED, UNPROVEN LIVE**:
+- **DB-E — hybrid substrate (ADR-002/003) — IMPLEMENTED, PROVEN LOCALLY**:
   the default profile embeds redb; `OutboardDb` uses the pinned native FDB
   client. Both consume the same account/container/zone `WriteBatch`, real
-  Braid runnable proof, idempotency marker, and durable zone change feed.
-  Compile and embedded recovery evidence are green. A live FDB parity run and
-  the LEM tape consumer receipt remain mandatory before release.
+  Braid runnable proof over the exact request CID and inspected effect,
+  idempotency marker, per-zone conflict frontier, and durable zone change feed.
+  Embedded recovery and the local live FDB 7.3 two-writer journey are green. A
+  remote Linux run and the LEM tape consumer receipt remain mandatory before
+  release.
 
 Dependency order A→B→C→D→E; B/C can parallelize after A. §9's filesystem
 face and §10's packs ride on B–D; §8's GNN compute rides on D.
