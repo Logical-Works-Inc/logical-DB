@@ -1411,6 +1411,11 @@ mod tests {
         let db = LogicalDb::open(configured).unwrap();
         assert_eq!(db.config().transaction_timeout_ms, 17);
         assert_eq!(db.config().transaction_size_limit_bytes, 23);
+        assert!(validate_database_options(&FdbConfig {
+            transaction_timeout_ms: i32::MAX as u64,
+            ..FdbConfig::default()
+        })
+        .is_ok());
 
         let outboard = FdbConfig {
             cluster_file: Some("fdb.cluster".into()),
@@ -1902,6 +1907,21 @@ mod tests {
             tx.set_versionstamped_value(b"bad".to_vec(), vec![7; 10]),
             Err(KernelError::Backend(_))
         ));
+
+        let mut exact_value = vec![1; MAX_VALUE_BYTES + 4];
+        exact_value[..10].fill(0);
+        let mut exact_tx = FdbTransaction::new(MAX_TRANSACTION_BYTES, 5_000);
+        exact_tx
+            .set_versionstamped_value(b"exact".to_vec(), exact_value.clone())
+            .unwrap();
+        exact_value.push(1);
+        assert!(matches!(
+            exact_tx.set_versionstamped_value(b"over".to_vec(), exact_value),
+            Err(KernelError::ValueTooLarge {
+                len,
+                limit: MAX_VALUE_BYTES
+            }) if len == MAX_VALUE_BYTES + 1
+        ));
     }
 
     #[test]
@@ -1932,6 +1952,42 @@ mod tests {
         assert!(matches!(
             batch.apply_transaction(&[], &[], 0),
             Err(KernelError::TsRegression { last: 1, got: 0 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_read_version_accepts_equal_and_rejects_stale() {
+        let db = LogicalDb::open(FdbConfig::default()).unwrap();
+        let (version, snapshot) = db.versioned_snapshot().unwrap();
+        let mut exact = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            version,
+            snapshot.clone(),
+        );
+        exact.require_exact_read_version();
+        exact
+            .set(b"exact-version".to_vec(), b"one".to_vec())
+            .unwrap();
+
+        let mut stale = FdbTransaction::new_with_snapshot(
+            MAX_TRANSACTION_BYTES,
+            DEFAULT_TRANSACTION_TIMEOUT_MS,
+            version,
+            snapshot,
+        );
+        stale.require_exact_read_version();
+        stale
+            .set(b"stale-version".to_vec(), b"two".to_vec())
+            .unwrap();
+
+        assert_eq!(db.try_commit(exact).await.unwrap(), version + 1);
+        assert!(matches!(
+            db.try_commit(stale).await,
+            Err(KernelError::StaleJustification {
+                expected,
+                got,
+            }) if expected == version + 1 && got == version
         ));
     }
 

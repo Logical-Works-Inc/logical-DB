@@ -135,16 +135,10 @@ impl Scope {
     /// bytes; embedded and outboard profiles therefore cannot drift in scope
     /// or ordering semantics.
     pub fn try_pack(&self, family: KeyFamily, tuple: &Tuple) -> Result<Vec<u8>> {
-        let mut out = self.family_prefix(family);
-        let encoded_len = tuple.encoded_len();
-        let packed_len = out.len().saturating_add(encoded_len);
-        if packed_len > crate::fdb::MAX_KEY_BYTES {
-            return Err(KernelError::KeyTooLarge {
-                len: packed_len,
-                limit: crate::fdb::MAX_KEY_BYTES,
-            });
-        }
-        out.extend_from_slice(&tuple.encode());
+        let prefix = self.family_prefix(family);
+        let mut out = Vec::with_capacity(crate::fdb::MAX_KEY_BYTES);
+        out.extend_from_slice(&prefix);
+        tuple.append_to_bounded_key(&mut out)?;
         Ok(out)
     }
 
@@ -318,17 +312,39 @@ impl Tuple {
         self.0.is_empty()
     }
 
-    fn encoded_len(&self) -> usize {
-        self.0.iter().fold(0usize, |total, element| {
-            let element_len = match element {
-                Element::Bytes(bytes) => 2usize
-                    .saturating_add(bytes.len())
-                    .saturating_add(bytes.iter().filter(|byte| **byte == 0).count()),
-                Element::Int(_) => 9,
-                Element::Bool(_) => 1,
-            };
-            total.saturating_add(element_len)
-        })
+    fn append_to_bounded_key(&self, out: &mut Vec<u8>) -> Result<()> {
+        for element in &self.0 {
+            match element {
+                Element::Bytes(bytes) => {
+                    push_bounded_key_byte(out, CODE_BYTES)?;
+                    for byte in bytes {
+                        if *byte == 0 {
+                            push_bounded_key_byte(out, 0)?;
+                            push_bounded_key_byte(out, 0xFF)?;
+                        } else {
+                            push_bounded_key_byte(out, *byte)?;
+                        }
+                    }
+                    push_bounded_key_byte(out, 0)?;
+                }
+                Element::Int(value) => {
+                    push_bounded_key_byte(out, CODE_INT)?;
+                    let flipped = (*value as u64) ^ 0x8000_0000_0000_0000;
+                    for byte in flipped.to_be_bytes() {
+                        push_bounded_key_byte(out, byte)?;
+                    }
+                }
+                Element::Bool(value) => push_bounded_key_byte(
+                    out,
+                    if *value {
+                        CODE_BOOL_TRUE
+                    } else {
+                        CODE_BOOL_FALSE
+                    },
+                )?,
+            }
+        }
+        Ok(())
     }
 
     /// Order-preserving encode. Each element is self-delimiting:
@@ -414,6 +430,17 @@ impl Tuple {
         }
         Ok(Self(out))
     }
+}
+
+fn push_bounded_key_byte(out: &mut Vec<u8>, byte: u8) -> Result<()> {
+    if out.len() == crate::fdb::MAX_KEY_BYTES {
+        return Err(KernelError::KeyTooLarge {
+            len: crate::fdb::MAX_KEY_BYTES + 1,
+            limit: crate::fdb::MAX_KEY_BYTES,
+        });
+    }
+    out.push(byte);
+    Ok(())
 }
 
 // Type codes — chosen to give the type ordering
@@ -691,6 +718,46 @@ mod tests {
                 Err(KernelError::MalformedKey)
             ));
         }
+    }
+
+    #[test]
+    fn scoped_key_limit_accepts_exactly_maximum_bytes() {
+        let base = scope(b"limit-account", b"limit-container", b"limit-zone");
+        let mixed = Tuple::new(vec![
+            Element::Bytes(vec![0, 1, 0]),
+            Element::Int(-7),
+            Element::Bool(true),
+        ]);
+        let mut expected_mixed = base.family_prefix(KeyFamily::Record);
+        expected_mixed.extend_from_slice(&mixed.encode());
+        assert_eq!(
+            base.try_pack(KeyFamily::Record, &mixed).unwrap(),
+            expected_mixed
+        );
+        let payload_len = crate::fdb::MAX_KEY_BYTES
+            .checked_sub(base.family_prefix(KeyFamily::Record).len() + 2)
+            .unwrap();
+        let exact = Tuple::new(vec![Element::Bytes(vec![1; payload_len])]);
+        assert_eq!(
+            base.try_pack(KeyFamily::Record, &exact).unwrap().len(),
+            crate::fdb::MAX_KEY_BYTES
+        );
+        let over = Tuple::new(vec![Element::Bytes(vec![1; payload_len + 1])]);
+        assert!(matches!(
+            base.try_pack(KeyFamily::Record, &over),
+            Err(KernelError::KeyTooLarge {
+                len,
+                limit: crate::fdb::MAX_KEY_BYTES
+            }) if len == crate::fdb::MAX_KEY_BYTES + 1
+        ));
+        let hostile = Tuple::new(vec![Element::Bytes(vec![0; 1_000_000])]);
+        assert!(matches!(
+            base.try_pack(KeyFamily::Record, &hostile),
+            Err(KernelError::KeyTooLarge {
+                len,
+                limit: crate::fdb::MAX_KEY_BYTES
+            }) if len == crate::fdb::MAX_KEY_BYTES + 1
+        ));
     }
 
     #[test]

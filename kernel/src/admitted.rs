@@ -22,14 +22,17 @@ pub const MAX_OPERATION_ID_BYTES: usize = 1_024;
 pub const MAX_DECLARED_EFFECTS: usize = 16;
 pub const MAX_AUTHORITY_SCOPES: usize = 128;
 pub const MAX_PUBLIC_RANGE_ROWS: usize = 100;
-pub const MAX_CHANGE_PAGE_BYTES: usize =
-    MAX_PUBLIC_RANGE_ROWS * (crate::fdb::MAX_KEY_BYTES + crate::fdb::MAX_VALUE_BYTES);
+pub const MAX_CHANGE_PAGE_BYTES: usize = 11_000_000;
 
 const OPERATION_DOMAIN: &[u8] = b"lw.logical-db.operation.v2";
 const REQUEST_DOMAIN: &[u8] = b"lw.logical-db.request.v2";
 const BRAID_PREDICATE_DOMAIN: &[u8] = b"lw.braid.justification.predicate.v0";
 const VERSIONSTAMP_BYTES: usize = 10;
 const TOKEN_SCOPE_BYTES: usize = 32;
+const MIN_CHANGE_SUFFIX_BYTES: usize = 13;
+const MAX_CHANGE_SUFFIX_BYTES: usize = 1_036;
+const MIN_CHANGE_TOKEN_BYTES: usize = 45;
+const MAX_CHANGE_TOKEN_BYTES: usize = 1_068;
 const OPERATION_MARKER_BYTES: usize = 32 + VERSIONSTAMP_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -360,10 +363,10 @@ const fn database_capability(effect: Effect) -> &'static str {
 fn normalize_effects(effects: &mut Vec<Effect>) -> Result<()> {
     effects.sort_unstable();
     effects.dedup();
-    if effects.is_empty() || effects.len() > MAX_DECLARED_EFFECTS {
-        return Err(KernelError::AuthorityScopeViolation);
+    match effects.as_slice() {
+        [] => Err(KernelError::AuthorityScopeViolation),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,9 +413,7 @@ pub struct ChangeToken(Vec<u8>);
 
 impl ChangeToken {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        if bytes.len() < TOKEN_SCOPE_BYTES + VERSIONSTAMP_BYTES + 3
-            || bytes.len() > TOKEN_SCOPE_BYTES + MAX_OPERATION_ID_BYTES + 12
-        {
+        if !(MIN_CHANGE_TOKEN_BYTES..=MAX_CHANGE_TOKEN_BYTES).contains(&bytes.len()) {
             return Err(KernelError::MalformedKey);
         }
         validate_change_suffix(&bytes[TOKEN_SCOPE_BYTES..])?;
@@ -439,7 +440,7 @@ impl ChangeToken {
 }
 
 fn validate_change_suffix(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < VERSIONSTAMP_BYTES + 3 || bytes.len() > MAX_OPERATION_ID_BYTES + 12 {
+    if !(MIN_CHANGE_SUFFIX_BYTES..=MAX_CHANGE_SUFFIX_BYTES).contains(&bytes.len()) {
         return Err(KernelError::MalformedKey);
     }
     let operation_len = u16::from_be_bytes(
@@ -637,7 +638,7 @@ impl RequestBinding {
         after: Option<&ChangeToken>,
         limit: usize,
     ) -> Result<Self> {
-        if limit == 0 || limit > MAX_PUBLIC_RANGE_ROWS {
+        if !(1..=MAX_PUBLIC_RANGE_ROWS).contains(&limit) {
             return Err(KernelError::RangeLimitInvalid {
                 requested: limit,
                 limit: MAX_PUBLIC_RANGE_ROWS,
@@ -1433,19 +1434,9 @@ fn validate_change_request(envelope: &AdmittedTxn, limit: usize) -> Result<()> {
 }
 
 fn change_page(scope: &Scope, rows: Vec<(Vec<u8>, Vec<u8>)>, more: bool) -> Result<ChangePage> {
-    let mut page_bytes = 0_usize;
     for (key, value) in &rows {
         crate::fdb::validate_key(key)?;
         crate::fdb::validate_value(value)?;
-        page_bytes = page_bytes
-            .saturating_add(key.len())
-            .saturating_add(value.len());
-    }
-    if page_bytes > MAX_CHANGE_PAGE_BYTES {
-        return Err(KernelError::TransactionTooLarge {
-            size: page_bytes,
-            limit: MAX_CHANGE_PAGE_BYTES,
-        });
     }
     let prefix = change_prefix(scope);
     let mut events = Vec::with_capacity(rows.len());
@@ -2154,6 +2145,18 @@ mod tests {
         let batch = new_write_batch(&account, vec![Effect::Put, Effect::Get]);
         let transaction = write_envelope(0, &batch, b"limit-operation");
 
+        assert_eq!(MAX_CHANGE_PAGE_BYTES, 11_000_000);
+        assert!(matches!(
+            WriteBatch::new(account.clone(), vec![]),
+            Err(KernelError::AuthorityScopeViolation)
+        ));
+        let normalized = WriteBatch::new(
+            account.clone(),
+            vec![Effect::Scan, Effect::Put, Effect::Put],
+        )
+        .unwrap();
+        assert_eq!(normalized.effects, vec![Effect::Put, Effect::Scan]);
+
         let mut charged = batch.clone();
         charged.encoded_bytes = crate::fdb::MAX_TRANSACTION_BYTES - 2;
         charged.charge(2).unwrap();
@@ -2198,6 +2201,24 @@ mod tests {
         assert!(matches!(
             batch.validate_for(&transaction, exact_total - 1),
             Err(KernelError::TransactionTooLarge { .. })
+        ));
+
+        let mut exact_change = batch.clone();
+        let empty_change_len = change_value_len(&transaction.operation_id, &[]);
+        let key_len = crate::fdb::MAX_VALUE_BYTES - empty_change_len - 9;
+        exact_change.mutations = vec![WriteMutation::Clear {
+            key: vec![1; key_len],
+        }];
+        exact_change.validate_for(&transaction, usize::MAX).unwrap();
+        exact_change.mutations[0] = WriteMutation::Clear {
+            key: vec![1; key_len + 1],
+        };
+        assert!(matches!(
+            exact_change.validate_for(&transaction, usize::MAX),
+            Err(KernelError::ValueTooLarge {
+                len,
+                limit: crate::fdb::MAX_VALUE_BYTES
+            }) if len == crate::fdb::MAX_VALUE_BYTES + 1
         ));
 
         let mut wrong_scope = batch.clone();
@@ -2245,7 +2266,18 @@ mod tests {
         assert_ne!(prefix, vec![0]);
         assert_ne!(prefix, vec![1]);
 
+        let expected_frontier = account.pack_system(
+            SystemFamily::Frontier,
+            &Tuple::new(vec![Element::Bytes(b"zone-frontier".to_vec())]),
+        );
+        assert_eq!(frontier_key(&account), expected_frontier);
+
         let operation = OperationId::new(b"codec-operation".to_vec()).unwrap();
+        let mut expected_embedded = prefix.clone();
+        expected_embedded.extend_from_slice(&[0xFF; VERSIONSTAMP_BYTES]);
+        expected_embedded.extend_from_slice(&(operation.as_bytes().len() as u16).to_be_bytes());
+        expected_embedded.extend_from_slice(operation.as_bytes());
+        assert_eq!(embedded_change_key(&account, &operation), expected_embedded);
         let tuple = Tuple::new(vec![Element::Bytes(b"record".to_vec())]);
         let key = account.pack(KeyFamily::Record, &tuple);
         let mut mutations = vec![2];
@@ -2349,14 +2381,34 @@ mod tests {
             Err(KernelError::MalformedKey)
         ));
         let minimum = change_token(&account, b"x");
+        assert_eq!(minimum.as_bytes().len(), MIN_CHANGE_TOKEN_BYTES);
         assert_eq!(
             minimum.suffix_for(&account).unwrap().len(),
-            VERSIONSTAMP_BYTES + 3
+            MIN_CHANGE_SUFFIX_BYTES
         );
         let maximum = change_token(&account, &vec![7; MAX_OPERATION_ID_BYTES]);
+        assert_eq!(maximum.as_bytes().len(), MAX_CHANGE_TOKEN_BYTES);
         assert!(ChangeToken::from_bytes(maximum.as_bytes().to_vec()).is_ok());
         assert!(matches!(
             ChangeToken::from_bytes(vec![7; TOKEN_SCOPE_BYTES + MAX_OPERATION_ID_BYTES + 13]),
+            Err(KernelError::MalformedKey)
+        ));
+        assert!(matches!(
+            ChangeToken::from_bytes(vec![7; MIN_CHANGE_TOKEN_BYTES - 1]),
+            Err(KernelError::MalformedKey)
+        ));
+        let mut zero_operation = minimum.as_bytes().to_vec();
+        zero_operation[TOKEN_SCOPE_BYTES + VERSIONSTAMP_BYTES..][..2]
+            .copy_from_slice(&0_u16.to_be_bytes());
+        assert!(matches!(
+            ChangeToken::from_bytes(zero_operation),
+            Err(KernelError::MalformedKey)
+        ));
+        let mut mismatched_operation = minimum.as_bytes().to_vec();
+        mismatched_operation[TOKEN_SCOPE_BYTES + VERSIONSTAMP_BYTES..][..2]
+            .copy_from_slice(&2_u16.to_be_bytes());
+        assert!(matches!(
+            ChangeToken::from_bytes(mismatched_operation),
             Err(KernelError::MalformedKey)
         ));
         assert!(matches!(
@@ -2424,7 +2476,10 @@ mod tests {
         holder.join().unwrap();
         assert!(matches!(
             result,
-            Err(KernelError::TransactionTimedOut { limit_ms: 1, .. })
+            Err(KernelError::TransactionTimedOut {
+                elapsed_ms,
+                limit_ms: 1,
+            }) if elapsed_ms >= 1
         ));
     }
 
