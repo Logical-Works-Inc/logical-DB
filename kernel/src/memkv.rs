@@ -23,6 +23,31 @@ impl MemKv {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub(crate) fn scan_range_limited(
+        &self,
+        start: std::ops::Bound<&[u8]>,
+        end: std::ops::Bound<&[u8]>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use std::ops::Bound;
+
+        let owned_start = match start {
+            Bound::Included(key) => Bound::Included(key.to_vec()),
+            Bound::Excluded(key) => Bound::Excluded(key.to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let owned_end = match end {
+            Bound::Included(key) => Bound::Included(key.to_vec()),
+            Bound::Excluded(key) => Bound::Excluded(key.to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        self.0
+            .range((owned_start, owned_end))
+            .take(limit)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
 }
 
 impl KvPort for MemKv {

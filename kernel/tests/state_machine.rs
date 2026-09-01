@@ -6,12 +6,14 @@
 //! The identical workload runs on the journaled reference path and
 //! the durable FDB backend (ADR-002, retired redb).
 
-#[cfg(feature = "fdb")]
-use logical_db::fdb::FdbBackend;
+#![cfg(any(not(feature = "fdb"), feature = "legacy-raw"))]
+
 use logical_db::memkv::MemKv;
 use logical_db::model::{Class, Op, Row};
 use logical_db::port::{ClockPort, KvPort};
 use logical_db::store::{Ldb, Mutation};
+#[cfg(all(feature = "fdb", feature = "legacy-raw"))]
+use logical_db::FdbBackend;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;

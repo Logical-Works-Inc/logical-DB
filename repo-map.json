@@ -1,9 +1,9 @@
 {
   "$schema": "./repo-map.schema.json",
   "schema_version": "1.0.0",
-  "updated": "2026-08-27",
-  "canon": "ADR-001 + ADR-002 (FDB substrate) + #16 opaque contains_many",
-  "note": "One storage kernel for every repo. F4 parity landed: FDB is canonical substrate; redb/journal retired from production path (INV-PARITY-BEFORE-DELETE satisfied, journaled open now refuses durable backends); seven-point parity green on kernel/tests/parity_fdb.rs. F2 tuple namespaces (cross_tenant_isolated) + F3 admitted envelope (typestate) + #16 opaque contains_many (bounded batch, deterministic dedup/order, continuation, tenant-isolated) landed for kernel#804; remaining measured step is parity via LEM tape, not a second F4 doc bump.",
+  "updated": "2026-08-31",
+  "canon": "ADR-001 + ADR-002 + ADR-003 hybrid admitted database",
+  "note": "One app-facing processing layer drives embedded redb or native FoundationDB. Hybrid v2 uses account/container/zone scope, consumed Braid RunnableInvocation admission, mutation-bound idempotency, and durable change tokens. The live FDB journey passes locally; remote Linux and LEM consumer receipts remain.",
   "statuses": {
     "live": "exists and is authoritative today",
     "meta": "agent/process tooling, not product surface",
@@ -31,7 +31,7 @@
     "keel": {
       "path": "~/keel",
       "ref": "srinji-kaggss/keel",
-      "role": "CI provider — keel-ci-plan renders and enforces the workflow"
+      "role": "CI provider — the locked final ci-plan renderer emits the workflow"
     }
   },
   "pillars": {
@@ -50,19 +50,22 @@
     { "id": "governance-process", "path": "laws/governance/", "status": "live", "pillar": "governance", "kind": "dir", "summary": "Process framework from logic-os-kernel: operating model, ticketing taxonomy, definition-of-done, issue template, collaboration standards.", "components": ["operating-model.md", "definition-of-done.md", "collaboration-standards.md", "issue-template.md", "decision-2026-08-25-ci-hermeticity.md"] },
     { "id": "adr-001", "path": "laws/governance/adr-001-canonical-db-model-authority.md", "status": "live", "pillar": "governance", "kind": "adr", "summary": "PROPOSED: this repo owns the one DB model; constellation registration pending Director ratification." },
     { "id": "adr-002", "path": "laws/governance/adr-002-foundationdb-substrate.md", "status": "live", "pillar": "governance", "kind": "adr", "summary": "ACCEPTED: FDB is canonical substrate; add-pin-vet, parity-before-delete, F0-F4." },
+    { "id": "adr-003", "path": "laws/governance/adr-003-hybrid-client-embedding-braid.md", "status": "live", "pillar": "governance", "kind": "adr", "summary": "ACCEPTED: one scoped admitted API runs embedded or outboard and consumes real Braid runnable proofs." },
     { "id": "fdb-recipe", "path": "scripts/local-fdb-cluster.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Hermetic one-process FDB dev cluster (INV-FDB-PIN, INV-FDB-SCRATCH); F0 falsifier." },
     { "id": "repo-map", "path": "repo-map.json", "status": "meta", "pillar": "infra", "kind": "data", "summary": "Declarative structure source of truth (this file)." },
     { "id": "repo-map-script", "path": "scripts/repo-map.mjs", "status": "meta", "pillar": "infra", "kind": "tool", "summary": "Validates repo-map.json against its schema and renders REPO_MAP.md; check detects drift." },
     { "id": "spec-lint", "path": "scripts/spec-lint.py", "status": "live", "pillar": "infra", "kind": "tool", "summary": "80-column prose contract over markdown; CI-enforced with teeth." },
-    { "id": "ci-plan", "path": "ci/keel-ci.toml", "status": "live", "pillar": "infra", "kind": "config", "summary": "Keel CI plan: stack-position, change-scope, spec-lint, workspace-gated test/fmt/clippy, property gauntlet, Kani proofs, cargo-mutants teeth, MC/DC slot (keel#480), ci-plan-current, eval-log, cleanup." },
+    { "id": "ci-plan", "path": "ci/keel-ci.toml", "status": "live", "pillar": "infra", "kind": "config", "summary": "Keel CI plan: scope and prose gates, tests/fmt/clippy, complete FDB feature compilation, property and Kani proof lanes, four-worker cargo-mutants teeth, generated-plan lock, eval log, and cleanup." },
     { "id": "ci-workflow", "path": ".github/workflows/ci.yml", "status": "live", "pillar": "infra", "kind": "generated", "summary": "Rendered workflow — canonical bytes enforced against the plan in CI." },
+    { "id": "rust-toolchain", "path": "rust-toolchain.toml", "status": "live", "pillar": "infra", "kind": "config", "summary": "Rust 1.98.0, clippy, and rustfmt are pinned for the Braid-enabled product graph." },
     { "id": "local-ci", "path": ".wwfd/local-ci.sh", "status": "live", "pillar": "infra", "kind": "tool", "summary": "Local CI exec boundary; writes the spend-guard receipt and eval cache on green." },
     { "id": "frankenstein", "path": "docs/FRANKENSTEIN.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "Organ map: which engine owns each graft (fjall, qdrant, FDB, redb, turso, arroy), internal donors (secure-authority), and the gap list G1…G6. Donor ideas are re-implemented, never vendored; the organs/ dump itself was deleted at v0.1 RC." },
     { "id": "format", "path": "docs/FORMAT.md", "status": "live", "pillar": "spec", "kind": "doc", "summary": "v0.1 format contract: journal frame + row encoding v1, KV key layout v1 (INV-ID-PREFIX-DISJOINT), FDB canonical after F4 parity (Redb retired, journal is MemKv oracle only), what is not yet stable, benchmark results schema and algorithmic gates." },
-    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The kernel crate logical-db (F4 parity landed): row model with framed keys, KvPort/DurableKv/ClockPort seams, FdbBackend canonical (file shim today, native binding when libfdb_c present, ADR-002 F1-F4) + MemKv reference + framed journal oracle, Ldb store (journaled open refuses durable backends per INV-ONE-CRASH-STORY), five storage classes, seven-point parity harness, state-machine parity + kill-recovery + planted-corruption suites, Kani proofs; RedbBackend retired.", "adrs": ["ADR-001", "ADR-002"] },
+    { "id": "kernel", "path": "kernel/", "status": "live", "pillar": "kernel", "kind": "dir", "summary": "The logical-db crate: hybrid v2 processing and key contract over embedded redb or native FDB, plus the legacy five-class model and recovery oracle.", "adrs": ["ADR-001", "ADR-002", "ADR-003"] },
     { "id": "contains", "path": "kernel/src/contains.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Opaque bounded batch existence contains_many: exact present/missing with budget, deterministic dedup+ordering, continuation, tenant-isolated via tuple subspaces (F2); supports kernel#804 missing-set. (ADR-002, #16)" },
-    { "id": "tuple", "path": "kernel/src/tuple.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Canonical tuple/subspace layer (F2): estate/subspace/tenant prefix + order-preserving codec; INV-TENANT-PREFIX, cross_tenant_isolated property." },
-    { "id": "admitted", "path": "kernel/src/admitted.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Admitted envelope typestate (F3): Safe/Authority/Justification proofs, INV-UNKNOWN-NEVER-WRITES + INV-JUSTIFICATION-FRESH, receipt capture." }
+    { "id": "tuple", "path": "kernel/src/tuple.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Account-first hybrid v2 scope, disjoint key families, and order-preserving tuple codec." },
+    { "id": "admitted", "path": "kernel/src/admitted.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Real Braid RunnableInvocation consumption, bounded WriteBatch, embedded/native drivers, operation and invocation deduplication, receipts, and zone change tokens." },
+    { "id": "migration", "path": "kernel/src/migration.rs", "status": "live", "pillar": "kernel", "kind": "file", "summary": "Lossless v1 row-key to scoped v2 copy primitive; never guesses scope or deletes source state." }
   ],
   "edges": [
     { "from": "ci-workflow", "rel": "generated_from", "to": "ci-plan" },
@@ -70,6 +73,7 @@
     { "from": "spec-lint", "rel": "governs", "to": "pathway" },
     { "from": "adr-001", "rel": "governs", "to": "kernel" },
     { "from": "adr-002", "rel": "governs", "to": "kernel" },
+    { "from": "adr-003", "rel": "governs", "to": "kernel" },
     { "from": "fdb-recipe", "rel": "depends_on", "to": "ci-plan" },
     { "from": "constitution", "rel": "governs", "to": "governance-process" },
     { "from": "frankenstein", "rel": "governs", "to": "kernel" },

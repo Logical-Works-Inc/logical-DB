@@ -28,10 +28,20 @@ cli() { "$BIN/fdbcli" -C "$CLUSTER" --exec "$1"; }
 
 wait_available() {
     for _ in $(seq 1 60); do
-        cli 'status minimal' 2>/dev/null | grep -q available && return 0
+        cli 'status minimal' 2>/dev/null \
+            | grep -Fxq 'The database is available.' && return 0
         sleep 1
     done
     die "server not available within 60s"
+}
+
+wait_coordinator() {
+    for _ in $(seq 1 60); do
+        cli 'status minimal' 2>/dev/null \
+            | grep -Fq 'The database is' && return 0
+        sleep 1
+    done
+    die "coordinator not reachable within 60s"
 }
 
 # ── verify ───────────────────────────────────────────────────────
@@ -54,7 +64,8 @@ cmd_verify() {
 }
 
 stage() {
-    [ -x "$BIN/fdbserver" ] && return 0
+    [ -x "$BIN/fdbserver" ] && [ -x "$BIN/fdbcli" ] \
+        && [ -f "$BIN/libfdb_c.dylib" ] && return 0
     mkdir -p "$BIN"
     local pkg="FoundationDB-${FDB_VERSION}_arm64.pkg"
     pkgutil --expand-full "$SCRATCH/$pkg" "$SCRATCH/expanded" || die "pkg expand failed (INV-FDB-PIN)"
@@ -69,6 +80,15 @@ stage() {
 cmd_up() {
     stage
     mkdir -p "$SCRATCH/data" "$SCRATCH/logs"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        die "server already running with pid $(cat "$PIDFILE")"
+    fi
+    if [ -f "$SCRATCH/.configured" ] \
+        && [ -z "$(find "$SCRATCH/data" -maxdepth 1 -type f -print -quit)" ]; then
+        die "configured marker exists but durable cluster data is missing"
+    fi
+    local needs_config=0
+    [ -f "$SCRATCH/.configured" ] || needs_config=1
     if [ ! -f "$CLUSTER" ]; then
         printf 'local_fdb:f0e1d2c3b4a5968778695a4b3c2d1e0f@127.0.0.1:%s\n' \
             "$PORT" > "$CLUSTER"
@@ -77,15 +97,19 @@ cmd_up() {
         -d "$SCRATCH/data" -L "$SCRATCH/logs" \
         >"$SCRATCH/server.out" 2>&1 &
     echo $! > "$PIDFILE"
-    wait_available
-    if [ ! -f "$SCRATCH/.configured" ]; then
-        if [ -n "$(find "$SCRATCH/data" -maxdepth 1 -type f 2>/dev/null | head -n1)" ]; then
-            touch "$SCRATCH/.configured"
-        else
-            cli 'configure new single memory'
-            touch "$SCRATCH/.configured"
-        fi
+    wait_coordinator
+    if [ "$needs_config" = 1 ]; then
+        # Coordination files appear before a database is configured, so their
+        # presence is not durable evidence. Only our explicit marker may skip
+        # configuration; an ambiguous recovered scratch directory fails here.
+        # The memory engine reserves roughly a gigabyte even for this one-row
+        # proof and can be killed under laptop pressure. The SSD engine proves
+        # the same transaction semantics without making CI readiness depend on
+        # transient free RAM.
+        cli 'configure new single ssd'
+        touch "$SCRATCH/.configured"
     fi
+    wait_available
     echo "up: pid $(cat "$PIDFILE") cluster $CLUSTER bin $BIN"
 }
 

@@ -70,7 +70,7 @@ jobs:
       code_changed: "${{ steps.scope.outputs.code_changed }}"
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
           fetch-depth: "0"
@@ -121,7 +121,7 @@ jobs:
     timeout-minutes: 2
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Self-test the lint gate (proves it can still fail)"
@@ -158,7 +158,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Run every workspace suite"
@@ -185,7 +185,7 @@ jobs:
     timeout-minutes: 3
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Self-test the fmt gate (proves it can still fail)"
@@ -227,7 +227,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Clippy with warnings denied"
@@ -247,6 +247,28 @@ jobs:
           fi
           cargo clippy --workspace --all-targets -- -D warnings
 
+  fdb-check:
+    name: "Native client — compile the complete FDB feature graph"
+    runs-on: ["self-hosted"]
+    needs: ["stack-position", "change-scope"]
+    timeout-minutes: 10
+    steps:
+      - name: "unnamed"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        with:
+          ref: "${{ env.KEEL_HEAD_SHA }}"
+      - name: "Compile embedded and official FDB client profiles"
+        if: ${{ needs.change-scope.outputs.code_changed == 'yes' }}
+        run: |
+          set -e
+          export KEEL_RUN_ROOT="$HOME/.keel-ci/runs/$KEEL_RUN_ID"
+          export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
+          export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
+          export KEEL_GATE_BIN="$HOME/.local/bin/keel"
+          export CARGO_TARGET_DIR="$KEEL_RUN_ROOT/target"
+          mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
+          cargo check --workspace --all-targets --features fdb
+
   property-verify:
     name: "Property — replay equals the committed-prefix fold"
     runs-on: ["self-hosted"]
@@ -254,7 +276,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Crash gauntlet: every byte cut recovers an exact batch prefix"
@@ -281,7 +303,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Prove the proof gate can fail (keel self-test)"
@@ -309,16 +331,19 @@ jobs:
             echo "SKIP no workspace yet — activates with DB-A kernel/."
             exit 0
           fi
-          cargo kani -p logical-db
+          # Kani 0.67 is pinned to Rust 1.93. Prove the storage codec/journal graph
+          # without the Rust-1.98 Braid integration; normal test/clippy lanes compile
+          # and exercise the default Braid surface.
+          cargo kani -p logical-db --no-default-features
 
   mutation-test-verify:
     name: "Teeth — cargo-mutants refuses survivors in logical-db"
     runs-on: ["self-hosted"]
     needs: ["stack-position", "change-scope"]
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Refuse survived or indeterminate mutants"
@@ -329,14 +354,14 @@ jobs:
           export KEEL_DIFFERENTIAL_DIR="$KEEL_RUN_ROOT/differential"
           export KEEL_EVIDENCE_DIR="$KEEL_RUN_ROOT/evidence"
           export KEEL_GATE_BIN="$HOME/.local/bin/keel"
-          export CARGO_TARGET_DIR="$KEEL_RUN_ROOT/target-mutants"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           set -eu
           if [ ! -f Cargo.toml ]; then
             echo "SKIP no workspace yet — activates with DB-A kernel/."
             exit 0
           fi
-          cargo mutants -p logical-db | tee "$RUNNER_TEMP/mutants.out"
+          cargo mutants -p logical-db --jobs 8 --minimum-test-timeout 60 \
+            | tee "$RUNNER_TEMP/mutants.out"
           # INV-MUTANTS-NONVACUOUS: cargo-mutants exits 0 when the package filter
           # matches nothing ("Found 0 mutants", run 32824022656) — a wrong-tree or
           # renamed workspace would pass as green teeth. Refuse any zero count.
@@ -370,10 +395,10 @@ jobs:
     name: "Canonical CI — generated workflow is current"
     runs-on: ["self-hosted"]
     needs: ["stack-position"]
-    timeout-minutes: 2
+    timeout-minutes: 10
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Regenerate and byte-check GitHub Actions"
@@ -385,32 +410,52 @@ jobs:
           export KEEL_GATE_BIN="$HOME/.local/bin/keel"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           set -eu
-          plan_bin="$HOME/keel/keel-core/target/release/keel-ci-plan"
-          if [ ! -x "$plan_bin" ]; then
-            echo "FAIL keel-ci-plan binary not found at $plan_bin — build keel first." >&2
-            exit 1
-          fi
           root="$(mktemp -d)"
-          cp -R ci "$root/ci"
-          mkdir "$root/keel-core"
-          printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' > "$root/keel-core/Cargo.toml"
-          (cd "$root" && "$plan_bin" generate)
-          if ! diff -u .github/workflows/ci.yml "$root/.github/workflows/ci.yml"; then
+          trap 'rm -rf "$root"' EXIT
+          keel_rev="c129d042884ddcee09c855b6d3c13112bae3bd28"
+          kernel_rev="7405623fe77cb314acb55c37ba3fcbf929372096"
+          keel_source="$root/keel"
+          kernel_source="$root/logic-os-kernel"
+          render_root="$root/render"
+          # Rebuild the retired renderer from the two immutable source inputs.
+          git clone --filter=blob:none --no-checkout \
+            git@github.com:srinji-kaggss/keel.git "$keel_source"
+          git -C "$keel_source" checkout --detach "$keel_rev"
+          test "$(git -C "$keel_source" rev-parse HEAD)" = "$keel_rev"
+          git clone --filter=blob:none --no-checkout \
+            git@github.com:srinji-kaggss/logic-os-kernel.git "$kernel_source"
+          git -C "$kernel_source" checkout --detach "$kernel_rev"
+          test "$(git -C "$kernel_source" rev-parse HEAD)" = "$kernel_rev"
+          KEEL_KERNEL_PATH="$kernel_source/kernel" \
+            CARGO_TARGET_DIR="$root/renderer-target" \
+            cargo build --release --locked \
+              --manifest-path "$keel_source/keel-core/Cargo.toml" \
+              --bin keel-ci-plan
+          plan_bin="$root/renderer-target/release/keel-ci-plan"
+          test -x "$plan_bin"
+          # Render in a disposable logical-DB-shaped root, then compare exact bytes.
+          mkdir "$render_root"
+          cp -R ci "$render_root/ci"
+          mkdir "$render_root/keel-core"
+          printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' \
+            > "$render_root/keel-core/Cargo.toml"
+          (cd "$render_root" && "$plan_bin" generate)
+          if ! diff -u .github/workflows/ci.yml \
+            "$render_root/.github/workflows/ci.yml"; then
             echo "FAIL .github/workflows/ci.yml is stale; regenerate it from ci/keel-ci.toml" >&2
             exit 1
           fi
-          rm -rf "$root"
           echo "OK   generated workflow is byte-current with ci/keel-ci.toml."
 
   eval-log:
     name: "Eval Log — compiled run observability"
     runs-on: ["self-hosted"]
-    needs: ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy", "property-verify", "kani-verify", "mutation-test-verify", "mcdc-coverage", "ci-plan-current"]
+    needs: ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy", "fdb-check", "property-verify", "kani-verify", "mutation-test-verify", "mcdc-coverage", "ci-plan-current"]
     if: ${{ always() }}
     timeout-minutes: 1
     steps:
       - name: "unnamed"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         with:
           ref: "${{ env.KEEL_HEAD_SHA }}"
       - name: "Compile and compare canonical eval JSONL"
@@ -423,17 +468,18 @@ jobs:
           export KEEL_GATE_BIN="$HOME/.local/bin/keel"
           mkdir -p "$KEEL_RUN_ROOT/work" "$KEEL_EVIDENCE_DIR" "$KEEL_DIFFERENTIAL_DIR"
           cat > "$KEEL_EVIDENCE_DIR/eval.jsonl" <<'KEEL_EVAL'
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
-          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"8789be254f59d92144c07568c5ab8616249a433d9e1bf3d34c2f16e7b6524a60","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"stack-position","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.stack-position.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"change-scope","outputs":{"code_changed":"${{ needs.change-scope.outputs.code_changed }}"},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.change-scope.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"spec-lint","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.spec-lint.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"test","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.test.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fmt","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.fmt.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"clippy","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.clippy.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"fdb-check","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.fdb-check.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"property-verify","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.property-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"kani-verify","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.kani-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mutation-test-verify","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.mutation-test-verify.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"mcdc-coverage","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.mcdc-coverage.result }}"}
+          {"base_sha":"${{ env.KEEL_BASE_SHA }}","head_sha":"${{ env.KEEL_HEAD_SHA }}","job_id":"ci-plan-current","outputs":{},"plan_sha256":"bed95e93a39d5a63179bab1b12bf4cc5a09c350411a94dbae85789b2cc6c5c75","schema":"keel.ci.eval/v1","status":"${{ needs.ci-plan-current.result }}"}
           KEEL_EVAL
           local_eval="$HOME/.keel-ci/eval/$KEEL_HEAD_SHA.jsonl"
           if [ ! -f "$local_eval" ]; then
@@ -449,7 +495,7 @@ jobs:
           cat eval.jsonl
       - name: "Upload eval log"
         if: ${{ always() }}
-        uses: "actions/upload-artifact@v4"
+        uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
         with:
           if-no-files-found: "error"
           name: "eval-log"

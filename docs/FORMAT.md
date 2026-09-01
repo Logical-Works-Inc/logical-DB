@@ -41,51 +41,64 @@ Frame payload is a sequence of rows (v1):
   `[namespace u8][len u16 BE][component]...` — length-prefixed, no
   reserved byte values; arbitrary bytes round-trip.
 
-## 3. Not yet stable in v0.1
+## 3. Hybrid KV layout v2 (candidate wire)
 
-- Persistence (ADR-002, F4 #13): canonical substrate is
-  FoundationDB (`FdbBackend` behind `DurableKv` +
-  `LogicalDb::transact_admitted`; file-backed shim + `MemKv`
-  oracle are the two tested crash stories; the same shim
-  delegates to the `foundationdb` crate (`libfdb_c`) when the
-  library is present). `RedbBackend` is retired from the
-  canonical path (remains in tree for provenance; `Ldb::open`
-  now refuses durable backends per INV-ONE-CRASH-STORY). The §1
-  journal frames remain for the MemKv reference/fault oracle
-  only. Never write one store's data through two crash stories.
-  Live FDB cluster verified 2026-08-27 on host
-  `/tmp/fdb-f0` (arm64, `fdbserver` 7.3.79, `fdbcli status
-  minimal` `available`, `DYLD_FALLBACK_LIBRARY_PATH` →
-  `/tmp/fdb-f0/macbin/libfdb_c.dylib`, test
-  `kernel/tests/fdb_live.rs:live_fdb_cluster_roundtrip`
-  `get/set/clear + ordered range`); linux lane uses the same
-  `libfdb_c` built from the source tree at
-  `~/Downloads/foundationdb-7.3.77` (runtime
-  `foundationdb/foundationdb:7.3.x`, not the 18.9GB
-  `foundationdb/build` compiler farm).
-- Opaque key wire: `kernel/src/tuple.rs` estate/subspace/tenant
-  prefix + order-preserving tuple codec and
-  `kernel/src/contains.rs` `contains_many` (bounded batch: exact
-  present/missing, deterministic dedup+ordering, continuation,
-  tenant-isolated via `cross_tenant_isolated` property) are
-  wire-stable for opaque bytes. No `Cid`/Braid type is defined or
-  advertised here; integrity framing (§1 CRC32, §2 codec) is
-  storage-internal, not a Braid CID.
-- Segment packing, mmap-first reads, and hydration are design
-  intent (DB_PATHWAY §3), not shipped format.
-- No migration tooling exists yet. Any future change to §1/§2
-  ships a version marker plus an upgrader or a documented
-  dead-end.
+Every app key is ordered account-first:
+
+    [FE "LDB" F2]
+    [escaped account 00 00]
+    [escaped container 00 00]
+    [escaped zone 00 00]
+    [family u8][tuple]
+
+Scope components escape a literal zero as `00 FF`; empty values and values over
+1024 bytes are rejected. Public family tags are Record=10, Revision=11,
+Index=13, and BlobRef=14. Change=12, Outbox=15, and Frontier=16 are
+storage-internal tags; apps cannot construct them. The frontier serializes
+same-zone writes across providers. The F2 format byte cannot alias the older
+product-subspace tags 01 through 05.
+
+Tuple values support bytes, signed i64, and bool. Their encoding preserves the
+tuple's total order. It is Logical-DB's stable codec; it is not claimed to be
+byte-compatible with FoundationDB's language-binding tuple layer. Both redb
+and FDB receive the exact bytes produced here.
+
+Effectful requests consume a Braid `RunnableInvocation` and an external
+scope-bound authority assertion. A bounded `WriteBatch` contains only logical
+family/tuple operations. Before Braid planning, the complete request is hashed
+into `logical_db.request_cid`; the snapshot carries that fact and the
+justification predicate proves exact equality. Logical-DB recomputes the CID
+from the executed write, point read, or bounded change request and fails closed
+on drift. Mutation bytes and Braid identities also bind the private outbox
+marker. Reusing an operation ID with other bytes fails closed. A second private
+marker consumes the content-addressed Braid invocation. The same transaction
+writes one ordered Change row and advances the zone frontier. Before admission,
+the capsule and registry are inspected; their content identities, strongest
+Braid effect, and exact Logical-DB capabilities must match the runnable and
+database request. Change tokens are opaque and bound to their zone; callers
+persist and replay them, never parse them as timestamps.
+
+Legacy v1 row keys remain readable through the compatibility model.
+`LegacyV1Point` maps each `(class,id,u64 timestamp)` losslessly into a chosen
+v2 scope. Migration is copy, verify, cut over, and only then retire the source;
+the primitive never deletes the source or guesses ownership.
+
+## 3.1 Not yet stable
+
+- The live-FDB hybrid journey exists and is locally exercised. A green remote
+  Linux receipt and a merged release are still required for production evidence.
+- Token retention and compaction, blob transfer, schema evolution, backup,
+  export, and account erasure have no released wire contract.
+- Segment packing, mmap-first reads, and hydration remain design intent.
 
 ## 4. Benchmark results format
 
 `cargo bench -p logical-db` runs `kernel/benches/ship_bench.rs` — a
  plain binary, no criterion dependency. Benches run the journaled
- MemKv reference path (the deterministic baseline); the `FdbBackend`
- file shim carries the same semantic suite, not these numbers; live
- FDB numbers come from the same harness against
+ MemKv reference path (the deterministic baseline); these are not embedded
+ redb or native FDB numbers. Live FDB numbers come from the harness against
  `/tmp/fdb-f0/fdb.cluster` (`cargo test --features fdb --test
- fdb_live`). The shim proves the crash story without `fdbserver`.
+ fdb_live`).
  It prints one JSON object per line on stdout:
 
     {"workload":"<name>","samples":N,"ops":N,

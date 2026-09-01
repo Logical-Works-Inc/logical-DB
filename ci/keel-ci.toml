@@ -1,15 +1,23 @@
 # logical-DB CI plan — rendered to .github/workflows/ci.yml by keel-ci-plan.
 #
 # Regenerate after ANY edit to this file (the rendered workflow is canonical).
-# keel-ci-plan needs ci/keel-ci.toml AND a keel-core/Cargo.toml marker in the
-# repo root; this repo deliberately has no keel-core crate yet. Stage a root:
+# Renderer source is locked to Keel commit
+# c129d042884ddcee09c855b6d3c13112bae3bd28, the last compatible ci-plan
+# implementation before Keel retired that control plane. Its build-time kernel
+# identity is locked to logic-os-kernel commit
+# 7405623fe77cb314acb55c37ba3fcbf929372096. CI rebuilds these declared inputs;
+# it never trusts a mutable renderer installed on the self-hosted runner. To
+# regenerate without mutating the checkout, stage a root:
 #   root=$(mktemp -d)
 #   cp -R ci "$root/ci"; mkdir "$root/keel-core"
 #   printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' \
 #     > "$root/keel-core/Cargo.toml"
-#   (cd "$root" && "$HOME/keel/keel-core/target/release/keel-ci-plan" generate)
+#   (cd "$root" && "$KEEL_CI_PLAN_BIN" generate)
 #   cp "$root/.github/workflows/ci.yml" .github/workflows/ci.yml
 # The `ci-plan-current` job below enforces exactly this byte-equality in CI.
+# INV-ACTION-PIN: every external action is an immutable upstream tag commit.
+# checkout v7.0.1 = 3d3c42e5...; upload-artifact v7.0.1 = 043fb46d....
+# Both tag-to-SHA mappings were independently verified before this plan landed.
 #
 # INV-HERMETIC-CHECKOUT (2026-08-25, run 32824022656): the runner exposes ONE
 # shared _work worktree to every job of every run, so a tree-reading job with
@@ -35,7 +43,7 @@
 version = 1
 name = "Keel CI"
 generated_workflow = ".github/workflows/ci.yml"
-full_timeout_minutes = 30
+full_timeout_minutes = 45
 finalizer_reserve_seconds = 120
 max_parallel_jobs = 4
 shell = "bash"
@@ -122,7 +130,7 @@ code_changed = "${{ steps.scope.outputs.code_changed }}"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [job.step.with]
 fetch_depth = "0"
@@ -169,7 +177,7 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Self-test the lint gate (proves it can still fail)"
@@ -206,7 +214,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Run every workspace suite"
@@ -232,7 +240,7 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Self-test the fmt gate (proves it can still fail)"
@@ -274,7 +282,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Clippy with warnings denied"
@@ -286,6 +294,29 @@ if [ ! -f Cargo.toml ]; then
   exit 0
 fi
 cargo clippy --workspace --all-targets -- -D warnings'''
+
+[[job]]
+id = "fdb-check"
+name = "Native client — compile the complete FDB feature graph"
+needs = ["stack-position", "change-scope"]
+condition = "success()"
+timeout_minutes = 10
+cost = "expensive"
+working_directory = "."
+runner = ["self-hosted"]
+evidence = ["log", "status"]
+[job.runtime_env]
+CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
+[[job.step]]
+condition = "success()"
+kind = "action"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+local_action = "checkout"
+[[job.step]]
+name = "Compile embedded and official FDB client profiles"
+condition = "needs.change-scope.outputs.code_changed == 'yes'"
+kind = "run"
+run = '''cargo check --workspace --all-targets --features fdb'''
 
 [[job]]
 id = "property-verify"
@@ -302,7 +333,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Crash gauntlet: every byte cut recovers an exact batch prefix"
@@ -330,7 +361,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Prove the proof gate can fail (keel self-test)"
@@ -346,30 +377,30 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo kani -p logical-db'''
+# Kani 0.67 is pinned to Rust 1.93. Prove the storage codec/journal graph
+# without the Rust-1.98 Braid integration; normal test/clippy lanes compile
+# and exercise the default Braid surface.
+cargo kani -p logical-db --no-default-features'''
 
 [[job]]
 id = "mutation-test-verify"
 name = "Teeth — cargo-mutants refuses survivors in logical-db"
 needs = ["stack-position", "change-scope"]
 condition = "success()"
-timeout_minutes = 25
+timeout_minutes = 35
 cost = "expensive"
 working_directory = "."
 runner = ["self-hosted"]
 evidence = ["log", "status"]
-[job.runtime_env]
-# INV-MUTANT-TARGET-ISOLATION (run 32893119128): cargo-mutants compiles
-# hundreds of body-mutated copies of the crate, and a later plain build
-# against the SAME target dir linked a mutant-era binary (Test finished in
-# 0.04s with unused-variable warnings and panic line numbers from mutated
-# sources). The mutants tier therefore owns a dedicated target dir that no
-# other job reads; cleanup deletes both.
-CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target-mutants"
+# INV-MUTANT-WORKER-ISOLATION: never set CARGO_TARGET_DIR for this job.
+# cargo-mutants gives each concurrently mutated source copy its own target;
+# overriding that path makes workers reuse one another's artifacts and can
+# report a killed mutant as a survivor. The job itself already runs in an
+# isolated checkout, and cargo-mutants removes its temporary copies.
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Refuse survived or indeterminate mutants"
@@ -380,7 +411,8 @@ if [ ! -f Cargo.toml ]; then
   echo "SKIP no workspace yet — activates with DB-A kernel/."
   exit 0
 fi
-cargo mutants -p logical-db | tee "$RUNNER_TEMP/mutants.out"
+cargo mutants -p logical-db --jobs 8 --minimum-test-timeout 60 \
+  | tee "$RUNNER_TEMP/mutants.out"
 # INV-MUTANTS-NONVACUOUS: cargo-mutants exits 0 when the package filter
 # matches nothing ("Found 0 mutants", run 32824022656) — a wrong-tree or
 # renamed workspace would pass as green teeth. Refuse any zero count.
@@ -417,7 +449,7 @@ id = "ci-plan-current"
 name = "Canonical CI — generated workflow is current"
 needs = ["stack-position"]
 condition = "success()"
-timeout_minutes = 2
+timeout_minutes = 10
 cost = "deterministic"
 working_directory = "."
 runner = ["self-hosted"]
@@ -425,28 +457,48 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Regenerate and byte-check GitHub Actions"
 condition = "success()"
 kind = "run"
 run = '''set -eu
-plan_bin="$HOME/keel/keel-core/target/release/keel-ci-plan"
-if [ ! -x "$plan_bin" ]; then
-  echo "FAIL keel-ci-plan binary not found at $plan_bin — build keel first." >&2
-  exit 1
-fi
 root="$(mktemp -d)"
-cp -R ci "$root/ci"
-mkdir "$root/keel-core"
-printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' > "$root/keel-core/Cargo.toml"
-(cd "$root" && "$plan_bin" generate)
-if ! diff -u .github/workflows/ci.yml "$root/.github/workflows/ci.yml"; then
+trap 'rm -rf "$root"' EXIT
+keel_rev="c129d042884ddcee09c855b6d3c13112bae3bd28"
+kernel_rev="7405623fe77cb314acb55c37ba3fcbf929372096"
+keel_source="$root/keel"
+kernel_source="$root/logic-os-kernel"
+render_root="$root/render"
+# Rebuild the retired renderer from the two immutable source inputs.
+git clone --filter=blob:none --no-checkout \
+  git@github.com:srinji-kaggss/keel.git "$keel_source"
+git -C "$keel_source" checkout --detach "$keel_rev"
+test "$(git -C "$keel_source" rev-parse HEAD)" = "$keel_rev"
+git clone --filter=blob:none --no-checkout \
+  git@github.com:srinji-kaggss/logic-os-kernel.git "$kernel_source"
+git -C "$kernel_source" checkout --detach "$kernel_rev"
+test "$(git -C "$kernel_source" rev-parse HEAD)" = "$kernel_rev"
+KEEL_KERNEL_PATH="$kernel_source/kernel" \
+  CARGO_TARGET_DIR="$root/renderer-target" \
+  cargo build --release --locked \
+    --manifest-path "$keel_source/keel-core/Cargo.toml" \
+    --bin keel-ci-plan
+plan_bin="$root/renderer-target/release/keel-ci-plan"
+test -x "$plan_bin"
+# Render in a disposable logical-DB-shaped root, then compare exact bytes.
+mkdir "$render_root"
+cp -R ci "$render_root/ci"
+mkdir "$render_root/keel-core"
+printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' \
+  > "$render_root/keel-core/Cargo.toml"
+(cd "$render_root" && "$plan_bin" generate)
+if ! diff -u .github/workflows/ci.yml \
+  "$render_root/.github/workflows/ci.yml"; then
   echo "FAIL .github/workflows/ci.yml is stale; regenerate it from ci/keel-ci.toml" >&2
   exit 1
 fi
-rm -rf "$root"
 echo "OK   generated workflow is byte-current with ci/keel-ci.toml."
 '''
 
@@ -454,8 +506,8 @@ echo "OK   generated workflow is byte-current with ci/keel-ci.toml."
 id = "eval-log"
 name = "Eval Log — compiled run observability"
 needs = ["stack-position", "change-scope", "spec-lint", "test", "fmt", "clippy",
-         "property-verify", "kani-verify", "mutation-test-verify", "mcdc-coverage",
-         "ci-plan-current"]
+         "fdb-check", "property-verify", "kani-verify", "mutation-test-verify",
+         "mcdc-coverage", "ci-plan-current"]
 condition = "always()"
 timeout_minutes = 1
 cost = "epilogue"
@@ -466,7 +518,7 @@ eval_log = true
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Compile and compare canonical eval JSONL"
@@ -476,7 +528,7 @@ kind = "eval"
 name = "Upload eval log"
 condition = "always()"
 kind = "action"
-uses = "actions/upload-artifact@v4"
+uses = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 local_action = "upload-artifact"
 [job.step.with]
 name = "eval-log"

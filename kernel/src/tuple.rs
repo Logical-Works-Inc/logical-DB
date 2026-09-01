@@ -25,6 +25,12 @@ use crate::{KernelError, Result};
 /// `Class` tags (`0x01`…`0x05`) can never collide after migration.
 const ESTATE_PREFIX: &[u8] = &[0xFE, b'L', b'D', b'B'];
 
+/// Hybrid application format. `0xF2` is outside every v1 product-subspace
+/// tag (`0x01..=0x05`), so old keys and new account-first keys are disjoint
+/// without consulting a migration table.
+const HYBRID_V2_PREFIX: &[u8] = &[0xFE, b'L', b'D', b'B', 0xF2];
+pub const MAX_SCOPE_ID_BYTES: usize = 1_024;
+
 // ── Tenant ────────────────────────────────────────────────────
 
 /// Tenant / authority scope. Opaque bytes; arbitrary `[u8]` is
@@ -40,6 +46,242 @@ impl TenantId {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+// ── Hybrid application scope (ADR-003) ───────────────────────
+
+fn validate_scope_id(axis: &'static str, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.is_empty() || bytes.len() > MAX_SCOPE_ID_BYTES {
+        return Err(KernelError::ScopeIdInvalid {
+            axis,
+            len: bytes.len(),
+            limit: MAX_SCOPE_ID_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+macro_rules! define_scope_id {
+    ($name:ident, $axis:literal) => {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(Vec<u8>);
+
+        impl $name {
+            pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+                validate_scope_id($axis, bytes.into()).map(Self)
+            }
+
+            pub fn as_bytes(&self) -> &[u8] {
+                &self.0
+            }
+        }
+    };
+}
+
+define_scope_id!(AccountId, "account");
+define_scope_id!(ContainerId, "container");
+define_scope_id!(ZoneId, "zone");
+
+/// The stable application ownership/atomicity scope. Account comes first in
+/// every key so export, erasure, backup, and quota scans are contiguous.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Scope {
+    account: AccountId,
+    container: ContainerId,
+    zone: ZoneId,
+}
+
+impl Scope {
+    pub fn new(account: AccountId, container: ContainerId, zone: ZoneId) -> Self {
+        Self {
+            account,
+            container,
+            zone,
+        }
+    }
+
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+
+    pub fn container(&self) -> &ContainerId {
+        &self.container
+    }
+
+    pub fn zone(&self) -> &ZoneId {
+        &self.zone
+    }
+
+    pub fn account_prefix(&self) -> Vec<u8> {
+        let mut out = HYBRID_V2_PREFIX.to_vec();
+        encode_component(self.account.as_bytes(), &mut out);
+        out
+    }
+
+    pub fn container_prefix(&self) -> Vec<u8> {
+        let mut out = self.account_prefix();
+        encode_component(self.container.as_bytes(), &mut out);
+        out
+    }
+
+    pub fn zone_prefix(&self) -> Vec<u8> {
+        let mut out = self.container_prefix();
+        encode_component(self.zone.as_bytes(), &mut out);
+        out
+    }
+
+    /// Pack one logical family key. Physical providers receive only these
+    /// bytes; embedded and outboard profiles therefore cannot drift in scope
+    /// or ordering semantics.
+    pub fn try_pack(&self, family: KeyFamily, tuple: &Tuple) -> Result<Vec<u8>> {
+        let prefix = self.family_prefix(family);
+        let mut out = Vec::with_capacity(crate::fdb::MAX_KEY_BYTES);
+        out.extend_from_slice(&prefix);
+        tuple.append_to_bounded_key(&mut out)?;
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pack(&self, family: KeyFamily, tuple: &Tuple) -> Vec<u8> {
+        self.try_pack(family, tuple)
+            .expect("internal hybrid key components are bounded")
+    }
+
+    pub(crate) fn family_prefix(&self, family: KeyFamily) -> Vec<u8> {
+        let mut out = self.zone_prefix();
+        out.push(family.tag());
+        out
+    }
+
+    pub(crate) fn system_prefix(&self, family: SystemFamily) -> Vec<u8> {
+        let mut out = self.zone_prefix();
+        out.push(family.tag());
+        out
+    }
+
+    pub(crate) fn pack_system(&self, family: SystemFamily, tuple: &Tuple) -> Vec<u8> {
+        let mut out = self.system_prefix(family);
+        // Every system tuple is assembled from already-bounded scope,
+        // operation, and proof identifiers inside admitted orchestration.
+        out.extend_from_slice(&tuple.encode());
+        out
+    }
+}
+
+/// App-owned data families under one zone. Change rows and idempotency markers
+/// are deliberately absent: only admitted orchestration can name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyFamily {
+    Record,
+    Revision,
+    Index,
+    BlobRef,
+}
+
+impl KeyFamily {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Record => 0x10,
+            Self::Revision => 0x11,
+            Self::Index => 0x13,
+            Self::BlobRef => 0x14,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            0x10 => Ok(Self::Record),
+            0x11 => Ok(Self::Revision),
+            0x13 => Ok(Self::Index),
+            0x14 => Ok(Self::BlobRef),
+            _ => Err(KernelError::MalformedKey),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SystemFamily {
+    Change,
+    Outbox,
+    Frontier,
+}
+
+impl SystemFamily {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Change => 0x12,
+            Self::Outbox => 0x15,
+            Self::Frontier => 0x16,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedKey {
+    pub scope: Scope,
+    pub family: KeyFamily,
+    pub tuple: Tuple,
+}
+
+impl ScopedKey {
+    pub fn decode(key: &[u8]) -> Result<Self> {
+        crate::fdb::validate_key(key)?;
+        if !key.starts_with(HYBRID_V2_PREFIX) {
+            let version = key.get(ESTATE_PREFIX.len()).copied().unwrap_or_default();
+            return if key.starts_with(ESTATE_PREFIX) {
+                Err(KernelError::UnsupportedFormatVersion(version))
+            } else {
+                Err(KernelError::MalformedKey)
+            };
+        }
+        let mut cursor = &key[HYBRID_V2_PREFIX.len()..];
+        let account = AccountId::new(decode_component(&mut cursor)?)?;
+        let container = ContainerId::new(decode_component(&mut cursor)?)?;
+        let zone = ZoneId::new(decode_component(&mut cursor)?)?;
+        let (family, tuple_bytes) = cursor.split_first().ok_or(KernelError::MalformedKey)?;
+        Ok(Self {
+            scope: Scope::new(account, container, zone),
+            family: KeyFamily::from_tag(*family)?,
+            tuple: Tuple::decode(tuple_bytes)?,
+        })
+    }
+}
+
+fn encode_component(bytes: &[u8], out: &mut Vec<u8>) {
+    for &byte in bytes {
+        if byte == 0x00 {
+            out.extend_from_slice(&[0x00, 0xFF]);
+        } else {
+            out.push(byte);
+        }
+    }
+    out.extend_from_slice(&[0x00, 0x00]);
+}
+
+fn decode_component(cursor: &mut &[u8]) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let (byte, rest) = cursor.split_first().ok_or(KernelError::MalformedKey)?;
+        *cursor = rest;
+        if *byte != 0x00 {
+            decoded.push(*byte);
+        } else {
+            let (next, rest) = cursor.split_first().ok_or(KernelError::MalformedKey)?;
+            *cursor = rest;
+            match *next {
+                0xFF => decoded.push(0x00),
+                0x00 => return Ok(decoded),
+                _ => return Err(KernelError::MalformedKey),
+            }
+        }
+        if decoded.len() > MAX_SCOPE_ID_BYTES {
+            return Err(KernelError::ScopeIdInvalid {
+                axis: "encoded scope",
+                len: decoded.len(),
+                limit: MAX_SCOPE_ID_BYTES,
+            });
+        }
     }
 }
 
@@ -68,6 +310,41 @@ impl Tuple {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    fn append_to_bounded_key(&self, out: &mut Vec<u8>) -> Result<()> {
+        for element in &self.0 {
+            match element {
+                Element::Bytes(bytes) => {
+                    push_bounded_key_byte(out, CODE_BYTES)?;
+                    for byte in bytes {
+                        if *byte == 0 {
+                            push_bounded_key_byte(out, 0)?;
+                            push_bounded_key_byte(out, 0xFF)?;
+                        } else {
+                            push_bounded_key_byte(out, *byte)?;
+                        }
+                    }
+                    push_bounded_key_byte(out, 0)?;
+                }
+                Element::Int(value) => {
+                    push_bounded_key_byte(out, CODE_INT)?;
+                    let flipped = (*value as u64) ^ 0x8000_0000_0000_0000;
+                    for byte in flipped.to_be_bytes() {
+                        push_bounded_key_byte(out, byte)?;
+                    }
+                }
+                Element::Bool(value) => push_bounded_key_byte(
+                    out,
+                    if *value {
+                        CODE_BOOL_TRUE
+                    } else {
+                        CODE_BOOL_FALSE
+                    },
+                )?,
+            }
+        }
+        Ok(())
     }
 
     /// Order-preserving encode. Each element is self-delimiting:
@@ -153,6 +430,17 @@ impl Tuple {
         }
         Ok(Self(out))
     }
+}
+
+fn push_bounded_key_byte(out: &mut Vec<u8>, byte: u8) -> Result<()> {
+    if out.len() == crate::fdb::MAX_KEY_BYTES {
+        return Err(KernelError::KeyTooLarge {
+            len: crate::fdb::MAX_KEY_BYTES + 1,
+            limit: crate::fdb::MAX_KEY_BYTES,
+        });
+    }
+    out.push(byte);
+    Ok(())
 }
 
 // Type codes — chosen to give the type ordering
@@ -315,6 +603,197 @@ impl Estate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope(account: &[u8], container: &[u8], zone: &[u8]) -> Scope {
+        Scope::new(
+            AccountId::new(account.to_vec()).unwrap(),
+            ContainerId::new(container.to_vec()).unwrap(),
+            ZoneId::new(zone.to_vec()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn hybrid_v2_round_trips_arbitrary_scoped_bytes() {
+        let original = ScopedKey {
+            scope: scope(b"person\0one", b"app\0notes", b"private\0zone"),
+            family: KeyFamily::Record,
+            tuple: Tuple::new(vec![
+                Element::Bytes(b"object\0id".to_vec()),
+                Element::Int(-7),
+                Element::Bool(true),
+            ]),
+        };
+        let encoded = original.scope.pack(original.family, &original.tuple);
+        assert_eq!(ScopedKey::decode(&encoded).unwrap(), original);
+    }
+
+    #[test]
+    fn tuple_wire_bytes_and_scope_component_boundaries_are_pinned() {
+        assert_eq!(Tuple::new(vec![]).encode(), Vec::<u8>::new());
+        assert_eq!(
+            Tuple::new(vec![Element::Bytes(b"a\0b".to_vec())]).encode(),
+            vec![CODE_BYTES, b'a', 0x00, 0xFF, b'b', 0x00]
+        );
+        assert_eq!(
+            Tuple::new(vec![Element::Int(0)]).encode(),
+            vec![CODE_INT, 0x80, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            Tuple::new(vec![Element::Bool(false), Element::Bool(true)]).encode(),
+            vec![CODE_BOOL_FALSE, CODE_BOOL_TRUE]
+        );
+
+        let empty = [0x00, 0x00];
+        let mut empty_cursor = empty.as_slice();
+        assert_eq!(
+            decode_component(&mut empty_cursor).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(empty_cursor.is_empty());
+
+        let mut exact = vec![b'x'; MAX_SCOPE_ID_BYTES];
+        exact.extend_from_slice(&[0x00, 0x00]);
+        let mut exact_cursor = exact.as_slice();
+        assert_eq!(
+            decode_component(&mut exact_cursor).unwrap(),
+            vec![b'x'; MAX_SCOPE_ID_BYTES]
+        );
+        assert!(exact_cursor.is_empty());
+
+        let mut oversized = vec![b'x'; MAX_SCOPE_ID_BYTES + 1];
+        oversized.extend_from_slice(&[0x00, 0x00]);
+        let mut oversized_cursor = oversized.as_slice();
+        assert!(matches!(
+            decode_component(&mut oversized_cursor),
+            Err(KernelError::ScopeIdInvalid {
+                axis: "encoded scope",
+                len,
+                limit: MAX_SCOPE_ID_BYTES
+            }) if len == MAX_SCOPE_ID_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn account_is_the_leftmost_dynamic_axis() {
+        let a = scope(b"account-a", b"same-container", b"same-zone");
+        let b = scope(b"account-b", b"same-container", b"same-zone");
+        let tuple = Tuple::new(vec![Element::Bytes(b"object".to_vec())]);
+        let key_a = a.pack(KeyFamily::Record, &tuple);
+        let key_b = b.pack(KeyFamily::Record, &tuple);
+        assert!(key_a < key_b);
+        assert!(key_a.starts_with(&a.account_prefix()));
+        assert!(!key_b.starts_with(&a.account_prefix()));
+    }
+
+    #[test]
+    fn containers_zones_and_families_are_disjoint() {
+        let base = scope(b"account", b"container-a", b"zone-a");
+        let other_container = scope(b"account", b"container-b", b"zone-a");
+        let other_zone = scope(b"account", b"container-a", b"zone-b");
+        let tuple = Tuple::new(vec![Element::Bytes(b"same-object".to_vec())]);
+        let record = base.pack(KeyFamily::Record, &tuple);
+        assert_ne!(record, other_container.pack(KeyFamily::Record, &tuple));
+        assert_ne!(record, other_zone.pack(KeyFamily::Record, &tuple));
+        assert_ne!(record, base.pack(KeyFamily::Revision, &tuple));
+
+        for family in [
+            KeyFamily::Record,
+            KeyFamily::Revision,
+            KeyFamily::Index,
+            KeyFamily::BlobRef,
+        ] {
+            let decoded = ScopedKey::decode(&base.pack(family, &tuple)).unwrap();
+            assert_eq!(decoded.scope, base);
+            assert_eq!(decoded.family, family);
+            assert_eq!(decoded.tuple, tuple);
+        }
+        for family in [
+            SystemFamily::Change,
+            SystemFamily::Outbox,
+            SystemFamily::Frontier,
+        ] {
+            let system_key = base.pack_system(family, &tuple);
+            assert!(matches!(
+                ScopedKey::decode(&system_key),
+                Err(KernelError::MalformedKey)
+            ));
+        }
+    }
+
+    #[test]
+    fn scoped_key_limit_accepts_exactly_maximum_bytes() {
+        let base = scope(b"limit-account", b"limit-container", b"limit-zone");
+        let mixed = Tuple::new(vec![
+            Element::Bytes(vec![0, 1, 0]),
+            Element::Int(-7),
+            Element::Bool(true),
+        ]);
+        let mut expected_mixed = base.family_prefix(KeyFamily::Record);
+        expected_mixed.extend_from_slice(&mixed.encode());
+        assert_eq!(
+            base.try_pack(KeyFamily::Record, &mixed).unwrap(),
+            expected_mixed
+        );
+        let payload_len = crate::fdb::MAX_KEY_BYTES
+            .checked_sub(base.family_prefix(KeyFamily::Record).len() + 2)
+            .unwrap();
+        let exact = Tuple::new(vec![Element::Bytes(vec![1; payload_len])]);
+        assert_eq!(
+            base.try_pack(KeyFamily::Record, &exact).unwrap().len(),
+            crate::fdb::MAX_KEY_BYTES
+        );
+        let over = Tuple::new(vec![Element::Bytes(vec![1; payload_len + 1])]);
+        assert!(matches!(
+            base.try_pack(KeyFamily::Record, &over),
+            Err(KernelError::KeyTooLarge {
+                len,
+                limit: crate::fdb::MAX_KEY_BYTES
+            }) if len == crate::fdb::MAX_KEY_BYTES + 1
+        ));
+        let hostile = Tuple::new(vec![Element::Bytes(vec![0; 1_000_000])]);
+        assert!(matches!(
+            base.try_pack(KeyFamily::Record, &hostile),
+            Err(KernelError::KeyTooLarge {
+                len,
+                limit: crate::fdb::MAX_KEY_BYTES
+            }) if len == crate::fdb::MAX_KEY_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn hybrid_v2_never_aliases_a_v1_product_subspace() {
+        let s = scope(b"account", b"container", b"zone");
+        let v2 = s.pack(
+            KeyFamily::Record,
+            &Tuple::new(vec![Element::Bytes(b"x".to_vec())]),
+        );
+        for v1 in [
+            KernelSubspace::new().pack(&TenantId::new(b"account"), &Tuple::new(vec![])),
+            LemSubspace::new().pack(&TenantId::new(b"account"), &Tuple::new(vec![])),
+            CairnSubspace::new().pack(&TenantId::new(b"account"), &Tuple::new(vec![])),
+            MooSubspace::new().pack(&TenantId::new(b"account"), &Tuple::new(vec![])),
+            ForgeSubspace::new().pack(&TenantId::new(b"account"), &Tuple::new(vec![])),
+        ] {
+            assert!(!v2.starts_with(&v1));
+            assert!(!v1.starts_with(HYBRID_V2_PREFIX));
+        }
+    }
+
+    #[test]
+    fn scope_ids_fail_closed_at_empty_and_oversized_boundaries() {
+        assert!(matches!(
+            AccountId::new(Vec::new()),
+            Err(KernelError::ScopeIdInvalid {
+                axis: "account",
+                ..
+            })
+        ));
+        assert!(ContainerId::new(vec![b'x'; MAX_SCOPE_ID_BYTES]).is_ok());
+        assert!(matches!(
+            ZoneId::new(vec![b'x'; MAX_SCOPE_ID_BYTES + 1]),
+            Err(KernelError::ScopeIdInvalid { axis: "zone", .. })
+        ));
+    }
 
     fn arb_bytes_cases() -> Vec<Vec<u8>> {
         vec![
