@@ -2,10 +2,12 @@
 #
 # Regenerate after ANY edit to this file (the rendered workflow is canonical).
 # Renderer source is locked to Keel commit
-# c129d042884ddcee09c855b6d3c13112bae3bd28, the last compatible compiled
-# ci-plan implementation before Keel retired that control plane. The plan and
-# rendered workflow remain byte-locked even if the executable is supplied via
-# KEEL_CI_PLAN_BIN. To regenerate without mutating the checkout, stage a root:
+# c129d042884ddcee09c855b6d3c13112bae3bd28, the last compatible ci-plan
+# implementation before Keel retired that control plane. Its build-time kernel
+# identity is locked to logic-os-kernel commit
+# 7405623fe77cb314acb55c37ba3fcbf929372096. CI rebuilds these declared inputs;
+# it never trusts a mutable renderer installed on the self-hosted runner. To
+# regenerate without mutating the checkout, stage a root:
 #   root=$(mktemp -d)
 #   cp -R ci "$root/ci"; mkdir "$root/keel-core"
 #   printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' \
@@ -447,7 +449,7 @@ id = "ci-plan-current"
 name = "Canonical CI — generated workflow is current"
 needs = ["stack-position"]
 condition = "success()"
-timeout_minutes = 2
+timeout_minutes = 10
 cost = "deterministic"
 working_directory = "."
 runner = ["self-hosted"]
@@ -462,21 +464,41 @@ name = "Regenerate and byte-check GitHub Actions"
 condition = "success()"
 kind = "run"
 run = '''set -eu
-plan_bin="${KEEL_CI_PLAN_BIN:-$HOME/keel/keel-core/target/release/keel-ci-plan}"
-if [ ! -x "$plan_bin" ]; then
-  echo "FAIL compatible keel-ci-plan binary not found at $plan_bin." >&2
-  exit 1
-fi
 root="$(mktemp -d)"
-cp -R ci "$root/ci"
-mkdir "$root/keel-core"
-printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' > "$root/keel-core/Cargo.toml"
-(cd "$root" && "$plan_bin" generate)
-if ! diff -u .github/workflows/ci.yml "$root/.github/workflows/ci.yml"; then
+trap 'rm -rf "$root"' EXIT
+keel_rev="c129d042884ddcee09c855b6d3c13112bae3bd28"
+kernel_rev="7405623fe77cb314acb55c37ba3fcbf929372096"
+keel_source="$root/keel"
+kernel_source="$root/logic-os-kernel"
+render_root="$root/render"
+# Rebuild the retired renderer from the two immutable source inputs.
+git clone --filter=blob:none --no-checkout \
+  git@github.com:srinji-kaggss/keel.git "$keel_source"
+git -C "$keel_source" checkout --detach "$keel_rev"
+test "$(git -C "$keel_source" rev-parse HEAD)" = "$keel_rev"
+git clone --filter=blob:none --no-checkout \
+  git@github.com:srinji-kaggss/logic-os-kernel.git "$kernel_source"
+git -C "$kernel_source" checkout --detach "$kernel_rev"
+test "$(git -C "$kernel_source" rev-parse HEAD)" = "$kernel_rev"
+KEEL_KERNEL_PATH="$kernel_source/kernel" \
+  CARGO_TARGET_DIR="$root/renderer-target" \
+  cargo build --release --locked \
+    --manifest-path "$keel_source/keel-core/Cargo.toml" \
+    --bin keel-ci-plan
+plan_bin="$root/renderer-target/release/keel-ci-plan"
+test -x "$plan_bin"
+# Render in a disposable logical-DB-shaped root, then compare exact bytes.
+mkdir "$render_root"
+cp -R ci "$render_root/ci"
+mkdir "$render_root/keel-core"
+printf '[package]\nname="marker"\nversion="0.0.0"\nedition="2021"\n' \
+  > "$render_root/keel-core/Cargo.toml"
+(cd "$render_root" && "$plan_bin" generate)
+if ! diff -u .github/workflows/ci.yml \
+  "$render_root/.github/workflows/ci.yml"; then
   echo "FAIL .github/workflows/ci.yml is stale; regenerate it from ci/keel-ci.toml" >&2
   exit 1
 fi
-rm -rf "$root"
 echo "OK   generated workflow is byte-current with ci/keel-ci.toml."
 '''
 
