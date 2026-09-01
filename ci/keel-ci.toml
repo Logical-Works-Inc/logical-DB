@@ -13,6 +13,9 @@
 #   (cd "$root" && "$KEEL_CI_PLAN_BIN" generate)
 #   cp "$root/.github/workflows/ci.yml" .github/workflows/ci.yml
 # The `ci-plan-current` job below enforces exactly this byte-equality in CI.
+# INV-ACTION-PIN: every external action is an immutable upstream tag commit.
+# checkout v7.0.1 = 3d3c42e5...; upload-artifact v7.0.1 = 043fb46d....
+# Both tag-to-SHA mappings were independently verified before this plan landed.
 #
 # INV-HERMETIC-CHECKOUT (2026-08-25, run 32824022656): the runner exposes ONE
 # shared _work worktree to every job of every run, so a tree-reading job with
@@ -125,7 +128,7 @@ code_changed = "${{ steps.scope.outputs.code_changed }}"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [job.step.with]
 fetch_depth = "0"
@@ -172,7 +175,7 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Self-test the lint gate (proves it can still fail)"
@@ -209,7 +212,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Run every workspace suite"
@@ -235,7 +238,7 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Self-test the fmt gate (proves it can still fail)"
@@ -277,7 +280,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Clippy with warnings denied"
@@ -305,7 +308,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Compile embedded and official FDB client profiles"
@@ -328,7 +331,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Crash gauntlet: every byte cut recovers an exact batch prefix"
@@ -356,7 +359,7 @@ CARGO_TARGET_DIR = "$KEEL_RUN_ROOT/target"
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Prove the proof gate can fail (keel self-test)"
@@ -395,7 +398,7 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Refuse survived or indeterminate mutants"
@@ -452,7 +455,7 @@ evidence = ["log", "status"]
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Regenerate and byte-check GitHub Actions"
@@ -493,7 +496,7 @@ eval_log = true
 [[job.step]]
 condition = "success()"
 kind = "action"
-uses = "actions/checkout@v4"
+uses = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 local_action = "checkout"
 [[job.step]]
 name = "Compile and compare canonical eval JSONL"
@@ -503,7 +506,7 @@ kind = "eval"
 name = "Upload eval log"
 condition = "always()"
 kind = "action"
-uses = "actions/upload-artifact@v4"
+uses = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 local_action = "upload-artifact"
 [job.step.with]
 name = "eval-log"
