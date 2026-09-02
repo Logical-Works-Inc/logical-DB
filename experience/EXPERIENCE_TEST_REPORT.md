@@ -16,9 +16,9 @@
   HTTP, and an isolated FoundationDB 7.3.77 single-process cluster.
 - Public artifacts tested: `logical_db::Database`, `logical_db::http`, the two
   versioned HTTP routes, and the compiled `logical-db-daemon` binary.
-- Explicit exclusions: native Windows execution, public TLS termination,
-  multi-node FDB failover, disk-full injection, sleep/wake, and sustained load
-  remain outside the completed observations.
+- Explicit exclusions: public TLS termination, multi-node FDB failover,
+  disk-full injection, sleep/wake, and sustained load remain outside the
+  completed observations.
 
 ## Experience charter
 
@@ -59,7 +59,7 @@
 | `external-facade-fdb` | External facade-only crate, two redb replicas, daemon, real FDB | Process/package/TCP/auth/CBOR/backend boundary | `pushed=1 pulled=1 value=verified`; no internal crate import | Proven within bounds | Land the equivalent content-addressed LEM tape after publication |
 | `fdb-ambiguity-v3` | Exact Braid-authorized writes on real FDB | Official client buggify throws after a full-chunk durable commit | `RecoveredUnknownCommit`; one frontier advance; exact duplicate; operation collision rejected; invocation consumed; bounded page reconstructed; scope isolated | Proven within bounds | Repeat in multi-process failover cluster |
 | `mutation-boundaries-v3` | Package and live daemon-composition mutation campaigns | Arithmetic, branch, bound, digest, replay, tuple, transaction, and migration mutations | No viable mutant survived; the live workspace campaign exercised FDB accept/page closures | Proven within bounds | Repeat after any storage-transaction change |
-| `windows-portability-v3` | Windows GNU foreign-target compile and portable path tests | Unicode/spaces and Windows-shaped placement | Core compiles; a native-only default-path/lock/Unicode/read-only journey is present but unobserved | Blocked | GitHub `windows-latest` matrix on pushed branch |
+| `windows-portability-v3` | Native GitHub Windows Server 2025 plus Windows GNU foreign-target compile | LOCALAPPDATA placement, Unicode, exclusive lock, restart, read-only edit, forced process termination, and loopback HTTP | All runtime tests passed on native Windows; core also cross-compiled locally | Proven within bounds | Repeat on minimum supported desktop Windows image before packaging |
 
 ## Friction ledger
 
@@ -68,7 +68,7 @@
 | Native FDB client discovery | `cargo build --features fdb` finds FDB | macOS needs the official client library staged in the linker/rpath | Operator setup is explicit but manual | Medium |
 | Server vs process | Router crate sounds runnable | A separate daemon composition root is required | Fixed by shipping `logical-db-daemon` | Resolved |
 | Media type | Generic `application/cbor` seems plausible | The service correctly requires the versioned vendor media type | Error is safe but bodyless | Low |
-| Windows proof | Cross-compile looks sufficient | Native file/HTTP/process behavior remains unobserved locally | Release must wait for matrix evidence | High |
+| Windows proof | Cross-compile looks sufficient | Native file/HTTP/process behavior required a Windows runner | Closed by the pushed native matrix | Resolved |
 
 ## Failures and ambiguity
 
@@ -102,7 +102,7 @@
   facade-only two-replica push/pull journey through the live FDB daemon.
 - Failed: no currently accepted journey failed after its regression was added.
 - Ambiguous: none inside the completed single-node FDB scope.
-- Blocked: native Windows runtime evidence until a pushed GitHub matrix runs.
+- Blocked: external LEM consumption and final synchronized repository tips.
 - Untested: multi-node FDB failover, public TLS/issuer integration, sleep/wake,
   disk exhaustion, mobile sandboxes, and sustained production load.
 

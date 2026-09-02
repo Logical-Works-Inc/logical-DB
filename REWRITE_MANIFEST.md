@@ -46,12 +46,14 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 
 ## Still blocking release and LEM handoff
 
-- [ ] Run native Windows runtime CI for file locking, concurrent open, Unicode,
-  read-only paths, process termination, and HTTP TLS; foreign-target compilation
-  alone does not close this gate.
+- [x] Native Windows CI passed data placement, file locking, concurrent open,
+  Unicode, read-only paths, process termination, loopback HTTP, and all default
+  workspace tests. Public TLS remains a deployment-host boundary, not an
+  embedded database function.
 - [ ] Package and consume the facade from LEM in an external-repository tape
   journey without importing internal crates.
-- [ ] Run the final independent hostile review after all preceding gates.
+- [x] Independent hostile review returned `MERGE` after the live FDB mutation
+  campaign killed both initially surviving transaction mutations.
 - [ ] Merge only that reviewed result, push it, observe all GitHub matrix jobs,
   and prove local/main/origin tips match.
 
