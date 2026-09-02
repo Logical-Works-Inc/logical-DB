@@ -12,7 +12,7 @@ repository.workspace = true
 
 [dependencies]
 automerge.workspace = true
-logical-db-model = { path = "../logical-db-model" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 thiserror.workspace = true
 
 [lints]

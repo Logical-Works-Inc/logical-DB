@@ -20,8 +20,9 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   explicit full resync have typed tests.
 - [x] The service has bounded HTTP ingress and an async FDB adapter with private
   tuple subspaces, chunked values, and transaction ceilings.
-- [x] Braid produces a real pinned `RunnableInvocation` bound to exact scoped
-  request facts and the durable frontier; FDB consumes it atomically.
+- [x] Externally prepared Braid material produces a real pinned
+  `RunnableInvocation` bound to exact scoped request facts and the durable
+  frontier; FDB consumes it atomically.
 - [x] A committed edit survives subprocess exit without destructor execution.
 - [x] Windows-native data placement is represented without POSIX assumptions.
 - [x] Schema/index migration is bounded, revision checked, durably resumable,
@@ -35,16 +36,25 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   writers, exact duplicate/conflict behavior, pagination, restart, and planted
   missing-chunk corruption; the deployable daemon also reached its live HTTP
   authentication and decoding boundary against that cluster.
-- [x] `logical-db-daemon` is a real loopback-only FDB composition root; embedded
-  applications and custom ecosystem hosts remain independent of it.
-- [x] A retained public-facade journey crosses HTTP, Braid, and a real FDB
-  cluster without importing internal crates in the consumer source.
+- [x] `logical-db-daemon` is a loopback-only FDB composition shell; embedded
+  applications and custom ecosystem hosts remain independent of it, and its
+  local authority fails closed for write and egress effects.
 - [x] Official client buggify forces post-commit `commit_unknown_result`; the
   adapter reports recovered ambiguity, advances once, and rejects invocation reuse.
 - [x] HTTP ingress bounds complete in-flight requests before body extraction,
   applies a deadline, and local materialization is bounded per document/page.
+- [x] Braid proof identity includes expiry and distinguishes scan from point
+  read authority; sync preserves rejection reasons and never reports completion
+  while upload backlog remains.
+- [x] One global upload cursor is durably bound to one upstream, so unsupported
+  multi-upstream fan-out fails closed instead of losing delivery.
+- [x] Conflict candidates, list/text/counter operations, snapshot decode bounds,
+  orphan index/event checks, absolute native roots, daemon token validation, and
+  retry guidance are present at their public boundaries.
+- [x] The dependency lock has no advisory or yanked findings; CI enforces a
+  pinned cargo-deny license/advisory/source policy and Dependabot configuration.
 
-## Still blocking release and LEM handoff
+## Still blocking production release and LEM handoff
 
 - [x] Native Windows CI passed data placement, file locking, concurrent open,
   Unicode, read-only paths, process termination, loopback HTTP, and all default
@@ -52,9 +62,20 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   embedded database function.
 - [ ] Package and consume the facade from LEM in an external-repository tape
   journey without importing internal crates.
+- [ ] Integrate independently verifiable, exact-request Braid confirmation
+  evidence before enabling daemon write or synchronization authority. Pinned
+  Braid's capsule flag alone is not treated as runtime evidence.
+- [ ] Add a versioned server snapshot baseline, retention floor, client recovery
+  transition, and peer-aware garbage collection before pruning the append-only log.
+- [ ] Add first-class document tombstones plus a supported embedded export and
+  restore contract, including interrupted-restore and corrupt-backup journeys.
+- [ ] Exercise multi-node FDB failover and point-in-time restore, public
+  TLS/issuer/rotation, sustained load/backpressure, disk exhaustion, sleep/wake,
+  and mobile sandbox lifecycle.
 - [x] Independent hostile review returned `MERGE` after the live FDB mutation
   campaign killed both initially surviving transaction mutations.
-- [ ] Merge only that reviewed result, push it, observe all GitHub matrix jobs,
-  and prove local/main/origin tips match.
+- [ ] Obtain a new independent hostile review for this hardening delta, merge
+  only the reviewed result, observe all GitHub jobs, and prove local/main/origin
+  tips match under protected-main policy.
 
 No green subset, churn percentage, or document may override an unchecked gate.

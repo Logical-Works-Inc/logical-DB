@@ -15,13 +15,13 @@ default = []
 http = ["dep:logical-db-http"]
 
 [dependencies]
-logical-db-crdt = { path = "../logical-db-crdt" }
-logical-db-http = { path = "../logical-db-http", optional = true }
-logical-db-model = { path = "../logical-db-model" }
-logical-db-platform = { path = "../logical-db-platform" }
-logical-db-protocol = { path = "../logical-db-protocol" }
-logical-db-store = { path = "../logical-db-store" }
-logical-db-sync = { path = "../logical-db-sync" }
+logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
+logical-db-http = { version = "0.1.0", path = "../logical-db-http", optional = true }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-platform = { version = "0.1.0", path = "../logical-db-platform" }
+logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
+logical-db-store = { version = "0.1.0", path = "../logical-db-store" }
+logical-db-sync = { version = "0.1.0", path = "../logical-db-sync" }
 sha2.workspace = true
 thiserror.workspace = true
 

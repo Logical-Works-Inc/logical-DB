@@ -8,7 +8,6 @@ use std::{error::Error, io};
 
 use foundationdb::{Database, api::FdbApiBuilder, options::NetworkOption};
 use foundationdb_tuple::Subspace;
-use logical_db_braid::prepare_local_request;
 use logical_db_crdt::{Document, Object, Scalar};
 use logical_db_model::{
     AccountId, DocumentId, Effect, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, OperationDigest,
@@ -17,6 +16,7 @@ use logical_db_model::{
 use logical_db_protocol::ChangeEnvelope;
 use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, ServiceStore};
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
+use sha2::{Digest, Sha256};
 
 const FULL_FDB_CHUNK_PROBE_BYTES: usize = 65_536;
 
@@ -48,6 +48,33 @@ impl ExecutionGrant for ForgedGrant {
 
     fn invocation_id(&self) -> [u8; 32] {
         self.invocation
+    }
+}
+
+fn fixture_grant(
+    scope: Scope,
+    effect: Effect,
+    request: OperationDigest,
+    frontier: u64,
+) -> ForgedGrant {
+    let mut digest = Sha256::new();
+    digest.update(b"logical-db/fdb-ambiguity-fixture/v1\0");
+    digest.update(scope.account().as_uuid().as_bytes());
+    digest.update(scope.space().as_uuid().as_bytes());
+    digest.update([match effect {
+        Effect::Read => 1,
+        Effect::Scan => 2,
+        Effect::Write => 3,
+        Effect::Sync => 4,
+    }]);
+    digest.update(request.into_bytes());
+    digest.update(frontier.to_be_bytes());
+    ForgedGrant {
+        scope,
+        effect,
+        request,
+        frontier,
+        invocation: digest.finalize().into(),
     }
 }
 
@@ -111,7 +138,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         let Ok(frontier) = store.frontier(scope).await else {
             continue;
         };
-        let grant = prepare_local_request(scope, Effect::Write, request, frontier, u64::MAX)?;
+        let grant = fixture_grant(scope, Effect::Write, request, frontier);
         match store.accept(&change, &grant).await {
             Ok(AcceptResult::RecoveredUnknownCommit) => {
                 let (observed, rebound) =
@@ -172,8 +199,7 @@ async fn verify_recovered_write(
         .first_mut()
         .ok_or_else(|| io::Error::other("change unexpectedly empty"))?;
     *first ^= 0xff;
-    let collision_grant =
-        prepare_local_request(scope, Effect::Write, collision.request, observed, u64::MAX)?;
+    let collision_grant = fixture_grant(scope, Effect::Write, collision.request, observed);
     let mut collision_result = None;
     for _retry in 0..128 {
         if let Ok(value) = store.accept(&collision, &collision_grant).await {
@@ -207,7 +233,7 @@ async fn verify_page(
     rebound: &ChangeEnvelope,
 ) -> Result<(), Box<dyn Error>> {
     let request = OperationDigest::new([0x77; 32]);
-    let grant = prepare_local_request(scope, Effect::Sync, request, observed, u64::MAX)?;
+    let grant = fixture_grant(scope, Effect::Sync, request, observed);
     let count = u16::try_from(MAX_CHANGES_PER_PAGE)?;
     let bytes = u32::try_from(MAX_PAGE_BYTES)?;
     let mut page_result = None;

@@ -271,11 +271,13 @@ mod runtime {
         decode_operation, decode_u64, encode_manifest, invocation_binding,
         invocation_binding_record, page_read_plan, valid_page_limits,
     };
-    use foundationdb::{Database, FdbBindingError, RangeOption, options::DatabaseOption};
+    use foundationdb::{Database, FdbBindingError, RangeOption, options::TransactionOption};
     use foundationdb_tuple::Subspace;
     use logical_db_model::{Effect, OperationDigest, Scope};
     use logical_db_protocol::ChangeEnvelope;
-    use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, ServiceStore, StoredPage};
+    use logical_db_service::{
+        AcceptResult, ExecutionGrant, PageResult, ServiceStore, StoreFailureClass, StoredPage,
+    };
     use thiserror::Error;
 
     const KIND_OPERATION: i64 = 1;
@@ -312,7 +314,7 @@ mod runtime {
     }
 
     impl FdbServiceStore {
-        /// Installs hard transaction ceilings and binds an allocated root subspace.
+        /// Binds a directory-allocated root subspace without mutating host-wide options.
         ///
         /// # Errors
         ///
@@ -321,10 +323,6 @@ mod runtime {
             if root.bytes().is_empty() {
                 return Err(FdbStoreError::UnallocatedRoot);
             }
-            database.set_option(DatabaseOption::TransactionTimeout(TRANSACTION_TIMEOUT_MS))?;
-            database.set_option(DatabaseOption::TransactionRetryLimit(
-                TRANSACTION_RETRY_LIMIT,
-            ))?;
             Ok(Self { database, root })
         }
 
@@ -340,6 +338,22 @@ mod runtime {
     #[allow(async_fn_in_trait)]
     impl ServiceStore for FdbServiceStore {
         type Error = FdbStoreError;
+
+        fn classify_error(error: &Self::Error) -> StoreFailureClass {
+            match error {
+                FdbStoreError::CommitMayHaveSucceeded { .. }
+                | FdbStoreError::Cancelled { .. }
+                | FdbStoreError::VersionSkew { .. }
+                | FdbStoreError::RetryExhausted { .. } => StoreFailureClass::Transient,
+                FdbStoreError::Client(_)
+                | FdbStoreError::UnallocatedRoot
+                | FdbStoreError::InvalidChangeEnvelope
+                | FdbStoreError::InvalidPageLimits
+                | FdbStoreError::Corruption(_)
+                | FdbStoreError::Native { .. }
+                | FdbStoreError::BindingInvariant(_) => StoreFailureClass::Permanent,
+            }
+        }
 
         async fn accept(
             &self,
@@ -374,6 +388,7 @@ mod runtime {
                     let log_space = log_space.clone();
                     let chunk_space = chunk_space.clone();
                     async move {
+                        configure_transaction(&transaction)?;
                         if let Some(existing) = transaction.get(&operation_key, false).await? {
                             let operation = decode_operation(existing.as_ref()).map_err(binding)?;
                             let stored_invocation_key = scope_space
@@ -446,6 +461,7 @@ mod runtime {
                 .run(move |transaction, _maybe_committed| {
                     let sequence_key = sequence_key.clone();
                     async move {
+                        configure_transaction(&transaction)?;
                         transaction
                             .get(&sequence_key, false)
                             .await?
@@ -494,7 +510,10 @@ mod runtime {
             self.database
                 .run(move |transaction, _maybe_committed| {
                     let spaces = spaces.clone();
-                    async move { load_page(&transaction, &spaces, query).await }
+                    async move {
+                        configure_transaction(&transaction)?;
+                        load_page(&transaction, &spaces, query).await
+                    }
                 })
                 .await
                 .map_err(classify_transaction)
@@ -532,6 +551,14 @@ mod runtime {
             .collect::<Vec<_>>();
         drop(values);
         materialize_page(transaction, spaces, query, frontier, range_more, manifests).await
+    }
+
+    fn configure_transaction(
+        transaction: &foundationdb::RetryableTransaction,
+    ) -> Result<(), FdbBindingError> {
+        transaction.set_option(TransactionOption::Timeout(TRANSACTION_TIMEOUT_MS))?;
+        transaction.set_option(TransactionOption::RetryLimit(TRANSACTION_RETRY_LIMIT))?;
+        Ok(())
     }
 
     async fn materialize_page(
@@ -759,6 +786,16 @@ mod runtime {
                 classify_transaction(FdbBindingError::ReferenceToTransactionKept),
                 FdbStoreError::BindingInvariant(_)
             ));
+            assert_eq!(
+                FdbServiceStore::classify_error(&FdbStoreError::CommitMayHaveSucceeded {
+                    code: 1_021
+                }),
+                StoreFailureClass::Transient
+            );
+            assert_eq!(
+                FdbServiceStore::classify_error(&FdbStoreError::UnallocatedRoot),
+                StoreFailureClass::Permanent
+            );
         }
     }
 }

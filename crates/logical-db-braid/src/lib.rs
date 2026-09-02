@@ -12,7 +12,7 @@ use braid_capability::Capability;
 use braid_flow_ir::{FactRef, Predicate, ValueExpr};
 use braid_flow_plan::{CompletionMap, FlowSnapshot};
 use braid_ir::{
-    Capsule, TermRegistry, Value,
+    Capsule, ConfirmPolicy, TermRegistry, Value,
     term::{EffectClass, Exposure, TermSpec, TypeTag},
 };
 use braid_run::{JustificationProof, RunnableInvocation};
@@ -25,6 +25,8 @@ use thiserror::Error;
 
 /// Braid capability prefix authorizing structured DB reads.
 pub const READ_CAPABILITY: &str = "logical_db.read";
+/// Braid capability prefix authorizing structured DB scans.
+pub const SCAN_CAPABILITY: &str = "logical_db.scan";
 /// Braid capability prefix authorizing structured DB writes.
 pub const WRITE_CAPABILITY: &str = "logical_db.write";
 /// Braid capability prefix authorizing replica synchronization.
@@ -34,6 +36,7 @@ const SCOPE_FACT: &str = "logical_db.scope";
 const EFFECT_FACT: &str = "logical_db.effect";
 const REQUEST_FACT: &str = "logical_db.request";
 const FRONTIER_FACT: &str = "logical_db.frontier";
+const EXPIRY_FACT: &str = "logical_db.expires_at_unix_ms";
 
 /// Exact logical facts and expiry supplied to Braid preparation as one value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,7 +72,8 @@ impl RequestBinding {
 #[must_use]
 pub fn capability_for(scope: Scope, effect: Effect, request: OperationDigest) -> Capability {
     let prefix = match effect {
-        Effect::Read | Effect::Scan => READ_CAPABILITY,
+        Effect::Read => READ_CAPABILITY,
+        Effect::Scan => SCAN_CAPABILITY,
         Effect::Write => WRITE_CAPABILITY,
         Effect::Sync => SYNC_CAPABILITY,
     };
@@ -165,9 +169,12 @@ pub fn prepare_request(
     if !capsule.grants.iter().any(|grant| grant == &required) {
         return Err(BraidAdapterError::MissingExactGrant);
     }
+    validate_operation_policy(&capsule, registry, &required, effect)?;
     let frontier_value =
         i64::try_from(frontier).map_err(|_| BraidAdapterError::Frontier(frontier))?;
-    let facts = request_facts(scope, effect, request, frontier_value);
+    let expiry_value = i64::try_from(expires_at_unix_ms)
+        .map_err(|_| BraidAdapterError::Expiry(expires_at_unix_ms))?;
+    let facts = request_facts(scope, effect, request, frontier_value, expiry_value);
     let snapshot = FlowSnapshot::new(facts.clone());
     let predicate = request_predicate(&facts)?;
     let justification =
@@ -194,11 +201,62 @@ pub fn prepare_request(
     })
 }
 
+fn validate_operation_policy(
+    capsule: &Capsule,
+    registry: &TermRegistry,
+    required: &Capability,
+    effect: Effect,
+) -> Result<(), BraidAdapterError> {
+    let (required_effect, required_ceiling) = operation_policy(effect);
+    if matches!(
+        required_effect,
+        EffectClass::Irreversible | EffectClass::Egress
+    ) && capsule.confirm != ConfirmPolicy::HumanConfirm
+    {
+        return Err(BraidAdapterError::EffectPolicyMismatch);
+    }
+    let mut exposures = Vec::with_capacity(capsule.braid.strands.len());
+    let mut matched = false;
+    for strand in &capsule.braid.strands {
+        let spec = registry
+            .get(&strand.term)
+            .ok_or(BraidAdapterError::EffectPolicyMismatch)?;
+        let incoming = strand
+            .inputs
+            .iter()
+            .try_fold(Exposure::Public, |value, index| {
+                exposures
+                    .get(*index as usize)
+                    .copied()
+                    .map(|exposure| value.max(exposure))
+                    .ok_or(BraidAdapterError::EffectPolicyMismatch)
+            })?;
+        if spec.capability.as_ref() != Some(required) {
+            exposures.push(spec.source_exposure.max(incoming));
+            continue;
+        }
+        if spec.effect != required_effect
+            || spec.egress_ceiling != required_ceiling
+            || incoming != Exposure::Vault
+        {
+            return Err(BraidAdapterError::EffectPolicyMismatch);
+        }
+        matched = true;
+        exposures.push(spec.source_exposure.max(incoming));
+    }
+    if matched {
+        Ok(())
+    } else {
+        Err(BraidAdapterError::EffectPolicyMismatch)
+    }
+}
+
 fn request_facts(
     scope: Scope,
     effect: Effect,
     request: OperationDigest,
     frontier: i64,
+    expires_at_unix_ms: i64,
 ) -> BTreeMap<String, Value> {
     let mut scope_bytes = Vec::with_capacity(32);
     scope_bytes.extend_from_slice(scope.account().as_uuid().as_bytes());
@@ -211,6 +269,7 @@ fn request_facts(
             Value::Bytes(request.into_bytes().to_vec()),
         ),
         (FRONTIER_FACT.into(), Value::Int(frontier)),
+        (EXPIRY_FACT.into(), Value::Int(expires_at_unix_ms)),
     ])
 }
 
@@ -246,10 +305,12 @@ fn effect_name(effect: Effect) -> &'static str {
     }
 }
 
-/// Generates the minimal one-term registry and capsule used by the standalone host.
+/// Generates minimal local material for non-dangerous read and scan effects.
 ///
-/// This is not an allow-boolean shortcut: every call creates, admits, justifies,
-/// and prepares a real [`RunnableInvocation`] over exact request/frontier facts.
+/// This is not an allow-boolean shortcut: successful calls create, admit,
+/// justify, and prepare a real [`RunnableInvocation`] over exact facts.
+/// Irreversible and egress effects fail because this function cannot supply
+/// independently prepared confirmation evidence.
 ///
 /// # Errors
 ///
@@ -265,22 +326,35 @@ pub fn prepare_local_request(
     let mut registry = TermRegistry::new(1);
     registry
         .insert(TermSpec {
-            id: "logical_db.invoke".into(),
+            id: "logical_db.bound_request".into(),
             inputs: Vec::new(),
             output: TypeTag::Bool,
-            capability: Some(capability.clone()),
-            effect: match effect {
-                Effect::Write => EffectClass::ReversibleWrite,
-                Effect::Read | Effect::Scan | Effect::Sync => EffectClass::Read,
-            },
-            source_exposure: Exposure::Internal,
+            capability: None,
+            effect: EffectClass::Pure,
+            source_exposure: Exposure::Vault,
             egress_ceiling: None,
             cost: 1,
         })
         .map_err(BraidAdapterError::Registry)?;
+    let (operation_effect, egress_ceiling) = operation_policy(effect);
+    registry
+        .insert(TermSpec {
+            id: "logical_db.invoke".into(),
+            inputs: vec![TypeTag::Bool],
+            output: TypeTag::Bool,
+            capability: Some(capability.clone()),
+            effect: operation_effect,
+            source_exposure: Exposure::Vault,
+            egress_ceiling,
+            cost: 1,
+        })
+        .map_err(BraidAdapterError::Registry)?;
     let mut builder = Builder::new(&registry, "execute exact Logical-DB request");
+    let bound_request = builder
+        .strand("logical_db.bound_request", &[])
+        .map_err(BraidAdapterError::Build)?;
     let result = builder
-        .strand("logical_db.invoke", &[])
+        .strand("logical_db.invoke", &[bound_request])
         .map_err(BraidAdapterError::Build)?;
     builder.output(result).budget_tight();
     let capsule = builder.build().map_err(BraidAdapterError::Build)?;
@@ -293,7 +367,20 @@ pub fn prepare_local_request(
     )
 }
 
-/// Authenticated scope policy that produces a new exact Braid invocation per request.
+fn operation_policy(effect: Effect) -> (EffectClass, Option<Exposure>) {
+    match effect {
+        Effect::Read | Effect::Scan => (EffectClass::Read, None),
+        Effect::Write => (EffectClass::Irreversible, Some(Exposure::Vault)),
+        Effect::Sync => (EffectClass::Egress, Some(Exposure::Vault)),
+    }
+}
+
+/// Local authority for non-dangerous operations only.
+///
+/// Braid's pinned confirmation model carries no independently verifiable
+/// runtime evidence. This authority therefore refuses irreversible writes and
+/// egress synchronization. Hosts must supply externally prepared grants through
+/// [`BraidAuthority`] for those effects.
 pub struct LocalBraidAuthority {
     scope: Scope,
     expires_at_unix_ms: u64,
@@ -322,7 +409,7 @@ impl Authority for LocalBraidAuthority {
         now_unix_ms: u64,
     ) -> Option<Self::Grant> {
         if scope != self.scope
-            || !matches!(effect, Effect::Write | Effect::Sync)
+            || !matches!(effect, Effect::Read | Effect::Scan)
             || now_unix_ms >= self.expires_at_unix_ms
         {
             return None;
@@ -380,9 +467,16 @@ pub enum BraidAdapterError {
     /// Capsule grant set omitted the exact scope/effect/request capability.
     #[error("Braid capsule lacks the exact scoped request capability")]
     MissingExactGrant,
+    /// Exact capability was not attached to a vault-tainted term with the
+    /// required effect, ceiling, and dangerous-operation confirmation policy.
+    #[error("Braid capsule does not model the required Logical-DB effect and data exposure")]
+    EffectPolicyMismatch,
     /// Frontier exceeded Braid's canonical fixed integer domain.
     #[error("Braid snapshot frontier {0} exceeds its canonical integer domain")]
     Frontier(u64),
+    /// Expiry exceeded Braid's canonical fixed integer domain.
+    #[error("Braid snapshot expiry {0} exceeds its canonical integer domain")]
+    Expiry(u64),
     /// Snapshot fact name violated Braid identifier rules.
     #[error("Braid snapshot fact name is invalid: {0}")]
     Fact(braid_flow_ir::IdentifierError),
@@ -410,32 +504,251 @@ mod tests {
     fn real_runnable_is_bound_to_scope_effect_request_frontier_and_expiry() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let request = OperationDigest::new([9; 32]);
-        let grant = prepare_local_request(scope, Effect::Write, request, 7, 100).unwrap();
+        let grant = prepare_local_request(scope, Effect::Read, request, 7, 100).unwrap();
         assert_eq!(ExecutionGrant::scope(&grant), scope);
-        assert_eq!(ExecutionGrant::effect(&grant), Effect::Write);
+        assert_eq!(ExecutionGrant::effect(&grant), Effect::Read);
         assert_eq!(ExecutionGrant::request(&grant), request);
         assert_eq!(ExecutionGrant::frontier(&grant), 7);
-        assert!(grant.permits(scope, Effect::Write, request, 7, 99));
-        assert!(!grant.permits(scope, Effect::Write, request, 8, 99));
+        assert!(grant.permits(scope, Effect::Read, request, 7, 99));
+        assert!(!grant.permits(scope, Effect::Read, request, 8, 99));
         assert!(!grant.permits(scope, Effect::Sync, request, 7, 99));
-        assert!(!grant.permits(scope, Effect::Write, OperationDigest::new([8; 32]), 7, 99));
-        assert!(!grant.permits(scope, Effect::Write, request, 7, 100));
+        assert!(!grant.permits(scope, Effect::Read, OperationDigest::new([8; 32]), 7, 99));
+        assert!(!grant.permits(scope, Effect::Read, request, 7, 100));
     }
 
     #[test]
-    fn invocation_identity_changes_with_frontier_and_request() {
+    fn invocation_identity_changes_with_frontier_request_and_expiry() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let first =
-            prepare_local_request(scope, Effect::Write, OperationDigest::new([1; 32]), 1, 9)
-                .unwrap();
+        let first = prepare_local_request(scope, Effect::Read, OperationDigest::new([1; 32]), 1, 9)
+            .unwrap();
         let frontier =
-            prepare_local_request(scope, Effect::Write, OperationDigest::new([1; 32]), 2, 9)
+            prepare_local_request(scope, Effect::Read, OperationDigest::new([1; 32]), 2, 9)
                 .unwrap();
         let request =
-            prepare_local_request(scope, Effect::Write, OperationDigest::new([2; 32]), 1, 9)
+            prepare_local_request(scope, Effect::Read, OperationDigest::new([2; 32]), 1, 9)
+                .unwrap();
+        let expiry =
+            prepare_local_request(scope, Effect::Read, OperationDigest::new([1; 32]), 1, 10)
                 .unwrap();
         assert_ne!(first.invocation_id(), frontier.invocation_id());
         assert_ne!(first.invocation_id(), request.invocation_id());
+        assert_ne!(first.invocation_id(), expiry.invocation_id());
+    }
+
+    #[test]
+    fn scan_and_point_read_require_distinct_capabilities() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([3; 32]);
+        assert_ne!(
+            capability_for(scope, Effect::Read, request),
+            capability_for(scope, Effect::Scan, request)
+        );
+    }
+
+    #[test]
+    fn durable_and_network_effects_are_never_downgraded() {
+        assert_eq!(
+            operation_policy(Effect::Write),
+            (EffectClass::Irreversible, Some(Exposure::Vault))
+        );
+        assert_eq!(
+            operation_policy(Effect::Sync),
+            (EffectClass::Egress, Some(Exposure::Vault))
+        );
+        assert_eq!(operation_policy(Effect::Read), (EffectClass::Read, None));
+        assert_eq!(operation_policy(Effect::Scan), (EffectClass::Read, None));
+    }
+
+    #[test]
+    fn external_capsule_cannot_attach_write_capability_to_a_weaker_effect() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([5; 32]);
+        let capability = capability_for(scope, Effect::Write, request);
+        let mut registry = TermRegistry::new(1);
+        registry
+            .insert(TermSpec {
+                id: "request".into(),
+                inputs: vec![],
+                output: TypeTag::Bool,
+                capability: None,
+                effect: EffectClass::Pure,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: None,
+                cost: 1,
+            })
+            .unwrap();
+        registry
+            .insert(TermSpec {
+                id: "downgraded_write".into(),
+                inputs: vec![TypeTag::Bool],
+                output: TypeTag::Bool,
+                capability: Some(capability.clone()),
+                effect: EffectClass::ReversibleWrite,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: Some(Exposure::Vault),
+                cost: 1,
+            })
+            .unwrap();
+        let mut builder = Builder::new(&registry, "attempt write downgrade");
+        let source = builder.strand("request", &[]).unwrap();
+        let sink = builder.strand("downgraded_write", &[source]).unwrap();
+        builder
+            .output(sink)
+            .budget_tight()
+            .confirm(ConfirmPolicy::HumanConfirm);
+        let capsule = builder.build().unwrap();
+        assert!(matches!(
+            prepare_request(
+                &capsule.to_bytes(),
+                &registry,
+                &[capability],
+                RequestBinding::new(scope, Effect::Write, request, 0, 1),
+            ),
+            Err(BraidAdapterError::EffectPolicyMismatch)
+        ));
+    }
+
+    #[test]
+    fn externally_confirmed_exact_write_capsule_is_accepted() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([6; 32]);
+        let capability = capability_for(scope, Effect::Write, request);
+        let mut registry = TermRegistry::new(1);
+        registry
+            .insert(TermSpec {
+                id: "request".into(),
+                inputs: vec![],
+                output: TypeTag::Bool,
+                capability: None,
+                effect: EffectClass::Pure,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: None,
+                cost: 1,
+            })
+            .unwrap();
+        registry
+            .insert(TermSpec {
+                id: "write".into(),
+                inputs: vec![TypeTag::Bool],
+                output: TypeTag::Bool,
+                capability: Some(capability.clone()),
+                effect: EffectClass::Irreversible,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: Some(Exposure::Vault),
+                cost: 1,
+            })
+            .unwrap();
+        let mut builder = Builder::new(&registry, "externally confirmed write");
+        let source = builder.strand("request", &[]).unwrap();
+        let sink = builder.strand("write", &[source]).unwrap();
+        builder
+            .output(sink)
+            .budget_tight()
+            .confirm(ConfirmPolicy::HumanConfirm);
+        let capsule = builder.build().unwrap();
+        let grant = prepare_request(
+            &capsule.to_bytes(),
+            &registry,
+            &[capability],
+            RequestBinding::new(scope, Effect::Write, request, 0, 1),
+        )
+        .unwrap();
+        assert_eq!(grant.effect(), Effect::Write);
+    }
+
+    #[test]
+    fn external_read_capsule_cannot_change_the_required_ceiling_shape() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([7; 32]);
+        let capability = capability_for(scope, Effect::Read, request);
+        let mut registry = TermRegistry::new(1);
+        registry
+            .insert(TermSpec {
+                id: "request".into(),
+                inputs: vec![],
+                output: TypeTag::Bool,
+                capability: None,
+                effect: EffectClass::Pure,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: None,
+                cost: 1,
+            })
+            .unwrap();
+        registry
+            .insert(TermSpec {
+                id: "read".into(),
+                inputs: vec![TypeTag::Bool],
+                output: TypeTag::Bool,
+                capability: Some(capability.clone()),
+                effect: EffectClass::Read,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: Some(Exposure::Vault),
+                cost: 1,
+            })
+            .unwrap();
+        let mut builder = Builder::new(&registry, "attempt read policy drift");
+        let source = builder.strand("request", &[]).unwrap();
+        let sink = builder.strand("read", &[source]).unwrap();
+        builder.output(sink).budget_tight();
+        let capsule = builder.build().unwrap();
+        assert!(matches!(
+            prepare_request(
+                &capsule.to_bytes(),
+                &registry,
+                &[capability],
+                RequestBinding::new(scope, Effect::Read, request, 0, 1),
+            ),
+            Err(BraidAdapterError::EffectPolicyMismatch)
+        ));
+    }
+
+    #[test]
+    fn external_sync_capsule_must_route_vault_tainted_request_material() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([8; 32]);
+        let capability = capability_for(scope, Effect::Sync, request);
+        let mut registry = TermRegistry::new(1);
+        registry
+            .insert(TermSpec {
+                id: "public_request".into(),
+                inputs: vec![],
+                output: TypeTag::Bool,
+                capability: None,
+                effect: EffectClass::Pure,
+                source_exposure: Exposure::Public,
+                egress_ceiling: None,
+                cost: 1,
+            })
+            .unwrap();
+        registry
+            .insert(TermSpec {
+                id: "sync".into(),
+                inputs: vec![TypeTag::Bool],
+                output: TypeTag::Bool,
+                capability: Some(capability.clone()),
+                effect: EffectClass::Egress,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: Some(Exposure::Vault),
+                cost: 1,
+            })
+            .unwrap();
+        let mut builder = Builder::new(&registry, "attempt untainted sync");
+        let source = builder.strand("public_request", &[]).unwrap();
+        let sink = builder.strand("sync", &[source]).unwrap();
+        builder
+            .output(sink)
+            .budget_tight()
+            .confirm(ConfirmPolicy::HumanConfirm);
+        let capsule = builder.build().unwrap();
+        assert!(matches!(
+            prepare_request(
+                &capsule.to_bytes(),
+                &registry,
+                &[capability],
+                RequestBinding::new(scope, Effect::Sync, request, 0, 1),
+            ),
+            Err(BraidAdapterError::EffectPolicyMismatch)
+        ));
     }
 
     #[test]
@@ -445,19 +758,25 @@ mod tests {
         let request = OperationDigest::new([4; 32]);
         assert!(
             policy
-                .authorize(scope, Effect::Write, request, 3, 19)
+                .authorize(scope, Effect::Read, request, 3, 19)
                 .is_some()
         );
         assert!(
             policy
-                .authorize(scope, Effect::Read, request, 3, 19)
+                .authorize(scope, Effect::Write, request, 3, 19)
                 .is_none()
         );
         assert!(
             policy
-                .authorize(scope, Effect::Write, request, 3, 20)
+                .authorize(scope, Effect::Read, request, 3, 20)
                 .is_none()
         );
+        assert!(matches!(
+            prepare_local_request(scope, Effect::Write, request, 3, 20),
+            Err(BraidAdapterError::Build(
+                braid_sdk::BuildError::ConfirmRequired { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -469,19 +788,19 @@ mod tests {
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let request = OperationDigest::new([6; 32]);
-        let grant = prepare_local_request(scope, Effect::Write, request, 11, 30).unwrap();
+        let grant = prepare_local_request(scope, Effect::Read, request, 11, 30).unwrap();
         let expected_id = grant.invocation_id();
         let authority = BraidAuthority::new(vec![grant]).unwrap();
         assert_eq!(
             authority
-                .authorize(scope, Effect::Write, request, 11, 29)
+                .authorize(scope, Effect::Read, request, 11, 29)
                 .unwrap()
                 .invocation_id(),
             expected_id
         );
         assert!(
             authority
-                .authorize(scope, Effect::Write, request, 12, 29)
+                .authorize(scope, Effect::Read, request, 12, 29)
                 .is_none()
         );
     }

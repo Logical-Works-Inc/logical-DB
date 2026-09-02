@@ -263,6 +263,9 @@ impl PullPage {
     pub fn validate(&self, expected_scope: Scope) -> Result<(), ProtocolError> {
         validate_protocol(self.protocol)?;
         validate_page(&self.changes)?;
+        if self.more && self.changes.is_empty() {
+            return Err(ProtocolError::NonProgressPage);
+        }
         if self
             .changes
             .iter()
@@ -289,6 +292,9 @@ pub enum ProtocolError {
     /// A page violated count or aggregate byte bounds.
     #[error("page exceeds protocol count or byte limits")]
     PageLimit,
+    /// A sender claimed more data without advancing the page.
+    #[error("page claims more data but contains no changes")]
+    NonProgressPage,
     /// A push contained changes attributed to a different sender.
     #[error("change replica differs from push sender")]
     ReplicaMismatch,
@@ -549,6 +555,18 @@ mod tests {
             more: false,
         };
         assert_eq!(page.validate(first), Err(ProtocolError::ScopeMismatch));
+    }
+
+    #[test]
+    fn pull_rejects_a_non_progress_page() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let page = PullPage {
+            protocol: PROTOCOL_VERSION,
+            changes: Vec::new(),
+            checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+            more: true,
+        };
+        assert_eq!(page.validate(scope), Err(ProtocolError::NonProgressPage));
     }
 
     #[test]

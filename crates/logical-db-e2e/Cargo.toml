@@ -12,17 +12,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-logical-db = { path = "../logical-db", features = ["http"] }
+logical-db = { version = "0.1.0", path = "../logical-db", features = ["http"] }
 tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-logical-db-http = { path = "../logical-db-http" }
-logical-db-model = { path = "../logical-db-model" }
-logical-db-protocol = { path = "../logical-db-protocol" }
-logical-db-server = { path = "../logical-db-server" }
-logical-db-service = { path = "../logical-db-service" }
+logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
+logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
+logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 
 [lints]
 workspace = true

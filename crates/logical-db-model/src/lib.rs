@@ -20,6 +20,8 @@ pub const MAX_CHANGE_BYTES: usize = 1_048_576;
 pub const MAX_CHANGES_PER_PAGE: usize = 256;
 /// Maximum aggregate bytes accepted in one protocol page.
 pub const MAX_PAGE_BYTES: usize = 8_388_608;
+/// Maximum encoded state for one materialized document snapshot.
+pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 
 macro_rules! entity_id {
     ($name:ident, $doc:literal) => {

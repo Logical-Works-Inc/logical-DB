@@ -46,25 +46,32 @@ pub fn database_path_in(
 fn platform_data_root() -> Result<PathBuf, PlatformError> {
     #[cfg(target_os = "windows")]
     {
-        return nonempty_env("LOCALAPPDATA").map(PathBuf::from);
+        return absolute_data_root(nonempty_env("LOCALAPPDATA")?);
     }
     #[cfg(target_os = "macos")]
     {
-        return nonempty_env("HOME")
-            .map(PathBuf::from)
+        return absolute_data_root(nonempty_env("HOME")?)
             .map(|home| home.join("Library").join("Application Support"));
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Ok(root) = nonempty_env("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(root));
+            return absolute_data_root(root);
         }
-        return nonempty_env("HOME")
-            .map(PathBuf::from)
+        return absolute_data_root(nonempty_env("HOME")?)
             .map(|home| home.join(".local").join("share"));
     }
     #[allow(unreachable_code)]
     Err(PlatformError::MissingDataRoot)
+}
+
+fn absolute_data_root(value: OsString) -> Result<PathBuf, PlatformError> {
+    let root = PathBuf::from(value);
+    if root.is_absolute() {
+        Ok(root)
+    } else {
+        Err(PlatformError::RelativeDataRoot)
+    }
 }
 
 fn nonempty_env(name: &'static str) -> Result<OsString, PlatformError> {
@@ -96,6 +103,9 @@ pub enum PlatformError {
     /// The process has no usable native per-user data root.
     #[error("native per-user data root is unavailable")]
     MissingDataRoot,
+    /// A process environment variable would place state relative to the CWD.
+    #[error("native per-user data root must be absolute")]
+    RelativeDataRoot,
 }
 
 #[cfg(test)]
@@ -140,5 +150,13 @@ mod tests {
         );
         #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
         assert!(!nonempty_env("HOME").unwrap().is_empty());
+    }
+
+    #[test]
+    fn environment_derived_root_must_never_be_relative_to_process_cwd() {
+        assert_eq!(
+            absolute_data_root(OsString::from("relative/data")),
+            Err(PlatformError::RelativeDataRoot)
+        );
     }
 }

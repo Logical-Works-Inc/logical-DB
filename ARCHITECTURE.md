@@ -55,7 +55,8 @@ single frontier advance, and invocation consumption.
 
 | Boundary | Stable entry points | Deliberately private |
 |---|---|---|
-| Embedded app | `Database::open`, `open_default`, `open_with_schema`, `edit`, `read`, `query_index`, `changes_since`, `synchronize` | redb tables, key bytes, Automerge handles, FDB tuples |
+| Embedded app | `Database::open`, `open_default`, `open_with_schema`, `edit`, `read`, `query_index`, `changes_since`, `synchronize` | redb tables, key bytes, raw Automerge/FDB handles |
+| Structured state | `Reader::{get,get_index,conflicts,conflicts_at,keys,len,text}`, `Editor` map/list/text/counter methods | CRDT actor/op internals except opaque conflict IDs |
 | Projection schema | `Projection`, `IndexId`, `IndexValue`, nonzero schema version | reverse rows, ordered value encoding, rebuild mechanics |
 | Thin client | `HttpTransport`, async `CredentialProvider`, `SyncLimits`, `SyncReport` | reqwest client, CBOR buffers, retry cursors |
 | HTTP service | `logical_db_server::router`, `Authenticator`, `Clock` | listener/TLS/process lifecycle, authorization headers |
@@ -121,10 +122,13 @@ durable peer checkpoint
 ```
 
 Unknown upload outcomes do not acknowledge the outbox. Push responses must have
-exact operation cardinality and order. A valid expired checkpoint produces HTTP
-410 and an explicit full-resync transition; forged or cross-scope checkpoints
-fail rather than guessing continuity. Notifications, when added by a host, are
-only pull hints.
+exact operation cardinality and order, and rejection codes survive to the app.
+`SyncReport::more` remains true for either unsent upload work or additional pull
+pages. Checkpoint expiry restarts without consuming the installed-page budget;
+an empty page that claims more work is rejected as non-progress. A valid expired
+checkpoint produces HTTP 410 and an explicit full-resync transition; forged or
+cross-scope checkpoints fail rather than guessing continuity. Notifications,
+when added by a host, are only pull hints.
 
 ## Internal axes
 
@@ -136,7 +140,8 @@ The embedded redb table uses a backend-private byte prefix:
 
 Kinds separate snapshots, immutable changes, operation receipts, ordered
 outbox entries, local and event sequences, revisions, peer checkpoints,
-acknowledgements, schema binding, forward index rows, and reverse index rows.
+acknowledgements, the single upstream binding, schema binding, forward index
+rows, and reverse index rows.
 Index scalar encodings preserve boolean and integer order and escape variable
 bytes before the document UUID cursor. Applications never receive these bytes.
 
@@ -151,8 +156,9 @@ root / (3, account UUID, space UUID) /
   (5, invocation digest)              single-use Braid execution marker
 ```
 
-Chunking stays below FDB’s 100 kB value limit. Transactions have explicit
-timeout and retry ceilings. The adapter distinguishes cancellation, version
+Chunking stays below FDB’s 100 kB value limit. Every adapter transaction applies
+its own timeout and retry ceilings without mutating a host-shared FDB handle.
+The adapter distinguishes cancellation, version
 skew, retry exhaustion, native failure, binding failure, durable corruption,
 and a commit that may have succeeded. On an FDB retry marked may-have-committed,
 the transaction first reads the exact operation manifest and chunks; equality
@@ -163,8 +169,14 @@ returns `RecoveredUnknownCommit` without a second append.
 Core CRUD never imports Braid. `logical-db-braid` pins real Braid crates at
 commit `4b1b3e9`; it admits canonical capsule bytes, evaluates an exact predicate
 over a content-addressed `FlowSnapshot`, and calls `RunnableInvocation::prepare`.
-The snapshot commits to account, space, strongest DB effect, request digest,
-and current durable frontier. `BraidGrant` retains that verifier-owned runnable;
+The adapter additionally refuses a capsule unless vault-classified request
+material flows into the exact scoped capability: reads remain `Read`, durable
+writes are `Irreversible`, and synchronization is `Egress` with a vault ceiling.
+Write and sync capsules must carry Braid's dangerous-operation confirmation
+policy; a capability string alone is insufficient.
+The snapshot commits to account, space, exact DB effect (point read and scan are
+distinct), request digest, current durable frontier, and exclusive expiry.
+`BraidGrant` retains that verifier-owned runnable;
 the service passes it unchanged to FDB, which atomically consumes its combined
 capsule/registry/authority/snapshot/predicate identity with a new operation.
 The same invocation cannot authorize another operation, and a proof prepared
@@ -178,21 +190,41 @@ deployable.
 
 The shipped standalone composition boots the FDB client network exactly once,
 opens the configured cluster file, obtains `("logical-db", "v3")` through the
-Directory Layer, builds a scope-bound `FdbServiceStore`, generates exact Braid
-runnables after constant-time bearer authentication, and retains the FDB guard
+Directory Layer, builds a scope-bound `FdbServiceStore`, and retains the FDB guard
 through graceful listener shutdown. It accepts only loopback plaintext;
 public ingress requires an external TLS terminator and credential issuer. The
 reusable router remains listener-neutral so Logic OS can supply its own
 lifecycle and Braid-derived authenticator.
 
+`LocalBraidAuthority` refuses irreversible writes and egress synchronization.
+Pinned Braid records `HumanConfirm` in the capsule but exposes no independently
+verifiable runtime confirmation evidence, so the daemon does not fabricate that
+field after bearer authentication. A host supplies `BraidAuthority` or its own
+`Authenticator` and separately prepared Braid material. Until that composition
+exists, the standalone daemon is a fail-closed shell, not a consumable sync
+service.
+
 ## Windows contract
 
 Explicit paths are first-class. The optional default helper uses
 `LOCALAPPDATA/LogicalDB/<application-id>/replica-v3.redb`, accepts Unicode and
-spaces in the root, rejects path-like application IDs, and creates no shared
+spaces in the root, rejects relative environment-derived roots and path-like
+application IDs, and creates no shared
 system directory. redb owns locking and immediate durable commits. Native
 `windows-latest`, macOS, and Linux jobs are release gates. The Windows job runs
 the embedded edit/restart, forced-process-termination, real loopback HTTP, and a
 Windows-only default-path/exclusive-lock/Unicode/read-only failure journey. FDB
 is a service deployment dependency, not a requirement for a Windows app: the
 Windows app embeds redb and uses the rustls HTTP client when cloud sync is enabled.
+
+## Deliberate release blockers
+
+The v1 log is append-only. It has no server snapshot baseline/retention floor,
+no peer-aware garbage collection, and no first-class document tombstone. The
+embedded store also lacks a supported portable export/restore contract. Deleting
+history before those pieces exist could strand an expired client, so this
+implementation intentionally does not disguise unsafe pruning as compaction.
+The standalone service is additionally blocked on externally verifiable,
+request-bound Braid confirmation evidence for irreversible and egress effects.
+Multi-node FDB failover/restore, public ingress, mobile sandboxing, and sustained
+load remain system tests rather than inferred properties.

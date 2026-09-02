@@ -8,6 +8,7 @@
 
 use std::{collections::BTreeSet, path::Path};
 
+pub use logical_db_model::MAX_SNAPSHOT_BYTES;
 use logical_db_model::{
     ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue, MAX_CHANGE_BYTES,
     OperationDigest, OperationId, PeerId, ReplicaId, Scope,
@@ -36,8 +37,7 @@ const KIND_SCHEMA: u8 = 11;
 const KIND_EVENT_SEQUENCE: u8 = 12;
 const KIND_EVENT: u8 = 13;
 const KIND_MIGRATION: u8 = 14;
-/// Maximum encoded state for one materialized document.
-pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
+const KIND_UPSTREAM: u8 = 15;
 /// Maximum aggregate snapshot state retained while installing or migrating one page.
 pub const MAX_MATERIALIZED_PAGE_BYTES: usize = 67_108_864;
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
@@ -828,10 +828,27 @@ impl EmbeddedStore {
             .take(limit)
             .map(|entry| {
                 let (key, value) = entry?;
-                decode_event(
+                let event = decode_event(
                     decode_sequence_key_for_kind(key.value(), KIND_EVENT)?,
                     value.value(),
-                )
+                )?;
+                let change = table
+                    .get(key_change(scope, event.document, event.digest).as_slice())?
+                    .ok_or(StoreError::CorruptInternalValue)?;
+                if !is_nonempty_bounded(change.value().len(), MAX_CHANGE_BYTES) {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                let snapshot = table
+                    .get(key_snapshot(scope, event.document).as_slice())?
+                    .ok_or(StoreError::CorruptInternalValue)?;
+                if !is_nonempty_bounded(snapshot.value().len(), MAX_SNAPSHOT_BYTES) {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                let revision = table
+                    .get(key_revision(scope, event.document).as_slice())?
+                    .ok_or(StoreError::CorruptInternalValue)?;
+                decode_revision(revision.value())?;
+                Ok(event)
             })
             .collect()
     }
@@ -893,12 +910,31 @@ impl EmbeddedStore {
             .range(start.as_slice()..end.as_slice())?
             .take(limit)
             .map(|entry| {
-                let (key, _value) = entry?;
+                let (key, value) = entry?;
                 if key.value().len() != row_prefix.len() + 16 {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                if value.value() != [1_u8] {
                     return Err(StoreError::CorruptInternalValue);
                 }
                 let document =
                     decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)?;
+                let reverse = table
+                    .get(key_index_reverse(scope, document, index).as_slice())?
+                    .ok_or(StoreError::CorruptInternalValue)?;
+                if reverse.value() != encoded.as_slice() {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                let snapshot = table
+                    .get(key_snapshot(scope, document).as_slice())?
+                    .ok_or(StoreError::CorruptInternalValue)?;
+                if !is_nonempty_bounded(snapshot.value().len(), MAX_SNAPSHOT_BYTES) {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                let revision = table
+                    .get(key_revision(scope, document).as_slice())?
+                    .ok_or(StoreError::CorruptInternalValue)?;
+                decode_revision(revision.value())?;
                 Ok(IndexHit { document })
             })
             .collect()
@@ -909,13 +945,20 @@ impl EmbeddedStore {
     ///
     /// # Errors
     ///
-    /// Refuses acknowledgements beyond the highest committed local sequence.
-    pub fn acknowledge_outbox(&self, scope: Scope, through: u64) -> Result<(), StoreError> {
+    /// Refuses a mismatched or unattributable upstream and acknowledgements
+    /// beyond the highest committed local sequence.
+    pub fn acknowledge_outbox(
+        &self,
+        scope: Scope,
+        peer: PeerId,
+        through: u64,
+    ) -> Result<(), StoreError> {
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
         {
             let mut table = transaction.open_table(DATA)?;
             ensure_not_migrating(&table, scope)?;
+            bind_upstream_in_table(&mut table, scope, peer)?;
             let highest = table
                 .get(key_sequence(scope).as_slice())?
                 .map(|value| decode_u64(value.value()))
@@ -934,6 +977,28 @@ impl EmbeddedStore {
                 key_outbox_ack(scope).as_slice(),
                 acknowledged.to_be_bytes().as_slice(),
             )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Durably binds a scope's globally acknowledged outbox to one upstream.
+    ///
+    /// The current wire model has one upload acknowledgement cursor per scope.
+    /// Refusing a second upstream prevents an acknowledgement by one service
+    /// from silently suppressing delivery to another.
+    ///
+    /// # Errors
+    ///
+    /// Returns a topology error if the scope was already bound elsewhere or
+    /// legacy sync state cannot be attributed to exactly one service.
+    pub fn bind_upstream(&self, scope: Scope, peer: PeerId) -> Result<(), StoreError> {
+        let mut transaction = self.database.begin_write()?;
+        transaction.set_durability(Durability::Immediate)?;
+        {
+            let mut table = transaction.open_table(DATA)?;
+            ensure_not_migrating(&table, scope)?;
+            bind_upstream_in_table(&mut table, scope, peer)?;
         }
         transaction.commit()?;
         Ok(())
@@ -980,6 +1045,7 @@ impl EmbeddedStore {
         {
             let mut table = transaction.open_table(DATA)?;
             ensure_not_migrating(&table, scope)?;
+            bind_upstream_in_table(&mut table, scope, peer)?;
             for document in documents {
                 let revision_key = key_revision(scope, document.document);
                 let current = table
@@ -1102,6 +1168,20 @@ pub enum StoreError {
         /// Highest local sequence that exists.
         highest: u64,
     },
+    /// One globally acknowledged outbox cannot safely target two services.
+    #[error("scope is bound to upstream {configured}, not requested upstream {requested}")]
+    UpstreamMismatch {
+        /// Durable synchronization service identity.
+        configured: PeerId,
+        /// Conflicting service identity supplied by the caller.
+        requested: PeerId,
+    },
+    /// Legacy durable checkpoints identify more than one possible upstream.
+    #[error("scope has legacy checkpoints for multiple upstreams; explicit migration is required")]
+    AmbiguousLegacyUpstream,
+    /// A legacy global acknowledgement cannot be attributed to an upstream.
+    #[error("scope has an acknowledged legacy outbox without an attributable upstream")]
+    UnattributedLegacyAcknowledgement,
     /// An opaque checkpoint violated its durable resource bound.
     #[error("checkpoint byte length {0} is outside local bounds")]
     InvalidCheckpointSize(usize),
@@ -1166,6 +1246,67 @@ fn ensure_not_migrating(
     } else {
         Ok(())
     }
+}
+
+fn bind_upstream_in_table(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    requested: PeerId,
+) -> Result<(), StoreError> {
+    let upstream_key = key_upstream(scope);
+    if let Some(value) = table.get(upstream_key.as_slice())? {
+        let configured = decode_uuid(value.value()).map(PeerId::from_uuid)?;
+        return if configured == requested {
+            Ok(())
+        } else {
+            Err(StoreError::UpstreamMismatch {
+                configured,
+                requested,
+            })
+        };
+    }
+
+    let checkpoint_prefix = prefix(scope, KIND_CHECKPOINT);
+    let checkpoint_end = next_prefix(&checkpoint_prefix).ok_or(StoreError::CorruptInternalValue)?;
+    let legacy_peers = table
+        .range(checkpoint_prefix.as_slice()..checkpoint_end.as_slice())?
+        .take(2)
+        .map(|entry| {
+            let (key, value) = entry?;
+            if key.value().len() != checkpoint_prefix.len() + 16
+                || !is_nonempty_bounded(value.value().len(), MAX_CHECKPOINT_BYTES)
+            {
+                return Err(StoreError::CorruptInternalValue);
+            }
+            decode_uuid(&key.value()[checkpoint_prefix.len()..]).map(PeerId::from_uuid)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let configured = match legacy_peers.as_slice() {
+        [] => {
+            let acknowledged = table
+                .get(key_outbox_ack(scope).as_slice())?
+                .map(|value| decode_u64(value.value()))
+                .transpose()?
+                .unwrap_or(0);
+            if acknowledged != 0 {
+                return Err(StoreError::UnattributedLegacyAcknowledgement);
+            }
+            requested
+        }
+        [peer] => *peer,
+        [_, _, ..] => return Err(StoreError::AmbiguousLegacyUpstream),
+    };
+    if configured != requested {
+        return Err(StoreError::UpstreamMismatch {
+            configured,
+            requested,
+        });
+    }
+    table.insert(
+        upstream_key.as_slice(),
+        configured.as_uuid().as_bytes().as_slice(),
+    )?;
+    Ok(())
 }
 
 fn schema_value(version: u32, digest: [u8; 32]) -> [u8; SCHEMA_VALUE_BYTES] {
@@ -1267,6 +1408,10 @@ fn key_checkpoint(scope: Scope, peer: PeerId) -> Vec<u8> {
 
 fn key_outbox_ack(scope: Scope) -> Vec<u8> {
     prefix(scope, KIND_OUTBOX_ACK)
+}
+
+fn key_upstream(scope: Scope) -> Vec<u8> {
+    prefix(scope, KIND_UPSTREAM)
 }
 
 fn key_schema(scope: Scope) -> Vec<u8> {
@@ -1622,6 +1767,15 @@ mod tests {
             b"verified-change",
         )
         .unwrap()
+    }
+
+    fn insert_legacy_value(store: &EmbeddedStore, key: &[u8], value: &[u8]) {
+        let transaction = store.database.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(DATA).unwrap();
+            table.insert(key, value).unwrap();
+        }
+        transaction.commit().unwrap();
     }
 
     fn apply_migration_documents(
@@ -2196,6 +2350,7 @@ mod tests {
         let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let document = DocumentId::new();
+        let peer = PeerId::new();
         let operation = OperationId::new();
         let first = change(scope, document, operation, 4, 5);
         assert_eq!(store.load_snapshot(scope, document).unwrap(), None);
@@ -2239,14 +2394,14 @@ mod tests {
             Err(StoreError::InvalidEventLimit(0))
         ));
         assert!(matches!(
-            store.acknowledge_outbox(scope, 2),
+            store.acknowledge_outbox(scope, peer, 2),
             Err(StoreError::InvalidAcknowledgement {
                 through: 2,
                 highest: 1
             })
         ));
-        store.acknowledge_outbox(scope, 1).unwrap();
-        store.acknowledge_outbox(scope, 0).unwrap();
+        store.acknowledge_outbox(scope, peer, 1).unwrap();
+        store.acknowledge_outbox(scope, peer, 0).unwrap();
         assert!(store.outbox_page(scope, 0, 10).unwrap().is_empty());
 
         let second = change(scope, document, OperationId::new(), 6, 7);
@@ -2263,6 +2418,151 @@ mod tests {
         assert!(matches!(
             store.outbox_page(scope, 0, 0),
             Err(StoreError::InvalidOutboxLimit(0))
+        ));
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn global_outbox_acknowledgement_binds_exactly_one_upstream() {
+        let path = test_path("single-upstream");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let configured = PeerId::new();
+        let requested = PeerId::new();
+        store.bind_upstream(scope, configured).unwrap();
+        store.bind_upstream(scope, configured).unwrap();
+        assert!(matches!(
+            store.bind_upstream(scope, requested),
+            Err(StoreError::UpstreamMismatch {
+                configured: actual,
+                requested: attempted,
+            }) if actual == configured && attempted == requested
+        ));
+        assert!(matches!(
+            store.acknowledge_outbox(scope, requested, 0),
+            Err(StoreError::UpstreamMismatch { .. })
+        ));
+        assert!(matches!(
+            store.install_remote_page(scope, requested, &[], &[], b"checkpoint"),
+            Err(StoreError::UpstreamMismatch { .. })
+        ));
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_checkpoint_migrates_only_to_its_attributable_upstream() {
+        let path = test_path("legacy-single-upstream");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let legacy = PeerId::new();
+        insert_legacy_value(&store, &key_checkpoint(scope, legacy), b"legacy-checkpoint");
+        assert!(matches!(
+            store.bind_upstream(scope, PeerId::new()),
+            Err(StoreError::UpstreamMismatch { configured, .. }) if configured == legacy
+        ));
+        store.bind_upstream(scope, legacy).unwrap();
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_or_unattributed_legacy_sync_state_fails_closed() {
+        let ambiguous_path = test_path("legacy-ambiguous-upstream");
+        let ambiguous = EmbeddedStore::open(&ambiguous_path, ReplicaId::new()).unwrap();
+        let ambiguous_scope = Scope::new(AccountId::new(), SpaceId::new());
+        for peer in [PeerId::new(), PeerId::new()] {
+            insert_legacy_value(
+                &ambiguous,
+                &key_checkpoint(ambiguous_scope, peer),
+                b"checkpoint",
+            );
+        }
+        assert!(matches!(
+            ambiguous.bind_upstream(ambiguous_scope, PeerId::new()),
+            Err(StoreError::AmbiguousLegacyUpstream)
+        ));
+        drop(ambiguous);
+        fs::remove_file(ambiguous_path).unwrap();
+
+        let ack_path = test_path("legacy-unattributed-ack");
+        let acknowledged = EmbeddedStore::open(&ack_path, ReplicaId::new()).unwrap();
+        let acknowledged_scope = Scope::new(AccountId::new(), SpaceId::new());
+        insert_legacy_value(
+            &acknowledged,
+            &key_outbox_ack(acknowledged_scope),
+            &1_u64.to_be_bytes(),
+        );
+        assert!(matches!(
+            acknowledged.bind_upstream(acknowledged_scope, PeerId::new()),
+            Err(StoreError::UnattributedLegacyAcknowledgement)
+        ));
+        drop(acknowledged);
+        fs::remove_file(ack_path).unwrap();
+
+        let corrupt_path = test_path("legacy-corrupt-checkpoint");
+        let corrupt = EmbeddedStore::open(&corrupt_path, ReplicaId::new()).unwrap();
+        let corrupt_scope = Scope::new(AccountId::new(), SpaceId::new());
+        let corrupt_peer = PeerId::new();
+        insert_legacy_value(&corrupt, &key_checkpoint(corrupt_scope, corrupt_peer), b"");
+        assert!(matches!(
+            corrupt.bind_upstream(corrupt_scope, corrupt_peer),
+            Err(StoreError::CorruptInternalValue)
+        ));
+        drop(corrupt);
+        fs::remove_file(corrupt_path).unwrap();
+    }
+
+    #[test]
+    fn index_and_event_reads_reject_orphaned_internal_rows() {
+        let path = test_path("orphaned-rows");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let index = IndexId::new();
+        let value = IndexValue::Text("kind".into());
+        let local = change(scope, document, OperationId::new(), 3, 4);
+        let digest = local.digest;
+        store
+            .commit_local(LocalCommit {
+                change: local,
+                expected_revision: None,
+                snapshot: b"snapshot",
+                indexes: &[IndexEntry {
+                    index,
+                    value: value.clone(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .query_index(scope, index, &value, None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.changes_since(scope, 0, 1).unwrap().len(), 1);
+        {
+            let transaction = store.database.begin_write().unwrap();
+            {
+                let mut table = transaction.open_table(DATA).unwrap();
+                table
+                    .remove(key_index_reverse(scope, document, index).as_slice())
+                    .unwrap();
+                table
+                    .remove(key_change(scope, document, digest).as_slice())
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            store.query_index(scope, index, &value, None, 1),
+            Err(StoreError::CorruptInternalValue)
+        ));
+        assert!(matches!(
+            store.changes_since(scope, 0, 1),
+            Err(StoreError::CorruptInternalValue)
         ));
         drop(store);
         fs::remove_file(path).unwrap();

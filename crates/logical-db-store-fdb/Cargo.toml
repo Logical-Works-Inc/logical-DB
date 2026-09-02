@@ -13,9 +13,9 @@ repository.workspace = true
 [dependencies]
 foundationdb = { workspace = true, optional = true }
 foundationdb-tuple.workspace = true
-logical-db-model = { path = "../logical-db-model" }
-logical-db-protocol = { path = "../logical-db-protocol" }
-logical-db-service = { path = "../logical-db-service" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
+logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 thiserror.workspace = true
 uuid.workspace = true
 
