@@ -74,8 +74,9 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   and mobile sandbox lifecycle.
 - [x] Independent hostile review returned `MERGE` after the live FDB mutation
   campaign killed both initially surviving transaction mutations.
-- [ ] Obtain a new independent hostile review for this hardening delta, merge
-  only the reviewed result, observe all GitHub jobs, and prove local/main/origin
-  tips match under protected-main policy.
+- [x] A second independent hostile review covered the complete hardening delta
+  and returned `MERGE` with no Critical or Important findings.
+- [ ] Merge only the reviewed result, observe every required GitHub job, and
+  prove local/main/origin tips match under protected-main policy.
 
 No green subset, churn percentage, or document may override an unchecked gate.
