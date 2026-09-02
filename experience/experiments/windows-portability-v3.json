@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "windows-portability-v3",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28"],
+  "actor": "Windows desktop application author",
+  "job": "embed a replica under LOCALAPPDATA using Unicode-capable paths and the same facade semantics",
+  "artifact": "logical-db core crates and logical-db-platform placement helper",
+  "environment": {"host": "macOS arm64", "target": "x86_64-pc-windows-gnu", "native_runner": "unavailable locally"},
+  "initial_state": {"target": "installed", "Windows kernel": "not present"},
+  "expectation": "portable code compiles without POSIX-only assumptions, while native behavior is not claimed without native execution",
+  "perturbation": "Windows-shaped root with spaces and Unicode, invalid application IDs, and foreign-target compilation",
+  "actions": ["run platform unit tests", "compile core workspace for x86_64-pc-windows-gnu", "exclude HTTP only where the macOS host lacks the Windows C linker"],
+  "observations": ["the Windows-shaped path preserved spaces and Unicode", "invalid path-like IDs failed", "core crates cross-compiled", "no Windows process actually opened or locked a redb file in this environment"],
+  "external_state_diff": ["foreign target artifacts were created under target", "no Windows filesystem state existed"],
+  "invariant": "release claims distinguish portable compilation from native file, process, and HTTP behavior",
+  "verdict": "blocked",
+  "failure_classes": ["native-runtime-evidence-unavailable"],
+  "follow_up_experiments": ["push branch and observe windows-latest compile/test/clippy", "inspect Unicode, concurrent open, kill recovery, and HTTP journeys in that run"],
+  "evidence": ["crates/logical-db-platform/src/lib.rs", ".github/workflows/ci.yml Windows matrix", "foreign-target cargo check result"],
+  "limitations": ["cross compilation is not native runtime proof"]
+}

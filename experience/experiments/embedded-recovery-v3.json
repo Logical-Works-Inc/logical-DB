@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "embedded-recovery-v3",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28"],
+  "actor": "desktop application author",
+  "job": "commit structured local state, observe it, terminate abnormally, and recover without a partial transition",
+  "artifact": "logical_db::Database public facade and logical-db-e2e subprocess fixtures",
+  "environment": {"os": "macOS arm64", "rust": "1.98", "storage": "fresh redb files under the native temp directory"},
+  "initial_state": {"database": "absent", "schema": 1, "network": "unused"},
+  "expectation": "a returned edit is immediately durable and a killed in-flight writer exposes only complete prior commits",
+  "perturbation": "repeat an exact operation, exit without destructors, kill a writer during repeated commits, reopen twice, and inspect the durable event/outbox sequences",
+  "actions": ["run facade restart and exact-retry tests", "run crash_recovery subprocess journey", "run kill_recovery subprocess journey", "reopen and compare documents, events, and outbox"],
+  "observations": ["the committed edit survived process::exit(71)", "the killed writer left contiguous events whose documents were readable", "event and outbox cardinalities matched", "a second reopen returned the identical event page"],
+  "external_state_diff": ["one isolated redb file was created", "only complete committed snapshots and metadata were visible after recovery", "the file was removed after inspection"],
+  "invariant": "snapshot, change, exact operation receipt, outbox, indexes, and event become visible in one durable transition",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["repeat on native Windows", "inject a full disk during commit"],
+  "evidence": ["crates/logical-db-e2e/tests/crash_recovery.rs", "crates/logical-db-e2e/tests/kill_recovery.rs", "crates/logical-db-store/src/lib.rs state-machine and corruption tests"],
+  "limitations": ["macOS filesystem only", "kill is not physical power loss"]
+}

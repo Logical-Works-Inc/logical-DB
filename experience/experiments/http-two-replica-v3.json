@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "http-two-replica-v3",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28"],
+  "actor": "application author enabling synchronization",
+  "job": "synchronize two independently edited embedded replicas through the public HTTP transport",
+  "artifact": "logical_db::Database, logical_db_http::HttpTransport, and logical_db_server::router",
+  "environment": {"os": "macOS arm64", "transport": "real loopback TCP HTTP", "credentials": "test bearer provider"},
+  "initial_state": {"replicas": 2, "documents": 0, "peer_checkpoints": "absent"},
+  "expectation": "offline writes converge without duplicated events and hostile envelopes fail at their exact resource boundary",
+  "perturbation": "concurrent offline fields, repeated synchronization, malformed CBOR, forged/expired checkpoints, and response bodies at and above 12 MiB",
+  "actions": ["launch an ephemeral Axum listener", "edit both replicas offline", "synchronize both directions", "repeat pages and restart", "exercise malformed and exact size boundaries"],
+  "observations": ["both replicas materialized equal values", "index hits and durable events agreed", "duplicate pages produced no phantom event", "the exact HTTP ceiling was accepted and the next byte was rejected"],
+  "external_state_diff": ["two independent redb replicas converged", "durable peer checkpoints advanced only with installed pages", "temporary files were removed"],
+  "invariant": "transport failure never acknowledges unsent state and a remote page plus checkpoint installs atomically after CRDT verification",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["run through a production TLS terminator", "delay and sever a connection after upload"],
+  "evidence": ["crates/logical-db-e2e/src/lib.rs", "crates/logical-db-http/src/lib.rs", "crates/logical-db-server/src/lib.rs"],
+  "limitations": ["loopback HTTP only", "in-memory service store in the two-replica journey"]
+}

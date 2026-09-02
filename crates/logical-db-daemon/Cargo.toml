@@ -1,0 +1,49 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+# S33 S34 S35 S36 S37 S38 S39. Source URLs are in ../../evidence/SOURCES.md.
+
+[package]
+name = "logical-db-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "logical-db-daemon"
+path = "src/main.rs"
+required-features = ["fdb"]
+
+[[bin]]
+name = "fdb-ambiguity-journey"
+path = "src/ambiguity.rs"
+required-features = ["fdb"]
+
+[features]
+default = []
+fdb = ["dep:foundationdb", "dep:foundationdb-tuple", "dep:logical-db-store-fdb"]
+
+[dependencies]
+axum.workspace = true
+foundationdb = { workspace = true, optional = true }
+foundationdb-tuple = { workspace = true, optional = true }
+hmac.workspace = true
+logical-db-model = { path = "../logical-db-model" }
+logical-db-braid = { path = "../logical-db-braid" }
+logical-db-crdt = { path = "../logical-db-crdt" }
+logical-db-protocol = { path = "../logical-db-protocol" }
+logical-db-server = { path = "../logical-db-server" }
+logical-db-service = { path = "../logical-db-service" }
+logical-db-store-fdb = { path = "../logical-db-store-fdb", features = ["fdb"], optional = true }
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

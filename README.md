@@ -1,109 +1,96 @@
-# logical-DB
+# Logical-DB
 
-One processing and storage contract for every app. The crate can run
-in-process over a durable redb file or beside a native FoundationDB client.
-Both profiles use the same account/container/zone key contract, bounded
-request processing, Braid admission, idempotency markers, and durable zone
-change feed.
+> Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+> S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+> S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
+> `evidence/SOURCES.md`.
 
-**Status:** hybrid v2 is implemented on the current feature branch, not yet
-released. The default build supports in-memory and durable embedded profiles.
-`HybridDb::embedded_at` is the app-owned durable entry point. The `fdb`
-feature adds `OutboardDb`, which drives the pinned FoundationDB 7.3 client
-without giving applications a raw database handle. `HybridDb` exposes the common
-`read_version`, `commit_admitted`, `get_admitted`, and `changes_admitted`
-surface. Effectful operations consume a real Braid `RunnableInvocation`; its
-snapshot and predicate prove the canonical CID of the exact database request.
-`BraidExecutionBinding::inspect` also derives the exact Logical-DB capability
-set and strongest effect from the capsule and registry; read, delete, and
-unrelated write capsules cannot authorize a put request.
-Namespace authority remains external and scope-bound. Every commit atomically
-writes its data, private markers, zone conflict frontier, and ordered change
-row.
+Logical-DB is a local-first structured state substrate for one person’s apps.
+It is not a FoundationDB client disguised as an application database. Each app
+owns an embedded, immediately durable replica; an optional thin-client layer
+exchanges immutable causal changes with a service whose production storage
+adapter uses FoundationDB.
 
-The older five-class journal model remains available as a compatibility and
-fault-oracle layer. It is not the hybrid app API. Migration begins with the
-lossless `LegacyV1Point` copy primitive and follows copy, verify, cutover;
-source deletion is deliberately outside that primitive. The live native-FDB
-test exercises the hybrid API; a green remote Linux receipt and an LEM
-consumer receipt are still required before this branch is production-ready.
+## What applications embed
 
-## Embedding contract
+The `logical-db` facade exposes typed account/space/document identities,
+transactional CRDT edits, read projections, schema-bound secondary indexes, a
+durable change feed, and bounded synchronization. It needs neither Braid nor a
+network for local reads and writes.
 
-Applications do not receive a raw KV or provider handle. They first build a
-bounded logical request from `Scope`, a public `KeyFamily`, `Tuple`,
-`OperationId`, and, for writes, `WriteBatch`. That request yields a
-`RequestBinding`. Braid puts its CID in `logical_db.request_cid`, proves exact
-equality in the justification, and snapshots `logical_db.read_version`. The
-trusted host inspects the capsule and registry into a
-`BraidExecutionBinding`, then moves the `AdmittedTxn` and exact request into
-`HybridDb`.
+```rust
+use logical_db::{
+    AccountId, Database, DocumentId, IndexId, IndexValue, Item, Object,
+    OperationDigest, OperationId, Projection, ReplicaId, Scalar, Scope, SpaceId,
+};
 
-`HybridDb::embedded_at` executes the layer in the app process over redb.
-`HybridDb::outboard` executes the identical layer beside the official FDB
-client. A future CloudKit-shaped HTTP or device-sync adapter belongs above this
-boundary and must reconstruct these request bytes rather than add a second
-database model. Internal change/outbox families and raw transactions are
-sealed; `legacy-raw` is an explicit migration escape hatch.
+let scope = Scope::new(AccountId::new(), SpaceId::new());
+let kind = IndexId::new(); // production apps persist a stable schema UUID
+let projection = Projection::new(kind, |reader| {
+    Ok(match reader.get(&Object::root(), "kind")? {
+        Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
+        _ => None,
+    })
+});
+let database = Database::open_with_schema(
+    "app-state.redb",
+    scope,
+    ReplicaId::new(),
+    1,
+    vec![projection],
+)?;
+let document = DocumentId::new();
+database.edit(
+    document,
+    OperationId::new(),
+    OperationDigest::new([7; 32]),
+    |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+)?;
+let notes = database.query_index(kind, &IndexValue::Text("note".into()), None, 128)?;
+# Ok::<(), logical_db::DatabaseError>(())
+```
 
-Both providers enforce the configured timeout before storage work begins.
-FoundationDB additionally enforces it inside the native transaction. Embedded
-execution will not report a timeout after durable mutation has started; it
-returns the real commit outcome. Native uncertainty is a typed
-`CommitOutcomeUnknown` and requires retrying the same operation ID and bytes.
+Use `Database::open` when the host supplies an explicit path.
+`Database::open_default` selects the native per-user data root (`LOCALAPPDATA`
+on Windows) and creates only the app-private parent directories. A database file
+is durably bound to one `ReplicaId` and one exact schema/projection digest.
+Schema changes use `Database::migrate_schema`: it persists the target identity
+and document cursor, rebuilds indexes in bounded revision-checked pages, resumes
+after interruption, and swaps the schema binding only after the final page.
 
-## Try it
+Enable the facade's `http` feature to import `logical_db::http::{HttpTransport,
+CredentialProvider, StaticBearer}` without coupling an app to internal crates.
+Custom transports implement the facade-exported `logical_db::transport::Transport`
+using its versioned push/pull types.
 
-    cargo test --workspace
+## Deployment shapes
 
-The default profile needs no daemon. An app embeds the durable profile with
-`HybridDb::embedded_at(path, DatabaseOptions::default())`. Compile the outboard
-adapter with
-`cargo check --workspace --all-targets --features fdb`; a live run additionally
-requires the FoundationDB C client, network guard, and cluster recipe.
+- **Embedded only:** app → `logical-db` → Automerge + redb. No daemon, network,
+  FDB, or Braid.
+- **Thin client:** the same embedded API plus `logical-db-http`; sync is bounded,
+  resumable, idempotent, and driven by durable peer checkpoints.
+- **Standalone service:** the `logical-db-daemon` binary composes a loopback-only
+  Axum listener, bounded request admission, exact Braid runnable authority,
+  HMAC checkpoints, a Directory Layer subspace, and the FDB adapter. A
+  production deployment puts its TLS and token issuer in front; the process
+  refuses a non-loopback plaintext bind.
+- **Ecosystem host:** Logic OS or another host nests the same router and uses
+  `logical-db-braid` to admit exact account/space/request capabilities. The host
+  does not own embedded CRUD.
 
-On macOS, the hermetic live-FDB journey is:
+The wire boundary is two versioned CBOR operations:
+`POST /v1/changes:push` and `POST /v1/changes:pull`, media type
+`application/vnd.logical-db.v1+cbor`. Bodies, pages, changes, checkpoints,
+redirects, credentials, timeouts, and page counts have hard ceilings.
 
-    export FDB_SCRATCH=/tmp/fdb-f0
-    scripts/local-fdb-cluster.sh verify
-    scripts/local-fdb-cluster.sh up
-    export FDB_CLUSTER_FILE="$FDB_SCRATCH/fdb.cluster"
-    export RUSTFLAGS="-L native=$FDB_SCRATCH/macbin \
-    -C link-arg=-Wl,-rpath,$FDB_SCRATCH/macbin"
-    cargo test --features fdb --test fdb_live -- --ignored --nocapture
-    scripts/local-fdb-cluster.sh down
+## Status
 
-## The five axes
-
-1. **One model across every repo** — sentinel, logic-os-kernel, and
-   anything else bind through published ports; nobody forks the storage
-   truth.
-2. **A fraction of the compute** — quantize by default, rescore rarely;
-   mmap-first, immutable segments, and hydration lifecycle are design
-   intent pending their phases.
-3. **Mouldable / low-code** — schemas and use-case packs are rows; a new
-   use-case is data, not a migration or a recompile (design intent).
-4. **GNN-native** — message passing over stored edges as a query
-   primitive (design intent); AI and non-AI artifacts are rows
-   distinguished only by claim lineage.
-5. **A filesystem face** — vault-shaped and desktop-search-shaped
-   projections over the same store (design intent).
-
-Non-negotiable: **DiD by construction** — everything entering passes the
-ingest gauntlet; queries are typed ASTs with bound parameters; there is
-no string-query surface, so injection-class bugs are structurally absent.
-Rust core; C++ only at named boundaries.
-
-## Read order
-
-`VISION.md` → `docs/DB_PATHWAY.md` → `docs/FORMAT.md` → `GOVERNANCE.md`
-→ `laws/governance/`.
-
-## Governance & CI
-
-Governance structure follows logic-os-kernel's (ticketing taxonomy,
-definition-of-done, ADR series); the constitution lives in `GOVERNANCE.md`.
-CI is keel-derived (`ci/keel-ci.toml` → `.github/workflows/ci.yml`) with
-eval parity: local runs go through `.wwfd/local-ci.sh`, which writes the
-spend-guard receipt on green; merges are local `--no-ff`, never GitHub
-merge commits.
+The clean-room rewrite verifier requires every surviving text file to name at
+least twenty ledger sources and proves all baseline blobs changed, greater than
+85% line churn, a one-way crate DAG, and no legacy `kernel` surface. The rewrite
+also has deterministic state-machine tests, crash-resumable schema migration,
+kill/restart journeys, mutation campaigns, a retained facade-to-FDB journey, and
+official FDB unknown-commit injection. `REWRITE_MANIFEST.md` remains
+authoritative: native GitHub Windows execution, external LEM consumption, final
+hostile review, and synchronized GitHub tips are not complete until their
+evidence exists.

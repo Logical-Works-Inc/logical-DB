@@ -1,0 +1,124 @@
+# Logical-DB application and service API boundary
+
+> Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+> S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+> S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
+> `../evidence/SOURCES.md`.
+
+## What an application is allowed to know
+
+An app imports `logical-db`, not redb, Automerge, FoundationDB, the server, or
+Braid. Its durable identity axis is:
+
+```text
+AccountId / SpaceId / DocumentId
+ReplicaId / OperationId / OperationDigest
+IndexId / IndexValue / PeerId
+```
+
+The embedded surface is deliberately small:
+
+```text
+Database::open(path, scope, replica)
+Database::open_default(application_id, scope, replica)
+Database::open_with_schema(path, scope, replica, version, projections)
+Database::edit(document, operation, request_digest, edit_fn)
+Database::read(document, read_fn)
+Database::query_index(index, value, after_document, limit)
+Database::changes_since(after_sequence, limit)
+Database::migrate_schema(version, projections, batch_size)
+Database::synchronize(peer, transport, limits, cancelled)
+```
+
+`edit_fn` receives only the typed CRDT `Editor`; `read_fn` and projection
+functions receive only `Reader`. Storage handles, tuple keys, transaction
+objects, raw CRDT objects, and network clients cannot cross this boundary.
+
+With feature `http`, an app additionally receives:
+
+```text
+logical_db::http::HttpTransport
+logical_db::http::{CredentialProvider, StaticBearer, Url}
+logical_db::{SyncLimits, SyncReport}
+```
+
+Custom network implementations use `logical_db::transport::Transport` and the
+versioned protocol types re-exported beside it. They never implement a storage
+backend.
+
+## Embedded call graph
+
+```text
+app
+ `-- Database
+      |-- CRDT edit/read and deterministic projection
+      |-- one local redb transaction
+      |    `-- snapshot + revision + change + operation receipt
+      |        + outbox + indexes + event
+      `-- optional sync state machine
+           `-- Transport (HTTP or app-supplied)
+```
+
+This path works offline and imports no Braid or FoundationDB code. It is the
+Windows/macOS/Linux app-embedding shape.
+
+## Thin-client and standalone call graph
+
+```text
+Database::synchronize
+ `-- HttpTransport
+      `-- POST versioned bounded CBOR
+           `-- server request admission (body + concurrency + deadline)
+                `-- Authenticator
+                     `-- Authority::authorize(scope,effect,request,frontier,time)
+                          `-- Braid RunnableInvocation / ExecutionGrant
+                `-- ServiceStore
+                     |-- frontier(scope)
+                     |-- accept(change, grant)
+                     `-- page(scope, request, position, count, bytes, grant)
+                          `-- FoundationDB transaction
+```
+
+The deployable daemon is one composition of those ports. Logic OS can nest the
+same router under its own TLS, identity, lifecycle, and observability boundary;
+it does not get a second database implementation and does not own local CRUD.
+
+## Private tuple axes
+
+Embedded redb uses one versioned table whose internal key prefix is:
+
+```text
+LDB-v3 / account / space / kind / kind-specific suffix
+```
+
+FDB receives a Directory-Layer root and then uses typed tuples:
+
+```text
+root / 3 / account / space /
+  operation / operation_uuid
+  sequence
+  log / sequence
+  chunk / sequence / chunk_index
+  invocation / runnable_digest
+```
+
+Account and space are the isolation axes; sequence is the ordered change axis;
+operation is the idempotency axis; invocation is the single-use authority axis.
+None is a user-visible record model. Documents and projections are materialized
+application state above those backend-private encodings.
+
+## Failure ownership
+
+- The embedded facade owns CRDT, schema, projection, local durability, and
+  materialization-budget errors.
+- The transport owns TLS, credentials, representation, status, body, and
+  checkpoint-expiry errors.
+- The service owns protocol correlation, authorization, and cross-scope checks.
+- The FDB adapter owns unknown commit, cancellation, version skew, retry
+  exhaustion, native failure, binding failure, and durable corruption.
+- The host owns account authentication, TLS termination, FDB boot/configuration,
+  listener lifecycle, secret rotation, metrics, and rollout.
+
+That separation is the standalone/embedded invariant: deployment may replace
+ports, but it cannot fork the data semantics or leak physical backend APIs into
+applications.

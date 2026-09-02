@@ -1,5 +1,6 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+# S33 S34 S35 S36. Source URLs are in ../../evidence/SOURCES.md.
+
 [net]
-# Cargo's libgit2 transport cannot use the Director's SSH agent reliably.
-# The CLI path is the same authenticated path used by repository operations and
-# keeps exact-revision Braid dependencies reproducible in fresh workspaces.
 git-fetch-with-cli = true

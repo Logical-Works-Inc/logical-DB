@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32 S33 S34 S35 S36 S40 S41 S42 S43",
+  "id": "fdb-ambiguity-v3",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28", "S29", "S30", "S31", "S32", "S33", "S34", "S35", "S36", "S40", "S41", "S42", "S43"],
+  "actor": "Logical-DB service operator recovering an indeterminate write result",
+  "job": "prove one exact operation remains once-only when the FDB client loses certainty after durable commit",
+  "artifact": "source-controlled fdb-ambiguity-journey and FdbServiceStore MaybeCommitted branch",
+  "environment": {"os": "macOS arm64", "fdb": "official 7.3.77 client and isolated live server", "fault": "CLIENT_BUGGIFY at 12 percent fire probability"},
+  "initial_state": {"scope": "fresh UUID axes", "frontier": 0, "authority": "real Braid runnable per operation"},
+  "expectation": "retry observes the exact durable operation and returns a recovered-unknown category without appending twice",
+  "perturbation": "official client throws commit_unknown_result after the server reports a committed version",
+  "actions": ["enable client buggify before the single network boot", "write exact Braid-authorized operations containing a full 64 KiB storage chunk", "observe FDB MaybeCommitted retry state", "retry the exact operation", "submit the same operation identity with different bytes", "reuse the original invocation for a distinct operation", "pull a bounded page and probe a one-byte ceiling", "read a foreign scope frontier"],
+  "observations": ["PASS fdb-commit-unknown-recovered", "frontier advanced exactly once", "exact retry was duplicate or recovered duplicate", "same operation with different bytes returned Conflict", "distinct operation with consumed invocation returned InvocationConsumed", "full storage chunk reconstructed in the bounded page", "one-byte page ceiling failed closed", "foreign scope frontier remained zero"],
+  "external_state_diff": ["one operation manifest, log row, invocation marker, sequence, and change chunks committed atomically", "no second sequence was allocated by recovery"],
+  "invariant": "an unknown FDB commit is recovered through durable operation identity and cannot duplicate effect or authority consumption",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["repeat during a multi-process commit-proxy failover"],
+  "evidence": ["crates/logical-db-daemon/src/ambiguity.rs", "crates/logical-db-store-fdb/src/lib.rs", "latest retained local output: attempt 2, frontier 2, invocation consumed, page bounded, scope isolated"],
+  "limitations": ["client fault injection rather than physical commit-proxy loss", "single FDB server process"]
+}

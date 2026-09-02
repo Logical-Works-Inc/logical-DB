@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32",
+  "id": "daemon-live-fdb",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28", "S29", "S30", "S31", "S32"],
+  "actor": "standalone service operator",
+  "job": "start a bounded Logical-DB service against a configured FDB cluster and verify its public ingress boundary",
+  "artifact": "compiled target/debug/logical-db-daemon",
+  "environment": {"os": "macOS arm64", "bind": "127.0.0.1:4660", "fdb": "isolated 7.3.77 cluster"},
+  "initial_state": {"listener": "absent", "directory": "created or opened by the process", "credential": "one scope-bound bearer"},
+  "expectation": "the process refuses unsafe configuration, isolates authentication, reaches protocol decoding, and releases FDB on graceful shutdown",
+  "perturbation": "invalid key length, generic media type, absent bearer, malformed authenticated CBOR, and Ctrl-C",
+  "actions": ["build with the staged official FDB client and rpath", "launch with explicit account/space/key/token", "send generic and vendor-media requests", "send SIGINT"],
+  "observations": ["invalid checkpoint key failed before network boot", "generic media type returned 415", "correct media without authorization returned 401", "valid bearer plus malformed CBOR returned 400", "Ctrl-C exited 0"],
+  "external_state_diff": ["the Directory Layer path logical-db/v3 was created or opened", "a loopback listener existed only for the experiment", "the listener closed after SIGINT"],
+  "invariant": "standalone deployment composes one FDB lifecycle, exact scope authority, bounded versioned HTTP, and graceful shutdown without leaking unsafe handles",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["run behind a production TLS/issuer host", "send valid push and pull envelopes through the daemon"],
+  "evidence": ["crates/logical-db-daemon/src/main.rs", "HTTP observations 415/401/400", "daemon exit status 0 after SIGINT"],
+  "limitations": ["loopback only by design", "operator supplied the FDB dynamic library path"]
+}

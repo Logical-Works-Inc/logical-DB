@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32",
+  "id": "external-facade-fdb",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28", "S29", "S30", "S31", "S32"],
+  "actor": "downstream application author with no access to Logical-DB internals",
+  "job": "embed two local replicas and exchange a structured value through the standalone FDB service using only the facade",
+  "artifact": "source-controlled facade_fdb_journey depending on logical-db with the http feature and the compiled logical-db-daemon",
+  "environment": {"os": "macOS arm64", "rust": "1.98", "service": "loopback daemon", "storage": "two fresh redb files plus FoundationDB 7.3.77"},
+  "initial_state": {"consumer": "separate Cargo package", "internal Logical-DB dependencies": "none", "replicas": 2},
+  "expectation": "the documented facade is sufficient to persist, push, page, merge, and read state across the full production-shaped boundary",
+  "perturbation": "separate process/package boundary, separate embedded files, real TCP, real authentication, real CBOR, real FDB, and a second pull-only replica",
+  "actions": ["compile the external crate against only logical-db/http", "edit the first embedded replica", "synchronize it through the daemon", "open and synchronize the second replica", "read the structured value from the second replica", "interrupt the daemon gracefully"],
+  "observations": ["PASS facade-http-braid-fdb pushed=1 pulled=1 retry=0", "the daemon exited 0 after Ctrl-C", "the consumer source imported no logical-db internal crate"],
+  "external_state_diff": ["one FDB log record and its exact operation/chunk state were created below the Directory Layer root", "the second redb replica gained one merged document", "both temporary redb files were deleted after verification"],
+  "invariant": "the facade alone composes embedded durability, protocol transport, authenticated standalone service, FDB persistence, and causal materialization",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["land an equivalent content-addressed episode tape in LEM after reviewed Logical-DB publication", "repeat against a public TLS terminator"],
+  "evidence": ["crates/logical-db-e2e/src/bin/facade_fdb_journey.rs", "output PASS facade-http-braid-fdb pushed=1 pulled=1 retry=0", "crates/logical-db-daemon/src/main.rs"],
+  "limitations": ["not yet the final LEM adapter", "single-node FDB cluster"]
+}

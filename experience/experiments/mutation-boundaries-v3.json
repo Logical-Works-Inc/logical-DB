@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "mutation-boundaries-v3",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28"],
+  "actor": "maintainer evaluating test sensitivity",
+  "job": "prove the behavioral suite rejects viable changes to bounds, ordering, replay, migration, authentication, and storage codecs",
+  "artifact": "cargo-mutants package campaigns over the rewritten workspace",
+  "environment": {"os": "macOS arm64", "mode": "package, live daemon-composition, and real FDB transaction mutation campaigns"},
+  "initial_state": {"suite": "green", "mutants": "generated mechanically"},
+  "expectation": "no viable semantic mutation survives the focused campaigns",
+  "perturbation": "replace arithmetic, comparisons, branches, return values, and boundary constants across model, protocol, CRDT, store, sync, service, Braid, FDB codecs, HTTP, server, platform, and facade",
+  "actions": ["run each package campaign", "run FDB mutants with the whole workspace and live daemon ambiguity test", "classify build failures as unviable", "inspect both surviving transaction mutants", "add operation-collision and full-chunk probes", "rerun every mutant generated at both survivor expressions"],
+  "observations": ["protocol 65 caught and 5 unviable", "store 221 caught and 16 unviable", "initial live FDB campaign: 110 total, 95 caught, 13 unviable, 2 missed", "focused post-repair FDB campaign: 4 total, 4 caught, 0 missed", "all other completed packages also had zero viable misses"],
+  "external_state_diff": ["mutation build products only", "no repository source mutation remained after campaign cleanup"],
+  "invariant": "the tests are sensitive to the control/data decisions used as release evidence",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["repeat the live FDB workspace campaign after any storage-transaction change", "mutate public TLS and issuer composition when those hosts exist"],
+  "evidence": ["protocol 70 total: 65 caught, 5 unviable, 0 missed", "store 237 total: 221 caught, 16 unviable, 0 missed", "live FDB workspace 110 total: 95 caught, 13 unviable, 2 initial misses", "post-repair survivor expressions 4 total: 4 caught, 0 missed"],
+  "limitations": ["unviable mutants are not semantic passes", "single-node FDB and client buggify do not reproduce multi-process failover timing"]
+}

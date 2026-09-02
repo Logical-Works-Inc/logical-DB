@@ -1,26 +1,54 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
+# evidence/SOURCES.md.
+
 [workspace]
-resolver = "2"
-members = ["kernel"]
+resolver = "3"
+members = [
+  "crates/logical-db",
+  "crates/logical-db-model",
+  "crates/logical-db-crdt",
+  "crates/logical-db-protocol",
+  "crates/logical-db-store",
+  "crates/logical-db-sync",
+  "crates/logical-db-service",
+  "crates/logical-db-braid",
+  "crates/logical-db-store-fdb",
+  "crates/logical-db-http",
+  "crates/logical-db-server",
+  "crates/logical-db-e2e",
+  "crates/logical-db-platform",
+  "crates/logical-db-daemon",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/srinji-kaggss/logical-DB"
 
 [workspace.dependencies]
-# One exact Braid authority revision for primitives, admission, planning, and
-# execution binding. Consumers must never mix Cid/proof types from different
-# Braid revisions in one transaction boundary.
-braid-ir = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
-braid-run = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
-braid-verify = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
-braid-capability = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
-braid-flow-ir = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
-braid-flow-plan = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "41c1a9cf2299abefd1573fecc50a2622ee41b326" }
-# The storage-only graph stays on Braid's MSRV bridge so Kani 0.67 can prove
-# it with Rust 1.93. Braid proof types above remain one exact 41c revision;
-# lgwks_std is not exchanged across that boundary.
-lgwks_std = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "5b5e1cd19bc2", features = [
-  "hash",
-  "json",
-] }
-# Derive macros expand to `serde::…` paths, which cargo resolves against a
-# direct dependency only — the lgwks_std::json re-export covers function
-# surface, not proc-macro expansion. serde_json stays out; every call goes
-# through lgwks_std::json (estate convention from the Braid migration).
-serde = { version = "1", features = ["derive"] }
+automerge = "=0.11.0"
+redb = "=4.2.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+thiserror = "=2.0.20"
+uuid = { version = "=1.26.0", features = ["serde", "v7"] }
+hmac = "=0.13.0"
+sha2 = "=0.11.0"
+futures = "=0.3.32"
+foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
+foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] }
+serde_bytes = "=0.11.19"
+ciborium = "=0.2.2"
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "http2", "system-proxy", "stream"] }
+axum = "=0.8.9"
+tokio = { version = "=1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "=0.5.3", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

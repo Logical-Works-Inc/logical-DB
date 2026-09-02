@@ -1,0 +1,21 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32",
+  "id": "fdb-live-7-3-77",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28", "S29", "S30", "S31", "S32"],
+  "actor": "Logical-DB service operator",
+  "job": "store and page real service changes through the public FDB adapter across restart and corrupt state",
+  "artifact": "logical_db_store_fdb::FdbServiceStore linked to the official FoundationDB 7.3.77 client",
+  "environment": {"os": "macOS arm64", "fdb": "7.3.77 single ssd process", "cluster": "isolated 127.0.0.1:4650"},
+  "initial_state": {"cluster": "available and empty", "root": "directory-allocated nonempty subspace"},
+  "expectation": "large values are chunked, concurrent operation identities remain exact, ordered pages restart, and missing physical chunks fail closed",
+  "perturbation": "150 KiB change, eight concurrent writers, exact duplicate, conflicting reuse, bounded pages, client reopen, and deletion of one physical chunk",
+  "actions": ["boot the staged client once", "accept the large and concurrent changes", "replay duplicate and conflict", "page through all changes", "reopen the adapter", "plant a missing chunk and read it"],
+  "observations": ["PASS fdb-live accepted=9 duplicate=2 conflict=1 pages=5 restart=1 corruption=1", "the cluster reported available before the run", "corrupt chunk state returned an adapter error instead of partial bytes"],
+  "external_state_diff": ["operation manifests, ordered log manifests, and 64 KiB chunks appeared only below the allocated root", "cluster remained available after restart", "the planted corruption was confined to the disposable test subspace"],
+  "invariant": "scope tuple isolation, exact idempotency, bounded ordered pagination, and all-or-error change reconstruction hold on real FDB",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [],
+  "follow_up_experiments": ["repeat on a three-node cluster with process failover"],
+  "evidence": ["external harness /tmp/logical-db-fdb.QBRPOW/harness", "crates/logical-db-store-fdb/src/lib.rs", "official FDB package SHA-256 aadeb7e4e530fdbefcf10255c45f4022165325ac43c4535a05559ed6d9ea1a37"],
+  "limitations": ["single FDB process"]
+}
