@@ -722,6 +722,39 @@ pub enum DatabaseError {
     MissingOperation(OperationId),
 }
 
+/// Stable recovery decision for application-facing database failures.
+///
+/// This keeps storage-engine variants private while allowing an embedding layer
+/// to distinguish a caller bug from optimistic concurrency and an ambiguous
+/// durability result. New categories may be added without exposing internals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DatabaseErrorKind {
+    /// One operation identity was reused for a different canonical request.
+    OperationConflict,
+    /// Another successor committed first; rebuild the edit on current state.
+    ConcurrentWrite,
+    /// Durability is ambiguous; retry the exact operation and request identity.
+    RetryExactRequest,
+    /// No specialized recovery contract applies.
+    Other,
+}
+
+impl DatabaseError {
+    /// Classifies recovery without leaking the embedded store's error types.
+    #[must_use]
+    pub const fn kind(&self) -> DatabaseErrorKind {
+        match self {
+            Self::Store(StoreError::OperationConflict) => DatabaseErrorKind::OperationConflict,
+            Self::Store(StoreError::StaleDocument) => DatabaseErrorKind::ConcurrentWrite,
+            Self::Store(StoreError::CommitOutcomeUnknown(_)) => {
+                DatabaseErrorKind::RetryExactRequest
+            }
+            _ => DatabaseErrorKind::Other,
+        }
+    }
+}
+
 fn projection_digest(
     schema_version: u32,
     projections: &[Projection],
@@ -880,13 +913,29 @@ mod tests {
             (document, OperationDigest::new([4; 32])),
             (DocumentId::new(), request),
         ] {
+            let error = database
+                .edit(other_document, operation, other_request, |_editor| Ok(()))
+                .unwrap_err();
             assert!(matches!(
-                database.edit(other_document, operation, other_request, |_editor| Ok(())),
-                Err(DatabaseError::Store(StoreError::OperationConflict))
+                &error,
+                DatabaseError::Store(StoreError::OperationConflict)
             ));
+            assert_eq!(error.kind(), DatabaseErrorKind::OperationConflict);
         }
         drop(database);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn facade_error_kinds_preserve_recovery_decisions_without_store_types() {
+        assert_eq!(
+            DatabaseError::Store(StoreError::StaleDocument).kind(),
+            DatabaseErrorKind::ConcurrentWrite
+        );
+        assert_eq!(
+            DatabaseError::InvalidSchemaVersion.kind(),
+            DatabaseErrorKind::Other
+        );
     }
 
     #[test]
