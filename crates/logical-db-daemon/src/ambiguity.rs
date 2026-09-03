@@ -14,7 +14,7 @@ use logical_db_model::{
     SpaceId,
 };
 use logical_db_protocol::ChangeEnvelope;
-use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, ServiceStore};
+use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, ServiceStore, StoredPage};
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
 use sha2::{Digest, Sha256};
 
@@ -307,19 +307,7 @@ async fn verify_page(
     loop {
         let request = page_fixture_request(scope, after, count, bytes);
         let grant = fixture_grant(scope, Effect::Sync, request, observed);
-        let mut page_result = None;
-        for _retry in 0..128 {
-            if let Ok(value) = store
-                .page(scope, request, after, count, bytes, &grant)
-                .await
-            {
-                page_result = Some(value);
-                break;
-            }
-        }
-        let Some(PageResult::Page(page)) = page_result else {
-            return Err(io::Error::other("stable page proof became stale").into());
-        };
+        let page = read_page_with_retry(store, scope, request, after, count, bytes, &grant).await?;
         if page.position <= after
             || page.position > observed
             || page.changes.is_empty()
@@ -380,6 +368,40 @@ async fn verify_page(
     }
     let rebound_request = page_fixture_request(scope, 0, 1, bytes);
     verify_rebound_grants(store, scope, observed, rebound_request, rebound).await
+}
+
+async fn read_page_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+    request: OperationDigest,
+    after: u64,
+    max_changes: u16,
+    max_bytes: u32,
+    grant: &impl ExecutionGrant,
+) -> Result<StoredPage, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store
+            .page(scope, request, after, max_changes, max_bytes, grant)
+            .await
+        {
+            Ok(PageResult::Page(page)) => return Ok(page),
+            Ok(PageResult::StaleAuthority) => {
+                let durable = store.frontier(scope).await;
+                return Err(io::Error::other(format!(
+                    "page authority became stale after={after} expected_frontier={} durable_frontier={durable:?}",
+                    grant.frontier()
+                ))
+                .into());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "page retry budget exhausted after={after} expected_frontier={} last_error={last_error:?}",
+        grant.frontier()
+    ))
+    .into())
 }
 
 fn page_fixture_request(
