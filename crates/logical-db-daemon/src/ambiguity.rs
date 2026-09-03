@@ -4,14 +4,14 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
 //! S33 S34 S35 S36 S37 S38 S39 S42 S43. Source URLs are in `evidence/SOURCES.md`.
 
-use std::{error::Error, io};
+use std::{collections::HashSet, error::Error, io};
 
 use foundationdb::{Database, api::FdbApiBuilder, options::NetworkOption};
 use foundationdb_tuple::Subspace;
 use logical_db_crdt::{Document, Object, Scalar};
 use logical_db_model::{
-    AccountId, DocumentId, Effect, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, OperationDigest,
-    OperationId, ReplicaId, Scope, SpaceId,
+    AccountId, DocumentId, Effect, MAX_PAGE_BYTES, OperationDigest, OperationId, ReplicaId, Scope,
+    SpaceId,
 };
 use logical_db_protocol::ChangeEnvelope;
 use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, ServiceStore};
@@ -143,7 +143,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             Ok(AcceptResult::RecoveredUnknownCommit) => {
                 let (observed, rebound) =
                     verify_recovered_write(&store, scope, frontier, &change, &grant).await?;
-                verify_page(&store, scope, observed, &change, &rebound).await?;
+                let (observed, continuation) =
+                    append_continuation_record(&store, scope, observed).await?;
+                verify_page(&store, scope, observed, &change, &continuation, &rebound).await?;
                 println!(
                     "PASS fdb-commit-unknown-recovered attempt={attempt} frontier={observed} invocation=consumed page=bounded scope=isolated"
                 );
@@ -160,6 +162,63 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     Err(io::Error::other("FDB buggify did not exercise a post-commit unknown result").into())
+}
+
+async fn append_continuation_record(
+    store: &FdbServiceStore,
+    scope: Scope,
+    minimum_frontier: u64,
+) -> Result<(u64, ChangeEnvelope), Box<dyn Error>> {
+    for attempt in 0_u16..512 {
+        let Ok(frontier) = store.frontier(scope).await else {
+            continue;
+        };
+        if frontier < minimum_frontier {
+            return Err(io::Error::other("durable frontier regressed").into());
+        }
+        let mut document = Document::new();
+        let ((), mut encoded) = document.edit(|editor| {
+            editor.put(
+                &Object::root(),
+                "continuation-proof",
+                Scalar::Integer(i64::from(attempt)),
+            )
+        })?;
+        let encoded = encoded
+            .pop()
+            .ok_or_else(|| io::Error::other("missing continuation CRDT change"))?;
+        let request = continuation_fixture_request(scope, frontier, attempt);
+        let change = ChangeEnvelope {
+            scope,
+            document: DocumentId::new(),
+            replica: ReplicaId::new(),
+            operation: OperationId::new(),
+            request,
+            digest: encoded.digest,
+            bytes: encoded.bytes,
+        };
+        let grant = fixture_grant(scope, Effect::Write, request, frontier);
+        if matches!(
+            store.accept(&change, &grant).await,
+            Ok(AcceptResult::Accepted | AcceptResult::RecoveredUnknownCommit)
+        ) {
+            let observed = frontier
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("continuation frontier overflowed"))?;
+            return Ok((observed, change));
+        }
+    }
+    Err(io::Error::other("could not append a known continuation record").into())
+}
+
+fn continuation_fixture_request(scope: Scope, frontier: u64, attempt: u16) -> OperationDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"logical-db/fdb-continuation-fixture/v1\0");
+    digest.update(scope.account().as_uuid().as_bytes());
+    digest.update(scope.space().as_uuid().as_bytes());
+    digest.update(frontier.to_be_bytes());
+    digest.update(attempt.to_be_bytes());
+    OperationDigest::new(digest.finalize().into())
 }
 
 async fn verify_recovered_write(
@@ -230,32 +289,84 @@ async fn verify_page(
     scope: Scope,
     observed: u64,
     change: &ChangeEnvelope,
+    continuation: &ChangeEnvelope,
     rebound: &ChangeEnvelope,
 ) -> Result<(), Box<dyn Error>> {
-    let request = OperationDigest::new([0x77; 32]);
-    let grant = fixture_grant(scope, Effect::Sync, request, observed);
-    let count = u16::try_from(MAX_CHANGES_PER_PAGE)?;
+    // Force the proof through the continuation path even when buggify produces
+    // the recovered commit early. A one-record page also makes every progress
+    // and `more` assertion observable rather than merely permitted.
+    let count = 1;
     let bytes = u32::try_from(MAX_PAGE_BYTES)?;
-    let mut page_result = None;
-    for _retry in 0..128 {
-        if let Ok(value) = store.page(scope, request, 0, count, bytes, &grant).await {
-            page_result = Some(value);
+    let mut after = 0_u64;
+    let mut returned = 0_usize;
+    let mut pages = 0_usize;
+    let mut first_page_had_more = false;
+    let mut recovered_change_count = 0_usize;
+    let mut continuation_change_count = 0_usize;
+    let mut operations = HashSet::new();
+    loop {
+        let request = page_fixture_request(scope, after, count, bytes);
+        let grant = fixture_grant(scope, Effect::Sync, request, observed);
+        let mut page_result = None;
+        for _retry in 0..128 {
+            if let Ok(value) = store
+                .page(scope, request, after, count, bytes, &grant)
+                .await
+            {
+                page_result = Some(value);
+                break;
+            }
+        }
+        let Some(PageResult::Page(page)) = page_result else {
+            return Err(io::Error::other("stable page proof became stale").into());
+        };
+        if page.position <= after
+            || page.position > observed
+            || page.changes.is_empty()
+            || page.changes.len() > usize::from(count)
+            || page.more != (page.position < observed)
+        {
+            return Err(io::Error::other("ordered FDB page violated its bounds").into());
+        }
+        returned = returned
+            .checked_add(page.changes.len())
+            .ok_or_else(|| io::Error::other("page coverage overflowed"))?;
+        pages = pages
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("page count overflowed"))?;
+        if pages == 1 {
+            first_page_had_more = page.more;
+        }
+        for returned_change in &page.changes {
+            if !operations.insert(returned_change.operation) {
+                return Err(io::Error::other("ordered FDB pages repeated an operation").into());
+            }
+            recovered_change_count += usize::from(returned_change == change);
+            continuation_change_count += usize::from(returned_change == continuation);
+        }
+        after = page.position;
+        if !page.more {
             break;
         }
     }
-    let Some(PageResult::Page(page)) = page_result else {
-        return Err(io::Error::other("stable page proof became stale").into());
-    };
-    if page.position != observed
-        || page.more
-        || page.changes.len() != usize::try_from(observed)?
-        || !page.changes.contains(change)
+    if pages < 2
+        || !first_page_had_more
+        || after != observed
+        || returned != usize::try_from(observed)?
+        || operations.len() != returned
+        || recovered_change_count != 1
+        || continuation_change_count != 1
     {
-        return Err(io::Error::other("ordered FDB page lost its frontier").into());
+        return Err(io::Error::other("ordered FDB pages lost their frontier").into());
     }
     let mut byte_ceiling_proven = false;
+    let byte_request = page_fixture_request(scope, 0, count, 1);
+    let byte_grant = fixture_grant(scope, Effect::Sync, byte_request, observed);
     for _retry in 0..128 {
-        match store.page(scope, request, 0, count, 1, &grant).await {
+        match store
+            .page(scope, byte_request, 0, count, 1, &byte_grant)
+            .await
+        {
             Err(FdbStoreError::Corruption(FdbDataError::ChangeExceedsPage)) => {
                 byte_ceiling_proven = true;
                 break;
@@ -267,7 +378,24 @@ async fn verify_page(
     if !byte_ceiling_proven {
         return Err(io::Error::other("page byte ceiling was not enforced").into());
     }
-    verify_rebound_grants(store, scope, observed, request, rebound).await
+    let rebound_request = page_fixture_request(scope, 0, 1, bytes);
+    verify_rebound_grants(store, scope, observed, rebound_request, rebound).await
+}
+
+fn page_fixture_request(
+    scope: Scope,
+    after: u64,
+    max_changes: u16,
+    max_bytes: u32,
+) -> OperationDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"logical-db/fdb-page-fixture/v1\0");
+    digest.update(scope.account().as_uuid().as_bytes());
+    digest.update(scope.space().as_uuid().as_bytes());
+    digest.update(after.to_be_bytes());
+    digest.update(max_changes.to_be_bytes());
+    digest.update(max_bytes.to_be_bytes());
+    OperationDigest::new(digest.finalize().into())
 }
 
 async fn verify_rebound_grants(
@@ -336,7 +464,22 @@ async fn verify_rebound_grants(
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use logical_db_model::{AccountId, Scope, SpaceId};
+
+    use super::{page_fixture_request, run};
+
+    #[test]
+    fn page_fixture_identity_binds_scope_position_and_limits() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let baseline = page_fixture_request(scope, 0, 1, 1024);
+        assert_ne!(baseline, page_fixture_request(scope, 1, 1, 1024));
+        assert_ne!(baseline, page_fixture_request(scope, 0, 2, 1024));
+        assert_ne!(baseline, page_fixture_request(scope, 0, 1, 1025));
+        assert_ne!(
+            baseline,
+            page_fixture_request(Scope::new(AccountId::new(), SpaceId::new()), 0, 1, 1024)
+        );
+    }
 
     #[tokio::test]
     async fn live_fdb_recovers_unknown_commit_and_preserves_all_axes() {
