@@ -35,7 +35,7 @@ thiserror = "=2.0.20"
 uuid = { version = "=1.26.0", features = ["serde", "v7"] }
 hmac = "=0.13.0"
 sha2 = "=0.11.0"
-futures = "=0.3.32"
+futures = "=0.3.34"
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
 foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] }
 serde_bytes = "=0.11.19"
