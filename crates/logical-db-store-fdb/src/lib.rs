@@ -53,6 +53,23 @@ fn valid_page_limits(max_changes: u16, max_bytes: u32) -> bool {
 }
 
 #[cfg(any(feature = "fdb", test))]
+fn logical_page_more(
+    frontier: u64,
+    position: u64,
+    range_more: bool,
+    stopped_at_page_boundary: bool,
+) -> Result<bool, DataError> {
+    if position > frontier || (stopped_at_page_boundary && position == frontier) {
+        return Err(DataError::InvalidManifest);
+    }
+    let more = position < frontier;
+    if more && !range_more && !stopped_at_page_boundary {
+        return Err(DataError::InvalidManifest);
+    }
+    Ok(more)
+}
+
+#[cfg(any(feature = "fdb", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Record {
     document: DocumentId,
@@ -269,9 +286,11 @@ mod runtime {
     use super::{
         CHUNK_BYTES, DataError, FORMAT_VERSION, KIND_LOG, MANIFEST_BYTES, Record, decode_manifest,
         decode_operation, decode_u64, encode_manifest, invocation_binding,
-        invocation_binding_record, page_read_plan, valid_page_limits,
+        invocation_binding_record, logical_page_more, page_read_plan, valid_page_limits,
     };
-    use foundationdb::{Database, FdbBindingError, RangeOption, options::TransactionOption};
+    use foundationdb::{
+        Database, FdbBindingError, KeySelector, RangeOption, options::TransactionOption,
+    };
     use foundationdb_tuple::Subspace;
     use logical_db_model::{Effect, OperationDigest, Scope};
     use logical_db_protocol::ChangeEnvelope;
@@ -572,10 +591,10 @@ mod runtime {
         let mut changes = Vec::with_capacity(usize::from(query.max_changes));
         let mut aggregate = 0usize;
         let mut position = query.after;
-        let mut more = range_more;
+        let mut stopped_at_page_boundary = false;
         for (key, value) in manifests {
             if changes.len() == usize::from(query.max_changes) {
-                more = true;
+                stopped_at_page_boundary = true;
                 break;
             }
             let (sequence,) = spaces
@@ -594,7 +613,7 @@ mod runtime {
                 if changes.is_empty() {
                     return Err(binding(DataError::ChangeExceedsPage));
                 }
-                more = true;
+                stopped_at_page_boundary = true;
                 break;
             }
             let bytes = load_change_bytes(transaction, &spaces.chunk, sequence, &record).await?;
@@ -602,14 +621,33 @@ mod runtime {
             aggregate = next_bytes;
             position = sequence;
         }
-        if more != (position < frontier) {
+        if position == frontier && log_has_entry_after(transaction, &spaces.log, frontier).await? {
             return Err(binding(DataError::InvalidManifest));
         }
+        let more = logical_page_more(frontier, position, range_more, stopped_at_page_boundary)
+            .map_err(binding)?;
         Ok(PageResult::Page(StoredPage {
             changes,
             position,
             more,
         }))
+    }
+
+    async fn log_has_entry_after(
+        transaction: &foundationdb::RetryableTransaction,
+        log: &Subspace,
+        frontier: u64,
+    ) -> Result<bool, FdbBindingError> {
+        let terminal = log.pack(&(frontier,));
+        let (_, end) = log.range();
+        let options = RangeOption {
+            begin: KeySelector::first_greater_than(terminal),
+            end: KeySelector::first_greater_or_equal(end),
+            limit: Some(1),
+            target_bytes: MANIFEST_BYTES,
+            ..RangeOption::default()
+        };
+        Ok(!transaction.get_range(&options, 1, false).await?.is_empty())
     }
 
     async fn verify_operation(
@@ -920,6 +958,21 @@ mod tests {
                 limit: 257,
                 target_bytes: 30_208
             }
+        );
+        assert_eq!(logical_page_more(10, 10, true, false), Ok(false));
+        assert_eq!(logical_page_more(10, 9, true, false), Ok(true));
+        assert_eq!(logical_page_more(10, 9, false, true), Ok(true));
+        assert_eq!(
+            logical_page_more(10, 11, false, false),
+            Err(DataError::InvalidManifest)
+        );
+        assert_eq!(
+            logical_page_more(10, 10, false, true),
+            Err(DataError::InvalidManifest)
+        );
+        assert_eq!(
+            logical_page_more(10, 9, false, false),
+            Err(DataError::InvalidManifest)
         );
         assert_eq!(chunk_count(0), 0);
         assert_eq!(chunk_count(1), 1);
