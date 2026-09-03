@@ -288,7 +288,9 @@ mod runtime {
         decode_operation, decode_u64, encode_manifest, invocation_binding,
         invocation_binding_record, logical_page_more, page_read_plan, valid_page_limits,
     };
-    use foundationdb::{Database, FdbBindingError, RangeOption, options::TransactionOption};
+    use foundationdb::{
+        Database, FdbBindingError, KeySelector, RangeOption, options::TransactionOption,
+    };
     use foundationdb_tuple::Subspace;
     use logical_db_model::{Effect, OperationDigest, Scope};
     use logical_db_protocol::ChangeEnvelope;
@@ -619,6 +621,9 @@ mod runtime {
             aggregate = next_bytes;
             position = sequence;
         }
+        if position == frontier && log_has_entry_after(transaction, &spaces.log, frontier).await? {
+            return Err(binding(DataError::InvalidManifest));
+        }
         let more = logical_page_more(frontier, position, range_more, stopped_at_page_boundary)
             .map_err(binding)?;
         Ok(PageResult::Page(StoredPage {
@@ -626,6 +631,23 @@ mod runtime {
             position,
             more,
         }))
+    }
+
+    async fn log_has_entry_after(
+        transaction: &foundationdb::RetryableTransaction,
+        log: &Subspace,
+        frontier: u64,
+    ) -> Result<bool, FdbBindingError> {
+        let terminal = log.pack(&(frontier,));
+        let (_, end) = log.range();
+        let options = RangeOption {
+            begin: KeySelector::first_greater_than(terminal),
+            end: KeySelector::first_greater_or_equal(end),
+            limit: Some(1),
+            target_bytes: MANIFEST_BYTES,
+            ..RangeOption::default()
+        };
+        Ok(!transaction.get_range(&options, 1, false).await?.is_empty())
     }
 
     async fn verify_operation(
