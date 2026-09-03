@@ -10,6 +10,7 @@ use std::{
     fmt,
     future::{Future, ready},
     io::Cursor,
+    net::IpAddr,
     time::Duration,
 };
 
@@ -19,7 +20,7 @@ use logical_db_sync::{PullResult, Transport};
 pub use reqwest::Url;
 use reqwest::{
     Client, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -27,6 +28,8 @@ use thiserror::Error;
 
 const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";
 const MAX_HTTP_BODY_BYTES: usize = 12_582_912;
+/// Maximum server-directed retry delay accepted from an untrusted response.
+pub const MAX_RETRY_AFTER_SECONDS: u64 = 3_600;
 
 /// Refreshable credential boundary invoked before every request.
 pub trait CredentialProvider: Send {
@@ -54,6 +57,9 @@ impl StaticBearer {
     pub fn new(token: &str) -> Result<Self, CredentialError> {
         if token.is_empty() {
             return Err(CredentialError::Empty);
+        }
+        if token.len() > 4_096 || !valid_b64token(token.as_bytes()) {
+            return Err(CredentialError::InvalidToken);
         }
         let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| CredentialError::InvalidHeader)?;
@@ -102,7 +108,12 @@ where
         {
             return Err(HttpError::InvalidEndpoint);
         }
-        let loopback = matches!(endpoint.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        let loopback = endpoint.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
         if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
             return Err(HttpError::InsecureEndpoint);
         }
@@ -110,13 +121,15 @@ where
             let path = format!("{}/", endpoint.path());
             endpoint.set_path(&path);
         }
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .redirect(Policy::none())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .map_err(HttpError::Network)?;
+            .pool_idle_timeout(Duration::from_secs(90));
+        if loopback {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(HttpError::Network)?;
         Ok(Self {
             client,
             endpoint,
@@ -153,6 +166,20 @@ where
             .map_err(HttpError::Network)?;
         decode_response(response).await
     }
+}
+
+fn valid_b64token(token: &[u8]) -> bool {
+    let mut padding = false;
+    token.iter().all(|byte| {
+        if *byte == b'=' {
+            padding = true;
+            true
+        } else {
+            !padding
+                && (byte.is_ascii_alphanumeric()
+                    || matches!(*byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
+        }
+    })
 }
 
 impl<Credentials> Transport for HttpTransport<Credentials>
@@ -204,7 +231,14 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, HttpError> {
 async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, HttpError> {
     let status = response.status();
     if !status.is_success() {
-        return Err(HttpError::Status(status.as_u16()));
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(parse_retry_after);
+        return Err(HttpError::Status {
+            code: status.as_u16(),
+            retry_after,
+        });
     }
     if response
         .headers()
@@ -241,6 +275,15 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
     Ok(value)
 }
 
+fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds <= MAX_RETRY_AFTER_SECONDS)
+        .map(Duration::from_secs)
+}
+
 /// Credential provider failure with no secret-bearing payload.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CredentialError {
@@ -250,6 +293,9 @@ pub enum CredentialError {
     /// Token cannot be represented as an HTTP header.
     #[error("credential token contains invalid header bytes")]
     InvalidHeader,
+    /// Token violated the RFC 6750 bearer-token grammar or resource ceiling.
+    #[error("credential token is not a bounded RFC 6750 b64token")]
+    InvalidToken,
     /// External refresh failed without exposing credential contents.
     #[error("credential refresh failed")]
     Refresh,
@@ -274,8 +320,13 @@ pub enum HttpError {
     #[error("HTTP response has an unsupported media type")]
     MediaType,
     /// Service returned a non-success status; body is intentionally discarded.
-    #[error("HTTP service returned status {0}")]
-    Status(u16),
+    #[error("HTTP service returned status {code}")]
+    Status {
+        /// HTTP status code without a potentially sensitive response body.
+        code: u16,
+        /// Server-supplied delta delay, when syntactically valid.
+        retry_after: Option<Duration>,
+    },
     /// Request or response violated protocol invariants.
     #[error("HTTP protocol validation failed: {0}")]
     Protocol(ProtocolError),
@@ -291,6 +342,27 @@ pub enum HttpError {
     /// Bounded network request failed.
     #[error("HTTP network failed: {0}")]
     Network(reqwest::Error),
+}
+
+impl HttpError {
+    /// Returns whether retrying the exact idempotent sync request is reasonable.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            Self::Network(_) => true,
+            Self::Status { code, .. } => matches!(*code, 408 | 425 | 429 | 502 | 503 | 504),
+            _ => false,
+        }
+    }
+
+    /// Returns the server's bounded delta delay when one was supplied.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,7 +405,23 @@ mod tests {
             )
             .route(
                 "/bad-status",
-                get(|| async { (AxumStatus::BAD_REQUEST, Body::empty()) }),
+                get(|| async {
+                    AxumResponse::builder()
+                        .status(AxumStatus::TOO_MANY_REQUESTS)
+                        .header(RETRY_AFTER, "7")
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/hostile-retry",
+                get(|| async {
+                    AxumResponse::builder()
+                        .status(AxumStatus::SERVICE_UNAVAILABLE)
+                        .header(RETRY_AFTER, u64::MAX.to_string())
+                        .body(Body::empty())
+                        .unwrap()
+                }),
             )
             .route(
                 "/too-large",
@@ -401,6 +489,23 @@ mod tests {
     }
 
     #[test]
+    fn static_bearer_rejects_ambiguous_whitespace_padding_and_excess() {
+        assert!(matches!(
+            StaticBearer::new("space inside"),
+            Err(CredentialError::InvalidToken)
+        ));
+        assert!(matches!(
+            StaticBearer::new("valid==then-invalid"),
+            Err(CredentialError::InvalidToken)
+        ));
+        assert!(StaticBearer::new("valid-token_123+/==").is_ok());
+        assert!(matches!(
+            StaticBearer::new(&"a".repeat(4_097)),
+            Err(CredentialError::InvalidToken)
+        ));
+    }
+
+    #[test]
     fn cbor_request_encoding_is_nonempty_and_enforces_exact_body_edge() {
         let encoded = encode(&vec![1_u8, 2, 3]).unwrap();
         assert!(!encoded.is_empty());
@@ -439,7 +544,22 @@ mod tests {
             .unwrap();
         assert!(matches!(
             decode_response::<u8>(response).await,
-            Err(HttpError::Status(400))
+            Err(HttpError::Status {
+                code: 429,
+                retry_after: Some(delay),
+            }) if delay == Duration::from_secs(7)
+        ));
+        let response = client
+            .get(endpoint.join("hostile-retry").unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            decode_response::<u8>(response).await,
+            Err(HttpError::Status {
+                code: 503,
+                retry_after: None,
+            })
         ));
         let response = client
             .get(endpoint.join("wrong-media").unwrap())

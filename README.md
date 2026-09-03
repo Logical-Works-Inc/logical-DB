@@ -18,6 +18,11 @@ transactional CRDT edits, read projections, schema-bound secondary indexes, a
 durable change feed, and bounded synchronization. It needs neither Braid nor a
 network for local reads and writes.
 
+The read boundary exposes map discovery, list access, collaborative text, and
+all causally concurrent values; the editor exposes map/list/object operations,
+text splice, deletion, and counters. Applications therefore do not have to
+discard CRDT conflicts behind a last-writer-looking getter.
+
 ```rust
 use logical_db::{
     AccountId, Database, DocumentId, IndexId, IndexValue, Item, Object,
@@ -68,12 +73,16 @@ using its versioned push/pull types.
 - **Embedded only:** app → `logical-db` → Automerge + redb. No daemon, network,
   FDB, or Braid.
 - **Thin client:** the same embedded API plus `logical-db-http`; sync is bounded,
-  resumable, idempotent, and driven by durable peer checkpoints.
+  resumable, idempotent, and driven by a durable service checkpoint. A local
+  scope is durably bound to one upstream because v1 has one upload cursor;
+  attempting a second upstream fails instead of suppressing undelivered writes.
 - **Standalone service:** the `logical-db-daemon` binary composes a loopback-only
-  Axum listener, bounded request admission, exact Braid runnable authority,
-  HMAC checkpoints, a Directory Layer subspace, and the FDB adapter. A
-  production deployment puts its TLS and token issuer in front; the process
-  refuses a non-loopback plaintext bind.
+  Axum listener, bounded request admission, HMAC checkpoints, a Directory Layer
+  subspace, and the FDB adapter. Its local Braid authority deliberately refuses
+  writes and sync because pinned Braid has no independently verifiable runtime
+  confirmation evidence. It is not a usable sync service until an ecosystem
+  host supplies externally prepared grants; it also refuses a non-loopback
+  plaintext bind.
 - **Ecosystem host:** Logic OS or another host nests the same router and uses
   `logical-db-braid` to admit exact account/space/request capabilities. The host
   does not own embedded CRUD.
@@ -89,8 +98,11 @@ The clean-room rewrite verifier requires every surviving text file to name at
 least twenty ledger sources and proves all baseline blobs changed, greater than
 85% line churn, a one-way crate DAG, and no legacy `kernel` surface. The rewrite
 also has deterministic state-machine tests, crash-resumable schema migration,
-kill/restart journeys, mutation campaigns, a retained facade-to-FDB journey, and
-official FDB unknown-commit injection. `REWRITE_MANIFEST.md` remains
-authoritative: native GitHub Windows execution, external LEM consumption, final
-hostile review, and synchronized GitHub tips are not complete until their
-evidence exists.
+kill/restart journeys, mutation campaigns, and official FDB unknown-commit
+injection. The former facade-to-daemon journey is explicitly retired because
+its confirmation model was unsound. `REWRITE_MANIFEST.md` remains
+authoritative. The implemented core is not being called production-complete
+while server-log retention/snapshot baselines, embedded export/restore,
+deletion/tombstone policy, multi-node FDB recovery, public TLS/issuer
+integration, runtime Braid confirmation, sustained load, and external LEM
+consumption remain unproven or unimplemented.

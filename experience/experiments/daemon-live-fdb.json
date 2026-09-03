@@ -12,10 +12,10 @@
   "actions": ["build with the staged official FDB client and rpath", "launch with explicit account/space/key/token", "send generic and vendor-media requests", "send SIGINT"],
   "observations": ["invalid checkpoint key failed before network boot", "generic media type returned 415", "correct media without authorization returned 401", "valid bearer plus malformed CBOR returned 400", "Ctrl-C exited 0"],
   "external_state_diff": ["the Directory Layer path logical-db/v3 was created or opened", "a loopback listener existed only for the experiment", "the listener closed after SIGINT"],
-  "invariant": "standalone deployment composes one FDB lifecycle, exact scope authority, bounded versioned HTTP, and graceful shutdown without leaking unsafe handles",
+  "invariant": "standalone deployment composes one FDB lifecycle, scope authentication, bounded versioned HTTP, and graceful shutdown without leaking unsafe handles; write and sync authority remain disabled",
   "verdict": "proven-within-bounds",
   "failure_classes": [],
-  "follow_up_experiments": ["run behind a production TLS/issuer host", "send valid push and pull envelopes through the daemon"],
+  "follow_up_experiments": ["integrate independently verifiable Braid runtime confirmation", "then send valid push and pull envelopes through the daemon"],
   "evidence": ["crates/logical-db-daemon/src/main.rs", "HTTP observations 415/401/400", "daemon exit status 0 after SIGINT"],
-  "limitations": ["loopback only by design", "operator supplied the FDB dynamic library path"]
+  "limitations": ["loopback only by design", "operator supplied the FDB dynamic library path", "local authority refuses write and sync"]
 }

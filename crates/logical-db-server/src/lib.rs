@@ -18,7 +18,9 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, WWW_AUTHENTICATE},
+        header::{
+            ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE,
+        },
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -27,6 +29,7 @@ use axum::{
 use logical_db_protocol::{PullRequest, PushRequest};
 use logical_db_service::{
     Authority, CheckpointCodec, ProtocolService, ServiceError, ServicePull, ServiceStore,
+    StoreFailureClass,
 };
 use tokio::{sync::Semaphore, time::timeout};
 
@@ -214,7 +217,7 @@ where
         let response = service
             .push(&request, now)
             .await
-            .map_err(|error| map_service_error(&error))?;
+            .map_err(|error| map_service_error::<Store>(&error))?;
         encode_response(StatusCode::OK, &response)
     }
     .await;
@@ -241,7 +244,7 @@ where
         match service
             .pull(&request, now)
             .await
-            .map_err(|error| map_service_error(&error))?
+            .map_err(|error| map_service_error::<Store>(&error))?
         {
             ServicePull::Page(page) => encode_response(StatusCode::OK, &page),
             ServicePull::CheckpointExpired => Err(ApiError::CheckpointExpired),
@@ -320,11 +323,18 @@ fn encode_response<Value: serde::Serialize>(
         .into_response())
 }
 
-fn map_service_error<StoreError>(error: &ServiceError<StoreError>) -> ApiError {
+fn map_service_error<Store>(error: &ServiceError<Store::Error>) -> ApiError
+where
+    Store: ServiceStore,
+{
     match error {
         ServiceError::Protocol(_) | ServiceError::Checkpoint(_) => ApiError::Malformed,
         ServiceError::Forbidden => ApiError::Forbidden,
-        ServiceError::StaleAuthority | ServiceError::Store(_) => ApiError::Unavailable,
+        ServiceError::StaleAuthority => ApiError::Unavailable,
+        ServiceError::Store(error) => match Store::classify_error(error) {
+            StoreFailureClass::Transient => ApiError::Unavailable,
+            StoreFailureClass::Permanent => ApiError::Internal,
+        },
         ServiceError::CrossScopeStoreData | ServiceError::CorruptStoreData => ApiError::Internal,
     }
 }
@@ -365,6 +375,11 @@ impl IntoResponse for ApiError {
             response
                 .headers_mut()
                 .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if matches!(self, Self::Busy | Self::Unavailable) {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
@@ -467,6 +482,66 @@ mod tests {
         fn now_unix_ms(&self) -> Option<u64> {
             Some(1_000)
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ClassifiedStoreError {
+        Transient,
+        Permanent,
+    }
+
+    struct ClassifiedStore;
+
+    impl ServiceStore for ClassifiedStore {
+        type Error = ClassifiedStoreError;
+
+        fn classify_error(error: &Self::Error) -> StoreFailureClass {
+            match error {
+                ClassifiedStoreError::Transient => StoreFailureClass::Transient,
+                ClassifiedStoreError::Permanent => StoreFailureClass::Permanent,
+            }
+        }
+
+        fn accept(
+            &self,
+            _change: &ChangeEnvelope,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            ready(Err(ClassifiedStoreError::Permanent))
+        }
+
+        fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Err(ClassifiedStoreError::Permanent))
+        }
+
+        fn page(
+            &self,
+            _scope: Scope,
+            _request: OperationDigest,
+            _after: u64,
+            _max_changes: u16,
+            _max_bytes: u32,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            ready(Err(ClassifiedStoreError::Permanent))
+        }
+    }
+
+    #[test]
+    fn only_explicitly_transient_store_failures_are_retryable() {
+        let transient = map_service_error::<ClassifiedStore>(&ServiceError::Store(
+            ClassifiedStoreError::Transient,
+        ))
+        .into_response();
+        assert_eq!(transient.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(transient.headers().get(RETRY_AFTER).unwrap(), "1");
+
+        let permanent = map_service_error::<ClassifiedStore>(&ServiceError::Store(
+            ClassifiedStoreError::Permanent,
+        ))
+        .into_response();
+        assert_eq!(permanent.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(permanent.headers().get(RETRY_AFTER).is_none());
     }
 
     #[derive(Default)]
@@ -780,6 +855,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(saturated.headers().get(RETRY_AFTER).unwrap(), "1");
         assert_eq!(
             first.await.unwrap().unwrap().status(),
             StatusCode::GATEWAY_TIMEOUT

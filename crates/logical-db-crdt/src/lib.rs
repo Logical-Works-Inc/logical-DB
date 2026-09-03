@@ -7,10 +7,12 @@
 #![forbid(unsafe_code)]
 
 use automerge::{
-    AutoCommit, AutomergeError, Change, ChangeHash, LoadChangeError, ObjId, ObjType, ROOT, ReadDoc,
-    ScalarValue, Value, transaction::Transactable,
+    AutoCommit, AutomergeError, Change, ChangeHash, LoadChangeError, LoadOptions, ObjId, ObjType,
+    ROOT, ReadDoc, ScalarValue, TextEncoding, Value, transaction::Transactable,
 };
-use logical_db_model::{ChangeDigest, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES};
+use logical_db_model::{
+    ChangeDigest, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, MAX_SNAPSHOT_BYTES,
+};
 use thiserror::Error;
 
 /// Opaque object handle valid only for the document that produced it.
@@ -157,7 +159,7 @@ impl Document {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: AutoCommit::new(),
+            inner: AutoCommit::new_with_encoding(TextEncoding::UnicodeCodePoint),
         }
     }
 
@@ -168,8 +170,14 @@ impl Document {
     /// Returns [`CrdtError::Automerge`] when bytes are malformed or fail
     /// document verification.
     pub fn load(bytes: &[u8]) -> Result<Self, CrdtError> {
+        if !is_nonempty_bounded(bytes.len(), MAX_SNAPSHOT_BYTES) {
+            return Err(CrdtError::InvalidSnapshotSize(bytes.len()));
+        }
         Ok(Self {
-            inner: AutoCommit::load(bytes)?,
+            inner: AutoCommit::load_with_options(
+                bytes,
+                LoadOptions::new().text_encoding(TextEncoding::UnicodeCodePoint),
+            )?,
         })
     }
 
@@ -179,7 +187,11 @@ impl Document {
     ///
     /// Returns [`CrdtError::Automerge`] if internal document verification fails.
     pub fn save(&mut self) -> Result<Vec<u8>, CrdtError> {
-        Ok(self.inner.save_and_verify()?)
+        let snapshot = self.inner.save_and_verify()?;
+        if !is_nonempty_bounded(snapshot.len(), MAX_SNAPSHOT_BYTES) {
+            return Err(CrdtError::InvalidSnapshotSize(snapshot.len()));
+        }
+        Ok(snapshot)
     }
 
     /// Returns the current causal frontier.
@@ -265,16 +277,10 @@ impl Document {
     /// invalid for the current document.
     pub fn get(&mut self, object: &Object, property: &str) -> Result<Option<Item>, CrdtError> {
         validate_property(property)?;
-        self.inner
+        Ok(self
+            .inner
             .get(&object.0, property)?
-            .map(|(value, object)| match value {
-                Value::Object(kind) => Ok(Item::Object {
-                    kind: kind.into(),
-                    handle: Object(object),
-                }),
-                Value::Scalar(value) => Ok(Item::Scalar(value.into_owned().into())),
-            })
-            .transpose()
+            .map(|(value, object)| item_from(value, object)))
     }
 }
 
@@ -298,6 +304,15 @@ pub enum Item {
     },
 }
 
+/// One causally distinct value retained for a conflicting property or index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConflictValue {
+    /// Scalar or nested object authored by one causal operation.
+    pub value: Item,
+    /// Stable opaque Automerge operation identity for UI reconciliation.
+    pub causal_id: Vec<u8>,
+}
+
 /// Read-only document view used by application projections.
 ///
 /// ```compile_fail
@@ -318,16 +333,95 @@ impl Reader<'_> {
     /// Returns a property, object, or Automerge access failure.
     pub fn get(&mut self, object: &Object, property: &str) -> Result<Option<Item>, CrdtError> {
         validate_property(property)?;
-        self.document
+        Ok(self
+            .document
             .get(&object.0, property)?
-            .map(|(value, object)| match value {
-                Value::Object(kind) => Ok(Item::Object {
-                    kind: kind.into(),
-                    handle: Object(object),
-                }),
-                Value::Scalar(value) => Ok(Item::Scalar(value.into_owned().into())),
+            .map(|(value, object)| item_from(value, object)))
+    }
+
+    /// Reads one visible list or text-sequence value by index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an object, index, or Automerge access failure.
+    pub fn get_index(&mut self, object: &Object, index: usize) -> Result<Option<Item>, CrdtError> {
+        Ok(self
+            .document
+            .get(&object.0, index)?
+            .map(|(value, object)| item_from(value, object)))
+    }
+
+    /// Returns every causally concurrent value for a map property.
+    ///
+    /// A non-conflicting property returns zero or one value. Callers that show
+    /// user-visible state can surface or reconcile multiple values explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a property, object, or Automerge access failure.
+    pub fn conflicts(
+        &mut self,
+        object: &Object,
+        property: &str,
+    ) -> Result<Vec<ConflictValue>, CrdtError> {
+        validate_property(property)?;
+        Ok(self
+            .document
+            .get_all(&object.0, property)?
+            .into_iter()
+            .map(|(value, operation)| ConflictValue {
+                value: item_from(value, operation.clone()),
+                causal_id: operation.to_bytes(),
             })
-            .transpose()
+            .collect())
+    }
+
+    /// Returns every causally concurrent value at one list or text index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an object, index, or Automerge access failure.
+    pub fn conflicts_at(
+        &mut self,
+        object: &Object,
+        index: usize,
+    ) -> Result<Vec<ConflictValue>, CrdtError> {
+        Ok(self
+            .document
+            .get_all(&object.0, index)?
+            .into_iter()
+            .map(|(value, operation)| ConflictValue {
+                value: item_from(value, operation.clone()),
+                causal_id: operation.to_bytes(),
+            })
+            .collect())
+    }
+
+    /// Lists the visible keys of a map or visible element identifiers of a sequence.
+    #[must_use]
+    pub fn keys(&mut self, object: &Object) -> Vec<String> {
+        self.document.keys(&object.0).collect()
+    }
+
+    /// Returns the visible length of a map, list, or text object.
+    #[must_use]
+    pub fn len(&mut self, object: &Object) -> usize {
+        self.document.length(&object.0)
+    }
+
+    /// Returns whether a map, list, or text object has no visible entries.
+    #[must_use]
+    pub fn is_empty(&mut self, object: &Object) -> bool {
+        self.len(object) == 0
+    }
+
+    /// Materializes a collaborative text object as UTF-8.
+    ///
+    /// # Errors
+    ///
+    /// Returns an object-kind or Automerge access failure.
+    pub fn text(&mut self, object: &Object) -> Result<String, CrdtError> {
+        Ok(self.document.text(&object.0)?)
     }
 }
 
@@ -391,6 +485,103 @@ impl Editor<'_> {
             .insert(&list.0, index, ScalarValue::from(value))?;
         Ok(())
     }
+
+    /// Replaces a visible scalar at one list index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a numeric portability, index, object, or Automerge failure.
+    pub fn put_index(
+        &mut self,
+        list: &Object,
+        index: usize,
+        value: Scalar,
+    ) -> Result<(), CrdtError> {
+        validate_scalar(&value)?;
+        self.document
+            .put(&list.0, index, ScalarValue::from(value))?;
+        Ok(())
+    }
+
+    /// Inserts a nested map, list, or text object into a list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index, object, or Automerge failure.
+    pub fn insert_object(
+        &mut self,
+        list: &Object,
+        index: usize,
+        kind: ObjectKind,
+    ) -> Result<Object, CrdtError> {
+        Ok(Object(self.document.insert_object(
+            &list.0,
+            index,
+            ObjType::from(kind),
+        )?))
+    }
+
+    /// Deletes one visible list or text-sequence value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index, object, or Automerge failure.
+    pub fn delete_index(&mut self, object: &Object, index: usize) -> Result<(), CrdtError> {
+        self.document.delete(&object.0, index)?;
+        Ok(())
+    }
+
+    /// Adds a signed delta to a map counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a property, type, object, or Automerge failure.
+    pub fn increment(
+        &mut self,
+        object: &Object,
+        property: &str,
+        delta: i64,
+    ) -> Result<(), CrdtError> {
+        validate_property(property)?;
+        self.document.increment(&object.0, property, delta)?;
+        Ok(())
+    }
+
+    /// Adds a signed delta to a list counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index, type, object, or Automerge failure.
+    pub fn increment_index(
+        &mut self,
+        list: &Object,
+        index: usize,
+        delta: i64,
+    ) -> Result<(), CrdtError> {
+        self.document.increment(&list.0, index, delta)?;
+        Ok(())
+    }
+
+    /// Replaces a bounded range of collaborative text using Unicode code-point offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns a text-size, range, object, or Automerge failure.
+    pub fn splice_text(
+        &mut self,
+        text: &Object,
+        position: usize,
+        delete: usize,
+        replacement: &str,
+    ) -> Result<(), CrdtError> {
+        if replacement.len() > MAX_CHANGE_BYTES {
+            return Err(CrdtError::ScalarTooLarge(replacement.len()));
+        }
+        let delete = isize::try_from(delete).map_err(|_| CrdtError::InvalidSequenceRange)?;
+        self.document
+            .splice_text(&text.0, position, delete, replacement)?;
+        Ok(())
+    }
 }
 
 /// Stable failures from the CRDT adapter.
@@ -408,6 +599,9 @@ pub enum CrdtError {
     /// One immutable change was empty or exceeded the envelope limit.
     #[error("CRDT change byte length {0} is outside protocol bounds")]
     InvalidChangeSize(usize),
+    /// A complete snapshot was empty or exceeded its materialization ceiling.
+    #[error("CRDT snapshot byte length {0} is outside local bounds")]
+    InvalidSnapshotSize(usize),
     /// A change batch exceeded its count or aggregate byte ceiling.
     #[error("CRDT change page exceeds bounded protocol limits")]
     ChangePageTooLarge,
@@ -423,6 +617,19 @@ pub enum CrdtError {
     /// Unknown forward-compatible scalar encodings are read-only.
     #[error("unknown scalar encodings cannot be authored by this client")]
     UnknownScalarWrite,
+    /// A sequence deletion could not be represented by the Automerge API.
+    #[error("sequence deletion range exceeds the supported index domain")]
+    InvalidSequenceRange,
+}
+
+fn item_from(value: Value<'_>, object: ObjId) -> Item {
+    match value {
+        Value::Object(kind) => Item::Object {
+            kind: kind.into(),
+            handle: Object(object),
+        },
+        Value::Scalar(value) => Item::Scalar(value.into_owned().into()),
+    }
 }
 
 fn validate_property(property: &str) -> Result<(), CrdtError> {
@@ -536,6 +743,41 @@ mod tests {
         let once = target.save().unwrap();
         target.apply(&changes).unwrap();
         assert_eq!(target.save().unwrap(), once);
+    }
+
+    #[test]
+    fn concurrent_same_property_values_remain_explicitly_inspectable() {
+        let mut origin = Document::new();
+        origin
+            .edit(|editor| editor.put(&Object::root(), "status", Scalar::String("base".into())))
+            .unwrap();
+        let snapshot = origin.save().unwrap();
+        let mut first = Document::load(&snapshot).unwrap();
+        let mut second = Document::load(&snapshot).unwrap();
+        let first_change = first
+            .edit(|editor| editor.put(&Object::root(), "status", Scalar::String("first".into())))
+            .unwrap()
+            .1;
+        let second_change = second
+            .edit(|editor| editor.put(&Object::root(), "status", Scalar::String("second".into())))
+            .unwrap()
+            .1;
+        first.apply(&second_change).unwrap();
+        second.apply(&first_change).unwrap();
+        let mut values = first.reader().conflicts(&Object::root(), "status").unwrap();
+        values.sort_by(|left, right| left.causal_id.cmp(&right.causal_id));
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().all(|value| !value.causal_id.is_empty()));
+        assert!(
+            values
+                .iter()
+                .any(|value| { value.value == Item::Scalar(Scalar::String("first".into())) })
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| { value.value == Item::Scalar(Scalar::String("second".into())) })
+        );
     }
 
     #[test]
@@ -654,6 +896,49 @@ mod tests {
     }
 
     #[test]
+    fn lists_text_counters_and_discovery_are_available_through_stable_api() {
+        let mut document = Document::new();
+        let ((), changes) = document
+            .edit(|editor| {
+                let list = editor.put_object(&Object::root(), "items", ObjectKind::List)?;
+                editor.insert(&list, 0, Scalar::String("old".into()))?;
+                editor.put_index(&list, 0, Scalar::String("new".into()))?;
+                editor.insert_object(&list, 1, ObjectKind::Map)?;
+                editor.delete_index(&list, 1)?;
+                editor.put(&Object::root(), "count", Scalar::Counter(1))?;
+                editor.increment(&Object::root(), "count", 2)?;
+                let text = editor.put_object(&Object::root(), "body", ObjectKind::Text)?;
+                editor.splice_text(&text, 0, 0, "héllo")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        let Some(Item::Object { handle: list, .. }) =
+            document.get(&Object::root(), "items").unwrap()
+        else {
+            panic!("list expected")
+        };
+        let Some(Item::Object { handle: text, .. }) =
+            document.get(&Object::root(), "body").unwrap()
+        else {
+            panic!("text expected")
+        };
+        let mut reader = document.reader();
+        assert!(reader.keys(&Object::root()).contains(&"items".to_owned()));
+        assert_eq!(reader.len(&list), 1);
+        assert!(!reader.is_empty(&list));
+        assert_eq!(
+            reader.get_index(&list, 0).unwrap(),
+            Some(Item::Scalar(Scalar::String("new".into())))
+        );
+        assert_eq!(reader.text(&text).unwrap(), "héllo");
+        assert_eq!(
+            reader.get(&Object::root(), "count").unwrap(),
+            Some(Item::Scalar(Scalar::Counter(3)))
+        );
+    }
+
+    #[test]
     fn property_and_scalar_portability_rules_accept_edges_and_reject_violations() {
         assert!(!is_nonempty_bounded(0, MAX_CHANGE_BYTES));
         assert!(is_nonempty_bounded(MAX_CHANGE_BYTES, MAX_CHANGE_BYTES));
@@ -703,6 +988,18 @@ mod tests {
                 bytes: vec![]
             }),
             Err(CrdtError::UnknownScalarWrite)
+        ));
+    }
+
+    #[test]
+    fn snapshot_decoder_rejects_empty_and_oversized_input_before_autoconstruction() {
+        assert!(matches!(
+            Document::load(&[]),
+            Err(CrdtError::InvalidSnapshotSize(0))
+        ));
+        assert!(matches!(
+            Document::load(&vec![0; MAX_SNAPSHOT_BYTES + 1]),
+            Err(CrdtError::InvalidSnapshotSize(size)) if size == MAX_SNAPSHOT_BYTES + 1
         ));
     }
 

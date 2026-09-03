@@ -27,12 +27,13 @@ struct BearerAuthenticator {
 }
 
 impl BearerAuthenticator {
-    fn new(key: [u8; 32], token: &[u8], scope: Scope) -> Self {
-        Self {
+    fn new(key: [u8; 32], token: &[u8], scope: Scope) -> Result<Self, io::Error> {
+        validate_bearer_token(token)?;
+        Ok(Self {
             key,
             expected_tag: bearer_tag(key, token),
             scope,
-        }
+        })
     }
 }
 
@@ -104,6 +105,54 @@ fn parse_key(value: &str) -> Result<[u8; 32], io::Error> {
     Ok(key)
 }
 
+fn validate_bearer_token(token: &[u8]) -> Result<(), io::Error> {
+    let mut padding = false;
+    let valid = (32..=4_096).contains(&token.len())
+        && token.iter().all(|byte| {
+            if *byte == b'=' {
+                padding = true;
+                true
+            } else {
+                !padding
+                    && (byte.is_ascii_alphanumeric()
+                        || matches!(*byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/'))
+            }
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bearer token must be 32..=4096 RFC 6750 b64token bytes",
+        ))
+    }
+}
+
+fn parse_non_nil_uuid(value: &str, name: &'static str) -> Result<Uuid, io::Error> {
+    let value =
+        Uuid::parse_str(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, name))?;
+    if value.is_nil() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, name));
+    }
+    Ok(value)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = std::env::var("LOGICAL_DB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
@@ -119,8 +168,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bearer = required("LOGICAL_DB_BEARER_TOKEN")?;
     let key = parse_key(&required("LOGICAL_DB_CHECKPOINT_KEY_HEX")?)?;
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&required("LOGICAL_DB_ACCOUNT_ID")?)?),
-        SpaceId::from_uuid(Uuid::parse_str(&required("LOGICAL_DB_SPACE_ID")?)?),
+        AccountId::from_uuid(parse_non_nil_uuid(
+            &required("LOGICAL_DB_ACCOUNT_ID")?,
+            "LOGICAL_DB_ACCOUNT_ID must be a non-nil UUID",
+        )?),
+        SpaceId::from_uuid(parse_non_nil_uuid(
+            &required("LOGICAL_DB_SPACE_ID")?,
+            "LOGICAL_DB_SPACE_ID must be a non-nil UUID",
+        )?),
     );
 
     // SAFETY: FoundationDB requires exactly one network bootstrap per process.
@@ -148,14 +203,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .to_vec(),
     );
     let store = FdbServiceStore::new(database, root)?;
-    let authentication = BearerAuthenticator::new(key, bearer.as_bytes(), scope);
+    let authentication = BearerAuthenticator::new(key, bearer.as_bytes(), scope)?;
     let checkpoints = CheckpointCodec::new(key, 86_400_000)?;
     let application = router(store, authentication, checkpoints, SystemClock);
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, application)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     drop(network);
     Ok(())
@@ -192,19 +245,24 @@ mod tests {
     #[test]
     fn bearer_authentication_is_exact_and_constant_time_verified() {
         let expected_scope = scope(11);
-        let authentication = BearerAuthenticator::new(KEY, b"correct", expected_scope);
+        let authentication =
+            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0001", expected_scope)
+                .unwrap();
         let policy = authentication
-            .authenticate(&HeaderValue::from_static("Bearer correct"), 1_000)
+            .authenticate(
+                &HeaderValue::from_static("Bearer correct-correct-correct-correct-0001"),
+                1_000,
+            )
             .unwrap();
         assert!(
             policy
                 .authorize(expected_scope, Effect::Write, request(1), 0, 60_999)
-                .is_some()
+                .is_none()
         );
         assert!(
             policy
                 .authorize(expected_scope, Effect::Sync, request(2), 0, 60_999)
-                .is_some()
+                .is_none()
         );
         assert!(
             policy
@@ -214,7 +272,7 @@ mod tests {
         assert!(
             policy
                 .authorize(expected_scope, Effect::Read, request(4), 0, 60_999)
-                .is_none()
+                .is_some()
         );
         assert!(
             policy
@@ -228,18 +286,38 @@ mod tests {
         );
         assert!(
             authentication
-                .authenticate(&HeaderValue::from_static("Basic correct"), 1_000)
+                .authenticate(
+                    &HeaderValue::from_static("Basic correct-correct-correct-correct-0001"),
+                    1_000,
+                )
                 .is_err()
         );
     }
 
     #[test]
     fn policy_expiry_cannot_overflow() {
-        let authentication = BearerAuthenticator::new(KEY, b"correct", scope(30));
+        let authentication =
+            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0001", scope(30))
+                .unwrap();
         assert!(
             authentication
-                .authenticate(&HeaderValue::from_static("Bearer correct"), u64::MAX)
+                .authenticate(
+                    &HeaderValue::from_static("Bearer correct-correct-correct-correct-0001"),
+                    u64::MAX,
+                )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn daemon_configuration_rejects_weak_tokens_and_nil_scope_axes() {
+        for invalid in [b"short".as_slice(), b"contains a space________________"] {
+            assert!(validate_bearer_token(invalid).is_err());
+        }
+        assert!(validate_bearer_token(b"valid-valid-valid-valid-valid-token").is_ok());
+        assert!(validate_bearer_token(b"valid-valid-valid-valid-valid=====").is_ok());
+        assert!(validate_bearer_token(b"valid-valid-valid=====invalid____").is_err());
+        assert!(parse_non_nil_uuid(&Uuid::nil().to_string(), "nil").is_err());
+        assert!(parse_non_nil_uuid(&Uuid::now_v7().to_string(), "valid").is_ok());
     }
 }

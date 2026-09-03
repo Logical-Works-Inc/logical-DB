@@ -13,9 +13,9 @@
   "observations": ["PASS facade-http-braid-fdb pushed=1 pulled=1 retry=0", "the daemon exited 0 after Ctrl-C", "the consumer source imported no logical-db internal crate"],
   "external_state_diff": ["one FDB log record and its exact operation/chunk state were created below the Directory Layer root", "the second redb replica gained one merged document", "both temporary redb files were deleted after verification"],
   "invariant": "the facade alone composes embedded durability, protocol transport, authenticated standalone service, FDB persistence, and causal materialization",
-  "verdict": "proven-within-bounds",
-  "failure_classes": [],
-  "follow_up_experiments": ["land an equivalent content-addressed episode tape in LEM after reviewed Logical-DB publication", "repeat against a public TLS terminator"],
+  "verdict": "retired-invalid-confirmation-model",
+  "failure_classes": ["the daemon locally fabricated Braid HumanConfirm instead of consuming independent runtime evidence"],
+  "follow_up_experiments": ["repeat only after exact-request runtime confirmation is externally verified", "land an equivalent content-addressed episode tape in LEM after reviewed Logical-DB publication"],
   "evidence": ["crates/logical-db-e2e/src/bin/facade_fdb_journey.rs", "output PASS facade-http-braid-fdb pushed=1 pulled=1 retry=0", "crates/logical-db-daemon/src/main.rs"],
-  "limitations": ["not yet the final LEM adapter", "single-node FDB cluster"]
+  "limitations": ["historical result is not current acceptance evidence", "not yet the final LEM adapter", "single-node FDB cluster"]
 }

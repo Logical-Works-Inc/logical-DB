@@ -57,18 +57,24 @@ pub trait ReplicaPort {
     fn scope(&self) -> Scope;
     /// Durable installation identity.
     fn replica(&self) -> ReplicaId;
+    /// Durably binds the globally acknowledged outbox to one upstream service.
+    ///
+    /// # Errors
+    ///
+    /// Returns a topology error if this replica is already bound elsewhere.
+    fn bind_upstream(&self, peer: PeerId) -> Result<(), Self::Error>;
     /// Bounded unacknowledged local changes.
     ///
     /// # Errors
     ///
     /// Returns the replica's durable read or validation failure.
     fn pending(&self, limit: usize) -> Result<Vec<OutboundChange>, Self::Error>;
-    /// Atomically advances the durable upload acknowledgement.
+    /// Atomically advances the durable upload acknowledgement for `peer`.
     ///
     /// # Errors
     ///
     /// Returns the replica's durable commit or validation failure.
-    fn acknowledge(&self, through: u64) -> Result<(), Self::Error>;
+    fn acknowledge(&self, peer: PeerId, through: u64) -> Result<(), Self::Error>;
     /// Last atomically installed opaque peer checkpoint.
     ///
     /// # Errors
@@ -171,7 +177,7 @@ pub struct SyncReport {
     pub pages: usize,
     /// Whether an expired checkpoint forced a full pull.
     pub full_resync: bool,
-    /// Whether more remote pages remain after the host budget was consumed.
+    /// Whether unsent local changes or remote pages remain after this bounded cycle.
     pub more: bool,
 }
 
@@ -185,7 +191,12 @@ pub enum SyncError<ReplicaError, TransportError> {
     /// Wire version, bounds, scope, or correlation was invalid.
     Protocol(ProtocolError),
     /// Service explicitly rejected one uploaded operation.
-    Rejected(OperationId),
+    Rejected {
+        /// Operation rejected by the service.
+        operation: OperationId,
+        /// Stable reason needed for policy-aware recovery.
+        code: logical_db_protocol::RejectionCode,
+    },
     /// Host requested cancellation between atomic operations.
     Cancelled,
 }
@@ -198,8 +209,11 @@ impl<R: fmt::Display, T: fmt::Display> fmt::Display for SyncError<R, T> {
                 write!(formatter, "transport synchronization failed: {error}")
             }
             Self::Protocol(error) => write!(formatter, "protocol synchronization failed: {error}"),
-            Self::Rejected(operation) => {
-                write!(formatter, "service rejected operation {operation}")
+            Self::Rejected { operation, code } => {
+                write!(
+                    formatter,
+                    "service rejected operation {operation}: {code:?}"
+                )
             }
             Self::Cancelled => formatter.write_str("synchronization was cancelled"),
         }
@@ -232,8 +246,10 @@ where
     if cancelled() {
         return Err(SyncError::Cancelled);
     }
-    let pushed = push_pending(
+    replica.bind_upstream(peer).map_err(SyncError::Replica)?;
+    let (pushed, upload_more) = push_pending(
         replica,
+        peer,
         transport,
         limits.changes_per_page,
         limits.bytes_per_page,
@@ -252,7 +268,8 @@ where
         .map(Checkpoint::from_wire)
         .transpose()
         .map_err(SyncError::Protocol)?;
-    for _ in 0..limits.pages_per_cycle {
+    let mut restarted_after_expiry = false;
+    while report.pages < usize::from(limits.pages_per_cycle) {
         let request = PullRequest {
             protocol: PROTOCOL_VERSION,
             scope: replica.scope(),
@@ -274,9 +291,10 @@ where
             .map_err(SyncError::Transport)?
         {
             PullResult::Page(page) => page,
-            PullResult::CheckpointExpired if after.is_some() => {
+            PullResult::CheckpointExpired if after.is_some() && !restarted_after_expiry => {
                 after = None;
                 report.full_resync = true;
+                restarted_after_expiry = true;
                 continue;
             }
             PullResult::CheckpointExpired => {
@@ -299,9 +317,10 @@ where
             .map_err(SyncError::Replica)?;
         report.pulled += inbound.len();
         report.pages += 1;
-        report.more = page.more;
+        let download_more = page.more;
+        report.more = upload_more || download_more;
         after = Some(page.checkpoint);
-        if !report.more {
+        if !download_more {
             return Ok(report);
         }
         if cancelled() {
@@ -313,10 +332,11 @@ where
 
 async fn push_pending<R, T>(
     replica: &R,
+    peer: PeerId,
     transport: &mut T,
     page_limit: u16,
     byte_limit: u32,
-) -> Result<usize, SyncError<R::Error, T::Error>>
+) -> Result<(usize, bool), SyncError<R::Error, T::Error>>
 where
     R: ReplicaPort,
     T: Transport,
@@ -325,7 +345,7 @@ where
         .pending(usize::from(page_limit))
         .map_err(SyncError::Replica)?;
     if available.is_empty() {
-        return Ok(0);
+        return Ok((0, false));
     }
     let mut aggregate_bytes = 0usize;
     let mut pending = Vec::with_capacity(available.len());
@@ -365,13 +385,19 @@ where
         .map_err(SyncError::Transport)?;
     response.validate(&request).map_err(SyncError::Protocol)?;
     for outcome in &response.outcomes {
-        if let PushOutcome::Rejected { operation, .. } = outcome {
-            return Err(SyncError::Rejected(*operation));
+        if let PushOutcome::Rejected { operation, code } = outcome {
+            return Err(SyncError::Rejected {
+                operation: *operation,
+                code: *code,
+            });
         }
     }
     let through = pending.last().map_or(0, |change| change.sequence);
-    replica.acknowledge(through).map_err(SyncError::Replica)?;
-    Ok(pending.len())
+    replica
+        .acknowledge(peer, through)
+        .map_err(SyncError::Replica)?;
+    let more = !replica.pending(1).map_err(SyncError::Replica)?.is_empty();
+    Ok((pending.len(), more))
 }
 
 fn pull_request_digest(
@@ -423,10 +449,19 @@ mod tests {
         fn replica(&self) -> ReplicaId {
             self.installation
         }
-        fn pending(&self, limit: usize) -> Result<Vec<OutboundChange>, Self::Error> {
-            Ok(self.pending.iter().take(limit).cloned().collect())
+        fn bind_upstream(&self, _peer: PeerId) -> Result<(), Self::Error> {
+            Ok(())
         }
-        fn acknowledge(&self, through: u64) -> Result<(), Self::Error> {
+        fn pending(&self, limit: usize) -> Result<Vec<OutboundChange>, Self::Error> {
+            Ok(self
+                .pending
+                .iter()
+                .filter(|change| change.sequence > self.acknowledged.get())
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        fn acknowledge(&self, _peer: PeerId, through: u64) -> Result<(), Self::Error> {
             self.acknowledged.set(through);
             Ok(())
         }
@@ -502,7 +537,10 @@ mod tests {
             &replica,
             PeerId::new(),
             &mut wire,
-            SyncLimits::default(),
+            SyncLimits {
+                pages_per_cycle: 1,
+                ..SyncLimits::default()
+            },
             || false,
         ))
         .unwrap();
@@ -550,7 +588,7 @@ mod tests {
             pulls: std::collections::VecDeque::default(),
         };
         assert!(
-            matches!(futures::executor::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected(value)) if value == operation)
+            matches!(futures::executor::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation)
         );
         assert_eq!(replica.acknowledged.get(), 0);
     }
@@ -586,9 +624,62 @@ mod tests {
             pulls: std::collections::VecDeque::new(),
         };
         assert_eq!(
-            futures::executor::block_on(push_pending(&replica, &mut wire, 2, 1)).unwrap(),
-            1
+            futures::executor::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))
+                .unwrap(),
+            (1, true)
         );
+        assert_eq!(replica.acknowledged.get(), 1);
+    }
+
+    #[test]
+    fn report_keeps_unsent_upload_backlog_visible() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let first = OperationId::new();
+        let replica = Replica {
+            scope,
+            installation: ReplicaId::new(),
+            pending: [first, OperationId::new()]
+                .into_iter()
+                .enumerate()
+                .map(|(offset, operation)| OutboundChange {
+                    sequence: u64::try_from(offset + 1).unwrap(),
+                    document: DocumentId::new(),
+                    operation,
+                    request: OperationDigest::new([u8::try_from(offset + 1).unwrap(); 32]),
+                    digest: ChangeDigest::new([u8::try_from(offset + 1).unwrap(); 32]),
+                    bytes: vec![1],
+                })
+                .collect(),
+            checkpoint: std::cell::RefCell::new(None),
+            acknowledged: std::cell::Cell::new(0),
+            installed: std::cell::RefCell::new(Vec::new()),
+        };
+        let mut wire = Wire {
+            push: Some(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: vec![PushOutcome::Accepted { operation: first }],
+            }),
+            pulls: [PullResult::Page(PullPage {
+                protocol: PROTOCOL_VERSION,
+                changes: Vec::new(),
+                checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+                more: false,
+            })]
+            .into(),
+        };
+        let report = futures::executor::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits {
+                changes_per_page: 1,
+                ..SyncLimits::default()
+            },
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(report.pushed, 1);
+        assert!(report.more);
         assert_eq!(replica.acknowledged.get(), 1);
     }
 
@@ -701,6 +792,45 @@ mod tests {
     }
 
     #[test]
+    fn exact_pull_page_budget_never_fetches_one_page_too_many() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        let change = ChangeEnvelope {
+            scope,
+            document: DocumentId::new(),
+            replica: ReplicaId::new(),
+            operation: OperationId::new(),
+            request: OperationDigest::new([7; 32]),
+            digest: ChangeDigest::new([8; 32]),
+            bytes: vec![1],
+        };
+        let mut wire = Wire {
+            push: None,
+            pulls: [PullResult::Page(PullPage {
+                protocol: PROTOCOL_VERSION,
+                changes: vec![change],
+                checkpoint: Checkpoint::from_wire(vec![2]).unwrap(),
+                more: true,
+            })]
+            .into(),
+        };
+        let report = futures::executor::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits {
+                pages_per_cycle: 1,
+                ..SyncLimits::default()
+            },
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(report.pages, 1);
+        assert!(report.more);
+        assert!(wire.pulls.is_empty());
+    }
+
+    #[test]
     fn sync_error_display_keeps_each_recovery_category_visible() {
         let operation = OperationId::new();
         assert_eq!(
@@ -717,9 +847,12 @@ mod tests {
                 .contains("protocol synchronization failed")
         );
         assert!(
-            SyncError::<&str, &str>::Rejected(operation)
-                .to_string()
-                .contains(&operation.to_string())
+            SyncError::<&str, &str>::Rejected {
+                operation,
+                code: RejectionCode::Forbidden,
+            }
+            .to_string()
+            .contains(&operation.to_string())
         );
         assert_eq!(
             SyncError::<&str, &str>::Cancelled.to_string(),

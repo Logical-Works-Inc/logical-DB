@@ -1,6 +1,6 @@
 # Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
-# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
-# S42 S43. Source URLs are in evidence/SOURCES.md.
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S42 S43. Source URLs
+# are in evidence/SOURCES.md.
 
 name: logical-db-v3
 
@@ -59,6 +59,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: cargo fmt --all -- --check
 
+  supply-chain:
+    name: advisory, license, and source policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: install pinned policy checker
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: enforce dependency policy
+        run: cargo deny check
+
   fdb-composition:
     name: official FDB client / daemon feature
     runs-on: ubuntu-latest
@@ -92,7 +103,7 @@ jobs:
           cargo clippy -p logical-db-daemon --features fdb --all-targets --locked -- -D warnings
           cargo test -p logical-db-store-fdb --features fdb --locked
           cargo test -p logical-db-daemon --features fdb --locked
-      - name: run retained facade HTTP Braid FDB journey
+      - name: run retained FDB ambiguity journey
         shell: bash
         run: |
           set -euo pipefail
@@ -106,11 +117,8 @@ jobs:
             -d "${live_root}/data" -L "${live_root}/logs" \
             --memory 1GiB --cache-memory 256MiB --storage-memory 256MiB &
           fdb_pid=$!
-          daemon_pid=""
           cleanup() {
-            if [[ -n "${daemon_pid}" ]]; then kill -INT "${daemon_pid}" 2>/dev/null || true; fi
             kill "${fdb_pid}" 2>/dev/null || true
-            wait "${daemon_pid}" 2>/dev/null || true
             wait "${fdb_pid}" 2>/dev/null || true
           }
           trap cleanup EXIT
@@ -124,17 +132,3 @@ jobs:
           export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
           cargo run -p logical-db-daemon --bin fdb-ambiguity-journey \
             --features fdb --locked
-          cargo build -p logical-db-daemon --features fdb --locked
-          export LOGICAL_DB_BIND="127.0.0.1:18080"
-          export LOGICAL_DB_BEARER_TOKEN="ci-facade-bearer"
-          export LOGICAL_DB_CHECKPOINT_KEY_HEX="5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
-          export LOGICAL_DB_ACCOUNT_ID="018f1000-0000-7000-8000-000000000001"
-          export LOGICAL_DB_SPACE_ID="018f1000-0000-7000-8000-000000000002"
-          target/debug/logical-db-daemon &
-          daemon_pid=$!
-          for _attempt in {1..40}; do
-            if curl --silent --output /dev/null http://127.0.0.1:18080/; then break; fi
-            sleep 1
-          done
-          export LOGICAL_DB_JOURNEY_ENDPOINT="http://127.0.0.1:18080/"
-          cargo run -p logical-db-e2e --bin facade_fdb_journey --locked

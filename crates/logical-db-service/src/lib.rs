@@ -9,7 +9,7 @@
 use std::{future::Future, sync::Arc};
 
 use hmac::{Hmac, KeyInit, Mac};
-use logical_db_crdt::EncodedChange;
+use logical_db_crdt::{CrdtError, EncodedChange};
 use logical_db_model::{Effect, OperationDigest, Scope};
 use logical_db_protocol::{
     ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest,
@@ -89,10 +89,27 @@ pub enum PageResult {
     StaleAuthority,
 }
 
+/// Stable retry classification for failures crossing the service boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFailureClass {
+    /// Retrying the exact idempotent request after backoff may make progress.
+    Transient,
+    /// Retry cannot repair the failure and risks an unbounded request storm.
+    Permanent,
+}
+
 /// Service-side durable storage contract implemented by `FoundationDB`.
 pub trait ServiceStore: Send + Sync {
     /// Adapter-specific failure.
     type Error;
+
+    /// Classifies one adapter failure for transport retry semantics.
+    ///
+    /// The fail-closed default is permanent. Adapters must explicitly opt
+    /// individual failure categories into automatic retry.
+    fn classify_error(_error: &Self::Error) -> StoreFailureClass {
+        StoreFailureClass::Permanent
+    }
 
     /// Idempotently accepts one validated immutable change.
     ///
@@ -129,6 +146,10 @@ where
     Store: ServiceStore + ?Sized,
 {
     type Error = Store::Error;
+
+    fn classify_error(error: &Self::Error) -> StoreFailureClass {
+        Store::classify_error(error)
+    }
 
     fn accept(
         &self,
@@ -331,16 +352,19 @@ where
                 });
                 continue;
             };
-            if (EncodedChange {
+            let validation = (EncodedChange {
                 digest: change.digest,
                 bytes: change.bytes.clone(),
             })
-            .validate()
-            .is_err()
-            {
+            .validate();
+            if let Err(error) = validation {
                 outcomes.push(PushOutcome::Rejected {
                     operation,
-                    code: RejectionCode::DigestMismatch,
+                    code: if matches!(error, CrdtError::DigestMismatch) {
+                        RejectionCode::DigestMismatch
+                    } else {
+                        RejectionCode::InvalidChange
+                    },
                 });
                 continue;
             }
@@ -467,6 +491,7 @@ fn valid_stored_page(after: u64, frontier: u64, page: &StoredPage) -> bool {
         .is_some_and(|position| position == page.position)
         && page.position <= frontier
         && page.more == (page.position < frontier)
+        && (!page.more || !page.changes.is_empty())
 }
 
 /// Service boundary failures.
@@ -765,6 +790,44 @@ mod tests {
     }
 
     #[test]
+    fn push_distinguishes_malformed_change_from_digest_mismatch() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([5; 32], 100).unwrap(),
+        );
+        let mut malformed = change(scope, replica, OperationId::new());
+        malformed.bytes = vec![1];
+        let mut mismatched = change(scope, replica, OperationId::new());
+        mismatched.digest = ChangeDigest::new([0; 32]);
+        let response = futures::executor::block_on(service.push(
+            &PushRequest {
+                protocol: PROTOCOL_VERSION,
+                replica,
+                changes: vec![malformed, mismatched],
+            },
+            10,
+        ))
+        .unwrap();
+        assert!(matches!(
+            response.outcomes[0],
+            PushOutcome::Rejected {
+                code: RejectionCode::InvalidChange,
+                ..
+            }
+        ));
+        assert!(matches!(
+            response.outcomes[1],
+            PushOutcome::Rejected {
+                code: RejectionCode::DigestMismatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn pull_store_consumes_exact_grant_and_rejects_stale_frontier() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
@@ -823,27 +886,35 @@ mod tests {
 
     #[test]
     fn stored_page_shape_cannot_skip_or_lie_about_the_bound_frontier() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
         let page = StoredPage {
+            changes: vec![change(scope, replica, OperationId::new())],
+            position: 5,
+            more: true,
+        };
+        assert!(valid_stored_page(4, 6, &page));
+        let stalled = StoredPage {
             changes: Vec::new(),
             position: 4,
             more: true,
         };
-        assert!(valid_stored_page(4, 5, &page));
+        assert!(!valid_stored_page(4, 6, &stalled));
         let skipped = StoredPage {
-            position: 5,
+            position: 6,
             ..page.clone()
         };
-        assert!(!valid_stored_page(4, 5, &skipped));
+        assert!(!valid_stored_page(4, 6, &skipped));
         let false_end = StoredPage {
             more: false,
             ..page.clone()
         };
-        assert!(!valid_stored_page(4, 5, &false_end));
+        assert!(!valid_stored_page(4, 6, &false_end));
         let beyond = StoredPage {
             position: 6,
             more: false,
             ..page
         };
-        assert!(!valid_stored_page(4, 5, &beyond));
+        assert!(!valid_stored_page(4, 6, &beyond));
     }
 }

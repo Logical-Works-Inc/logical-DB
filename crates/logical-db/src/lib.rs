@@ -12,8 +12,8 @@ use std::{
     sync::Arc,
 };
 
+pub use logical_db_crdt::{ConflictValue, Editor, Item, Object, ObjectKind, Reader, Scalar};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
-pub use logical_db_crdt::{Editor, Item, Object, ObjectKind, Reader, Scalar};
 pub use logical_db_model::{
     AccountId, ChangeDigest, DocumentId, IndexEntry, IndexId, IndexValue, OperationDigest,
     OperationId, PeerId, ReplicaId, Scope, SpaceId,
@@ -534,9 +534,10 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Refuses acknowledgements beyond the local durable sequence.
-    pub fn acknowledge_uploaded(&self, through: u64) -> Result<(), DatabaseError> {
-        Ok(self.store.acknowledge_outbox(self.scope, through)?)
+    /// Refuses a mismatched upstream or acknowledgements beyond the local
+    /// durable sequence.
+    pub fn acknowledge_uploaded(&self, peer: PeerId, through: u64) -> Result<(), DatabaseError> {
+        Ok(self.store.acknowledge_outbox(self.scope, peer, through)?)
     }
 
     /// Runs one bounded push/pull cycle over an application-supplied transport.
@@ -567,6 +568,10 @@ impl ReplicaPort for Database {
         Database::replica(self)
     }
 
+    fn bind_upstream(&self, peer: PeerId) -> Result<(), Self::Error> {
+        Ok(self.store.bind_upstream(self.scope, peer)?)
+    }
+
     fn pending(&self, limit: usize) -> Result<Vec<OutboundChange>, Self::Error> {
         Database::pending_changes(self, 0, limit).map(|changes| {
             changes
@@ -583,8 +588,8 @@ impl ReplicaPort for Database {
         })
     }
 
-    fn acknowledge(&self, through: u64) -> Result<(), Self::Error> {
-        Database::acknowledge_uploaded(self, through)
+    fn acknowledge(&self, peer: PeerId, through: u64) -> Result<(), Self::Error> {
+        Database::acknowledge_uploaded(self, peer, through)
     }
 
     fn checkpoint(&self, peer: PeerId) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -978,6 +983,21 @@ mod tests {
             ReplicaPort::checkpoint(&database, peer).unwrap(),
             Some(vec![9])
         );
+        let second_peer = PeerId::new();
+        assert!(matches!(
+            futures::executor::block_on(database.synchronize(
+                second_peer,
+                &mut AcceptingTransport,
+                SyncLimits::default(),
+                || false,
+            )),
+            Err(SyncError::Replica(DatabaseError::Store(
+                StoreError::UpstreamMismatch {
+                    configured,
+                    requested,
+                }
+            ))) if configured == peer && requested == second_peer
+        ));
         drop(database);
         fs::remove_file(path).unwrap();
     }
@@ -1274,7 +1294,7 @@ mod tests {
                     Some(Some(Item::Scalar(Scalar::Integer(2))))
                 );
             }
-            first.acknowledge_uploaded(1).unwrap();
+            first.acknowledge_uploaded(peer, 1).unwrap();
             assert!(first.pending_changes(0, 10).unwrap().is_empty());
         }
         let first = Database::open(&first_path, scope, first_replica).unwrap();

@@ -11,8 +11,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-logical-db-model = { path = "../logical-db-model" }
-logical-db-protocol = { path = "../logical-db-protocol" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 sha2.workspace = true
 
 [dev-dependencies]

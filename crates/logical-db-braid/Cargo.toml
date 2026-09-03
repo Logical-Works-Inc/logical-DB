@@ -11,20 +11,20 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-braid-capability = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-braid-flow-ir = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-braid-flow-plan = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-braid-ir = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-braid-run = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-braid-sdk = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-braid-verify = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
-logical-db-model = { path = "../logical-db-model" }
-logical-db-service = { path = "../logical-db-service" }
+braid-capability = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-flow-ir = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-flow-plan = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-ir = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-run = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-sdk = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-verify = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-braid-vocab-cms = { git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
+braid-vocab-cms = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
 
 [lints]
 workspace = true

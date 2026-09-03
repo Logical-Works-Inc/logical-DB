@@ -33,6 +33,10 @@ Database::synchronize(peer, transport, limits, cancelled)
 `edit_fn` receives only the typed CRDT `Editor`; `read_fn` and projection
 functions receive only `Reader`. Storage handles, tuple keys, transaction
 objects, raw CRDT objects, and network clients cannot cross this boundary.
+`Reader::conflicts` and `conflicts_at` return every causal candidate plus an
+opaque stable causal ID, while `get` and `get_index` return the visible winner.
+Lists, nested objects, Unicode-code-point text splice/read, counters, key
+discovery, and sequence length are available without importing Automerge.
 
 With feature `http`, an app additionally receives:
 
@@ -66,7 +70,8 @@ Windows/macOS/Linux app-embedding shape.
 
 ```text
 Database::synchronize
- `-- HttpTransport
+ `-- bind scope to one durable upstream (v1 global upload cursor)
+      `-- HttpTransport
       `-- POST versioned bounded CBOR
            `-- server request admission (body + concurrency + deadline)
                 `-- Authenticator
@@ -79,8 +84,10 @@ Database::synchronize
                           `-- FoundationDB transaction
 ```
 
-The deployable daemon is one composition of those ports. Logic OS can nest the
-same router under its own TLS, identity, lifecycle, and observability boundary;
+The daemon is one composition shell for those ports, but its local authority
+currently refuses write and egress effects: bearer authentication is not
+independent confirmation. Logic OS can nest the same router under its own TLS,
+identity, lifecycle, observability, and externally prepared Braid authority;
 it does not get a second database implementation and does not own local CRUD.
 
 ## Private tuple axes
@@ -112,13 +119,21 @@ application state above those backend-private encodings.
 - The embedded facade owns CRDT, schema, projection, local durability, and
   materialization-budget errors.
 - The transport owns TLS, credentials, representation, status, body, and
-  checkpoint-expiry errors.
+  checkpoint-expiry errors; retryable statuses preserve only numeric
+  `Retry-After` delays no greater than one hour.
 - The service owns protocol correlation, authorization, and cross-scope checks.
 - The FDB adapter owns unknown commit, cancellation, version skew, retry
-  exhaustion, native failure, binding failure, and durable corruption.
+  exhaustion, native failure, binding failure, and durable corruption. Only its
+  explicit transient categories cross HTTP as retryable 503; permanent and
+  corrupt/configuration failures are 500 without retry advice.
 - The host owns account authentication, TLS termination, FDB boot/configuration,
   listener lifecycle, secret rotation, metrics, and rollout.
 
 That separation is the standalone/embedded invariant: deployment may replace
 ports, but it cannot fork the data semantics or leak physical backend APIs into
 applications.
+
+The v1 boundary does not promise multi-upstream fan-out, server history
+retention, snapshot-baseline recovery, database export/restore, document
+tombstones, or range/composite queries. Those require new durable protocol and
+schema contracts; they are not hidden behind the existing facade.
