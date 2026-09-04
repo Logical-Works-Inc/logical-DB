@@ -15,15 +15,16 @@ use std::{
 pub use logical_db_crdt::{ConflictValue, Editor, Item, Object, ObjectKind, Reader, Scalar};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 pub use logical_db_model::{
-    AccountId, ChangeDigest, DocumentId, IndexEntry, IndexId, IndexValue, OperationDigest,
-    OperationId, PeerId, ReplicaId, Scope, SpaceId,
+    AccountId, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue,
+    OperationDigest, OperationId, PeerId, ReplicaId, Scope, SpaceId,
 };
 pub use logical_db_platform::PlatformError;
-pub use logical_db_store::ChangeEvent;
+pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
 use logical_db_store::{
-    CommitOutcome, EmbeddedStore, IndexHit, LocalChange, LocalCommit, MAX_MATERIALIZED_PAGE_BYTES,
-    MAX_SNAPSHOT_BYTES, MigrationIndexes, RemoteChange as StoredRemoteChange, RemoteDocument,
-    StoreError,
+    CommitOutcome, EmbeddedStore, ExportDocument, ExportEntry, IndexHit, LocalChange, LocalCommit,
+    MAX_MATERIALIZED_PAGE_BYTES, MAX_SNAPSHOT_BYTES, MigrationIndexes,
+    RemoteChange as StoredRemoteChange, RemoteDocument, StoreError, decode_export, encode_export,
+    restore_operation,
 };
 use logical_db_sync::{
     InboundChange, OutboundChange, ReplicaPort, SyncError, synchronize as run_synchronization,
@@ -683,6 +684,291 @@ impl Database {
         Ok(())
     }
 
+    /// Exports one versioned logical backup of this scope.
+    ///
+    /// The payload is a versioned logical dump — ordered commit history plus
+    /// document snapshots with tombstone flags — never a file copy: the store
+    /// refuses foreign files through replica binding, so restore replays
+    /// these entries through the commit path instead. Entries follow the
+    /// durable event order, so histories that arrived through
+    /// synchronization keep their causal positions with deterministic
+    /// synthesized operation bindings, and tombstones stay converged after
+    /// restore. The
+    /// full history, including acknowledged outbox entries, is exported so a
+    /// restored replica reproduces outbox order, operation bindings, and event
+    /// cursors; replayed outbox entries attribute the restoring installation
+    /// as their presenter.
+    ///
+    /// Restored indexes are recomputed from the target handle's projections:
+    /// open the restore target with the same projection set to reproduce
+    /// index rows exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed corruption, bound, migration, or storage failure.
+    pub fn export(&self) -> Result<Vec<u8>, DatabaseError> {
+        let mut bindings = BTreeMap::new();
+        let mut after = 0_u64;
+        loop {
+            let page = self.store.history_page(self.scope, after, 256)?;
+            if page.is_empty() {
+                break;
+            }
+            for item in &page {
+                let binding = self
+                    .store
+                    .operation(self.scope, item.operation)?
+                    .ok_or(DatabaseError::MissingOperation(item.operation))?;
+                bindings
+                    .entry((item.document, item.digest))
+                    .or_insert((item.operation, binding.request));
+                after = item.sequence;
+            }
+            if page.len() < 256 {
+                break;
+            }
+        }
+        let mut entries = Vec::new();
+        let mut cursor = 0_u64;
+        loop {
+            let events = self.store.changes_since(self.scope, cursor, 256)?;
+            if events.is_empty() {
+                break;
+            }
+            let complete = events.len() < 256;
+            for event in &events {
+                let bytes = self
+                    .store
+                    .load_change(self.scope, event.document, event.digest)?
+                    .ok_or(DatabaseError::MissingChange(event.digest))?;
+                let (operation, request) = match bindings.get(&(event.document, event.digest)) {
+                    Some(binding) => *binding,
+                    None => restore_operation(event.document, event.digest),
+                };
+                entries.push(ExportEntry {
+                    document: event.document,
+                    operation,
+                    request,
+                    digest: event.digest,
+                    bytes,
+                });
+                cursor = event.sequence;
+            }
+            if complete {
+                break;
+            }
+        }
+        let mut documents = Vec::new();
+        let mut scan = None;
+        loop {
+            let page = self.store.export_scan(self.scope, scan, 64)?;
+            if page.documents.is_empty() {
+                break;
+            }
+            let complete = page.documents.len() < 64;
+            for document in &page.documents {
+                documents.push(ExportDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                });
+                scan = Some(document.document);
+            }
+            if complete {
+                break;
+            }
+        }
+        Ok(encode_export(self.scope, &entries, &documents)?)
+    }
+
+    /// Restores one versioned logical backup into this scope.
+    ///
+    /// The payload is bounded before allocation and fully validated before
+    /// the first commit: unknown versions, oversized inputs, scope mismatch,
+    /// malformed structure, and corrupt change or snapshot bytes are refused
+    /// without touching live state. Valid entries replay through the commit
+    /// path with their original operation identities, so retrying the same
+    /// payload short-circuits as exact duplicates.
+    ///
+    /// An interrupted restore leaves a durable cursor bound to the payload
+    /// identity; retrying with the same bytes resumes from the cursor and
+    /// completes, while a different payload is refused until the active one
+    /// finishes. Finalization verifies every replayed revision before the
+    /// cursor clears. Restore into a fresh scope; a target that already holds
+    /// divergent documents fails closed at the first conflicting entry with
+    /// the cursor retained for inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed export, scope, CRDT, revision, cursor, or storage
+    /// failure. No document, outbox, event, or checkpoint row changes unless
+    /// the payload validates end to end.
+    pub fn restore(&self, payload: &[u8]) -> Result<RestoreReport, DatabaseError> {
+        let identity = export_identity(payload);
+        let (scope, entries, documents) = decode_export(payload)?;
+        if scope != self.scope {
+            return Err(DatabaseError::ExportScopeMismatch);
+        }
+        if entries.is_empty() && documents.is_empty() {
+            return Ok(RestoreReport {
+                documents: 0,
+                entries: 0,
+                applied: 0,
+                resumed: false,
+            });
+        }
+        let documented = check_restore_coverage(&documents, &entries)?;
+        let mut loaded = BTreeMap::new();
+        for document in &documented {
+            let revision = self
+                .store
+                .load_snapshot(self.scope, *document)?
+                .map(|snapshot| snapshot.revision);
+            loaded.insert(*document, revision);
+        }
+        self.check_restore_replay(&documents, &entries)?;
+        if self
+            .store
+            .restore_cursor(self.scope)?
+            .is_some_and(|cursor| cursor.payload != identity)
+        {
+            return Err(StoreError::RestoreInProgress.into());
+        }
+        let cursor = self.store.restore_begin(self.scope, &identity)?;
+        let resumed = cursor.next > 0;
+        let start = usize::try_from(cursor.next).map_err(|_| StoreError::RestoreIncomplete)?;
+        if start > entries.len() {
+            return Err(StoreError::RestoreIncomplete.into());
+        }
+        let mut current = loaded;
+        let applied = self.replay_restore_entries(&entries, &identity, start, &mut current)?;
+        let expected = current
+            .into_iter()
+            .map(|(document, revision)| {
+                revision
+                    .map(|revision| (document, revision))
+                    .ok_or(StoreError::RestoreIncomplete)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.store
+            .restore_finish(self.scope, &identity, &expected)?;
+        Ok(RestoreReport {
+            documents: documents.len(),
+            entries: entries.len(),
+            applied,
+            resumed,
+        })
+    }
+
+    fn check_restore_replay(
+        &self,
+        documents: &[ExportDocument],
+        entries: &[ExportEntry],
+    ) -> Result<(), DatabaseError> {
+        let mut duplicate = BTreeSet::new();
+        for entry in entries {
+            if let Some(committed) = self.store.operation(self.scope, entry.operation)? {
+                if committed.document != entry.document
+                    || committed.request != entry.request
+                    || committed.digest != entry.digest
+                {
+                    return Err(StoreError::OperationConflict.into());
+                }
+                let stored = self
+                    .store
+                    .load_change(self.scope, entry.document, entry.digest)?
+                    .ok_or(DatabaseError::MissingChange(entry.digest))?;
+                if stored != entry.bytes {
+                    return Err(StoreError::OperationConflict.into());
+                }
+                duplicate.insert(entry.operation);
+            }
+        }
+        let mut states: BTreeMap<DocumentId, Document> = BTreeMap::new();
+        let mut last_flag = BTreeMap::new();
+        for entry in entries {
+            let state = states.entry(entry.document).or_default();
+            state.apply(std::slice::from_ref(&EncodedChange {
+                digest: entry.digest,
+                bytes: entry.bytes.clone(),
+            }))?;
+            last_flag.insert(entry.document, state.is_deleted()?);
+        }
+        for document in documents {
+            if last_flag.get(&document.document) != Some(&document.tombstone) {
+                return Err(StoreError::InvalidExport.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_restore_entries(
+        &self,
+        entries: &[ExportEntry],
+        identity: &[u8; 32],
+        start: usize,
+        current: &mut BTreeMap<DocumentId, Option<DocumentRevision>>,
+    ) -> Result<usize, DatabaseError> {
+        let mut states: BTreeMap<DocumentId, Document> = BTreeMap::new();
+        let mut applied = 0_usize;
+        for (offset, entry) in entries.iter().enumerate() {
+            let state = states.entry(entry.document).or_default();
+            state.apply(std::slice::from_ref(&EncodedChange {
+                digest: entry.digest,
+                bytes: entry.bytes.clone(),
+            }))?;
+            if offset < start {
+                continue;
+            }
+            let tombstoned = state.is_deleted()?;
+            let indexes = if tombstoned {
+                Vec::new()
+            } else {
+                self.project(state)?
+            };
+            let snapshot = state.save()?;
+            let expected = current.get(&entry.document).copied().flatten();
+            let change = LocalChange::new(
+                self.scope,
+                entry.document,
+                entry.operation,
+                entry.request,
+                entry.digest,
+                &entry.bytes,
+            )?;
+            let outcome = self.store.commit_local(LocalCommit {
+                change,
+                expected_revision: expected,
+                snapshot: &snapshot,
+                indexes: &indexes,
+                tombstone: tombstoned,
+            })?;
+            if matches!(outcome, CommitOutcome::Applied { .. }) {
+                let next = match expected {
+                    Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+                    None => DocumentRevision::new(1),
+                };
+                current.insert(entry.document, Some(next));
+                applied += 1;
+            }
+            let next = u64::try_from(offset + 1).map_err(|_| StoreError::SequenceExhausted)?;
+            self.store.restore_advance(self.scope, identity, next)?;
+        }
+        Ok(applied)
+    }
+
+    /// Loads the durable restore cursor for this scope, when one is active.
+    ///
+    /// A present cursor means a previous restore was interrupted; retrying
+    /// [`Database::restore`] with the same payload resumes from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed durable read or corruption error.
+    pub fn restore_cursor(&self) -> Result<Option<RestoreCursor>, DatabaseError> {
+        Ok(self.store.restore_cursor(self.scope)?)
+    }
+
     fn project(&self, state: &mut Document) -> Result<Vec<IndexEntry>, DatabaseError> {
         project_with(&self.projections, state)
     }
@@ -873,6 +1159,19 @@ pub struct MigrationReport {
     pub documents: usize,
 }
 
+/// Work durably completed by one versioned restore or exact resumption.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestoreReport {
+    /// Number of documents carried by the export payload.
+    pub documents: usize,
+    /// Number of ordered history entries carried by the payload.
+    pub entries: usize,
+    /// Number of entries newly committed by this invocation.
+    pub applied: usize,
+    /// Whether the invocation resumed an interrupted restore cursor.
+    pub resumed: bool,
+}
+
 /// Stable failures exposed by the embedded facade.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -920,6 +1219,13 @@ pub enum DatabaseError {
     /// [`DatabaseErrorKind::Other`].
     #[error("document is deleted and only accepts further tombstones")]
     DocumentDeleted,
+    /// A versioned export was produced for a different ownership scope.
+    ///
+    /// Restoring a foreign scope would interleave two histories, so the
+    /// payload is refused before any durable state changes. Classified as
+    /// [`DatabaseErrorKind::Other`].
+    #[error("logical export scope does not match this replica scope")]
+    ExportScopeMismatch,
 }
 
 /// Stable recovery decision for application-facing database failures.
@@ -953,6 +1259,59 @@ impl DatabaseError {
             _ => DatabaseErrorKind::Other,
         }
     }
+}
+
+fn check_restore_coverage(
+    documents: &[ExportDocument],
+    entries: &[ExportEntry],
+) -> Result<BTreeSet<DocumentId>, DatabaseError> {
+    let documented = documents
+        .iter()
+        .map(|document| document.document)
+        .collect::<BTreeSet<_>>();
+    let mut covered = BTreeSet::new();
+    for entry in entries {
+        if !documented.contains(&entry.document) {
+            return Err(StoreError::InvalidExport.into());
+        }
+        covered.insert(entry.document);
+    }
+    if covered != documented {
+        return Err(StoreError::InvalidExport.into());
+    }
+    let mut bindings = BTreeMap::new();
+    for entry in entries {
+        let binding = (
+            entry.document,
+            entry.request,
+            entry.digest,
+            entry.bytes.clone(),
+        );
+        if let Some(previous) = bindings.insert(entry.operation, binding.clone()) {
+            if previous == binding {
+                return Err(StoreError::InvalidExport.into());
+            }
+            return Err(StoreError::OperationConflict.into());
+        }
+    }
+    for entry in entries {
+        EncodedChange {
+            digest: entry.digest,
+            bytes: entry.bytes.clone(),
+        }
+        .validate()?;
+    }
+    for document in documents {
+        let mut state = Document::load(&document.snapshot)?;
+        if state.is_deleted()? != document.tombstone {
+            return Err(StoreError::InvalidExport.into());
+        }
+    }
+    Ok(documented)
+}
+
+fn export_identity(payload: &[u8]) -> [u8; 32] {
+    Sha256::digest(payload).into()
 }
 
 fn projection_digest(
@@ -1965,5 +2324,638 @@ mod tests {
         assert!(database.is_deleted(document).unwrap());
         drop(database);
         fs::remove_file(db_path).unwrap();
+    }
+
+    fn kind_projection(index: IndexId) -> Projection {
+        Projection::new(index, |reader| {
+            Ok(match reader.get(&Object::root(), "kind")? {
+                Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
+                _ => None,
+            })
+        })
+    }
+
+    fn kind_entry(index: IndexId, kind: &str) -> Vec<IndexEntry> {
+        vec![IndexEntry {
+            index,
+            value: IndexValue::Text(kind.into()),
+        }]
+    }
+
+    fn read_kind(database: &Database, document: DocumentId) -> Option<String> {
+        database
+            .read(document, |reader| reader.get(&Object::root(), "kind"))
+            .unwrap()
+            .and_then(|item| item)
+            .and_then(|item| match item {
+                Item::Scalar(Scalar::String(value)) => Some(value),
+                _ => None,
+            })
+    }
+
+    /// Compares the durable outbox cursor content, excluding the presenting
+    /// replica: a restored replica attributes replayed entries to its own
+    /// installation, while sequence, document, operation, request, digest,
+    /// and bytes reproduce exactly.
+    fn pending_identity(
+        changes: &[PendingChange],
+    ) -> Vec<(
+        u64,
+        DocumentId,
+        OperationId,
+        OperationDigest,
+        ChangeDigest,
+        Vec<u8>,
+    )> {
+        changes
+            .iter()
+            .map(|change| {
+                (
+                    change.sequence,
+                    change.document,
+                    change.operation,
+                    change.request,
+                    change.digest,
+                    change.bytes.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn export_then_restore_reproduces_reads_indexes_and_cursors_exactly() {
+        let source_path = path();
+        let target_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let index = IndexId::new();
+        let first = DocumentId::new();
+        let second = DocumentId::new();
+        let third = DocumentId::new();
+        let source = Database::open_with_projections(
+            &source_path,
+            scope,
+            ReplicaId::new(),
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        for (document, request, kind) in [
+            (first, [1; 32], "note"),
+            (second, [2; 32], "note"),
+            (third, [3; 32], "task"),
+            (first, [4; 32], "task"),
+        ] {
+            source
+                .edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new(request),
+                    |editor| editor.put(&Object::root(), "kind", Scalar::String(kind.into())),
+                )
+                .unwrap();
+        }
+        source
+            .delete(second, OperationId::new(), OperationDigest::new([5; 32]))
+            .unwrap();
+        let source_events = source.changes_since(0, 256).unwrap();
+        assert_eq!(source_events.len(), 5);
+        assert!(
+            source_events
+                .windows(2)
+                .all(|pair| pair[0].sequence + 1 == pair[1].sequence)
+        );
+        let source_pending = source.pending_changes(0, 256).unwrap();
+        assert_eq!(source_pending.len(), 5);
+        let payload = source.export().unwrap();
+        assert!(!payload.is_empty());
+        assert!(payload.len() <= MAX_EXPORT_BYTES);
+        drop(source);
+
+        let target = Database::open_with_projections(
+            &target_path,
+            scope,
+            ReplicaId::new(),
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        let report = target.restore(&payload).unwrap();
+        assert_eq!(
+            report,
+            RestoreReport {
+                documents: 3,
+                entries: 5,
+                applied: 5,
+                resumed: false,
+            }
+        );
+        assert_eq!(read_kind(&target, first).as_deref(), Some("task"));
+        assert_eq!(read_kind(&target, third).as_deref(), Some("task"));
+        assert_eq!(read_kind(&target, second), None);
+        assert!(target.is_deleted(second).unwrap());
+        assert!(!target.is_deleted(first).unwrap());
+        assert!(!target.is_deleted(third).unwrap());
+        let mut tasks = target
+            .query_index(index, &IndexValue::Text("task".into()), None, 10)
+            .unwrap();
+        tasks.sort();
+        let mut expected_tasks = vec![first, third];
+        expected_tasks.sort();
+        assert_eq!(tasks, expected_tasks);
+        assert!(
+            target
+                .query_index(index, &IndexValue::Text("note".into()), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(target.changes_since(0, 256).unwrap(), source_events);
+        let restored_pending = target.pending_changes(0, 256).unwrap();
+        assert_eq!(
+            pending_identity(&restored_pending),
+            pending_identity(&source_pending)
+        );
+        assert!(
+            restored_pending
+                .iter()
+                .all(|change| change.replica == target.replica())
+        );
+        assert_eq!(target.restore_cursor().unwrap(), None);
+        drop(target);
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(target_path).unwrap();
+    }
+
+    struct RestorePrefix<'a> {
+        target_path: &'a std::path::Path,
+        replica: ReplicaId,
+        scope: Scope,
+        index: IndexId,
+        payload: &'a [u8],
+        identity: &'a [u8; 32],
+        prefix: usize,
+        first: DocumentId,
+    }
+
+    fn replay_restore_prefix(fixture: &RestorePrefix<'_>) -> usize {
+        use logical_db_crdt::{Document, EncodedChange};
+        use logical_db_store::{EmbeddedStore, LocalChange, LocalCommit, decode_export};
+
+        let store = EmbeddedStore::open(fixture.target_path, fixture.replica).unwrap();
+        let (_, entries, _) = decode_export(fixture.payload).unwrap();
+        let replayed = entries.len();
+        store
+            .restore_begin(fixture.scope, fixture.identity)
+            .unwrap();
+        let mut states: BTreeMap<DocumentId, Document> = BTreeMap::new();
+        let mut revisions: BTreeMap<DocumentId, Option<DocumentRevision>> = BTreeMap::new();
+        for entry in entries.iter().take(fixture.prefix) {
+            let state = states.entry(entry.document).or_default();
+            state
+                .apply(std::slice::from_ref(&EncodedChange {
+                    digest: entry.digest,
+                    bytes: entry.bytes.clone(),
+                }))
+                .unwrap();
+            let tombstone = state.is_deleted().unwrap();
+            let snapshot = state.save().unwrap();
+            let expected = revisions.get(&entry.document).copied().flatten();
+            let indexes = kind_entry(
+                fixture.index,
+                if entry.document == fixture.first {
+                    "note"
+                } else {
+                    "task"
+                },
+            );
+            let change = LocalChange::new(
+                fixture.scope,
+                entry.document,
+                entry.operation,
+                entry.request,
+                entry.digest,
+                &entry.bytes,
+            )
+            .unwrap();
+            store
+                .commit_local(LocalCommit {
+                    change,
+                    expected_revision: expected,
+                    snapshot: &snapshot,
+                    indexes: &indexes,
+                    tombstone,
+                })
+                .unwrap();
+            let next = match expected {
+                Some(revision) => revision.next().unwrap(),
+                None => DocumentRevision::new(1),
+            };
+            revisions.insert(entry.document, Some(next));
+        }
+        store
+            .restore_advance(fixture.scope, fixture.identity, fixture.prefix as u64)
+            .unwrap();
+        replayed
+    }
+
+    #[test]
+    fn interrupted_restore_resumes_to_completion_on_retry() {
+        use sha2::{Digest, Sha256};
+
+        const PREFIX: usize = 2;
+        let source_path = path();
+        let target_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let index = IndexId::new();
+        let first = DocumentId::new();
+        let second = DocumentId::new();
+        let source = Database::open_with_projections(
+            &source_path,
+            scope,
+            ReplicaId::new(),
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        for (document, request, kind) in [
+            (first, [1; 32], "note"),
+            (second, [2; 32], "task"),
+            (first, [3; 32], "task"),
+            (second, [4; 32], "note"),
+        ] {
+            source
+                .edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new(request),
+                    |editor| editor.put(&Object::root(), "kind", Scalar::String(kind.into())),
+                )
+                .unwrap();
+        }
+        let payload = source.export().unwrap();
+        let source_pending = source.pending_changes(0, 256).unwrap();
+        let source_events = source.changes_since(0, 256).unwrap();
+        drop(source);
+        let identity: [u8; 32] = Sha256::digest(&payload).into();
+
+        let replica = ReplicaId::new();
+        drop(
+            Database::open_with_projections(
+                &target_path,
+                scope,
+                replica,
+                vec![kind_projection(index)],
+            )
+            .unwrap(),
+        );
+        let replayed = replay_restore_prefix(&RestorePrefix {
+            target_path: &target_path,
+            replica,
+            scope,
+            index,
+            payload: &payload,
+            identity: &identity,
+            prefix: PREFIX,
+            first,
+        });
+        assert_eq!(replayed, 4);
+        let target = Database::open_with_projections(
+            &target_path,
+            scope,
+            replica,
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        let cursor = target.restore_cursor().unwrap().unwrap();
+        assert_eq!(cursor.next, PREFIX as u64);
+        let report = target.restore(&payload).unwrap();
+        assert_eq!(
+            report,
+            RestoreReport {
+                documents: 2,
+                entries: 4,
+                applied: 2,
+                resumed: true,
+            }
+        );
+        assert_eq!(read_kind(&target, first).as_deref(), Some("task"));
+        assert_eq!(read_kind(&target, second).as_deref(), Some("note"));
+        let restored_pending = target.pending_changes(0, 256).unwrap();
+        assert_eq!(
+            pending_identity(&restored_pending),
+            pending_identity(&source_pending)
+        );
+        assert!(
+            restored_pending
+                .iter()
+                .all(|change| change.replica == target.replica())
+        );
+        assert_eq!(target.changes_since(0, 256).unwrap(), source_events);
+        assert_eq!(target.restore_cursor().unwrap(), None);
+        drop(target);
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(target_path).unwrap();
+    }
+
+    #[test]
+    fn export_replays_synchronized_changes_with_synthesized_bindings() {
+        use logical_db_store::restore_operation;
+
+        let peer_path = path();
+        let source_path = path();
+        let target_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer_id = PeerId::new();
+        let index = IndexId::new();
+        let remote_edited = DocumentId::new();
+        let remote_deleted = DocumentId::new();
+        let local = DocumentId::new();
+        let peer = Database::open_with_projections(
+            &peer_path,
+            scope,
+            ReplicaId::new(),
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        peer.edit(
+            remote_edited,
+            OperationId::new(),
+            OperationDigest::new([1; 32]),
+            |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+        )
+        .unwrap();
+        peer.edit(
+            remote_deleted,
+            OperationId::new(),
+            OperationDigest::new([2; 32]),
+            |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+        )
+        .unwrap();
+        peer.delete(
+            remote_deleted,
+            OperationId::new(),
+            OperationDigest::new([3; 32]),
+        )
+        .unwrap();
+        let peer_pending = peer.pending_changes(0, 256).unwrap();
+        assert_eq!(peer_pending.len(), 3);
+        drop(peer);
+
+        let source = Database::open_with_projections(
+            &source_path,
+            scope,
+            ReplicaId::new(),
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        source
+            .edit(
+                local,
+                OperationId::new(),
+                OperationDigest::new([4; 32]),
+                |editor| editor.put(&Object::root(), "kind", Scalar::String("task".into())),
+            )
+            .unwrap();
+        source
+            .install_remote_page(peer_id, &remote_page(&peer_pending), b"checkpoint-remote")
+            .unwrap();
+        assert!(source.is_deleted(remote_deleted).unwrap());
+        let source_events = source.changes_since(0, 256).unwrap();
+        assert_eq!(source_events.len(), 4);
+        let payload = source.export().unwrap();
+        let source_local_pending = source.pending_changes(0, 256).unwrap();
+        assert_eq!(source_local_pending.len(), 1);
+        drop(source);
+
+        let target = Database::open_with_projections(
+            &target_path,
+            scope,
+            ReplicaId::new(),
+            vec![kind_projection(index)],
+        )
+        .unwrap();
+        let report = target.restore(&payload).unwrap();
+        assert_eq!(report.documents, 3);
+        assert_eq!(report.entries, 4);
+        assert_eq!(report.applied, 4);
+        assert!(!report.resumed);
+        assert_eq!(read_kind(&target, remote_edited).as_deref(), Some("note"));
+        assert_eq!(read_kind(&target, local).as_deref(), Some("task"));
+        assert_eq!(read_kind(&target, remote_deleted), None);
+        assert!(target.is_deleted(remote_deleted).unwrap());
+        assert_eq!(target.changes_since(0, 256).unwrap(), source_events);
+        let restored_pending = target.pending_changes(0, 256).unwrap();
+        assert_eq!(restored_pending.len(), 4);
+        assert_eq!(
+            pending_identity(&restored_pending[..1]),
+            pending_identity(&source_local_pending)
+        );
+        for change in &restored_pending[1..] {
+            let (operation, request) = restore_operation(change.document, change.digest);
+            assert_eq!(change.operation, operation);
+            assert_eq!(change.request, request);
+        }
+        assert_eq!(target.restore_cursor().unwrap(), None);
+        drop(target);
+        fs::remove_file(peer_path).unwrap();
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(target_path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_backup_is_refused_with_live_state_untouched() {
+        use logical_db_store::{decode_export, encode_export};
+
+        let source_path = path();
+        let target_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let source = Database::open(&source_path, scope, ReplicaId::new()).unwrap();
+        let document = DocumentId::new();
+        source
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        let payload = source.export().unwrap();
+        drop(source);
+
+        let live = Database::open(&target_path, scope, ReplicaId::new()).unwrap();
+        let live_document = DocumentId::new();
+        live.edit(
+            live_document,
+            OperationId::new(),
+            OperationDigest::new([9; 32]),
+            |editor| editor.put(&Object::root(), "title", Scalar::String("live".into())),
+        )
+        .unwrap();
+        let live_pending = live.pending_changes(0, 256).unwrap();
+        let live_events = live.changes_since(0, 256).unwrap();
+        let live_title = live
+            .read(live_document, |reader| reader.get(&Object::root(), "title"))
+            .unwrap();
+
+        let (backup_scope, mut entries, documents) = decode_export(&payload).unwrap();
+        entries[0].bytes[0] ^= 0xff;
+        let digest_damaged = encode_export(backup_scope, &entries, &documents).unwrap();
+        assert!(matches!(
+            live.restore(&digest_damaged),
+            Err(DatabaseError::Crdt(_))
+        ));
+
+        let mut truncated = payload.clone();
+        truncated.pop();
+        assert!(matches!(
+            live.restore(&truncated),
+            Err(DatabaseError::Store(_))
+        ));
+
+        let mut magic_damaged = payload.clone();
+        magic_damaged[0] ^= 0xff;
+        assert!(matches!(
+            live.restore(&magic_damaged),
+            Err(DatabaseError::Store(_))
+        ));
+
+        assert_eq!(
+            live.read(live_document, |reader| {
+                reader.get(&Object::root(), "title")
+            })
+            .unwrap(),
+            live_title
+        );
+        assert_eq!(live.pending_changes(0, 256).unwrap(), live_pending);
+        assert_eq!(live.changes_since(0, 256).unwrap(), live_events);
+        assert_eq!(live.restore_cursor().unwrap(), None);
+        drop(live);
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(target_path).unwrap();
+    }
+
+    #[test]
+    fn oversized_and_unknown_version_payloads_refused_before_allocation() {
+        let source_path = path();
+        let target_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let source = Database::open(&source_path, scope, ReplicaId::new()).unwrap();
+        source
+            .edit(
+                DocumentId::new(),
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        let payload = source.export().unwrap();
+        drop(source);
+
+        let live = Database::open(&target_path, scope, ReplicaId::new()).unwrap();
+        let live_document = DocumentId::new();
+        live.edit(
+            live_document,
+            OperationId::new(),
+            OperationDigest::new([9; 32]),
+            |editor| editor.put(&Object::root(), "title", Scalar::String("live".into())),
+        )
+        .unwrap();
+        let live_pending = live.pending_changes(0, 256).unwrap();
+
+        let oversized = vec![0xA5_u8; MAX_EXPORT_BYTES + 1];
+        assert!(matches!(
+            live.restore(&oversized),
+            Err(DatabaseError::Store(StoreError::InvalidExportSize(_)))
+        ));
+        let mut future = payload.clone();
+        future[4] = 2;
+        assert!(matches!(
+            live.restore(&future),
+            Err(DatabaseError::Store(StoreError::UnknownExportVersion(2)))
+        ));
+        assert!(matches!(live.restore(&[]), Err(DatabaseError::Store(_))));
+
+        assert_eq!(live.pending_changes(0, 256).unwrap(), live_pending);
+        assert!(
+            live.read(live_document, |reader| {
+                reader.get(&Object::root(), "title")
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(live.restore_cursor().unwrap(), None);
+        drop(live);
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(target_path).unwrap();
+    }
+
+    #[test]
+    fn export_includes_tombstones_and_restored_state_stays_converged() {
+        use logical_db_store::decode_export;
+
+        let source_path = path();
+        let target_path = path();
+        let converge_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let document = DocumentId::new();
+        let source = Database::open(&source_path, scope, ReplicaId::new()).unwrap();
+        source
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        let applied = source
+            .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+            .unwrap();
+        let DeleteOutcome::Applied(receipt) = applied else {
+            panic!("delete must apply");
+        };
+        let payload = source.export().unwrap();
+        let (_, entries, documents) = decode_export(&payload).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].document, document);
+        assert!(documents[0].tombstone);
+        assert!(entries.iter().any(|entry| entry.digest == receipt.digest));
+        drop(source);
+
+        let target = Database::open(&target_path, scope, ReplicaId::new()).unwrap();
+        let report = target.restore(&payload).unwrap();
+        assert_eq!(report.documents, 1);
+        assert_eq!(report.entries, 2);
+        assert!(target.is_deleted(document).unwrap());
+        assert!(
+            target
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        let candidates = target
+            .conflicts(document, &Object::root(), "title")
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].value,
+            Item::Scalar(Scalar::String("v1".into()))
+        );
+
+        let converged = Database::open(&converge_path, scope, ReplicaId::new()).unwrap();
+        let pending = target.pending_changes(0, 10).unwrap();
+        converged
+            .install_remote_page(peer, &remote_page(&pending), b"checkpoint-converged")
+            .unwrap();
+        assert!(
+            converged
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(converged.is_deleted(document).unwrap());
+        drop(target);
+        drop(converged);
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(target_path).unwrap();
+        fs::remove_file(converge_path).unwrap();
     }
 }
