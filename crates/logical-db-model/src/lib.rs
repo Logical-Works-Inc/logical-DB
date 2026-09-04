@@ -184,6 +184,102 @@ impl OperationDigest {
     }
 }
 
+/// Version of the service snapshot-baseline record.
+pub const SNAPSHOT_BASELINE_VERSION: u16 = 1;
+/// Encoded bytes of one versioned snapshot baseline: version plus position.
+pub const SNAPSHOT_BASELINE_BYTES: usize = 10;
+
+/// Versioned service snapshot baseline: durable position through which history
+/// is captured outside the prunable log prefix.
+///
+/// The version fails closed on decode so a future baseline layout can never be
+/// mistaken for the current position encoding.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct SnapshotBaseline {
+    version: u16,
+    position: u64,
+}
+
+impl SnapshotBaseline {
+    /// Records a baseline at the current layout version.
+    #[must_use]
+    pub const fn new(position: u64) -> Self {
+        Self {
+            version: SNAPSHOT_BASELINE_VERSION,
+            position,
+        }
+    }
+
+    /// Returns the baseline layout version.
+    #[must_use]
+    pub const fn version(self) -> u16 {
+        self.version
+    }
+
+    /// Returns the durable log position captured by the baseline.
+    #[must_use]
+    pub const fn position(self) -> u64 {
+        self.position
+    }
+
+    /// Encodes the baseline as fixed version-plus-position bytes.
+    #[must_use]
+    pub const fn encode(self) -> [u8; SNAPSHOT_BASELINE_BYTES] {
+        let version = self.version.to_be_bytes();
+        let position = self.position.to_be_bytes();
+        [
+            version[0],
+            version[1],
+            position[0],
+            position[1],
+            position[2],
+            position[3],
+            position[4],
+            position[5],
+            position[6],
+            position[7],
+        ]
+    }
+
+    /// Decodes fixed baseline bytes, refusing bad lengths and versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidSnapshotEncoding`] for a bad length and
+    /// [`ModelError::UnsupportedSnapshotVersion`] for a foreign version.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
+        if bytes.len() != SNAPSHOT_BASELINE_BYTES {
+            return Err(ModelError::InvalidSnapshotEncoding);
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version != SNAPSHOT_BASELINE_VERSION {
+            return Err(ModelError::UnsupportedSnapshotVersion { actual: version });
+        }
+        let position = u64::from_be_bytes([
+            bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+        ]);
+        Ok(Self { version, position })
+    }
+}
+
+/// Reports whether a checkpoint position fell behind the retention floor.
+///
+/// A behind-floor checkpoint no longer addresses servable log history and must
+/// take the explicit full-recovery transition instead of a partial page.
+#[must_use]
+pub const fn is_behind_retention(position: u64, floor: u64) -> bool {
+    position < floor
+}
+
+/// Reports whether a retention floor addresses committed history.
+///
+/// The floor may equal the frontier (everything prunable is pruned) but never
+/// pass it; a floor past the frontier addresses uncommitted positions.
+#[must_use]
+pub const fn retention_floor_valid(floor: u64, frontier: u64) -> bool {
+    floor <= frontier
+}
+
 /// Logical ownership scope independent from physical backend keys.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Scope {
@@ -325,6 +421,15 @@ pub enum ModelError {
     /// A protocol page exceeded a count or byte limit.
     #[error("page exceeds bounded protocol limits")]
     PageTooLarge,
+    /// A snapshot baseline record violated its fixed versioned encoding.
+    #[error("snapshot baseline encoding is malformed")]
+    InvalidSnapshotEncoding,
+    /// A snapshot baseline record used a foreign layout version.
+    #[error("snapshot baseline version {actual} is unsupported")]
+    UnsupportedSnapshotVersion {
+        /// Observed baseline layout version.
+        actual: u16,
+    },
 }
 
 #[cfg(test)]
@@ -364,5 +469,41 @@ mod tests {
         let operation = OperationDigest::new([29; 32]);
         assert_eq!(change.into_bytes(), [17; 32]);
         assert_eq!(operation.into_bytes(), [29; 32]);
+    }
+
+    #[test]
+    fn snapshot_baseline_codec_is_versioned_and_fail_closed() {
+        let baseline = SnapshotBaseline::new(41);
+        assert_eq!(baseline.version(), SNAPSHOT_BASELINE_VERSION);
+        assert_eq!(baseline.position(), 41);
+        let encoded = baseline.encode();
+        assert_eq!(encoded.len(), SNAPSHOT_BASELINE_BYTES);
+        assert_eq!(SnapshotBaseline::decode(&encoded), Ok(baseline));
+        assert_eq!(
+            SnapshotBaseline::decode(&encoded[..SNAPSHOT_BASELINE_BYTES - 1]),
+            Err(ModelError::InvalidSnapshotEncoding)
+        );
+        assert_eq!(
+            SnapshotBaseline::decode(&[0; SNAPSHOT_BASELINE_BYTES]),
+            Err(ModelError::UnsupportedSnapshotVersion { actual: 0 })
+        );
+        let mut unknown = encoded;
+        unknown[..2].copy_from_slice(&(SNAPSHOT_BASELINE_VERSION + 1).to_be_bytes());
+        assert_eq!(
+            SnapshotBaseline::decode(&unknown),
+            Err(ModelError::UnsupportedSnapshotVersion {
+                actual: SNAPSHOT_BASELINE_VERSION + 1
+            })
+        );
+    }
+
+    #[test]
+    fn retention_floor_predicates_gate_prune_and_recovery() {
+        assert!(is_behind_retention(0, 1));
+        assert!(!is_behind_retention(1, 1));
+        assert!(!is_behind_retention(2, 1));
+        assert!(retention_floor_valid(0, 0));
+        assert!(retention_floor_valid(2, 3));
+        assert!(!retention_floor_valid(4, 3));
     }
 }

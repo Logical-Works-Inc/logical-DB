@@ -10,7 +10,7 @@ use std::{future::Future, sync::Arc};
 
 use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, EncodedChange};
-use logical_db_model::{Effect, OperationDigest, Scope};
+use logical_db_model::{Effect, OperationDigest, Scope, SnapshotBaseline, is_behind_retention};
 use logical_db_protocol::{
     ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest,
     PushOutcome, PushRequest, PushResponse, RejectionCode,
@@ -85,6 +85,11 @@ pub struct StoredPage {
 pub enum PageResult {
     /// The transaction observed the justified frontier and returned a page.
     Page(StoredPage),
+    /// The requested position fell behind the durable retention floor.
+    ///
+    /// The caller must take the explicit full-recovery transition instead of
+    /// applying a partial prefix.
+    BehindFloor,
     /// The scope frontier changed before the read transaction executed.
     StaleAuthority,
 }
@@ -125,6 +130,21 @@ pub trait ServiceStore: Send + Sync {
     /// Reads the current monotonic scoped frontier used for Braid justification.
     fn frontier(&self, scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
+    /// Reads the durable retention floor below which log history is pruned.
+    ///
+    /// The default reports no floor, preserving the pre-retention page shape
+    /// for adapters without peer-aware collection. Adapters that prune must
+    /// override this with their durable per-scope floor.
+    fn retention_floor(
+        &self,
+        scope: Scope,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        async move {
+            let _ = scope;
+            Ok(0)
+        }
+    }
+
     /// Reads a bounded ordered page after a durable scoped position.
     ///
     /// # Errors
@@ -163,6 +183,13 @@ where
         (**self).frontier(scope)
     }
 
+    fn retention_floor(
+        &self,
+        scope: Scope,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        (**self).retention_floor(scope)
+    }
+
     fn page(
         &self,
         scope: Scope,
@@ -173,6 +200,232 @@ where
         grant: &impl ExecutionGrant,
     ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
         (**self).page(scope, request, after, max_changes, max_bytes, grant)
+    }
+}
+
+/// Stable refusal reasons for one peer-aware prune decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PruneRefusal {
+    /// A live unexpired checkpoint still addresses the requested prefix.
+    LiveCheckpoint {
+        /// Minimum position across live checkpoints that blocks collection.
+        min_live: u64,
+    },
+    /// Unconsumed operation records still reference the requested prefix.
+    PendingOperations {
+        /// Highest position fully consumed by every live peer.
+        consumed_through: u64,
+    },
+    /// The requested prefix reaches past the durable frontier.
+    BeyondFrontier {
+        /// Current monotonic scoped frontier.
+        frontier: u64,
+    },
+}
+
+/// Decides how far the prunable log prefix may advance.
+///
+/// Collection never passes the frontier, never removes history a live
+/// checkpoint still addresses, and never drops operation records peers have
+/// not consumed. A request at or below the floor is an idempotent no-op that
+/// reports the current floor.
+///
+/// # Errors
+///
+/// Returns the [`PruneRefusal`] that blocks collection.
+pub fn prune_decision(
+    frontier: u64,
+    floor: u64,
+    requested_up_to: u64,
+    min_live: Option<u64>,
+    consumed_through: u64,
+) -> Result<u64, PruneRefusal> {
+    if requested_up_to <= floor {
+        return Ok(floor);
+    }
+    if requested_up_to > frontier {
+        return Err(PruneRefusal::BeyondFrontier { frontier });
+    }
+    if let Some(min_live) = min_live
+        && requested_up_to > min_live
+    {
+        return Err(PruneRefusal::LiveCheckpoint { min_live });
+    }
+    if requested_up_to > consumed_through {
+        return Err(PruneRefusal::PendingOperations { consumed_through });
+    }
+    Ok(requested_up_to)
+}
+
+/// Durable receipt for one collected log prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PruneReceipt {
+    /// Highest log position collected by this decision, inclusive.
+    pub pruned_through: u64,
+    /// Durable retention floor after collection.
+    pub floor: u64,
+}
+
+/// Durable outcome of executing one frontier-bound prune invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PruneResult {
+    /// The prefix decision committed and the floor advanced (or held).
+    Pruned(PruneReceipt),
+    /// A live peer still needs part of the requested prefix.
+    Refused(PruneRefusal),
+    /// The durable frontier changed after the invocation was justified.
+    StaleAuthority,
+}
+
+/// Durable outcome of executing one frontier-bound snapshot seal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SealResult {
+    /// The versioned baseline committed durably.
+    Sealed {
+        /// Baseline position now available for full recovery.
+        position: u64,
+    },
+    /// The baseline addresses positions past the durable frontier.
+    BeyondFrontier {
+        /// Current monotonic scoped frontier.
+        frontier: u64,
+    },
+    /// The durable frontier changed after the invocation was justified.
+    StaleAuthority,
+}
+
+/// Durable outcome of executing one frontier-bound consumption mark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsumedResult {
+    /// The consumption watermark advanced monotonically.
+    Advanced {
+        /// Highest position fully consumed by every live peer.
+        consumed_through: u64,
+    },
+    /// The watermark already covered the request; nothing changed.
+    Unchanged {
+        /// Highest position fully consumed by every live peer.
+        consumed_through: u64,
+    },
+    /// The request addresses positions past the durable frontier.
+    BeyondFrontier {
+        /// Current monotonic scoped frontier.
+        frontier: u64,
+    },
+    /// The durable frontier changed after the invocation was justified.
+    StaleAuthority,
+}
+
+/// Durable retention contract for peer-aware log collection.
+///
+/// Reads report the versioned snapshot baseline, the retention floor, and the
+/// peer-consumption watermark. Writes are frontier-bound like page reads: a
+/// grant justified against a moved frontier reports stale authority instead of
+/// collecting under a prefix a live peer still needs.
+pub trait RetentionStore: ServiceStore {
+    /// Reads the highest position fully consumed by every live peer.
+    fn consumed_through(
+        &self,
+        scope: Scope,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+
+    /// Reads the versioned snapshot baseline available for full recovery.
+    fn snapshot_baseline(
+        &self,
+        scope: Scope,
+    ) -> impl Future<Output = Result<Option<SnapshotBaseline>, Self::Error>> + Send;
+
+    /// Durably records a versioned snapshot baseline for the scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed backend transaction or corruption failure.
+    fn seal_snapshot(
+        &self,
+        scope: Scope,
+        baseline: SnapshotBaseline,
+        request: OperationDigest,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send;
+
+    /// Monotonically advances the peer-consumption watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed backend transaction or corruption failure.
+    fn mark_consumed(
+        &self,
+        scope: Scope,
+        through: u64,
+        request: OperationDigest,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send;
+
+    /// Collects the log prefix through the peer-aware prune decision.
+    ///
+    /// Operation and invocation records survive collection so exact retries
+    /// stay idempotent; only log manifests and their chunks are dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed backend transaction or corruption failure.
+    fn prune(
+        &self,
+        scope: Scope,
+        up_to: u64,
+        min_live: Option<u64>,
+        request: OperationDigest,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send;
+}
+
+impl<Store> RetentionStore for Arc<Store>
+where
+    Store: RetentionStore + ?Sized,
+{
+    fn consumed_through(
+        &self,
+        scope: Scope,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        (**self).consumed_through(scope)
+    }
+
+    fn snapshot_baseline(
+        &self,
+        scope: Scope,
+    ) -> impl Future<Output = Result<Option<SnapshotBaseline>, Self::Error>> + Send {
+        (**self).snapshot_baseline(scope)
+    }
+
+    fn seal_snapshot(
+        &self,
+        scope: Scope,
+        baseline: SnapshotBaseline,
+        request: OperationDigest,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
+        (**self).seal_snapshot(scope, baseline, request, grant)
+    }
+
+    fn mark_consumed(
+        &self,
+        scope: Scope,
+        through: u64,
+        request: OperationDigest,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+        (**self).mark_consumed(scope, through, request, grant)
+    }
+
+    fn prune(
+        &self,
+        scope: Scope,
+        up_to: u64,
+        min_live: Option<u64>,
+        request: OperationDigest,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
+        (**self).prune(scope, up_to, min_live, request, grant)
     }
 }
 
@@ -401,6 +654,11 @@ where
 
     /// Reads one authorized page after an authenticated opaque checkpoint.
     ///
+    /// A checkpoint behind the durable retention floor takes the explicit
+    /// full-recovery transition instead of a partial prefix. A request without
+    /// a checkpoint resumes from the floor, which is the full-recovery read
+    /// path after collection.
+    ///
     /// # Errors
     ///
     /// Returns protocol, authority, checkpoint-authentication, backend, or
@@ -416,6 +674,11 @@ where
             .frontier(request.scope)
             .await
             .map_err(ServiceError::Store)?;
+        let floor = self
+            .store
+            .retention_floor(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
         let Some(grant) = self.policy.authorize(
             request.scope,
             Effect::Sync,
@@ -425,14 +688,18 @@ where
         ) else {
             return Err(ServiceError::Forbidden);
         };
-        let after = match &request.after {
+        let checkpoint_position = match &request.after {
             Some(token) => match self.checkpoints.open(request.scope, token, now_unix_ms) {
-                Ok(position) => position,
+                Ok(position) => Some(position),
                 Err(CheckpointError::Expired) => return Ok(ServicePull::CheckpointExpired),
                 Err(error) => return Err(ServiceError::Checkpoint(error)),
             },
-            None => 0,
+            None => None,
         };
+        if checkpoint_position.is_some_and(|position| is_behind_retention(position, floor)) {
+            return Ok(ServicePull::CheckpointExpired);
+        }
+        let after = checkpoint_position.unwrap_or(0).max(floor);
         let result = self
             .store
             .page(
@@ -445,8 +712,10 @@ where
             )
             .await
             .map_err(ServiceError::Store)?;
-        let PageResult::Page(stored) = result else {
-            return Err(ServiceError::StaleAuthority);
+        let stored = match result {
+            PageResult::Page(stored) => stored,
+            PageResult::BehindFloor => return Ok(ServicePull::CheckpointExpired),
+            PageResult::StaleAuthority => return Err(ServiceError::StaleAuthority),
         };
         if !valid_stored_page(after, frontier, &stored) {
             return Err(ServiceError::CorruptStoreData);
@@ -479,6 +748,106 @@ where
         page.validate(request.scope)
             .map_err(ServiceError::Protocol)?;
         Ok(ServicePull::Page(page))
+    }
+}
+
+impl<Store, Policy> ProtocolService<Store, Policy>
+where
+    Store: RetentionStore,
+    Policy: Authority,
+{
+    /// Durably records a versioned snapshot baseline for full recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns authority or backend failures. A baseline past the frontier is
+    /// a [`SealResult::BeyondFrontier`] refusal, never a silent commit.
+    pub async fn seal_snapshot(
+        &self,
+        scope: Scope,
+        baseline: SnapshotBaseline,
+        request: OperationDigest,
+        now_unix_ms: u64,
+    ) -> Result<SealResult, ServiceError<Store::Error>> {
+        let frontier = self
+            .store
+            .frontier(scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let Some(grant) =
+            self.policy
+                .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
+        else {
+            return Err(ServiceError::Forbidden);
+        };
+        self.store
+            .seal_snapshot(scope, baseline, request, &grant)
+            .await
+            .map_err(ServiceError::Store)
+    }
+
+    /// Advances the peer-consumption watermark guarding collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns authority or backend failures. A watermark past the frontier is
+    /// a [`ConsumedResult::BeyondFrontier`] refusal, never a silent advance.
+    pub async fn mark_consumed(
+        &self,
+        scope: Scope,
+        through: u64,
+        request: OperationDigest,
+        now_unix_ms: u64,
+    ) -> Result<ConsumedResult, ServiceError<Store::Error>> {
+        let frontier = self
+            .store
+            .frontier(scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let Some(grant) =
+            self.policy
+                .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
+        else {
+            return Err(ServiceError::Forbidden);
+        };
+        self.store
+            .mark_consumed(scope, through, request, &grant)
+            .await
+            .map_err(ServiceError::Store)
+    }
+
+    /// Collects the log prefix the peer-aware prune decision allows.
+    ///
+    /// `min_live` is the minimum position across live unexpired checkpoints;
+    /// `None` asserts no live peer holds history the floor does not cover.
+    ///
+    /// # Errors
+    ///
+    /// Returns authority or backend failures. A prefix a live peer still needs
+    /// is a [`PruneResult::Refused`] refusal, never a partial collection.
+    pub async fn prune(
+        &self,
+        scope: Scope,
+        up_to: u64,
+        min_live: Option<u64>,
+        request: OperationDigest,
+        now_unix_ms: u64,
+    ) -> Result<PruneResult, ServiceError<Store::Error>> {
+        let frontier = self
+            .store
+            .frontier(scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let Some(grant) =
+            self.policy
+                .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
+        else {
+            return Err(ServiceError::Forbidden);
+        };
+        self.store
+            .prune(scope, up_to, min_live, request, &grant)
+            .await
+            .map_err(ServiceError::Store)
     }
 }
 
@@ -532,7 +901,9 @@ mod tests {
     use std::{collections::HashMap, convert::Infallible, sync::Mutex};
 
     use logical_db_crdt::{Document, Object, Scalar};
-    use logical_db_model::{AccountId, ChangeDigest, DocumentId, OperationId, ReplicaId, SpaceId};
+    use logical_db_model::{
+        AccountId, ChangeDigest, DocumentId, OperationId, ReplicaId, SnapshotBaseline, SpaceId,
+    };
 
     use super::*;
 
@@ -603,10 +974,65 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Default)]
+    struct RetentionState {
+        floor: u64,
+        consumed: u64,
+        baseline: Option<SnapshotBaseline>,
+    }
+
     #[derive(Default)]
     struct Memory {
         changes: Mutex<Vec<ChangeEnvelope>>,
         operations: Mutex<HashMap<OperationId, (OperationDigest, ChangeDigest)>>,
+        retention: Mutex<HashMap<Scope, RetentionState>>,
+    }
+
+    impl Memory {
+        fn scope_frontier(&self, scope: Scope) -> u64 {
+            let changes = self.changes.lock().unwrap();
+            let state = self
+                .retention
+                .lock()
+                .unwrap()
+                .get(&scope)
+                .copied()
+                .unwrap_or_default();
+            state.floor + Self::retained_count(&changes, scope)
+        }
+
+        fn retained_count(changes: &[ChangeEnvelope], scope: Scope) -> u64 {
+            changes
+                .iter()
+                .filter(|change| change.scope == scope)
+                .count() as u64
+        }
+
+        fn retention_state(&self, scope: Scope) -> RetentionState {
+            self.retention
+                .lock()
+                .unwrap()
+                .get(&scope)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn check_retention_grant(
+            &self,
+            scope: Scope,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Option<u64> {
+            let frontier = self.scope_frontier(scope);
+            if grant.scope() != scope
+                || grant.effect() != Effect::Sync
+                || grant.request() != request
+                || grant.frontier() != frontier
+            {
+                return None;
+            }
+            Some(frontier)
+        }
     }
 
     #[allow(clippy::unused_async_trait_impl)]
@@ -630,13 +1056,10 @@ mod tests {
             Ok(AcceptResult::Accepted)
         }
         async fn frontier(&self, scope: Scope) -> Result<u64, Self::Error> {
-            Ok(self
-                .changes
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|change| change.scope == scope)
-                .count() as u64)
+            Ok(self.scope_frontier(scope))
+        }
+        async fn retention_floor(&self, scope: Scope) -> Result<u64, Self::Error> {
+            Ok(self.retention_state(scope).floor)
         }
         async fn page(
             &self,
@@ -653,20 +1076,21 @@ mod tests {
             {
                 return Ok(PageResult::StaleAuthority);
             }
+            let floor = self.retention_state(scope).floor;
+            if after < floor {
+                return Ok(PageResult::BehindFloor);
+            }
             let changes = self.changes.lock().unwrap();
-            if grant.frontier()
-                != changes
-                    .iter()
-                    .filter(|change| change.scope == scope)
-                    .count() as u64
-            {
+            let frontier = floor + Self::retained_count(&changes, scope);
+            if grant.frontier() != frontier {
                 return Ok(PageResult::StaleAuthority);
             }
+            let skip = usize::try_from(after - floor).unwrap_or(usize::MAX);
             let mut bytes = 0usize;
             let page = changes
                 .iter()
                 .filter(|change| change.scope == scope)
-                .skip(usize::try_from(after).unwrap_or(usize::MAX))
+                .skip(skip)
                 .take(usize::from(max_changes))
                 .take_while(|change| {
                     bytes += change.bytes.len();
@@ -675,15 +1099,111 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>();
             let position = after + page.len() as u64;
-            let more = changes
-                .iter()
-                .filter(|change| change.scope == scope)
-                .count()
-                > usize::try_from(position).unwrap_or(usize::MAX);
+            let more = frontier > position;
             Ok(PageResult::Page(StoredPage {
                 changes: page,
                 position,
                 more,
+            }))
+        }
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl RetentionStore for Memory {
+        async fn consumed_through(&self, scope: Scope) -> Result<u64, Self::Error> {
+            Ok(self.retention_state(scope).consumed)
+        }
+        async fn snapshot_baseline(
+            &self,
+            scope: Scope,
+        ) -> Result<Option<SnapshotBaseline>, Self::Error> {
+            Ok(self.retention_state(scope).baseline)
+        }
+        async fn seal_snapshot(
+            &self,
+            scope: Scope,
+            baseline: SnapshotBaseline,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Result<SealResult, Self::Error> {
+            let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
+                return Ok(SealResult::StaleAuthority);
+            };
+            if baseline.position() > frontier {
+                return Ok(SealResult::BeyondFrontier { frontier });
+            }
+            self.retention
+                .lock()
+                .unwrap()
+                .entry(scope)
+                .or_default()
+                .baseline = Some(baseline);
+            Ok(SealResult::Sealed {
+                position: baseline.position(),
+            })
+        }
+        async fn mark_consumed(
+            &self,
+            scope: Scope,
+            through: u64,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Result<ConsumedResult, Self::Error> {
+            let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
+                return Ok(ConsumedResult::StaleAuthority);
+            };
+            if through > frontier {
+                return Ok(ConsumedResult::BeyondFrontier { frontier });
+            }
+            let mut retention = self.retention.lock().unwrap();
+            let state = retention.entry(scope).or_default();
+            if through <= state.consumed {
+                return Ok(ConsumedResult::Unchanged {
+                    consumed_through: state.consumed,
+                });
+            }
+            state.consumed = through;
+            Ok(ConsumedResult::Advanced {
+                consumed_through: through,
+            })
+        }
+        async fn prune(
+            &self,
+            scope: Scope,
+            up_to: u64,
+            min_live: Option<u64>,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Result<PruneResult, Self::Error> {
+            let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
+                return Ok(PruneResult::StaleAuthority);
+            };
+            let state = self.retention_state(scope);
+            let through =
+                match prune_decision(frontier, state.floor, up_to, min_live, state.consumed) {
+                    Ok(through) => through,
+                    Err(refusal) => return Ok(PruneResult::Refused(refusal)),
+                };
+            if through > state.floor {
+                let floor = state.floor;
+                let mut position = floor;
+                self.changes.lock().unwrap().retain(|change| {
+                    if change.scope != scope {
+                        return true;
+                    }
+                    position += 1;
+                    position > through
+                });
+                self.retention
+                    .lock()
+                    .unwrap()
+                    .entry(scope)
+                    .or_default()
+                    .floor = through;
+            }
+            Ok(PruneResult::Pruned(PruneReceipt {
+                pruned_through: through,
+                floor: through.max(state.floor),
             }))
         }
     }
@@ -916,5 +1436,480 @@ mod tests {
             ..page
         };
         assert!(!valid_stored_page(4, 6, &beyond));
+    }
+
+    struct Deny;
+
+    impl Authority for Deny {
+        type Grant = Grant;
+
+        fn authorize(
+            &self,
+            _scope: Scope,
+            _effect: Effect,
+            _request: OperationDigest,
+            _frontier: u64,
+            _now: u64,
+        ) -> Option<Self::Grant> {
+            None
+        }
+    }
+
+    fn envelope_with(
+        scope: Scope,
+        replica: ReplicaId,
+        operation: OperationId,
+        request_byte: u8,
+    ) -> ChangeEnvelope {
+        let mut envelope = change(scope, replica, operation);
+        envelope.request = OperationDigest::new([request_byte; 32]);
+        envelope
+    }
+
+    fn tombstone_envelope(
+        scope: Scope,
+        replica: ReplicaId,
+        operation: OperationId,
+        request_byte: u8,
+    ) -> ChangeEnvelope {
+        let mut document = Document::new();
+        document
+            .edit(|editor| editor.put(&Object::root(), "k", Scalar::Integer(1)))
+            .unwrap();
+        let mut staged = document.delete().unwrap();
+        let encoded = staged.pop().unwrap();
+        assert!(staged.is_empty());
+        ChangeEnvelope {
+            scope,
+            document: DocumentId::new(),
+            replica,
+            operation,
+            request: OperationDigest::new([request_byte; 32]),
+            digest: encoded.digest,
+            bytes: encoded.bytes,
+        }
+    }
+
+    fn push_all<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        replica: ReplicaId,
+        changes: Vec<ChangeEnvelope>,
+    ) -> PushResponse
+    where
+        Store: ServiceStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        let request = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes,
+        };
+        futures::executor::block_on(service.push(&request, 10)).unwrap()
+    }
+
+    fn pull_after<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        replica: ReplicaId,
+        after: Option<Checkpoint>,
+        now: u64,
+    ) -> ServicePull
+    where
+        Store: ServiceStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        let request = PullRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([91; 32]),
+            after,
+            max_changes: 10,
+            max_bytes: 1_048_576,
+        };
+        futures::executor::block_on(service.pull(&request, now)).unwrap()
+    }
+
+    fn seal_at<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        position: u64,
+        now: u64,
+    ) -> SealResult
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        futures::executor::block_on(service.seal_snapshot(
+            scope,
+            SnapshotBaseline::new(position),
+            OperationDigest::new([61; 32]),
+            now,
+        ))
+        .unwrap()
+    }
+
+    fn consume_through<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        through: u64,
+        now: u64,
+    ) -> ConsumedResult
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        futures::executor::block_on(service.mark_consumed(
+            scope,
+            through,
+            OperationDigest::new([62; 32]),
+            now,
+        ))
+        .unwrap()
+    }
+
+    fn collect<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        up_to: u64,
+        min_live: Option<u64>,
+        now: u64,
+    ) -> PruneResult
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        futures::executor::block_on(service.prune(
+            scope,
+            up_to,
+            min_live,
+            OperationDigest::new([63; 32]),
+            now,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn prune_refuses_a_prefix_still_referenced_by_a_live_checkpoint() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([21; 32], 10_000).unwrap(),
+        );
+        let changes = (30u8..33)
+            .map(|request| envelope_with(scope, replica, OperationId::new(), request))
+            .collect::<Vec<_>>();
+        let response = push_all(&service, replica, changes);
+        assert!(
+            response
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, PushOutcome::Accepted { .. }))
+        );
+        assert_eq!(
+            consume_through(&service, scope, 3, 11),
+            ConsumedResult::Advanced {
+                consumed_through: 3
+            }
+        );
+        assert_eq!(
+            collect(&service, scope, 3, Some(1), 12),
+            PruneResult::Refused(PruneRefusal::LiveCheckpoint { min_live: 1 })
+        );
+        assert_eq!(
+            collect(&service, scope, 0, None, 13),
+            PruneResult::Pruned(PruneReceipt {
+                pruned_through: 0,
+                floor: 0
+            })
+        );
+        let ServicePull::Page(page) = pull_after(&service, scope, replica, None, 14) else {
+            panic!("page expected")
+        };
+        assert_eq!(page.changes.len(), 3);
+    }
+
+    #[test]
+    fn prune_refuses_a_prefix_with_unconsumed_operation_records() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([22; 32], 10_000).unwrap(),
+        );
+        let changes = (40u8..43)
+            .map(|request| envelope_with(scope, replica, OperationId::new(), request))
+            .collect::<Vec<_>>();
+        push_all(&service, replica, changes);
+        assert_eq!(
+            collect(&service, scope, 2, None, 11),
+            PruneResult::Refused(PruneRefusal::PendingOperations {
+                consumed_through: 0
+            })
+        );
+        assert_eq!(
+            consume_through(&service, scope, 2, 12),
+            ConsumedResult::Advanced {
+                consumed_through: 2
+            }
+        );
+        assert_eq!(
+            collect(&service, scope, 2, None, 13),
+            PruneResult::Pruned(PruneReceipt {
+                pruned_through: 2,
+                floor: 2
+            })
+        );
+        assert_eq!(
+            collect(&service, scope, 3, None, 14),
+            PruneResult::Refused(PruneRefusal::PendingOperations {
+                consumed_through: 2
+            })
+        );
+    }
+
+    #[test]
+    fn behind_floor_checkpoint_expires_then_full_recovery_completes() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([23; 32], 10_000).unwrap(),
+        );
+        let first = envelope_with(scope, replica, OperationId::new(), 50);
+        push_all(&service, replica, vec![first]);
+        let ServicePull::Page(first_page) = pull_after(&service, scope, replica, None, 11) else {
+            panic!("page expected")
+        };
+        assert_eq!(first_page.changes.len(), 1);
+        let stale_checkpoint = first_page.checkpoint.clone();
+        let second = envelope_with(scope, replica, OperationId::new(), 51);
+        let tombstone = tombstone_envelope(scope, replica, OperationId::new(), 52);
+        let tombstone_bytes = tombstone.bytes.clone();
+        let fourth = envelope_with(scope, replica, OperationId::new(), 53);
+        push_all(&service, replica, vec![second, tombstone, fourth]);
+        assert_eq!(
+            seal_at(&service, scope, 2, 12),
+            SealResult::Sealed { position: 2 }
+        );
+        assert_eq!(
+            consume_through(&service, scope, 4, 13),
+            ConsumedResult::Advanced {
+                consumed_through: 4
+            }
+        );
+        assert_eq!(
+            collect(&service, scope, 2, None, 14),
+            PruneResult::Pruned(PruneReceipt {
+                pruned_through: 2,
+                floor: 2
+            })
+        );
+        assert_eq!(
+            pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
+            ServicePull::CheckpointExpired
+        );
+        let ServicePull::Page(recovered) = pull_after(&service, scope, replica, None, 16) else {
+            panic!("recovery page expected")
+        };
+        assert_eq!(recovered.changes.len(), 2);
+        assert_eq!(recovered.changes[0].bytes, tombstone_bytes);
+        assert!(!recovered.more);
+    }
+
+    #[test]
+    fn chunk_manifest_and_invocation_references_stay_consistent_after_collection() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([24; 32], 10_000).unwrap(),
+        );
+        let operations = [OperationId::new(), OperationId::new(), OperationId::new()];
+        let changes = operations
+            .iter()
+            .zip(60u8..63)
+            .map(|(operation, request)| envelope_with(scope, replica, *operation, request))
+            .collect::<Vec<_>>();
+        push_all(&service, replica, changes.clone());
+        assert_eq!(
+            consume_through(&service, scope, 3, 11),
+            ConsumedResult::Advanced {
+                consumed_through: 3
+            }
+        );
+        assert_eq!(
+            collect(&service, scope, 2, None, 12),
+            PruneResult::Pruned(PruneReceipt {
+                pruned_through: 2,
+                floor: 2
+            })
+        );
+        let duplicate = push_all(&service, replica, vec![changes[0].clone()]);
+        assert!(matches!(
+            duplicate.outcomes[0],
+            PushOutcome::Duplicate { .. }
+        ));
+        let mut conflicting = changes[1].clone();
+        conflicting.request = OperationDigest::new([99; 32]);
+        let conflict = push_all(&service, replica, vec![conflicting]);
+        assert!(matches!(
+            conflict.outcomes[0],
+            PushOutcome::Rejected {
+                code: RejectionCode::OperationConflict,
+                ..
+            }
+        ));
+        let ServicePull::Page(page) = pull_after(&service, scope, replica, None, 13) else {
+            panic!("page expected")
+        };
+        assert_eq!(page.changes.len(), 1);
+        assert_eq!(page.changes[0].operation, operations[2]);
+        assert!(!page.more);
+    }
+
+    #[test]
+    fn retention_floor_and_baseline_survive_service_restart() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let store = std::sync::Arc::new(Memory::default());
+        let changes = (70u8..73)
+            .map(|request| envelope_with(scope, replica, OperationId::new(), request))
+            .collect::<Vec<_>>();
+        let stale_checkpoint = {
+            let service = ProtocolService::new(
+                store.clone(),
+                Allow,
+                CheckpointCodec::new([25; 32], 10_000).unwrap(),
+            );
+            push_all(&service, replica, vec![changes[0].clone()]);
+            let ServicePull::Page(first) = pull_after(&service, scope, replica, None, 11) else {
+                panic!("page expected")
+            };
+            push_all(&service, replica, changes[1..].to_vec());
+            assert_eq!(
+                seal_at(&service, scope, 2, 12),
+                SealResult::Sealed { position: 2 }
+            );
+            assert_eq!(
+                consume_through(&service, scope, 3, 13),
+                ConsumedResult::Advanced {
+                    consumed_through: 3
+                }
+            );
+            assert_eq!(
+                collect(&service, scope, 2, None, 14),
+                PruneResult::Pruned(PruneReceipt {
+                    pruned_through: 2,
+                    floor: 2
+                })
+            );
+            first.checkpoint
+        };
+        let service = ProtocolService::new(
+            store.clone(),
+            Allow,
+            CheckpointCodec::new([25; 32], 10_000).unwrap(),
+        );
+        assert_eq!(
+            futures::executor::block_on(store.retention_floor(scope)).unwrap(),
+            2
+        );
+        assert_eq!(
+            futures::executor::block_on(store.snapshot_baseline(scope)).unwrap(),
+            Some(SnapshotBaseline::new(2))
+        );
+        assert_eq!(
+            pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
+            ServicePull::CheckpointExpired
+        );
+    }
+
+    #[test]
+    fn prune_decision_rejects_every_uncollectible_edge() {
+        assert_eq!(prune_decision(10, 2, 2, None, 5), Ok(2));
+        assert_eq!(prune_decision(10, 2, 1, None, 5), Ok(2));
+        assert_eq!(prune_decision(10, 2, 5, None, 5), Ok(5));
+        assert_eq!(prune_decision(10, 2, 5, Some(5), 9), Ok(5));
+        assert_eq!(
+            prune_decision(3, 0, 4, None, 4),
+            Err(PruneRefusal::BeyondFrontier { frontier: 3 })
+        );
+        assert_eq!(
+            prune_decision(10, 0, 5, Some(4), 9),
+            Err(PruneRefusal::LiveCheckpoint { min_live: 4 })
+        );
+        assert_eq!(
+            prune_decision(10, 0, 5, None, 4),
+            Err(PruneRefusal::PendingOperations {
+                consumed_through: 4
+            })
+        );
+    }
+
+    #[test]
+    fn retention_writes_require_fresh_authority() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let stale = ProtocolService::new(
+            Memory::default(),
+            Stale,
+            CheckpointCodec::new([26; 32], 10_000).unwrap(),
+        );
+        assert_eq!(
+            futures::executor::block_on(stale.seal_snapshot(
+                scope,
+                SnapshotBaseline::new(0),
+                OperationDigest::new([61; 32]),
+                10,
+            ))
+            .unwrap(),
+            SealResult::StaleAuthority
+        );
+        assert_eq!(
+            futures::executor::block_on(stale.mark_consumed(
+                scope,
+                0,
+                OperationDigest::new([62; 32]),
+                10,
+            ))
+            .unwrap(),
+            ConsumedResult::StaleAuthority
+        );
+        assert_eq!(
+            futures::executor::block_on(stale.prune(
+                scope,
+                0,
+                None,
+                OperationDigest::new([63; 32]),
+                10,
+            ))
+            .unwrap(),
+            PruneResult::StaleAuthority
+        );
+        let denied = ProtocolService::new(
+            Memory::default(),
+            Deny,
+            CheckpointCodec::new([27; 32], 10_000).unwrap(),
+        );
+        assert!(matches!(
+            futures::executor::block_on(denied.prune(
+                scope,
+                0,
+                None,
+                OperationDigest::new([63; 32]),
+                10,
+            )),
+            Err(ServiceError::Forbidden)
+        ));
     }
 }
