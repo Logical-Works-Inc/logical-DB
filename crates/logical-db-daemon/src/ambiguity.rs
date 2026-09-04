@@ -394,6 +394,13 @@ async fn read_page_with_retry(
                 ))
                 .into());
             }
+            Ok(PageResult::BehindFloor) => {
+                return Err(io::Error::other(format!(
+                    "page checkpoint expired after={after} expected_frontier={}",
+                    grant.frontier()
+                ))
+                .into());
+            }
             Err(error) => last_error = Some(error),
         }
     }

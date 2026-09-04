@@ -495,61 +495,18 @@ mod runtime {
                     let chunk_space = chunk_space.clone();
                     async move {
                         configure_transaction(&transaction)?;
-                        if let Some(existing) = transaction.get(&operation_key, false).await? {
-                            let operation = decode_operation(existing.as_ref()).map_err(binding)?;
-                            let stored_invocation_key = scope_space
-                                .pack(&(KIND_INVOCATION, operation.invocation_id.as_slice()));
-                            let stored_binding = transaction
-                                .get(&stored_invocation_key, false)
-                                .await?
-                                .ok_or_else(|| binding(DataError::MissingInvocation))?;
-                            if stored_binding.as_ref()
-                                != invocation_binding_record(&operation.record)
-                            {
-                                return Err(binding(DataError::InvalidInvocation));
-                            }
-                            let record = operation.record;
-                            let floor = transaction
-                                .get(&retention_key, false)
-                                .await?
-                                .map(|value| {
-                                    decode_retention(value.as_ref())
-                                        .map(|(floor, _)| floor)
-                                        .map_err(binding)
-                                })
-                                .transpose()?
-                                .unwrap_or(0);
-                            let exact_bytes = if record.sequence <= floor {
-                                // Chunks below the floor were collected by
-                                // design; the manifest digest remains the
-                                // content identity for the retry decision.
-                                None
-                            } else {
-                                Some(
-                                    load_change_bytes(
-                                        &transaction,
-                                        &chunk_space,
-                                        record.sequence,
-                                        &record,
-                                    )
-                                    .await?,
-                                )
-                            };
-                            return Ok(
-                                if record.matches(&change)
-                                    && exact_bytes
-                                        .as_ref()
-                                        .is_none_or(|bytes| *bytes == change.bytes)
-                                {
-                                    if bool::from(maybe_committed) {
-                                        AcceptResult::RecoveredUnknownCommit
-                                    } else {
-                                        AcceptResult::Duplicate
-                                    }
-                                } else {
-                                    AcceptResult::Conflict
-                                },
-                            );
+                        if let Some(result) = existing_accept_result(
+                            &transaction,
+                            &scope_space,
+                            &chunk_space,
+                            &operation_key,
+                            &retention_key,
+                            &change,
+                            bool::from(maybe_committed),
+                        )
+                        .await?
+                        {
+                            return Ok(result);
                         }
                         if transaction.get(&invocation_key, false).await?.is_some() {
                             return Ok(AcceptResult::InvocationConsumed);
@@ -896,6 +853,61 @@ mod runtime {
                 .await
                 .map_err(classify_transaction)
         }
+    }
+
+    async fn existing_accept_result(
+        transaction: &foundationdb::RetryableTransaction,
+        scope_space: &Subspace,
+        chunk_space: &Subspace,
+        operation_key: &[u8],
+        retention_key: &[u8],
+        change: &ChangeEnvelope,
+        maybe_committed: bool,
+    ) -> Result<Option<AcceptResult>, FdbBindingError> {
+        let Some(existing) = transaction.get(operation_key, false).await? else {
+            return Ok(None);
+        };
+        let operation = decode_operation(existing.as_ref()).map_err(binding)?;
+        let stored_invocation_key =
+            scope_space.pack(&(KIND_INVOCATION, operation.invocation_id.as_slice()));
+        let stored_binding = transaction
+            .get(&stored_invocation_key, false)
+            .await?
+            .ok_or_else(|| binding(DataError::MissingInvocation))?;
+        if stored_binding.as_ref() != invocation_binding_record(&operation.record) {
+            return Err(binding(DataError::InvalidInvocation));
+        }
+        let record = operation.record;
+        let floor = transaction
+            .get(retention_key, false)
+            .await?
+            .map(|value| {
+                decode_retention(value.as_ref())
+                    .map(|(floor, _)| floor)
+                    .map_err(binding)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let exact_bytes = if record.sequence <= floor {
+            // Chunks below the floor were collected by design; the manifest
+            // digest remains the content identity for the retry decision.
+            None
+        } else {
+            Some(load_change_bytes(transaction, chunk_space, record.sequence, &record).await?)
+        };
+        let exact_retry = record.matches(change)
+            && exact_bytes
+                .as_ref()
+                .is_none_or(|bytes| *bytes == change.bytes);
+        Ok(Some(if exact_retry {
+            if maybe_committed {
+                AcceptResult::RecoveredUnknownCommit
+            } else {
+                AcceptResult::Duplicate
+            }
+        } else {
+            AcceptResult::Conflict
+        }))
     }
 
     async fn load_page(
