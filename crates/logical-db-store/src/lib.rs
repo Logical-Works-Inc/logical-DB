@@ -38,6 +38,7 @@ const KIND_EVENT_SEQUENCE: u8 = 12;
 const KIND_EVENT: u8 = 13;
 const KIND_MIGRATION: u8 = 14;
 const KIND_UPSTREAM: u8 = 15;
+const KIND_TOMBSTONE: u8 = 16;
 /// Maximum aggregate snapshot state retained while installing or migrating one page.
 pub const MAX_MATERIALIZED_PAGE_BYTES: usize = 67_108_864;
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
@@ -102,6 +103,12 @@ pub struct LocalCommit<'a> {
     pub snapshot: &'a [u8],
     /// Complete materialized index set for the successor snapshot.
     pub indexes: &'a [IndexEntry],
+    /// Whether the successor snapshot carries a first-class tombstone.
+    ///
+    /// Tombstoned documents keep their snapshot, change, operation, outbox,
+    /// and event rows; only secondary-index rows are cleared and reads
+    /// report absent. The flag is monotonic: once set it is never removed.
+    pub tombstone: bool,
 }
 
 /// Latest complete snapshot and its optimistic concurrency marker.
@@ -135,6 +142,11 @@ pub struct RemoteDocument<'a> {
     pub snapshot: &'a [u8],
     /// Complete materialized index set for the merged snapshot.
     pub indexes: &'a [IndexEntry],
+    /// Whether the merged snapshot carries a first-class tombstone.
+    ///
+    /// The flag is monotonic: installation sets it but never clears it, so
+    /// a late tombstone page converges to absent without resurrection.
+    pub tombstone: bool,
 }
 
 /// One stable secondary-index result.
@@ -632,6 +644,7 @@ impl EmbeddedStore {
                 Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
                 None => DocumentRevision::new(1),
             };
+            check_tombstone_transition(&table, scope, commit.change.document, commit.tombstone)?;
 
             let sequence_key = key_sequence(scope);
             let previous = table
@@ -671,6 +684,9 @@ impl EmbeddedStore {
                 revision_key.as_slice(),
                 next_revision.get().to_be_bytes().as_slice(),
             )?;
+            if commit.tombstone {
+                write_tombstone(&mut table, scope, commit.change.document)?;
+            }
             replace_indexes(&mut table, scope, commit.change.document, commit.indexes)?;
             table.insert(
                 key_event(scope, event_sequence).as_slice(),
@@ -757,6 +773,22 @@ impl EmbeddedStore {
             (Some(bytes), Some(revision)) => Ok(Some(StoredSnapshot { bytes, revision })),
             _ => Err(StoreError::CorruptInternalValue),
         }
+    }
+
+    /// Returns whether a first-class tombstone is durably recorded.
+    ///
+    /// The flag is monotonic: once a local delete or a remote tombstone page
+    /// commits it, neither restarts nor later non-tombstone pages clear it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed read or table error when durable state cannot be read.
+    pub fn is_tombstoned(&self, scope: Scope, document: DocumentId) -> Result<bool, StoreError> {
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        Ok(table
+            .get(key_tombstone(scope, document).as_slice())?
+            .is_some_and(|value| value.value() == [1_u8]))
     }
 
     /// Reads a bounded ordered page from the durable local outbox.
@@ -1081,6 +1113,9 @@ impl EmbeddedStore {
                     key_revision(scope, document.document).as_slice(),
                     next.get().to_be_bytes().as_slice(),
                 )?;
+                if document.tombstone {
+                    write_tombstone(&mut table, scope, document.document)?;
+                }
                 replace_indexes(&mut table, scope, document.document, document.indexes)?;
             }
             let mut event_sequence = table
@@ -1142,6 +1177,13 @@ pub enum StoreError {
     /// The document changed after its input snapshot was read.
     #[error("document changed before the successor snapshot committed")]
     StaleDocument,
+    /// A non-tombstone successor was attempted on a deleted document.
+    ///
+    /// Tombstones are monotonic: only another tombstone commit may follow.
+    /// Callers holding fresh writes for a deleted document must reconcile
+    /// against its conflict candidates instead of overwriting absence.
+    #[error("document is deleted and only accepts further tombstones")]
+    DocumentDeleted,
     /// A scope consumed every possible monotonic sequence.
     #[error("scope sequence is exhausted")]
     SequenceExhausted,
@@ -1432,6 +1474,12 @@ fn key_migration(scope: Scope) -> Vec<u8> {
     prefix(scope, KIND_MIGRATION)
 }
 
+fn key_tombstone(scope: Scope, document: DocumentId) -> Vec<u8> {
+    let mut key = prefix(scope, KIND_TOMBSTONE);
+    key.extend_from_slice(document.as_uuid().as_bytes());
+    key
+}
+
 fn index_row_prefix(scope: Scope, index: IndexId, encoded_value: &[u8]) -> Vec<u8> {
     let mut key = prefix(scope, KIND_INDEX);
     key.extend_from_slice(index.as_uuid().as_bytes());
@@ -1460,6 +1508,31 @@ fn key_index_reverse(scope: Scope, document: DocumentId, index: IndexId) -> Vec<
     let mut key = index_reverse_prefix(scope, document);
     key.extend_from_slice(index.as_uuid().as_bytes());
     key
+}
+
+fn check_tombstone_transition(
+    table: &Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    document: DocumentId,
+    tombstone: bool,
+) -> Result<(), StoreError> {
+    if !tombstone
+        && table
+            .get(key_tombstone(scope, document).as_slice())?
+            .is_some()
+    {
+        return Err(StoreError::DocumentDeleted);
+    }
+    Ok(())
+}
+
+fn write_tombstone(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    document: DocumentId,
+) -> Result<(), StoreError> {
+    table.insert(key_tombstone(scope, document).as_slice(), [1_u8].as_slice())?;
+    Ok(())
 }
 
 fn validate_indexes(indexes: &[IndexEntry]) -> Result<(), StoreError> {
@@ -1825,6 +1898,7 @@ mod tests {
                         index,
                         value: IndexValue::Text("old".into()),
                     }],
+                    tombstone: false,
                 })
                 .unwrap();
         }
@@ -1847,6 +1921,7 @@ mod tests {
                         expected_revision: None,
                         snapshot: b"verified-snapshot",
                         indexes: &[],
+                        tombstone: false,
                     })
                     .unwrap(),
                 CommitOutcome::Applied { sequence: 1 }
@@ -1877,6 +1952,7 @@ mod tests {
                         expected_revision: Some(DocumentRevision::new(1)),
                         snapshot: b"verified-snapshot",
                         indexes: &[],
+                        tombstone: false,
                     })
                     .unwrap(),
                 CommitOutcome::Duplicate { sequence: 1 }
@@ -1900,6 +1976,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"first",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert!(matches!(
@@ -1908,6 +1985,7 @@ mod tests {
                 expected_revision: Some(DocumentRevision::new(1)),
                 snapshot: b"second",
                 indexes: &[],
+                tombstone: false,
             }),
             Err(StoreError::OperationConflict)
         ));
@@ -1929,6 +2007,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"first",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert!(matches!(
@@ -1937,6 +2016,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"stale",
                 indexes: &[],
+                tombstone: false,
             }),
             Err(StoreError::StaleDocument)
         ));
@@ -2002,6 +2082,7 @@ mod tests {
                                 expected_revision: None,
                                 snapshot: b"concurrent-snapshot",
                                 indexes: &[],
+                                tombstone: false,
                             })
                             .unwrap();
                         let sequence = match outcome {
@@ -2131,6 +2212,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"snapshot",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         {
@@ -2201,6 +2283,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"state-before-binding",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert!(matches!(
@@ -2364,6 +2447,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"snapshot-one",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(
@@ -2411,6 +2495,7 @@ mod tests {
                 expected_revision: Some(DocumentRevision::new(1)),
                 snapshot: b"snapshot-two",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(store.outbox_page(scope, 0, 10).unwrap()[0].sequence, 2);
@@ -2533,6 +2618,7 @@ mod tests {
                     index,
                     value: value.clone(),
                 }],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(
@@ -2586,6 +2672,7 @@ mod tests {
                         index,
                         value: IndexValue::Text("note".into()),
                     }],
+                    tombstone: false,
                 })
                 .unwrap();
         }
@@ -2624,6 +2711,7 @@ mod tests {
                     index,
                     value: IndexValue::Text("task".into()),
                 }],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(
@@ -2768,6 +2856,7 @@ mod tests {
                     expected_revision: None,
                     snapshot: b"remote-snapshot",
                     indexes: &indexes,
+                    tombstone: false,
                 }],
                 &changes,
                 b"checkpoint-one",
@@ -2797,6 +2886,7 @@ mod tests {
                     expected_revision: Some(DocumentRevision::new(1)),
                     snapshot: b"remote-snapshot-two",
                     indexes: &indexes,
+                    tombstone: false,
                 }],
                 &changes,
                 b"checkpoint-two",
@@ -2841,12 +2931,14 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"x",
                 indexes: &[],
+                tombstone: false,
             },
             RemoteDocument {
                 document,
                 expected_revision: None,
                 snapshot: b"y",
                 indexes: &[],
+                tombstone: false,
             },
         ];
         assert!(matches!(
@@ -2863,6 +2955,7 @@ mod tests {
                     expected_revision: None,
                     snapshot: b"x",
                     indexes: &[],
+                    tombstone: false,
                 }],
                 &[RemoteChange {
                     document: other,
@@ -2899,6 +2992,7 @@ mod tests {
             key_event_sequence(scope),
             key_event(scope, 1),
             key_migration(scope),
+            key_tombstone(scope, document),
             key_index_row(scope, index, &[1], document),
             key_index_reverse(scope, document, index),
         ];
@@ -2996,6 +3090,126 @@ mod tests {
             store.apply_migration_page(scope, 2, [2; 32], None, &excessive),
             Err(StoreError::InvalidMigrationPage)
         ));
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tombstone_flag_commits_restarts_and_guards_resurrection() {
+        let path = test_path("tombstone-flag");
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let replica = ReplicaId::new();
+        {
+            let store = EmbeddedStore::open(&path, replica).unwrap();
+            assert!(!store.is_tombstoned(scope, document).unwrap());
+            assert!(!store.is_tombstoned(scope, DocumentId::new()).unwrap());
+            store
+                .commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 1, 2),
+                    expected_revision: None,
+                    snapshot: b"snapshot",
+                    indexes: &[],
+                    tombstone: true,
+                })
+                .unwrap();
+            assert!(store.is_tombstoned(scope, document).unwrap());
+            assert!(matches!(
+                store.commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 3, 4),
+                    expected_revision: Some(DocumentRevision::new(1)),
+                    snapshot: b"resurrect",
+                    indexes: &[],
+                    tombstone: false,
+                }),
+                Err(StoreError::DocumentDeleted)
+            ));
+            store
+                .commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 5, 6),
+                    expected_revision: Some(DocumentRevision::new(1)),
+                    snapshot: b"snapshot-two",
+                    indexes: &[],
+                    tombstone: true,
+                })
+                .unwrap();
+            assert!(store.is_tombstoned(scope, document).unwrap());
+        }
+        {
+            let store = EmbeddedStore::open(&path, replica).unwrap();
+            assert!(store.is_tombstoned(scope, document).unwrap());
+            assert_eq!(store.outbox_page(scope, 0, 10).unwrap().len(), 2);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn remote_install_sets_tombstone_flag_monotonically() {
+        let path = test_path("tombstone-remote");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let document = DocumentId::new();
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: None,
+                    snapshot: b"snapshot",
+                    indexes: &[],
+                    tombstone: false,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: ChangeDigest::new([1; 32]),
+                    bytes: b"change-one",
+                }],
+                b"checkpoint-one",
+            )
+            .unwrap();
+        assert!(!store.is_tombstoned(scope, document).unwrap());
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: Some(DocumentRevision::new(1)),
+                    snapshot: b"snapshot-two",
+                    indexes: &[],
+                    tombstone: true,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: ChangeDigest::new([2; 32]),
+                    bytes: b"change-two",
+                }],
+                b"checkpoint-two",
+            )
+            .unwrap();
+        assert!(store.is_tombstoned(scope, document).unwrap());
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: Some(DocumentRevision::new(2)),
+                    snapshot: b"snapshot-three",
+                    indexes: &[],
+                    tombstone: false,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: ChangeDigest::new([3; 32]),
+                    bytes: b"change-three",
+                }],
+                b"checkpoint-three",
+            )
+            .unwrap();
+        assert!(store.is_tombstoned(scope, document).unwrap());
         drop(store);
         fs::remove_file(path).unwrap();
     }

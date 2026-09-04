@@ -305,6 +305,9 @@ impl Database {
             Some(snapshot) => Document::load(&snapshot.bytes)?,
             None => Document::new(),
         };
+        if state.is_deleted()? {
+            return Err(DatabaseError::DocumentDeleted);
+        }
         let (value, mut changes) = state.edit(edit)?;
         if changes.len() != 1 {
             return Err(DatabaseError::ChangeCardinality(changes.len()));
@@ -325,6 +328,7 @@ impl Database {
             expected_revision,
             snapshot: &snapshot,
             indexes: &indexes,
+            tombstone: false,
         })?;
         match outcome {
             CommitOutcome::Applied { sequence } => Ok(EditOutcome::Applied(EditReceipt {
@@ -340,23 +344,180 @@ impl Database {
         }
     }
 
+    /// Commits a first-class tombstone that converges to absent on every
+    /// replica, including replicas offline at deletion time.
+    ///
+    /// The tombstone travels the same single-transaction discipline as an
+    /// edit (snapshot, change, operation receipt, outbox, indexes, event) and
+    /// carries the same operation-identity exact-retry contract: an exact
+    /// retry returns [`DeleteOutcome::Duplicate`] without staging a new
+    /// change, while a reused operation identity with different bytes fails
+    /// closed. Deleting a never-created document still commits a tombstone so
+    /// a late replica cannot resurrect the value. Tombstoned documents keep
+    /// their snapshot for conflict inspection while reads report absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed CRDT or storage failure. Concurrent successors of the
+    /// same snapshot return [`DatabaseError::Store`] containing
+    /// [`StoreError::StaleDocument`] rather than overwriting state. An exact
+    /// retry returns [`DeleteOutcome::Duplicate`] without staging a new
+    /// change.
+    pub fn delete(
+        &self,
+        document: DocumentId,
+        operation: OperationId,
+        request: OperationDigest,
+    ) -> Result<DeleteOutcome, DatabaseError> {
+        if let Some(existing) = self.store.operation(self.scope, operation)? {
+            if existing.document == document && existing.request == request {
+                let bytes = self
+                    .store
+                    .load_change(self.scope, document, existing.digest)?
+                    .ok_or(DatabaseError::MissingChange(existing.digest))?;
+                EncodedChange {
+                    digest: existing.digest,
+                    bytes,
+                }
+                .validate()?;
+                return Ok(DeleteOutcome::Duplicate(DuplicateReceipt {
+                    sequence: existing.sequence,
+                    digest: existing.digest,
+                }));
+            }
+            return Err(StoreError::OperationConflict.into());
+        }
+        let stored = self.store.load_snapshot(self.scope, document)?;
+        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let mut state = match stored {
+            Some(snapshot) => Document::load(&snapshot.bytes)?,
+            None => Document::new(),
+        };
+        let mut changes = state.delete()?;
+        if changes.len() != 1 {
+            return Err(DatabaseError::ChangeCardinality(changes.len()));
+        }
+        let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
+        let snapshot = state.save()?;
+        let heads = state.heads();
+        let local_change = LocalChange::new(
+            self.scope,
+            document,
+            operation,
+            request,
+            change.digest,
+            &change.bytes,
+        )?;
+        let outcome = self.store.commit_local(LocalCommit {
+            change: local_change,
+            expected_revision,
+            snapshot: &snapshot,
+            indexes: &[],
+            tombstone: true,
+        })?;
+        match outcome {
+            CommitOutcome::Applied { sequence } => Ok(DeleteOutcome::Applied(DeleteReceipt {
+                sequence,
+                digest: change.digest,
+                heads,
+            })),
+            CommitOutcome::Duplicate { sequence } => {
+                Ok(DeleteOutcome::Duplicate(DuplicateReceipt {
+                    sequence,
+                    digest: change.digest,
+                }))
+            }
+        }
+    }
+
     /// Reads a materialized document through a caller-supplied projection.
     ///
     /// # Errors
     ///
-    /// Returns a typed store or CRDT error. A missing document returns `None`.
+    /// Returns a typed store or CRDT error. A missing or deleted document
+    /// returns `None`; conflict candidates on deleted documents stay
+    /// available through [`Database::conflicts`].
     pub fn read<T>(
         &self,
         document: DocumentId,
         project: impl FnOnce(&mut Reader<'_>) -> Result<T, CrdtError>,
     ) -> Result<Option<T>, DatabaseError> {
-        self.store
-            .load_snapshot(self.scope, document)?
-            .map(|snapshot| {
+        match self.store.load_snapshot(self.scope, document)? {
+            None => Ok(None),
+            Some(snapshot) => {
                 let mut state = Document::load(&snapshot.bytes)?;
-                project(&mut state.reader()).map_err(DatabaseError::from)
-            })
-            .transpose()
+                if state.is_deleted()? {
+                    Ok(None)
+                } else {
+                    project(&mut state.reader())
+                        .map(Some)
+                        .map_err(DatabaseError::from)
+                }
+            }
+        }
+    }
+
+    /// Returns every causally concurrent value for a map property.
+    ///
+    /// Unlike [`Database::read`], inspection works on deleted documents:
+    /// tombstones keep their snapshot precisely so a concurrent edit made
+    /// while offline stays reconcilable after convergence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed store or CRDT error. A never-created document returns
+    /// `None`.
+    pub fn conflicts(
+        &self,
+        document: DocumentId,
+        object: &Object,
+        property: &str,
+    ) -> Result<Option<Vec<ConflictValue>>, DatabaseError> {
+        match self.store.load_snapshot(self.scope, document)? {
+            None => Ok(None),
+            Some(snapshot) => {
+                let mut state = Document::load(&snapshot.bytes)?;
+                Ok(Some(state.reader().conflicts(object, property)?))
+            }
+        }
+    }
+
+    /// Returns every causally concurrent value at one list or text index.
+    ///
+    /// Like [`Database::conflicts`], inspection works on deleted documents
+    /// and returns `None` only for never-created ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed store or CRDT error.
+    pub fn conflicts_at(
+        &self,
+        document: DocumentId,
+        object: &Object,
+        index: usize,
+    ) -> Result<Option<Vec<ConflictValue>>, DatabaseError> {
+        match self.store.load_snapshot(self.scope, document)? {
+            None => Ok(None),
+            Some(snapshot) => {
+                let mut state = Document::load(&snapshot.bytes)?;
+                Ok(Some(state.reader().conflicts_at(object, index)?))
+            }
+        }
+    }
+
+    /// Returns whether a first-class tombstone is recorded for a document.
+    ///
+    /// A never-created document reports `false`; only a committed delete
+    /// reports `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed store or CRDT error.
+    pub fn is_deleted(&self, document: DocumentId) -> Result<bool, DatabaseError> {
+        match self.store.load_snapshot(self.scope, document)? {
+            None => Ok(false),
+            Some(snapshot) => Ok(Document::load(&snapshot.bytes)?.is_deleted()?),
+        }
     }
 
     /// Queries an exact secondary-index value in stable document order.
@@ -473,7 +634,12 @@ impl Database {
                 None => Document::new(),
             };
             state.apply(encoded)?;
-            let indexes = self.project(&mut state)?;
+            let tombstoned = state.is_deleted()?;
+            let indexes = if tombstoned {
+                Vec::new()
+            } else {
+                self.project(&mut state)?
+            };
             let snapshot = state.save()?;
             if snapshot.len() > MAX_SNAPSHOT_BYTES {
                 return Err(DatabaseError::MaterializationBudgetExceeded);
@@ -484,17 +650,18 @@ impl Database {
             if materialized_bytes > MAX_MATERIALIZED_PAGE_BYTES {
                 return Err(DatabaseError::MaterializationBudgetExceeded);
             }
-            prepared.push((*document, expected_revision, snapshot, indexes));
+            prepared.push((*document, expected_revision, snapshot, indexes, tombstoned));
         }
 
         let durable_documents = prepared
             .iter()
             .map(
-                |(document, expected_revision, snapshot, indexes)| RemoteDocument {
+                |(document, expected_revision, snapshot, indexes, tombstoned)| RemoteDocument {
                     document: *document,
                     expected_revision: *expected_revision,
                     snapshot,
                     indexes,
+                    tombstone: *tombstoned,
                 },
             )
             .collect::<Vec<_>>();
@@ -677,6 +844,26 @@ pub struct DuplicateReceipt {
     pub digest: ChangeDigest,
 }
 
+/// Idempotent result of one embedded delete request.
+#[derive(Debug)]
+pub enum DeleteOutcome {
+    /// This call durably committed the tombstone.
+    Applied(DeleteReceipt),
+    /// The exact request had already committed, so no new change was staged.
+    Duplicate(DuplicateReceipt),
+}
+
+/// Result of one durable embedded delete.
+#[derive(Debug)]
+pub struct DeleteReceipt {
+    /// Monotonic local outbox sequence.
+    pub sequence: u64,
+    /// Immutable CRDT tombstone change identity.
+    pub digest: ChangeDigest,
+    /// Causal document frontier after the delete.
+    pub heads: Vec<ChangeDigest>,
+}
+
 /// Work durably completed by one schema migration or exact resumption.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MigrationReport {
@@ -725,6 +912,14 @@ pub enum DatabaseError {
     /// Durable outbox metadata referenced a missing exact operation binding.
     #[error("outbox references missing operation {0}")]
     MissingOperation(OperationId),
+    /// The document is deleted and only accepts further tombstones.
+    ///
+    /// Edits are refused on tombstoned documents so a fresh write can never
+    /// silently overwrite converged absence; reconcile through
+    /// [`Database::conflicts`] instead. Classified as
+    /// [`DatabaseErrorKind::Other`].
+    #[error("document is deleted and only accepts further tombstones")]
+    DocumentDeleted,
 }
 
 /// Stable recovery decision for application-facing database failures.
@@ -787,6 +982,9 @@ fn project_with(
     projections: &[Projection],
     state: &mut Document,
 ) -> Result<Vec<IndexEntry>, DatabaseError> {
+    if state.is_deleted()? {
+        return Ok(Vec::new());
+    }
     let mut reader = state.reader();
     projections
         .iter()
@@ -809,6 +1007,17 @@ mod tests {
 
     fn path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("logical-db-facade-{}.redb", uuid::Uuid::now_v7()))
+    }
+
+    fn remote_page(changes: &[PendingChange]) -> Vec<RemoteChange> {
+        changes
+            .iter()
+            .map(|change| RemoteChange {
+                document: change.document,
+                digest: change.digest,
+                bytes: change.bytes.clone(),
+            })
+            .collect()
     }
 
     struct AcceptingTransport;
@@ -1305,5 +1514,456 @@ mod tests {
         drop(first);
         fs::remove_file(first_path).unwrap();
         fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn delete_syncs_to_absent_and_clears_indexes_on_both_replicas() {
+        let first_path = path();
+        let second_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let index = IndexId::new();
+        let projection = Projection::new(index, |reader| {
+            Ok(match reader.get(&Object::root(), "kind")? {
+                Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
+                _ => None,
+            })
+        });
+        let first = Database::open_with_projections(
+            &first_path,
+            scope,
+            ReplicaId::new(),
+            vec![projection.clone()],
+        )
+        .unwrap();
+        let second = Database::open_with_projections(
+            &second_path,
+            scope,
+            ReplicaId::new(),
+            vec![projection],
+        )
+        .unwrap();
+        first
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+            )
+            .unwrap();
+        let base = first.pending_changes(0, 10).unwrap();
+        second
+            .install_remote_page(peer, &remote_page(&base), b"checkpoint-base")
+            .unwrap();
+        assert_eq!(
+            second
+                .query_index(index, &IndexValue::Text("note".into()), None, 10)
+                .unwrap(),
+            vec![document]
+        );
+
+        let outcome = first
+            .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+            .unwrap();
+        let DeleteOutcome::Applied(receipt) = outcome else {
+            panic!("first delete must apply");
+        };
+        assert_eq!(receipt.sequence, 2);
+        assert!(!receipt.heads.is_empty());
+        assert!(
+            first
+                .read(document, |reader| reader.get(&Object::root(), "kind"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(first.is_deleted(document).unwrap());
+        assert!(
+            first
+                .query_index(index, &IndexValue::Text("note".into()), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let pending = first.pending_changes(0, 10).unwrap();
+        assert_eq!(pending.len(), 2);
+        second
+            .install_remote_page(peer, &remote_page(&pending), b"checkpoint-deleted")
+            .unwrap();
+        for database in [&first, &second] {
+            assert!(
+                database
+                    .read(document, |reader| reader.get(&Object::root(), "kind"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(database.is_deleted(document).unwrap());
+            assert!(
+                database
+                    .query_index(index, &IndexValue::Text("note".into()), None, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(first);
+        drop(second);
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn offline_replica_and_late_joiner_converge_without_resurrection() {
+        let origin_path = path();
+        let offline_path = path();
+        let late_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let origin = Database::open(&origin_path, scope, ReplicaId::new()).unwrap();
+        let offline = Database::open(&offline_path, scope, ReplicaId::new()).unwrap();
+        origin
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        let base = origin.pending_changes(0, 10).unwrap();
+        offline
+            .install_remote_page(peer, &remote_page(&base), b"checkpoint-base")
+            .unwrap();
+        origin
+            .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+            .unwrap();
+        let tombstone_page = origin.pending_changes(0, 10).unwrap();
+        offline
+            .install_remote_page(peer, &remote_page(&tombstone_page), b"checkpoint-deleted")
+            .unwrap();
+        assert!(
+            offline
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        let offline_pending = offline.pending_changes(0, 10).unwrap();
+        origin
+            .install_remote_page(peer, &remote_page(&offline_pending), b"checkpoint-back")
+            .unwrap();
+        assert!(
+            origin
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+
+        let late = Database::open(&late_path, scope, ReplicaId::new()).unwrap();
+        late.install_remote_page(peer, &remote_page(&tombstone_page), b"checkpoint-late")
+            .unwrap();
+        assert!(
+            late.read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(late.is_deleted(document).unwrap());
+        drop(origin);
+        drop(offline);
+        drop(late);
+        fs::remove_file(origin_path).unwrap();
+        fs::remove_file(offline_path).unwrap();
+        fs::remove_file(late_path).unwrap();
+    }
+
+    #[test]
+    fn duplicate_delete_short_circuits_exact_retry() {
+        let db_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let database = Database::open(&db_path, scope, ReplicaId::new()).unwrap();
+        let document = DocumentId::new();
+        database
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        let operation = OperationId::new();
+        let request = OperationDigest::new([2; 32]);
+        let DeleteOutcome::Applied(applied) =
+            database.delete(document, operation, request).unwrap()
+        else {
+            panic!("first delete must apply");
+        };
+        let duplicate = database.delete(document, operation, request).unwrap();
+        assert!(matches!(
+            duplicate,
+            DeleteOutcome::Duplicate(DuplicateReceipt { sequence, digest })
+                if sequence == applied.sequence && digest == applied.digest
+        ));
+        assert_eq!(database.pending_changes(0, 10).unwrap().len(), 2);
+        let conflict = database
+            .delete(document, operation, OperationDigest::new([3; 32]))
+            .unwrap_err();
+        assert!(matches!(
+            &conflict,
+            DatabaseError::Store(StoreError::OperationConflict)
+        ));
+        assert_eq!(conflict.kind(), DatabaseErrorKind::OperationConflict);
+        drop(database);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_edit_and_delete_surface_candidates_with_absent_visible() {
+        let first_path = path();
+        let second_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        first
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("base".into())),
+            )
+            .unwrap();
+        let base = first.pending_changes(0, 10).unwrap();
+        second
+            .install_remote_page(peer, &remote_page(&base), b"checkpoint-base")
+            .unwrap();
+        first
+            .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+            .unwrap();
+        second
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([3; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("rival".into())),
+            )
+            .unwrap();
+        for (source, target, checkpoint) in [
+            (&first, &second, b"checkpoint-a".as_slice()),
+            (&second, &first, b"checkpoint-b".as_slice()),
+        ] {
+            let page = source.pending_changes(0, 10).unwrap();
+            target
+                .install_remote_page(peer, &remote_page(&page), checkpoint)
+                .unwrap();
+        }
+        for database in [&first, &second] {
+            assert!(
+                database
+                    .read(document, |reader| reader.get(&Object::root(), "title"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(database.is_deleted(document).unwrap());
+            let candidates = database
+                .conflicts(document, &Object::root(), "title")
+                .unwrap()
+                .unwrap();
+            assert!(
+                candidates.iter().any(
+                    |candidate| candidate.value == Item::Scalar(Scalar::String("rival".into()))
+                )
+            );
+        }
+        drop(first);
+        drop(second);
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn restart_between_delete_commit_and_sync_preserves_tombstone() {
+        let db_path = path();
+        let peer_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let replica = ReplicaId::new();
+        {
+            let database = Database::open(&db_path, scope, replica).unwrap();
+            database
+                .edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new([1; 32]),
+                    |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+                )
+                .unwrap();
+            database
+                .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+                .unwrap();
+        }
+        let database = Database::open(&db_path, scope, replica).unwrap();
+        assert!(database.is_deleted(document).unwrap());
+        assert!(
+            database
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        let pending = database.pending_changes(0, 10).unwrap();
+        assert_eq!(pending.len(), 2);
+        let target = Database::open(&peer_path, scope, ReplicaId::new()).unwrap();
+        target
+            .install_remote_page(peer, &remote_page(&pending), b"checkpoint-restart")
+            .unwrap();
+        assert!(
+            target
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(target.is_deleted(document).unwrap());
+        drop(database);
+        drop(target);
+        fs::remove_file(db_path).unwrap();
+        fs::remove_file(peer_path).unwrap();
+    }
+
+    #[test]
+    fn edit_after_delete_is_refused_without_leaking_store_types() {
+        let db_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let database = Database::open(&db_path, scope, ReplicaId::new()).unwrap();
+        let document = DocumentId::new();
+        database
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        database
+            .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+            .unwrap();
+        let error = database
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([3; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("rival".into())),
+            )
+            .unwrap_err();
+        assert!(matches!(&error, DatabaseError::DocumentDeleted));
+        assert_eq!(error.kind(), DatabaseErrorKind::Other);
+        let missing = DocumentId::new();
+        assert!(
+            database
+                .read(missing, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!database.is_deleted(missing).unwrap());
+        assert!(
+            database
+                .conflicts(missing, &Object::root(), "title")
+                .unwrap()
+                .is_none()
+        );
+        let candidates = database
+            .conflicts(document, &Object::root(), "title")
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].value,
+            Item::Scalar(Scalar::String("v1".into()))
+        );
+        drop(database);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn schema_migration_carries_tombstones_with_empty_indexes() {
+        let db_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let document = DocumentId::new();
+        let index = IndexId::new();
+        let projection = Projection::new(index, |reader| {
+            Ok(match reader.get(&Object::root(), "kind")? {
+                Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
+                _ => None,
+            })
+        });
+        {
+            let database =
+                Database::open_with_schema(&db_path, scope, replica, 1, vec![projection]).unwrap();
+            database
+                .edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new([1; 32]),
+                    |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+                )
+                .unwrap();
+            database
+                .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+                .unwrap();
+        }
+        let (database, report) =
+            Database::migrate_schema(&db_path, scope, replica, 2, vec![], 10).unwrap();
+        assert_eq!(report.documents, 1);
+        assert!(database.is_deleted(document).unwrap());
+        assert!(
+            database
+                .read(document, |reader| reader.get(&Object::root(), "kind"))
+                .unwrap()
+                .is_none()
+        );
+        drop(database);
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn synchronization_carries_tombstones_through_push_and_checkpoint() {
+        let db_path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let document = DocumentId::new();
+        let database = Database::open(&db_path, scope, ReplicaId::new()).unwrap();
+        database
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([1; 32]),
+                |editor| editor.put(&Object::root(), "title", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        database
+            .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
+            .unwrap();
+        let report = futures::executor::block_on(database.synchronize(
+            peer,
+            &mut AcceptingTransport,
+            SyncLimits::default(),
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(report.pushed, 2);
+        assert_eq!(report.pulled, 0);
+        assert!(database.pending_changes(0, 10).unwrap().is_empty());
+        assert_eq!(
+            ReplicaPort::checkpoint(&database, peer).unwrap(),
+            Some(vec![9])
+        );
+        assert!(
+            database
+                .read(document, |reader| reader.get(&Object::root(), "title"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(database.is_deleted(document).unwrap());
+        drop(database);
+        fs::remove_file(db_path).unwrap();
     }
 }
