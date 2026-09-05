@@ -153,17 +153,22 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn ensure_loopback(address: &SocketAddr) -> Result<(), io::Error> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the daemon has no TLS terminator and therefore binds only to loopback",
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = std::env::var("LOGICAL_DB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let address: SocketAddr = bind.parse()?;
-    if !address.ip().is_loopback() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the daemon has no TLS terminator and therefore binds only to loopback",
-        )
-        .into());
-    }
+    ensure_loopback(&address)?;
     let cluster_file = required("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     let bearer = required("LOGICAL_DB_BEARER_TOKEN")?;
     let key = parse_key(&required("LOGICAL_DB_CHECKPOINT_KEY_HEX")?)?;
@@ -216,8 +221,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use logical_db_model::{Effect, OperationDigest};
-    use logical_db_service::Authority;
+    use std::{
+        convert::Infallible,
+        future::{Future, ready},
+    };
+
+    use logical_db_crdt::{Document, Object, Scalar};
+    use logical_db_model::{DocumentId, Effect, OperationDigest, OperationId, ReplicaId};
+    use logical_db_protocol::{
+        ChangeEnvelope, PROTOCOL_VERSION, PullRequest, PushOutcome, PushRequest, RejectionCode,
+    };
+    use logical_db_service::{
+        AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ProtocolService,
+        ServiceError, ServiceStore,
+    };
 
     use super::*;
 
@@ -232,6 +249,104 @@ mod tests {
 
     fn request(seed: u8) -> OperationDigest {
         OperationDigest::new([seed; 32])
+    }
+
+    /// Store double that must never be contacted: the default composition
+    /// refuses write and sync authorization before any durable work.
+    struct RefusedStore;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl ServiceStore for RefusedStore {
+        type Error = Infallible;
+
+        async fn accept(
+            &self,
+            _change: &ChangeEnvelope,
+            _grant: &impl ExecutionGrant,
+        ) -> Result<AcceptResult, Self::Error> {
+            panic!("default composition refuses before the store is contacted")
+        }
+
+        fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Ok(0))
+        }
+
+        async fn page(
+            &self,
+            _scope: Scope,
+            _request: OperationDigest,
+            _after: u64,
+            _max_changes: u16,
+            _max_bytes: u32,
+            _grant: &impl ExecutionGrant,
+        ) -> Result<PageResult, Self::Error> {
+            panic!("default composition refuses before the store is contacted")
+        }
+    }
+
+    fn default_push_request(scope: Scope, replica: ReplicaId) -> (PushRequest, OperationId) {
+        let mut document = Document::new();
+        let ((), mut changes) = document
+            .edit(|editor| editor.put(&Object::root(), "field", Scalar::Integer(7)))
+            .unwrap();
+        let encoded = changes.pop().unwrap();
+        let operation = OperationId::new();
+        let request = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![ChangeEnvelope {
+                scope,
+                document: DocumentId::new(),
+                replica,
+                operation,
+                request: OperationDigest::new([8; 32]),
+                digest: encoded.digest,
+                bytes: encoded.bytes,
+            }],
+        };
+        (request, operation)
+    }
+
+    #[tokio::test]
+    async fn default_composition_refuses_writes_and_sync_end_to_end() {
+        let expected_scope = scope(41);
+        let authentication =
+            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", expected_scope)
+                .unwrap();
+        let policy = authentication
+            .authenticate(
+                &HeaderValue::from_static("Bearer correct-correct-correct-correct-0041"),
+                1_000,
+            )
+            .unwrap();
+        let service = ProtocolService::new(
+            RefusedStore,
+            policy,
+            CheckpointCodec::new([7; 32], 60_000).unwrap(),
+        );
+        let replica = ReplicaId::new();
+        let (push, operation) = default_push_request(expected_scope, replica);
+        let response = service.push(&push, 2_000).await.unwrap();
+        assert!(matches!(
+            response.outcomes.as_slice(),
+            [PushOutcome::Rejected {
+                operation: outcome,
+                code: RejectionCode::Forbidden
+            }] if *outcome == operation
+        ));
+        let pull = PullRequest {
+            protocol: PROTOCOL_VERSION,
+            scope: expected_scope,
+            replica,
+            request: OperationDigest::new([3; 32]),
+            after: None,
+            max_changes: 16,
+            max_bytes: 1_048_576,
+        };
+        assert!(matches!(
+            service.pull(&pull, 2_000).await,
+            Err(ServiceError::Forbidden)
+        ));
     }
 
     #[test]
@@ -307,6 +422,18 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn daemon_binds_only_to_loopback() {
+        for loopback in ["127.0.0.1:8080", "[::1]:8080"] {
+            let address: SocketAddr = loopback.parse().unwrap();
+            assert!(ensure_loopback(&address).is_ok());
+        }
+        for public in ["0.0.0.0:8080", "192.0.2.1:8080", "[::]:8080"] {
+            let address: SocketAddr = public.parse().unwrap();
+            assert!(ensure_loopback(&address).is_err());
+        }
     }
 
     #[test]

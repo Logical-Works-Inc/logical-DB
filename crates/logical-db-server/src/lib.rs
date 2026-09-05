@@ -404,7 +404,7 @@ mod tests {
         Scope, SpaceId,
     };
     use logical_db_protocol::{
-        ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse,
+        ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
     use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, StoredPage};
     use tokio::sync::Notify;
@@ -473,6 +473,97 @@ mod tests {
             } else {
                 Err(AuthenticationError::Unauthorized)
             }
+        }
+    }
+
+    /// Test double with the default composition's exact posture: one bound
+    /// scope, a short expiry, and read/scan effects only. Write and sync
+    /// authorization always fails, mirroring `LocalBraidAuthority`.
+    struct DefaultComposition {
+        scope: Scope,
+        expires_at_unix_ms: u64,
+    }
+
+    impl Authority for DefaultComposition {
+        type Grant = Grant;
+
+        fn authorize(
+            &self,
+            scope: Scope,
+            effect: Effect,
+            request: OperationDigest,
+            frontier: u64,
+            now_unix_ms: u64,
+        ) -> Option<Self::Grant> {
+            if scope != self.scope
+                || !matches!(effect, Effect::Read | Effect::Scan)
+                || now_unix_ms >= self.expires_at_unix_ms
+            {
+                return None;
+            }
+            Some(Grant {
+                scope,
+                effect,
+                request,
+                frontier,
+            })
+        }
+    }
+
+    struct DefaultAuthentication {
+        scope: Scope,
+    }
+
+    impl Authenticator for DefaultAuthentication {
+        type Policy = DefaultComposition;
+
+        fn authenticate(
+            &self,
+            authorization: &HeaderValue,
+            now_unix_ms: u64,
+        ) -> Result<Self::Policy, AuthenticationError> {
+            if authorization.as_bytes() != b"Bearer default-composition" {
+                return Err(AuthenticationError::Unauthorized);
+            }
+            let expires_at = now_unix_ms
+                .checked_add(60_000)
+                .ok_or(AuthenticationError::Forbidden)?;
+            Ok(DefaultComposition {
+                scope: self.scope,
+                expires_at_unix_ms: expires_at,
+            })
+        }
+    }
+
+    /// Store double reporting every invocation already consumed, as the
+    /// durable adapter does after a grant's single use.
+    struct ConsumedInvocations;
+
+    impl ServiceStore for ConsumedInvocations {
+        type Error = Infallible;
+
+        fn accept(
+            &self,
+            _change: &ChangeEnvelope,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            ready(Ok(AcceptResult::InvocationConsumed))
+        }
+
+        fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Ok(0))
+        }
+
+        fn page(
+            &self,
+            _scope: Scope,
+            _request: OperationDigest,
+            _after: u64,
+            _max_changes: u16,
+            _max_bytes: u32,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            ready(Ok(PageResult::StaleAuthority))
         }
     }
 
@@ -669,10 +760,14 @@ mod tests {
     }
 
     fn request(path: &str, body: Vec<u8>) -> Request<Body> {
+        request_as(path, body, "Bearer integration-test")
+    }
+
+    fn request_as(path: &str, body: Vec<u8>, authorization: &str) -> Request<Body> {
         Request::post(path)
             .header(CONTENT_TYPE, MEDIA_TYPE)
             .header(ACCEPT, MEDIA_TYPE)
-            .header(AUTHORIZATION, "Bearer integration-test")
+            .header(AUTHORIZATION, authorization)
             .body(Body::from(body))
             .unwrap()
     }
@@ -860,5 +955,95 @@ mod tests {
             first.await.unwrap().unwrap().status(),
             StatusCode::GATEWAY_TIMEOUT
         );
+    }
+
+    #[tokio::test]
+    async fn default_composition_refuses_writes_and_sync_over_http() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let app = router(
+            Memory::default(),
+            DefaultAuthentication { scope },
+            CheckpointCodec::new([9; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let change = change(scope, replica);
+        let push = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![change.clone()],
+        };
+        let response = app
+            .clone()
+            .oneshot(request_as(
+                "/v1/changes:push",
+                encode(&push),
+                "Bearer default-composition",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        let response: PushResponse = ciborium::from_reader(body.as_ref()).unwrap();
+        assert!(matches!(
+            response.outcomes.as_slice(),
+            [PushOutcome::Rejected { operation, code: RejectionCode::Forbidden }]
+                if *operation == change.operation
+        ));
+
+        let pull = PullRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([3; 32]),
+            after: None,
+            max_changes: 16,
+            max_bytes: 1_048_576,
+        };
+        let response = app
+            .oneshot(request_as(
+                "/v1/changes:pull",
+                encode(&pull),
+                "Bearer default-composition",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn consumed_invocation_surfaces_as_typed_rejection_over_http() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let app = router(
+            ConsumedInvocations,
+            Bearer,
+            CheckpointCodec::new([9; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let change = change(scope, replica);
+        let push = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![change.clone()],
+        };
+        let response = app
+            .oneshot(request("/v1/changes:push", encode(&push)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        let response: PushResponse = ciborium::from_reader(body.as_ref()).unwrap();
+        assert!(matches!(
+            response.outcomes.as_slice(),
+            [PushOutcome::Rejected {
+                operation,
+                code: RejectionCode::InvocationConsumed
+            }] if *operation == change.operation
+        ));
     }
 }
