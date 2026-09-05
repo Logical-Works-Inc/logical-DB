@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, time::Duration};
 
 use logical_db_model::{
     ChangeDigest, DocumentId, ModelError, NAMESPACE_CHECKPOINT_TTL_MS, NamespaceCheckpoint,
@@ -424,6 +424,21 @@ fn pull_request_digest(
     digest.update(limits.bytes_per_page.to_be_bytes());
     OperationDigest::new(digest.finalize().into())
 }
+
+/// Layout version of one encoded orchestrator state blob.
+pub const ORCHESTRATOR_STATE_VERSION: u16 = 1;
+/// Exact byte length of one encoded orchestrator state blob.
+pub const ORCHESTRATOR_STATE_BYTES: usize = 22;
+/// Magic prefix rejecting foreign slot bytes before version checks.
+const ORCHESTRATOR_STATE_MAGIC: [u8; 8] = *b"LDBSYNC1";
+/// Default ceiling on synchronize cycles drained by one orchestrator run.
+const DEFAULT_MAX_CYCLES: usize = 8;
+/// Default first retryable-failure delay in milliseconds.
+const DEFAULT_BASE_BACKOFF_MS: u64 = 1_000;
+/// Default backoff ceiling in milliseconds.
+const DEFAULT_MAX_BACKOFF_MS: u64 = 60_000;
+/// Doubling steps folded into the exponential delay before the ceiling binds.
+const MAX_BACKOFF_DOUBLINGS: u32 = 16;
 
 /// One namespace sync domain: name, policy, and observation time.
 ///
@@ -892,6 +907,607 @@ fn namespace_pull_digest(
     digest.update(policy.changes_per_page().to_be_bytes());
     digest.update(policy.bytes_per_page().to_be_bytes());
     OperationDigest::new(digest.finalize().into())
+}
+
+/// Drain and backoff budgets for one [`SyncOrchestrator`].
+///
+/// [`max_cycles`](Self::max_cycles) bounds how many [`synchronize`] cycles one
+/// run issues before yielding with [`more`](RunReport::more) still set; the
+/// host reschedules on the next hint. The backoff bounds shape the delay
+/// recorded after a retryable transport failure: the first failure waits
+/// [`base_backoff_ms`](Self::base_backoff_ms), each consecutive failure
+/// doubles, and [`max_backoff_ms`](Self::max_backoff_ms) always caps the wait,
+/// including server-supplied retry hints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrchestratorPolicy {
+    max_cycles: usize,
+    base_backoff_ms: u64,
+    max_backoff_ms: u64,
+}
+
+impl OrchestratorPolicy {
+    /// Builds validated orchestrator budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::PageLimit`] for an empty cycle budget or an
+    /// empty backoff bound.
+    pub fn new(
+        max_cycles: usize,
+        base_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if max_cycles == 0 || base_backoff_ms == 0 || max_backoff_ms == 0 {
+            return Err(ProtocolError::PageLimit);
+        }
+        Ok(Self {
+            max_cycles,
+            base_backoff_ms,
+            max_backoff_ms,
+        })
+    }
+
+    /// Returns the maximum [`synchronize`] cycles drained by one run.
+    #[must_use]
+    pub const fn max_cycles(self) -> usize {
+        self.max_cycles
+    }
+
+    /// Returns the first retryable-failure delay in milliseconds.
+    #[must_use]
+    pub const fn base_backoff_ms(self) -> u64 {
+        self.base_backoff_ms
+    }
+
+    /// Returns the backoff ceiling in milliseconds, applied to hints as well.
+    #[must_use]
+    pub const fn max_backoff_ms(self) -> u64 {
+        self.max_backoff_ms
+    }
+}
+
+impl Default for OrchestratorPolicy {
+    fn default() -> Self {
+        Self {
+            max_cycles: DEFAULT_MAX_CYCLES,
+            base_backoff_ms: DEFAULT_BASE_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
+        }
+    }
+}
+
+/// Opaque scheduling state the application persists across launches.
+///
+/// The blob carries only scheduling state — consecutive retryable failures
+/// and the backoff deadline. Checkpoints and upload acknowledgements stay in
+/// the replica's durable slots, so restoring this blob after process death
+/// resumes timing without replaying acknowledged uploads. Encode with
+/// [`encode`](Self::encode), persist the bytes in the application's own
+/// sidecar, and restore with [`SyncOrchestrator::restore`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrchestratorState {
+    consecutive_failures: u32,
+    not_ready_until_ms: u64,
+}
+
+impl OrchestratorState {
+    /// Builds idle scheduling state with no backoff outstanding.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            not_ready_until_ms: 0,
+        }
+    }
+
+    /// Returns the consecutive retryable transport failures behind the deadline.
+    #[must_use]
+    pub const fn consecutive_failures(self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Returns the millisecond timestamp before which runs defer without work.
+    #[must_use]
+    pub const fn not_ready_until_ms(self) -> u64 {
+        self.not_ready_until_ms
+    }
+
+    /// Returns whether a run at `now_unix_ms` must defer without work.
+    #[must_use]
+    pub const fn is_backing_off(self, now_unix_ms: u64) -> bool {
+        self.not_ready_until_ms > now_unix_ms
+    }
+
+    /// Encodes the state as magic plus version plus two fixed fields.
+    #[must_use]
+    pub fn encode(self) -> [u8; ORCHESTRATOR_STATE_BYTES] {
+        let mut output = [0_u8; ORCHESTRATOR_STATE_BYTES];
+        output[0..ORCHESTRATOR_STATE_MAGIC.len()].copy_from_slice(&ORCHESTRATOR_STATE_MAGIC);
+        output[8..10].copy_from_slice(&ORCHESTRATOR_STATE_VERSION.to_be_bytes());
+        output[10..14].copy_from_slice(&self.consecutive_failures.to_be_bytes());
+        output[14..22].copy_from_slice(&self.not_ready_until_ms.to_be_bytes());
+        output
+    }
+
+    /// Decodes state bytes, refusing foreign, truncated, or padded input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchestratorStateError::Malformed`] for a bad structure and
+    /// [`OrchestratorStateError::UnsupportedVersion`] for a foreign version.
+    pub fn decode(bytes: &[u8]) -> Result<Self, OrchestratorStateError> {
+        if bytes.len() != ORCHESTRATOR_STATE_BYTES {
+            return Err(OrchestratorStateError::Malformed);
+        }
+        if bytes[0..ORCHESTRATOR_STATE_MAGIC.len()] != ORCHESTRATOR_STATE_MAGIC {
+            return Err(OrchestratorStateError::Malformed);
+        }
+        let version = u16::from_be_bytes([bytes[8], bytes[9]]);
+        if version != ORCHESTRATOR_STATE_VERSION {
+            return Err(OrchestratorStateError::UnsupportedVersion { actual: version });
+        }
+        Ok(Self {
+            consecutive_failures: u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]),
+            not_ready_until_ms: u64::from_be_bytes([
+                bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
+                bytes[21],
+            ]),
+        })
+    }
+
+    fn note_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn note_retryable(&mut self, now_unix_ms: u64, delay_ms: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.not_ready_until_ms = now_unix_ms.saturating_add(delay_ms);
+    }
+}
+
+impl Default for OrchestratorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stable orchestrator state-codec failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrchestratorStateError {
+    /// The blob violated its fixed magic-plus-version-plus-fields encoding.
+    Malformed,
+    /// The blob used a foreign layout version.
+    UnsupportedVersion {
+        /// Observed state layout version.
+        actual: u16,
+    },
+}
+
+impl fmt::Display for OrchestratorStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed => formatter.write_str("orchestrator state encoding is malformed"),
+            Self::UnsupportedVersion { actual } => {
+                write!(
+                    formatter,
+                    "orchestrator state version {actual} is unsupported"
+                )
+            }
+        }
+    }
+}
+
+impl Error for OrchestratorStateError {}
+
+/// Transport failure classification supplied by the application.
+///
+/// The sync crate stays transport-neutral, so the application names
+/// retryability the way its own transport does: the HTTP transport passes its
+/// `is_retryable` predicate and bounded `retry_after` hint directly. A
+/// retryable failure becomes a deferred report with a recorded backoff
+/// deadline; any other failure surfaces immediately with no state recorded.
+pub struct RetrySignal<'signal, TransportError> {
+    /// Classifies a transport failure as worth backing off for.
+    pub is_retryable: &'signal dyn Fn(&TransportError) -> bool,
+    /// Server-supplied delta delay, when syntactically valid.
+    pub retry_after: &'signal dyn Fn(&TransportError) -> Option<Duration>,
+}
+
+fn never_retryable<TransportError>(_: &TransportError) -> bool {
+    false
+}
+
+fn no_retry_hint<TransportError>(_: &TransportError) -> Option<Duration> {
+    None
+}
+
+impl<TransportError> RetrySignal<'static, TransportError> {
+    /// Builds a classifier that surfaces every transport failure immediately.
+    #[must_use]
+    pub fn never() -> Self {
+        Self {
+            is_retryable: &never_retryable,
+            retry_after: &no_retry_hint,
+        }
+    }
+}
+
+/// Observable result of one orchestrator run over [`synchronize`] cycles.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RunReport {
+    /// Local changes accepted or already present remotely across cycles.
+    pub pushed: usize,
+    /// Remote changes atomically installed locally across cycles.
+    pub pulled: usize,
+    /// Pull pages installed across cycles.
+    pub pages: usize,
+    /// [`synchronize`] cycles issued.
+    pub cycles: usize,
+    /// Whether any cycle forced a full pull after checkpoint expiry.
+    pub full_resync: bool,
+    /// Whether unsent local changes or remote pages remain after this run.
+    pub more: bool,
+    /// Whether a backoff window is now active and the host must reschedule.
+    pub deferred: bool,
+}
+
+/// Observable result of one orchestrator run over one namespace domain.
+///
+/// The run is one upload page plus a pull drain, so the report embeds the
+/// phase reports instead of duplicating their fields: [`send`](Self::send)
+/// is the single delivery-only upload page, and the remaining counters cover
+/// the pull drain. [`send.more`](NamespaceSendReport::more) stays set while
+/// the namespace has unacknowledged local changes — delivery never advances
+/// the shared acknowledgement, the global drain still owns it — even after
+/// the pull side reports [`more`](Self::more) cleared.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NamespaceRunReport {
+    /// Namespace this run drove.
+    pub namespace: String,
+    /// Pull cycles issued (the upload page is offered once per run).
+    pub cycles: usize,
+    /// The single delivery-only upload page offered before the pull drain.
+    pub send: NamespaceSendReport,
+    /// Remote changes for this namespace installed locally across cycles.
+    pub pulled: usize,
+    /// Pull pages installed across cycles.
+    pub pages: usize,
+    /// Whether any cycle forced a full pull after cursor expiry.
+    pub full_resync: bool,
+    /// Whether remote pages remain after this bounded run.
+    pub more: bool,
+    /// Whether a backoff window or an offline policy deferred the run.
+    pub deferred: bool,
+}
+
+/// Application-facing sync engine wrapping the sync functions.
+///
+/// The orchestrator owns batching (it loops [`synchronize`] on the [`more`](SyncReport::more)
+/// signal until the backlog drains or the policy budget binds), backoff (it
+/// converts retryable transport failures into deferred reports honoring retry
+/// hints instead of surfacing them), and opaque persisted state (see
+/// [`OrchestratorState`]). It never forks the push-then-pull loop: checkpoint
+/// expiry still recovers exactly once inside [`synchronize`] and surfaces a
+/// second expiry as a protocol error, and namespace runs drive
+/// [`send_namespace_now`] plus [`synchronize_namespace`] without duplicating
+/// their per-namespace cursors.
+///
+/// One orchestrator binds one upstream peer for its lifetime, matching the
+/// replica's single-upstream binding.
+#[derive(Clone, Debug)]
+pub struct SyncOrchestrator {
+    peer: PeerId,
+    policy: OrchestratorPolicy,
+    state: OrchestratorState,
+}
+
+impl SyncOrchestrator {
+    /// Binds an orchestrator to one upstream peer with idle scheduling state.
+    #[must_use]
+    pub const fn new(peer: PeerId, policy: OrchestratorPolicy) -> Self {
+        Self {
+            peer,
+            policy,
+            state: OrchestratorState::new(),
+        }
+    }
+
+    /// Rebuilds an orchestrator from application-persisted state bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrchestratorStateError::Malformed`] for a bad structure and
+    /// [`OrchestratorStateError::UnsupportedVersion`] for a foreign version.
+    pub fn restore(
+        peer: PeerId,
+        policy: OrchestratorPolicy,
+        bytes: &[u8],
+    ) -> Result<Self, OrchestratorStateError> {
+        Ok(Self {
+            peer,
+            policy,
+            state: OrchestratorState::decode(bytes)?,
+        })
+    }
+
+    /// Returns the bound upstream peer.
+    #[must_use]
+    pub const fn peer(&self) -> PeerId {
+        self.peer
+    }
+
+    /// Returns the drain and backoff budgets.
+    #[must_use]
+    pub const fn policy(&self) -> OrchestratorPolicy {
+        self.policy
+    }
+
+    /// Returns the current scheduling state for inspection.
+    #[must_use]
+    pub const fn state(&self) -> OrchestratorState {
+        self.state
+    }
+
+    /// Exports the opaque blob the application persists across launches.
+    #[must_use]
+    pub fn export_state(&self) -> [u8; ORCHESTRATOR_STATE_BYTES] {
+        self.state.encode()
+    }
+
+    /// Drains the backlog through the push-then-pull loop until it clears.
+    ///
+    /// The run issues [`synchronize`] cycles until a cycle reports no more
+    /// work or the policy cycle budget binds. A retryable transport failure
+    /// records a backoff deadline and returns a deferred report holding the
+    /// progress so far; call again after
+    /// [`not_ready_until_ms`](OrchestratorState::not_ready_until_ms).
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact replica, permanent-transport, protocol, rejection,
+    /// or cancellation boundary that stopped progress. Retryable transport
+    /// failures never surface here; they become deferred reports instead.
+    pub async fn run<R, T>(
+        &mut self,
+        replica: &R,
+        transport: &mut T,
+        limits: SyncLimits,
+        now_unix_ms: u64,
+        retry: &RetrySignal<'_, T::Error>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<RunReport, SyncError<R::Error, T::Error>>
+    where
+        R: ReplicaPort,
+        T: Transport,
+    {
+        if cancelled() {
+            return Err(SyncError::Cancelled);
+        }
+        let mut report = RunReport::default();
+        if self.state.is_backing_off(now_unix_ms) {
+            report.deferred = true;
+            return Ok(report);
+        }
+        loop {
+            if cancelled() {
+                return Err(SyncError::Cancelled);
+            }
+            match synchronize(replica, self.peer, transport, limits, &mut cancelled).await {
+                Ok(cycle) => {
+                    report.pushed += cycle.pushed;
+                    report.pulled += cycle.pulled;
+                    report.pages += cycle.pages;
+                    report.cycles += 1;
+                    report.full_resync = report.full_resync || cycle.full_resync;
+                    report.more = cycle.more;
+                    self.state.note_success();
+                    if !cycle.more || report.cycles >= self.policy.max_cycles() {
+                        return Ok(report);
+                    }
+                }
+                Err(SyncError::Transport(error)) if (retry.is_retryable)(&error) => {
+                    defer_transport(&mut self.state, self.policy, now_unix_ms, retry, &error);
+                    report.deferred = true;
+                    report.more = true;
+                    return Ok(report);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Sends enqueued changes now, for backup-now immediacy after local edits.
+    ///
+    /// This drives the same push-then-pull loop as [`run`](Self::run): the
+    /// protocol admits no push-only global cycle, so immediacy is caller
+    /// intent rather than wire behavior. The application never drives pages
+    /// itself; one call drains every pending page the budget allows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact replica, permanent-transport, protocol, rejection,
+    /// or cancellation boundary that stopped progress.
+    pub async fn send_now<R, T>(
+        &mut self,
+        replica: &R,
+        transport: &mut T,
+        limits: SyncLimits,
+        now_unix_ms: u64,
+        retry: &RetrySignal<'_, T::Error>,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<RunReport, SyncError<R::Error, T::Error>>
+    where
+        R: ReplicaPort,
+        T: Transport,
+    {
+        self.run(replica, transport, limits, now_unix_ms, retry, cancelled)
+            .await
+    }
+
+    /// Pulls remote changes now, for pull-to-refresh immediacy on push hints.
+    ///
+    /// This drives the same push-then-pull loop as [`run`](Self::run): the
+    /// protocol admits no pull-only global cycle, so immediacy is caller
+    /// intent rather than wire behavior. Multi-page backlogs drain across the
+    /// run's cycles until the [`more`](SyncReport::more) signal clears.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact replica, permanent-transport, protocol, rejection,
+    /// or cancellation boundary that stopped progress.
+    pub async fn fetch_now<R, T>(
+        &mut self,
+        replica: &R,
+        transport: &mut T,
+        limits: SyncLimits,
+        now_unix_ms: u64,
+        retry: &RetrySignal<'_, T::Error>,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<RunReport, SyncError<R::Error, T::Error>>
+    where
+        R: ReplicaPort,
+        T: Transport,
+    {
+        self.run(replica, transport, limits, now_unix_ms, retry, cancelled)
+            .await
+    }
+
+    /// Drives one namespace domain: one upload page, then a pull drain.
+    ///
+    /// The upload page is delivery-only by [`send_namespace_now`] design — it
+    /// never advances the shared acknowledgement — so exactly one is offered
+    /// per run and the loop continues on the pull [`more`](NamespaceSyncReport::more)
+    /// signal alone. Per-namespace cursors stay owned by
+    /// [`synchronize_namespace`]; this run only schedules its cycles. The
+    /// domain's observation time doubles as the backoff clock. An offline
+    /// domain defers without touching the replica binding or the transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact replica, permanent-transport, protocol,
+    /// checkpoint-map, rejection, or cancellation boundary that stopped
+    /// progress. Retryable transport failures never surface here; they become
+    /// deferred reports instead.
+    pub async fn run_namespace<R, T, F>(
+        &mut self,
+        replica: &R,
+        transport: &mut T,
+        domain: &NamespaceDomain,
+        is_mine: &F,
+        retry: &RetrySignal<'_, T::Error>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<NamespaceRunReport, NamespaceSyncError<R::Error, T::Error>>
+    where
+        R: ReplicaPort,
+        T: Transport,
+        F: Fn(DocumentId) -> bool,
+    {
+        let mut report = NamespaceRunReport {
+            namespace: domain.namespace().to_owned(),
+            send: NamespaceSendReport {
+                namespace: domain.namespace().to_owned(),
+                ..NamespaceSendReport::default()
+            },
+            ..NamespaceRunReport::default()
+        };
+        if cancelled() {
+            return Err(NamespaceSyncError::Cancelled);
+        }
+        let now_unix_ms = domain.now_unix_ms();
+        if self.state.is_backing_off(now_unix_ms) {
+            report.deferred = true;
+            report.send.deferred = true;
+            return Ok(report);
+        }
+        if domain.policy().network() == NetworkCondition::Offline {
+            report.deferred = true;
+            report.send.deferred = true;
+            return Ok(report);
+        }
+        let send = match send_namespace_now(
+            replica,
+            self.peer,
+            transport,
+            domain,
+            is_mine,
+            &mut cancelled,
+        )
+        .await
+        {
+            Ok(send) => send,
+            Err(NamespaceSyncError::Transport(error)) if (retry.is_retryable)(&error) => {
+                defer_transport(&mut self.state, self.policy, now_unix_ms, retry, &error);
+                report.deferred = true;
+                report.more = true;
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
+        report.send = send;
+        loop {
+            if cancelled() {
+                return Err(NamespaceSyncError::Cancelled);
+            }
+            match synchronize_namespace(
+                replica,
+                self.peer,
+                transport,
+                domain,
+                is_mine,
+                &mut cancelled,
+            )
+            .await
+            {
+                Ok(cycle) => {
+                    report.pulled += cycle.pulled;
+                    report.pages += cycle.pages;
+                    report.cycles += 1;
+                    report.full_resync = report.full_resync || cycle.full_resync;
+                    report.more = cycle.more;
+                    self.state.note_success();
+                    if !cycle.more || report.cycles >= self.policy.max_cycles() {
+                        return Ok(report);
+                    }
+                }
+                Err(NamespaceSyncError::Transport(error)) if (retry.is_retryable)(&error) => {
+                    defer_transport(&mut self.state, self.policy, now_unix_ms, retry, &error);
+                    report.deferred = true;
+                    report.more = true;
+                    return Ok(report);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn backoff_delay_ms(policy: OrchestratorPolicy, consecutive_failures: u32) -> u64 {
+    let mut delay = policy.base_backoff_ms();
+    for _ in 0..consecutive_failures.min(MAX_BACKOFF_DOUBLINGS) {
+        delay = delay.saturating_mul(2).min(policy.max_backoff_ms());
+    }
+    delay.min(policy.max_backoff_ms()).max(1)
+}
+
+fn hint_delay_ms(hint: Duration, max_backoff_ms: u64) -> u64 {
+    u64::try_from(hint.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(max_backoff_ms)
+        .max(1)
+}
+
+fn defer_transport<TransportError>(
+    state: &mut OrchestratorState,
+    policy: OrchestratorPolicy,
+    now_unix_ms: u64,
+    retry: &RetrySignal<'_, TransportError>,
+    error: &TransportError,
+) {
+    let delay = match (retry.retry_after)(error) {
+        Some(hint) => hint_delay_ms(hint, policy.max_backoff_ms()),
+        None => backoff_delay_ms(policy, state.consecutive_failures()),
+    };
+    state.note_retryable(now_unix_ms, delay);
 }
 
 #[cfg(test)]
@@ -1861,5 +2477,699 @@ mod tests {
             }) if value == operation
         ));
         assert_eq!(replica.acknowledged.get(), 0);
+    }
+
+    struct ScriptWire {
+        pulls: std::collections::VecDeque<PullResult>,
+        pushed: RefCell<Vec<OperationId>>,
+        pulls_seen: Cell<usize>,
+    }
+
+    impl ScriptWire {
+        fn with_pulls(pulls: Vec<PullResult>) -> Self {
+            Self {
+                pulls: pulls.into(),
+                pushed: RefCell::new(Vec::new()),
+                pulls_seen: Cell::new(0),
+            }
+        }
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl Transport for ScriptWire {
+        type Error = Infallible;
+        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+            for change in &request.changes {
+                self.pushed.borrow_mut().push(change.operation);
+            }
+            Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: request
+                    .changes
+                    .iter()
+                    .map(|change| PushOutcome::Accepted {
+                        operation: change.operation,
+                    })
+                    .collect(),
+            })
+        }
+        async fn pull(&mut self, _request: PullRequest) -> Result<PullResult, Self::Error> {
+            self.pulls_seen.set(self.pulls_seen.get() + 1);
+            Ok(self
+                .pulls
+                .pop_front()
+                .expect("orchestrator pulled past the scripted pages"))
+        }
+    }
+
+    fn scripted_page(
+        scope: Scope,
+        checkpoint: u8,
+        more: bool,
+        documents: &[DocumentId],
+    ) -> PullResult {
+        PullResult::Page(PullPage {
+            protocol: PROTOCOL_VERSION,
+            changes: documents
+                .iter()
+                .map(|document| ChangeEnvelope {
+                    scope,
+                    document: *document,
+                    replica: ReplicaId::new(),
+                    operation: OperationId::new(),
+                    request: OperationDigest::new([3; 32]),
+                    digest: ChangeDigest::new([4; 32]),
+                    bytes: vec![1],
+                })
+                .collect(),
+            checkpoint: Checkpoint::from_wire(vec![checkpoint]).unwrap(),
+            more,
+        })
+    }
+
+    fn scripted_empty_page(checkpoint: u8) -> PullResult {
+        PullResult::Page(PullPage {
+            protocol: PROTOCOL_VERSION,
+            changes: Vec::new(),
+            checkpoint: Checkpoint::from_wire(vec![checkpoint]).unwrap(),
+            more: false,
+        })
+    }
+
+    fn pending_replica(scope: Scope, count: u64) -> (Replica, Vec<OperationId>) {
+        let mut pending = Vec::new();
+        let mut operations = Vec::new();
+        for sequence in 1..=count {
+            let change = outbound(sequence, DocumentId::new());
+            operations.push(change.operation);
+            pending.push(change);
+        }
+        (
+            Replica {
+                scope,
+                installation: ReplicaId::new(),
+                pending,
+                checkpoint: RefCell::new(None),
+                acknowledged: Cell::new(0),
+                installed: RefCell::new(Vec::new()),
+            },
+            operations,
+        )
+    }
+
+    fn orchestrator() -> SyncOrchestrator {
+        SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default())
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WireFault {
+        Retryable,
+        Permanent,
+    }
+
+    impl std::fmt::Display for WireFault {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Retryable => formatter.write_str("retryable wire fault"),
+                Self::Permanent => formatter.write_str("permanent wire fault"),
+            }
+        }
+    }
+
+    impl std::error::Error for WireFault {}
+
+    struct FlakyTransport {
+        faults_left: usize,
+        fault: WireFault,
+        pushes: RefCell<Vec<OperationId>>,
+        pulls_seen: Cell<usize>,
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl Transport for FlakyTransport {
+        type Error = WireFault;
+        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+            if self.faults_left > 0 {
+                self.faults_left -= 1;
+                return Err(self.fault);
+            }
+            for change in &request.changes {
+                self.pushes.borrow_mut().push(change.operation);
+            }
+            Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: request
+                    .changes
+                    .iter()
+                    .map(|change| PushOutcome::Accepted {
+                        operation: change.operation,
+                    })
+                    .collect(),
+            })
+        }
+        async fn pull(&mut self, _request: PullRequest) -> Result<PullResult, Self::Error> {
+            if self.faults_left > 0 {
+                self.faults_left -= 1;
+                return Err(self.fault);
+            }
+            self.pulls_seen.set(self.pulls_seen.get() + 1);
+            Ok(PullResult::Page(PullPage {
+                protocol: PROTOCOL_VERSION,
+                changes: Vec::new(),
+                checkpoint: Checkpoint::from_wire(vec![7]).unwrap(),
+                more: false,
+            }))
+        }
+    }
+
+    struct ServiceLog {
+        entries: RefCell<Vec<LogChange>>,
+        pushes: RefCell<Vec<OperationId>>,
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl Transport for ServiceLog {
+        type Error = Infallible;
+        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+            let mut entries = self.entries.borrow_mut();
+            let mut outcomes = Vec::with_capacity(request.changes.len());
+            for change in &request.changes {
+                self.pushes.borrow_mut().push(change.operation);
+                let duplicate = entries
+                    .iter()
+                    .any(|entry| entry.document == change.document && entry.bytes == change.bytes);
+                if duplicate {
+                    outcomes.push(PushOutcome::Duplicate {
+                        operation: change.operation,
+                    });
+                } else {
+                    entries.push(LogChange {
+                        document: change.document,
+                        bytes: change.bytes.clone(),
+                    });
+                    outcomes.push(PushOutcome::Accepted {
+                        operation: change.operation,
+                    });
+                }
+            }
+            Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes,
+            })
+        }
+        async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error> {
+            let position = match &request.after {
+                None => 0_u64,
+                Some(checkpoint) => PositionalLog::position(checkpoint),
+            };
+            let start = usize::try_from(position).unwrap();
+            let entries = self.entries.borrow();
+            let changes = entries
+                .iter()
+                .skip(start)
+                .take(usize::from(request.max_changes))
+                .map(|entry| ChangeEnvelope {
+                    scope: request.scope,
+                    document: entry.document,
+                    replica: ReplicaId::new(),
+                    operation: OperationId::new(),
+                    request: OperationDigest::new([3; 32]),
+                    digest: ChangeDigest::new([4; 32]),
+                    bytes: entry.bytes.clone(),
+                })
+                .collect::<Vec<_>>();
+            let next = start + changes.len();
+            let more = next < entries.len();
+            Ok(PullResult::Page(PullPage {
+                protocol: PROTOCOL_VERSION,
+                changes,
+                checkpoint: Checkpoint::from_wire(PositionalLog::position_bytes(next as u64))
+                    .unwrap(),
+                more,
+            }))
+        }
+    }
+
+    #[test]
+    fn orchestrator_policy_rejects_empty_budgets_fail_closed() {
+        assert_eq!(
+            OrchestratorPolicy::new(0, 1_000, 60_000),
+            Err(ProtocolError::PageLimit)
+        );
+        assert_eq!(
+            OrchestratorPolicy::new(8, 0, 60_000),
+            Err(ProtocolError::PageLimit)
+        );
+        assert_eq!(
+            OrchestratorPolicy::new(8, 1_000, 0),
+            Err(ProtocolError::PageLimit)
+        );
+        assert_eq!(
+            OrchestratorPolicy::new(8, 1_000, 60_000).unwrap(),
+            OrchestratorPolicy::default()
+        );
+    }
+
+    #[test]
+    fn orchestrator_state_blob_is_versioned_and_fail_closed() {
+        let state = OrchestratorState::new();
+        assert_eq!(state.encode().len(), ORCHESTRATOR_STATE_BYTES);
+        assert_eq!(OrchestratorState::decode(&state.encode()).unwrap(), state);
+        assert!(matches!(
+            OrchestratorState::decode(&[0_u8; 4]),
+            Err(OrchestratorStateError::Malformed)
+        ));
+        let mut bad_magic = state.encode();
+        bad_magic[0] ^= 0xFF;
+        assert!(matches!(
+            OrchestratorState::decode(&bad_magic),
+            Err(OrchestratorStateError::Malformed)
+        ));
+        let mut bad_version = state.encode();
+        bad_version[8..10].copy_from_slice(&(ORCHESTRATOR_STATE_VERSION + 1).to_be_bytes());
+        assert!(matches!(
+            OrchestratorState::decode(&bad_version),
+            Err(OrchestratorStateError::UnsupportedVersion { actual: 2 })
+        ));
+    }
+
+    #[test]
+    fn orchestrator_send_now_drains_upload_pages_without_app_paging() {
+        let scope = log_scope();
+        let (replica, operations) = pending_replica(scope, 3);
+        let mut wire = ScriptWire::with_pulls(vec![scripted_empty_page(1), scripted_empty_page(2)]);
+        let mut engine = orchestrator();
+        let retry = RetrySignal::never();
+        let report = futures::executor::block_on(engine.send_now(
+            &replica,
+            &mut wire,
+            SyncLimits {
+                changes_per_page: 2,
+                ..SyncLimits::default()
+            },
+            1_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(report.pushed, 3);
+        assert_eq!(report.pulled, 0);
+        assert_eq!(report.pages, 2);
+        assert_eq!(report.cycles, 2);
+        assert!(!report.more);
+        assert!(!report.deferred);
+        assert!(!report.full_resync);
+        assert_eq!(*wire.pushed.borrow(), operations);
+        assert_eq!(replica.acknowledged.get(), 3);
+    }
+
+    #[test]
+    fn orchestrator_fetch_now_drains_pull_backlog_until_more_clears() {
+        let scope = log_scope();
+        let replica = empty_replica(scope);
+        let documents = [
+            DocumentId::new(),
+            DocumentId::new(),
+            DocumentId::new(),
+            DocumentId::new(),
+            DocumentId::new(),
+        ];
+        let mut wire = ScriptWire::with_pulls(vec![
+            scripted_page(scope, 1, true, &documents[0..2]),
+            scripted_page(scope, 2, true, &documents[2..4]),
+            scripted_page(scope, 3, false, &documents[4..5]),
+        ]);
+        let mut engine = orchestrator();
+        let retry = RetrySignal::never();
+        let report = futures::executor::block_on(engine.fetch_now(
+            &replica,
+            &mut wire,
+            SyncLimits {
+                pages_per_cycle: 1,
+                ..SyncLimits::default()
+            },
+            1_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(report.pulled, 5);
+        assert_eq!(report.pages, 3);
+        assert_eq!(report.cycles, 3);
+        assert!(!report.more);
+        assert!(!report.deferred);
+        let installed = replica
+            .installed
+            .borrow()
+            .iter()
+            .map(|change| change.document)
+            .collect::<Vec<_>>();
+        assert_eq!(installed, documents);
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![3]));
+    }
+
+    #[test]
+    fn orchestrator_surfaces_single_recovery_and_second_expiry_as_protocol_error() {
+        let scope = log_scope();
+        let replica = Replica {
+            scope,
+            installation: ReplicaId::new(),
+            pending: Vec::new(),
+            checkpoint: RefCell::new(Some(vec![9])),
+            acknowledged: Cell::new(0),
+            installed: RefCell::new(Vec::new()),
+        };
+        let mut wire =
+            ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
+        let mut engine = orchestrator();
+        let retry = RetrySignal::never();
+        let report = futures::executor::block_on(engine.fetch_now(
+            &replica,
+            &mut wire,
+            SyncLimits::default(),
+            1_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert!(report.full_resync);
+        assert_eq!(report.pages, 1);
+        assert!(!report.more);
+        assert!(!report.deferred);
+        assert_eq!(engine.state().consecutive_failures(), 0);
+
+        let fresh = empty_replica(scope);
+        let mut expired = ScriptWire::with_pulls(vec![
+            PullResult::CheckpointExpired,
+            PullResult::CheckpointExpired,
+        ]);
+        *fresh.checkpoint.borrow_mut() = Some(vec![9]);
+        let mut retrying = orchestrator();
+        assert!(matches!(
+            futures::executor::block_on(retrying.fetch_now(
+                &fresh,
+                &mut expired,
+                SyncLimits::default(),
+                1_000,
+                &retry,
+                || false,
+            )),
+            Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint))
+        ));
+        assert_eq!(retrying.state().consecutive_failures(), 0);
+        assert_eq!(retrying.state().not_ready_until_ms(), 0);
+    }
+
+    #[test]
+    fn orchestrator_backs_off_retryable_then_succeeds_and_surfaces_permanent() {
+        let scope = log_scope();
+        let (replica, _) = pending_replica(scope, 1);
+        let mut wire = FlakyTransport {
+            faults_left: 1,
+            fault: WireFault::Retryable,
+            pushes: RefCell::new(Vec::new()),
+            pulls_seen: Cell::new(0),
+        };
+        let is_retryable = |error: &WireFault| *error == WireFault::Retryable;
+        let retry_after = |_: &WireFault| Some(std::time::Duration::from_millis(50));
+        let retry = RetrySignal {
+            is_retryable: &is_retryable,
+            retry_after: &retry_after,
+        };
+        let mut engine = orchestrator();
+        let deferred = futures::executor::block_on(engine.send_now(
+            &replica,
+            &mut wire,
+            SyncLimits::default(),
+            0,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert!(deferred.deferred);
+        assert!(deferred.more);
+        assert_eq!(deferred.cycles, 0);
+        assert_eq!(engine.state().consecutive_failures(), 1);
+        assert_eq!(engine.state().not_ready_until_ms(), 50);
+        assert!(wire.pushes.borrow().is_empty());
+
+        let gated = futures::executor::block_on(engine.send_now(
+            &replica,
+            &mut wire,
+            SyncLimits::default(),
+            10,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert!(gated.deferred);
+        assert_eq!(gated.cycles, 0);
+        assert!(wire.pushes.borrow().is_empty());
+        assert_eq!(wire.pulls_seen.get(), 0);
+
+        let recovered = futures::executor::block_on(engine.send_now(
+            &replica,
+            &mut wire,
+            SyncLimits::default(),
+            60,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert!(!recovered.deferred);
+        assert_eq!(recovered.pushed, 1);
+        assert!(!recovered.more);
+        assert_eq!(engine.state().consecutive_failures(), 0);
+        assert_eq!(wire.pushes.borrow().len(), 1);
+        assert_eq!(wire.pulls_seen.get(), 1);
+
+        let (stuck, _) = pending_replica(scope, 1);
+        let mut fatal = FlakyTransport {
+            faults_left: 1,
+            fault: WireFault::Permanent,
+            pushes: RefCell::new(Vec::new()),
+            pulls_seen: Cell::new(0),
+        };
+        let mut failing = orchestrator();
+        assert!(matches!(
+            futures::executor::block_on(failing.send_now(
+                &stuck,
+                &mut fatal,
+                SyncLimits::default(),
+                0,
+                &retry,
+                || false,
+            )),
+            Err(SyncError::Transport(WireFault::Permanent))
+        ));
+        assert_eq!(failing.state().consecutive_failures(), 0);
+        assert_eq!(failing.state().not_ready_until_ms(), 0);
+        assert!(fatal.pushes.borrow().is_empty());
+    }
+
+    #[test]
+    fn orchestrator_state_restored_after_restart_resumes_without_duplicate_delivery() {
+        let scope = log_scope();
+        let (replica, operations) = pending_replica(scope, 3);
+        let policy = OrchestratorPolicy::new(1, 1_000, 60_000).unwrap();
+        let peer = PeerId::new();
+        let mut wire = ScriptWire::with_pulls(vec![
+            scripted_empty_page(1),
+            scripted_empty_page(2),
+            scripted_empty_page(3),
+        ]);
+        let mut engine = SyncOrchestrator::new(peer, policy);
+        let retry = RetrySignal::never();
+        let limits = SyncLimits {
+            changes_per_page: 1,
+            ..SyncLimits::default()
+        };
+        let partial = futures::executor::block_on(engine.send_now(
+            &replica,
+            &mut wire,
+            limits,
+            1_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(partial.pushed, 1);
+        assert!(partial.more);
+
+        let blob = engine.export_state();
+        assert_eq!(OrchestratorState::decode(&blob).unwrap(), engine.state());
+        let mut revived = SyncOrchestrator::restore(peer, policy, &blob).unwrap();
+        let resumed = futures::executor::block_on(revived.send_now(
+            &replica,
+            &mut wire,
+            limits,
+            2_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(resumed.pushed, 1);
+        assert!(resumed.more);
+        let finished = futures::executor::block_on(revived.send_now(
+            &replica,
+            &mut wire,
+            limits,
+            3_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(finished.pushed, 1);
+        assert!(!finished.more);
+        assert_eq!(*wire.pushed.borrow(), operations);
+        assert_eq!(replica.acknowledged.get(), 3);
+
+        assert!(matches!(
+            SyncOrchestrator::restore(peer, policy, &[7_u8; 3]),
+            Err(OrchestratorStateError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn orchestrator_drives_namespace_domains_without_duplicating_cursors() {
+        let scope = log_scope();
+        let document = DocumentId::new();
+        let change = outbound(1, document);
+        let operation = change.operation;
+        let replica = NsReplica::fresh(scope, vec![change]);
+        let (mut log, mut ownership) = log_with(scope, &["quiet"]);
+        ownership.insert(document, "quiet");
+        let is_mine = |candidate| ownership.get(&candidate) == Some(&"quiet");
+        let mut engine = orchestrator();
+        let retry = RetrySignal::never();
+        let report = futures::executor::block_on(engine.run_namespace(
+            &replica,
+            &mut log,
+            &domain("quiet", online_policy(16, 8), 1_000),
+            &is_mine,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(report.namespace, "quiet");
+        assert_eq!(report.send.namespace, "quiet");
+        assert_eq!(report.send.uploaded, 1);
+        assert!(report.send.more);
+        assert_eq!(report.pulled, 1);
+        assert_eq!(report.pages, 1);
+        assert_eq!(report.cycles, 1);
+        assert!(!report.more);
+        assert!(!report.deferred);
+        assert_eq!(*log.pushed_operations.borrow(), vec![operation]);
+        assert_eq!(replica.acknowledged.get(), 0);
+        assert_eq!(
+            replica.stored_map().get("quiet").unwrap().cursor(),
+            PositionalLog::position_bytes(1)
+        );
+
+        let pulls_before = log.pulls.get();
+        let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
+        let parked = futures::executor::block_on(engine.run_namespace(
+            &replica,
+            &mut log,
+            &domain("quiet", offline, 2_000),
+            &is_mine,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert!(parked.deferred);
+        assert!(parked.send.deferred);
+        assert_eq!(parked.cycles, 0);
+        assert_eq!(parked.send.uploaded, 0);
+        assert_eq!(parked.pulled, 0);
+        assert_eq!(log.pulls.get(), pulls_before);
+    }
+
+    #[test]
+    fn two_replicas_converge_through_orchestrator_runs_without_duplicate_delivery() {
+        let scope = log_scope();
+        let first_document = DocumentId::new();
+        let second_document = DocumentId::new();
+        let first = outbound(1, first_document);
+        let second = outbound(2, second_document);
+        let operations = vec![first.operation, second.operation];
+        let sender = Replica {
+            scope,
+            installation: ReplicaId::new(),
+            pending: vec![first, second],
+            checkpoint: RefCell::new(None),
+            acknowledged: Cell::new(0),
+            installed: RefCell::new(Vec::new()),
+        };
+        let receiver = empty_replica(scope);
+        let mut log = ServiceLog {
+            entries: RefCell::new(Vec::new()),
+            pushes: RefCell::new(Vec::new()),
+        };
+        let retry = RetrySignal::never();
+        let limits = SyncLimits {
+            changes_per_page: 8,
+            ..SyncLimits::default()
+        };
+        let mut uplink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
+        let sent = futures::executor::block_on(uplink.send_now(
+            &sender,
+            &mut log,
+            limits,
+            1_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(sent.pushed, 2);
+        assert!(!sent.more);
+
+        let mut downlink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
+        let fetched = futures::executor::block_on(downlink.fetch_now(
+            &receiver,
+            &mut log,
+            limits,
+            2_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(fetched.pulled, 2);
+        assert!(!fetched.more);
+        assert!(!fetched.full_resync);
+        let installed_docs = receiver
+            .installed
+            .borrow()
+            .iter()
+            .map(|change| change.document)
+            .collect::<Vec<_>>();
+        assert_eq!(installed_docs, vec![first_document, second_document]);
+        assert_eq!(*log.pushes.borrow(), operations);
+
+        let quiet = futures::executor::block_on(downlink.send_now(
+            &receiver,
+            &mut log,
+            limits,
+            3_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(quiet.pushed, 0);
+        assert_eq!(quiet.pulled, 0);
+        assert!(!quiet.more);
+        let settled = futures::executor::block_on(uplink.fetch_now(
+            &sender,
+            &mut log,
+            limits,
+            4_000,
+            &retry,
+            || false,
+        ))
+        .unwrap();
+        assert_eq!(settled.pulled, 0);
+        assert!(!settled.more);
+        assert_eq!(*log.pushes.borrow(), operations);
     }
 }
