@@ -77,6 +77,7 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-store",
         "logical-db-sync",
     },
+    "logical-db-kv": {"logical-db", "logical-db-model"},
 }
 
 

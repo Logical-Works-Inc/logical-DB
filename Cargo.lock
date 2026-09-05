@@ -1284,6 +1284,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "logical-db-kv"
+version = "0.1.0"
+dependencies = [
+ "logical-db",
+ "logical-db-model",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [

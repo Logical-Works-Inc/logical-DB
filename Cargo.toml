@@ -19,6 +19,7 @@ members = [
   "crates/logical-db-e2e",
   "crates/logical-db-platform",
   "crates/logical-db-daemon",
+  "crates/logical-db-kv",
 ]
 
 [workspace.package]
