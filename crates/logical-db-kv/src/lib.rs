@@ -67,20 +67,34 @@
 //! recency, defaulting to zero). Slots without a live value project no rows.
 //! The projection functions never fail a commit: unexpected shapes project
 //! nothing, while point reads stay strict (see [`KvError`]).
+//!
+//! # Namespace sync domains
+//!
+//! Namespaces compose with the key mapping instead of forking it: every slot
+//! already carries its namespace, so [`KvCache::document_namespace`]
+//! classifies any pulled change for a sync driver, [`KvCache::put_many`]
+//! keeps multi-key namespace writes atomic, [`KvCache::recent`] gives cold
+//! devices the newest keys first before [`KvCache::scan`] backfills, and
+//! [`KvCache::namespace_checkpoints`] with
+//! [`KvCache::store_namespace_checkpoints`] persists per-namespace cursors in
+//! the one durable checkpoint slot bound to the upstream.
 
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use logical_db::{Database, DatabaseError, MigrationReport, Projection};
-use logical_db::{EditOutcome, Item, Object, OperationDigest, OperationId, Scalar};
+use logical_db::{EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar};
 use logical_db_model::MAX_CHANGE_BYTES;
-pub use logical_db_model::{AccountId, DocumentId, IndexId, IndexValue, ReplicaId, Scope, SpaceId};
+pub use logical_db_model::{
+    AccountId, DocumentId, IndexId, IndexValue, NamespaceCheckpoint, NamespaceCheckpoints, PeerId,
+    ReplicaId, Scope, SpaceId,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -95,6 +109,11 @@ pub const MAX_VALUE_BYTES: usize = MAX_CHANGE_BYTES - 65_536;
 /// Largest page accepted by [`KvCache::scan`] and [`KvCache::evict_expired`],
 /// mirroring the facade's bounded pages.
 pub const MAX_PAGE_LIMIT: usize = 256;
+/// Largest atomic batch accepted by [`KvCache::put_many`].
+///
+/// The batch snapshots prior values for rollback, so the bound caps transient
+/// compensation memory as well as per-call outbox churn.
+pub const MAX_BATCH_PUT: usize = 32;
 /// Expiry meaning "never expires".
 pub const NEVER_EXPIRES_AT_MS: i64 = i64::MAX;
 
@@ -125,6 +144,17 @@ pub struct CacheEntry {
     pub value: Vec<u8>,
 }
 
+/// One entry of an atomic [`KvCache::put_many`] batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchPut {
+    /// Cache key, validated exactly like [`KvCache::put`].
+    pub key: String,
+    /// Opaque value bytes, bounded exactly like [`KvCache::put`].
+    pub value: Vec<u8>,
+    /// Optional time-to-live; `None` never expires.
+    pub ttl: Option<Duration>,
+}
+
 /// Stable failures exposed by the cache facade.
 #[derive(Debug, Error)]
 pub enum KvError {
@@ -148,6 +178,26 @@ pub enum KvError {
     /// A prefix-scan page fell outside `1..=256`.
     #[error("scan limit {0} is outside 1..=256")]
     InvalidScanLimit(usize),
+    /// A batch fell outside `1..=32`.
+    #[error("batch size {0} is outside 1..=32")]
+    InvalidBatchSize(usize),
+    /// A namespace checkpoint map was malformed.
+    #[error("namespace checkpoint map is malformed")]
+    CorruptCheckpointMap,
+    /// A namespace checkpoint map used a foreign layout version.
+    #[error("namespace checkpoint map version {actual} is unsupported")]
+    UnsupportedCheckpointMapVersion {
+        /// Observed map layout version.
+        actual: u16,
+    },
+    /// A namespace checkpoint map would not fit the durable slot.
+    #[error("namespace checkpoint map length {actual} exceeds maximum {maximum}")]
+    CheckpointMapTooLarge {
+        /// Observed encoded byte count.
+        actual: usize,
+        /// Accepted encoded byte count.
+        maximum: usize,
+    },
     /// An eviction batch fell outside `1..=256`.
     #[error("eviction limit {0} is outside 1..=256")]
     InvalidEvictionLimit(usize),
@@ -261,45 +311,54 @@ impl KvCache {
                 maximum: MAX_VALUE_BYTES,
             });
         }
-        let document = document_for(&self.namespace, key);
         let now = now_ms();
-        let expires_at_ms = expiry_for(ttl, now);
-        let sequence = self.next_sequence(now);
-        let operation = OperationId::new();
-        let digest = put_digest(
-            &operation,
-            &self.namespace,
-            key,
-            value,
-            expires_at_ms,
-            sequence,
-        );
-        let stored_key = key.to_owned();
-        let stored_value = value.to_vec();
-        let stored_namespace = self.namespace.clone();
-        match self.database.edit(document, operation, digest, |editor| {
-            editor.put(
-                &Object::root(),
-                FIELD_VERSION,
-                Scalar::Unsigned(ENVELOPE_VERSION),
-            )?;
-            editor.put(&Object::root(), FIELD_KEY, Scalar::String(stored_key))?;
-            editor.put(
-                &Object::root(),
-                FIELD_NAMESPACE,
-                Scalar::String(stored_namespace),
-            )?;
-            editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(stored_value))?;
-            editor.put(
-                &Object::root(),
-                FIELD_EXPIRY,
-                Scalar::Timestamp(expires_at_ms),
-            )?;
-            editor.put(&Object::root(), FIELD_SEQUENCE, Scalar::Unsigned(sequence))?;
-            Ok(())
-        })? {
-            EditOutcome::Applied(_) | EditOutcome::Duplicate(_) => Ok(()),
+        self.put_absolute(key, value, expiry_for(ttl, now), self.next_sequence(now))
+    }
+
+    /// Stores a batch of keys atomically: every entry validates before the
+    /// first commit, and a commit failure restores the prior values of the
+    /// entries this call already applied before reporting the error.
+    ///
+    /// Duplicate keys within one batch resolve last-wins in batch order.
+    /// Retrying a failed batch converges: restoration returns slots to their
+    /// pre-batch values, so the retry applies cleanly with fresh identities.
+    /// A rollback that itself fails still reports the original error; the
+    /// batch then needs an explicit retry to converge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvError::InvalidBatchSize`] for an empty or oversized batch,
+    /// [`KvError::InvalidKey`] or [`KvError::ValueTooLarge`] before committing
+    /// anything when any entry is invalid, or [`KvError::Database`] when a
+    /// commit fails.
+    pub fn put_many(&self, entries: &[BatchPut]) -> Result<(), KvError> {
+        if entries.is_empty() || entries.len() > MAX_BATCH_PUT {
+            return Err(KvError::InvalidBatchSize(entries.len()));
         }
+        for entry in entries {
+            validate_key(&entry.key)?;
+            if entry.value.len() > MAX_VALUE_BYTES {
+                return Err(KvError::ValueTooLarge {
+                    actual: entry.value.len(),
+                    maximum: MAX_VALUE_BYTES,
+                });
+            }
+        }
+        let now = now_ms();
+        let mut priors = Vec::with_capacity(entries.len());
+        for entry in entries {
+            priors.push(self.live_prior(&entry.key, now)?);
+        }
+        for (applied, entry) in entries.iter().enumerate() {
+            let expires_at_ms = expiry_for(entry.ttl, now);
+            let sequence = self.next_sequence(now);
+            if let Err(error) = self.put_absolute(&entry.key, &entry.value, expires_at_ms, sequence)
+            {
+                self.rollback(&entries[..applied], &priors[..applied]);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Reads the live value stored under `key`.
@@ -411,6 +470,70 @@ impl KvCache {
         Ok(entries)
     }
 
+    /// Returns up to `limit` live entries whose keys start with `prefix`,
+    /// newest observed first.
+    ///
+    /// This is the reverse catch-up path for cold devices: after syncing,
+    /// read the freshest keys immediately through `recent`, then backfill the
+    /// full key-ordered set through [`KvCache::scan`]. Newest means most
+    /// recently observed by this replica — local commits in commit order and
+    /// synced changes in install order — which is a display heuristic, never
+    /// a consistency primitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvError::InvalidScanLimit`] for a page outside `1..=256`, or
+    /// [`KvError::Database`] for a durable failure.
+    pub fn recent(&self, prefix: &str, limit: usize) -> Result<Vec<CacheEntry>, KvError> {
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(KvError::InvalidScanLimit(limit));
+        }
+        let now = now_ms();
+        let mut observed: BTreeMap<DocumentId, u64> = BTreeMap::new();
+        let mut after = 0_u64;
+        loop {
+            let events = self.database.changes_since(after, MAX_PAGE_LIMIT)?;
+            if events.is_empty() {
+                break;
+            }
+            let complete = events.len() < MAX_PAGE_LIMIT;
+            for event in &events {
+                observed.insert(event.document, event.sequence);
+                after = event.sequence;
+            }
+            if complete {
+                break;
+            }
+        }
+        let mut ranked: Vec<(u64, CacheEntry)> = Vec::new();
+        for (document, sequence) in &observed {
+            let Decoded::Found(envelope) = self.decode_slot(*document)? else {
+                continue;
+            };
+            if envelope.namespace != self.namespace || !envelope.key.starts_with(prefix) {
+                continue;
+            }
+            if envelope.expires_at_ms <= now {
+                continue;
+            }
+            ranked.push((
+                *sequence,
+                CacheEntry {
+                    key: envelope.key,
+                    value: envelope.value,
+                },
+            ));
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.key.cmp(&right.1.key))
+        });
+        ranked.truncate(limit);
+        Ok(ranked.into_iter().map(|(_, entry)| entry).collect())
+    }
+
     /// Deletes up to `limit` expired slots in this namespace, reporting how
     /// many were reclaimed.
     ///
@@ -438,6 +561,169 @@ impl KvCache {
             cleared += 1;
         }
         Ok(cleared)
+    }
+
+    /// Classifies a slot document for namespace sync filtering.
+    ///
+    /// Returns the namespace recorded in the slot envelope, or `None` for
+    /// missing, cleared, and non-cache documents. Expiry is ignored: an
+    /// expired slot still belongs to its namespace for sync purposes, and
+    /// reads keep enforcing expiry. Foreign slots never error; only slots
+    /// carrying undecodable cache markers do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvError::UnsupportedEnvelopeVersion`] when the slot was
+    /// written by a newer cache, [`KvError::CorruptEnvelope`] when the slot
+    /// carries cache markers that do not decode, or [`KvError::Database`]
+    /// for a durable failure.
+    pub fn document_namespace(&self, document: DocumentId) -> Result<Option<String>, KvError> {
+        match self.decode_slot(document)? {
+            Decoded::Found(envelope) => Ok(Some(envelope.namespace)),
+            Decoded::Absent => Ok(None),
+            Decoded::Corrupt => Err(KvError::CorruptEnvelope),
+            Decoded::Unsupported(actual) => Err(KvError::UnsupportedEnvelopeVersion { actual }),
+        }
+    }
+
+    /// Loads the multiplexed namespace checkpoint map from the durable
+    /// checkpoint slot bound to `peer`, or an empty map when nothing was
+    /// stored yet.
+    ///
+    /// The slot stays the single per-peer binding; namespaces partition state
+    /// within it. A slot holding a legacy global cursor fails closed so the
+    /// two sync shapes are never silently mixed on one peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvError::CorruptCheckpointMap`] (or the versioned and sized
+    /// variants) when the slot does not hold a namespace map, or
+    /// [`KvError::Database`] for a durable failure.
+    pub fn namespace_checkpoints(&self, peer: PeerId) -> Result<NamespaceCheckpoints, KvError> {
+        match self.database.checkpoint(peer)? {
+            None => Ok(NamespaceCheckpoints::new()),
+            Some(bytes) => {
+                NamespaceCheckpoints::decode(&bytes).map_err(|error| checkpoint_map_error(&error))
+            }
+        }
+    }
+
+    /// Stores the multiplexed namespace checkpoint map into the durable
+    /// checkpoint slot bound to `peer`, atomically and without touching any
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvError::CheckpointMapTooLarge`] when the map would not fit
+    /// the slot, or [`KvError::Database`] for a durable failure.
+    pub fn store_namespace_checkpoints(
+        &self,
+        peer: PeerId,
+        map: &NamespaceCheckpoints,
+    ) -> Result<(), KvError> {
+        let encoded = map.encode().map_err(|error| checkpoint_map_error(&error))?;
+        let changes: &[RemoteChange] = &[];
+        self.database.install_remote_page(peer, changes, &encoded)?;
+        Ok(())
+    }
+
+    fn put_absolute(
+        &self,
+        key: &str,
+        value: &[u8],
+        expires_at_ms: i64,
+        sequence: u64,
+    ) -> Result<(), KvError> {
+        let document = document_for(&self.namespace, key);
+        let operation = OperationId::new();
+        let digest = put_digest(
+            &operation,
+            &self.namespace,
+            key,
+            value,
+            expires_at_ms,
+            sequence,
+        );
+        let stored_key = key.to_owned();
+        let stored_value = value.to_vec();
+        let stored_namespace = self.namespace.clone();
+        match self.database.edit(document, operation, digest, |editor| {
+            editor.put(
+                &Object::root(),
+                FIELD_VERSION,
+                Scalar::Unsigned(ENVELOPE_VERSION),
+            )?;
+            editor.put(&Object::root(), FIELD_KEY, Scalar::String(stored_key))?;
+            editor.put(
+                &Object::root(),
+                FIELD_NAMESPACE,
+                Scalar::String(stored_namespace),
+            )?;
+            editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(stored_value))?;
+            editor.put(
+                &Object::root(),
+                FIELD_EXPIRY,
+                Scalar::Timestamp(expires_at_ms),
+            )?;
+            editor.put(&Object::root(), FIELD_SEQUENCE, Scalar::Unsigned(sequence))?;
+            Ok(())
+        })? {
+            EditOutcome::Applied(_) | EditOutcome::Duplicate(_) => Ok(()),
+        }
+    }
+
+    fn live_prior(&self, key: &str, now: i64) -> Result<Option<Prior>, KvError> {
+        let document = document_for(&self.namespace, key);
+        match self.decode_slot(document)? {
+            Decoded::Found(envelope)
+                if envelope.namespace == self.namespace
+                    && envelope.key == key
+                    && envelope.expires_at_ms > now =>
+            {
+                Ok(Some(Prior {
+                    value: envelope.value,
+                    expires_at_ms: envelope.expires_at_ms,
+                }))
+            }
+            Decoded::Found(_) | Decoded::Absent => Ok(None),
+            Decoded::Corrupt => Err(KvError::CorruptEnvelope),
+            Decoded::Unsupported(actual) => Err(KvError::UnsupportedEnvelopeVersion { actual }),
+        }
+    }
+
+    fn rollback(&self, entries: &[BatchPut], priors: &[Option<Prior>]) {
+        for (entry, prior) in entries.iter().zip(priors.iter()).rev() {
+            match prior {
+                Some(value) => {
+                    let _ = self.put_absolute(
+                        &entry.key,
+                        &value.value,
+                        value.expires_at_ms,
+                        self.next_sequence(now_ms()),
+                    );
+                }
+                None => {
+                    let _ = self.clear_if_live(&entry.key);
+                }
+            }
+        }
+    }
+
+    fn clear_if_live(&self, key: &str) -> Result<(), KvError> {
+        let document = document_for(&self.namespace, key);
+        let now = now_ms();
+        match self.decode_slot(document)? {
+            Decoded::Found(envelope)
+                if envelope.namespace == self.namespace
+                    && envelope.key == key
+                    && envelope.expires_at_ms > now =>
+            {
+                self.clear_slot(document, key)
+            }
+            Decoded::Found(_) | Decoded::Absent => Ok(()),
+            Decoded::Corrupt => Err(KvError::CorruptEnvelope),
+            Decoded::Unsupported(actual) => Err(KvError::UnsupportedEnvelopeVersion { actual }),
+        }
     }
 
     fn decode_slot(&self, document: DocumentId) -> Result<Decoded, KvError> {
@@ -595,6 +881,12 @@ struct Envelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct Prior {
+    value: Vec<u8>,
+    expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Decoded {
     Absent,
     Corrupt,
@@ -614,6 +906,21 @@ fn validate_namespace(namespace: &str) -> Result<(), KvError> {
         return Err(KvError::InvalidNamespace);
     }
     Ok(())
+}
+
+fn checkpoint_map_error(error: &logical_db_model::ModelError) -> KvError {
+    match error {
+        logical_db_model::ModelError::UnsupportedNamespaceCheckpointVersion { actual } => {
+            KvError::UnsupportedCheckpointMapVersion { actual: *actual }
+        }
+        logical_db_model::ModelError::NamespaceCheckpointMapTooLarge { actual, maximum } => {
+            KvError::CheckpointMapTooLarge {
+                actual: *actual,
+                maximum: *maximum,
+            }
+        }
+        _ => KvError::CorruptCheckpointMap,
+    }
 }
 
 fn now_ms() -> i64 {
@@ -938,6 +1245,246 @@ mod tests {
             KvCache::open(&db_path, scope, replica, ""),
             Err(KvError::InvalidNamespace)
         ));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn batch_put_applies_every_entry_atomically() {
+        let db_path = path("batch-apply");
+        let cache = open_cache(&db_path, "sessions");
+        cache
+            .put_many(&[
+                BatchPut {
+                    key: "a".into(),
+                    value: b"1".to_vec(),
+                    ttl: Some(Duration::from_secs(60)),
+                },
+                BatchPut {
+                    key: "b".into(),
+                    value: b"2".to_vec(),
+                    ttl: None,
+                },
+                BatchPut {
+                    key: "c".into(),
+                    value: b"3".to_vec(),
+                    ttl: Some(Duration::from_secs(60)),
+                },
+            ])
+            .unwrap();
+        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(cache.get("b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(cache.get("c").unwrap(), Some(b"3".to_vec()));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn batch_put_validation_failure_applies_nothing() {
+        let db_path = path("batch-atomic");
+        let cache = open_cache(&db_path, "sessions");
+        cache
+            .put("keep", b"v0", Some(Duration::from_secs(60)))
+            .unwrap();
+        let oversize = vec![7_u8; MAX_VALUE_BYTES + 1];
+        let error = cache
+            .put_many(&[
+                BatchPut {
+                    key: "first".into(),
+                    value: b"1".to_vec(),
+                    ttl: Some(Duration::from_secs(60)),
+                },
+                BatchPut {
+                    key: "keep".into(),
+                    value: b"replaced".to_vec(),
+                    ttl: Some(Duration::from_secs(60)),
+                },
+                BatchPut {
+                    key: "big".into(),
+                    value: oversize,
+                    ttl: Some(Duration::from_secs(60)),
+                },
+                BatchPut {
+                    key: "last".into(),
+                    value: b"z".to_vec(),
+                    ttl: Some(Duration::from_secs(60)),
+                },
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KvError::ValueTooLarge { actual, maximum }
+            if actual == MAX_VALUE_BYTES + 1 && maximum == MAX_VALUE_BYTES
+        ));
+        assert_eq!(cache.get("first").unwrap(), None);
+        assert_eq!(cache.get("last").unwrap(), None);
+        assert_eq!(cache.get("big").unwrap(), None);
+        assert_eq!(cache.get("keep").unwrap(), Some(b"v0".to_vec()));
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn batch_put_rejects_empty_and_oversize_batches() {
+        let db_path = path("batch-bounds");
+        let cache = open_cache(&db_path, "sessions");
+        assert!(matches!(
+            cache.put_many(&[]).unwrap_err(),
+            KvError::InvalidBatchSize(0)
+        ));
+        let oversize: Vec<BatchPut> = (0..=MAX_BATCH_PUT)
+            .map(|offset| BatchPut {
+                key: format!("k{offset}"),
+                value: b"v".to_vec(),
+                ttl: None,
+            })
+            .collect();
+        assert!(matches!(
+            cache.put_many(&oversize).unwrap_err(),
+            KvError::InvalidBatchSize(actual) if actual == MAX_BATCH_PUT + 1
+        ));
+        assert_eq!(cache.get("k0").unwrap(), None);
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn fresh_device_catches_up_newest_first_then_backfills() {
+        let writer_path = path("catchup-a");
+        let reader_path = path("catchup-b");
+        let scope = scope();
+        let peer = logical_db_model::PeerId::new();
+        {
+            let writer = KvCache::open(&writer_path, scope, ReplicaId::new(), "sessions").unwrap();
+            for key in ["k1", "k2", "k3", "k4", "k5"] {
+                writer
+                    .put(key, key.as_bytes(), Some(Duration::from_secs(60)))
+                    .unwrap();
+            }
+            let pending = writer.database().pending_changes(0, 64).unwrap();
+            let remote: Vec<logical_db::RemoteChange> = pending
+                .into_iter()
+                .map(|change| logical_db::RemoteChange {
+                    document: change.document,
+                    digest: change.digest,
+                    bytes: change.bytes,
+                })
+                .collect();
+            assert_eq!(remote.len(), 5);
+            let reader = KvCache::open(&reader_path, scope, ReplicaId::new(), "sessions").unwrap();
+            reader
+                .database()
+                .install_remote_page(peer, &remote, b"cursor-1")
+                .unwrap();
+            let newest = reader.recent("", 2).unwrap();
+            assert_eq!(
+                newest,
+                vec![
+                    CacheEntry {
+                        key: "k5".into(),
+                        value: b"k5".to_vec(),
+                    },
+                    CacheEntry {
+                        key: "k4".into(),
+                        value: b"k4".to_vec(),
+                    },
+                ]
+            );
+            let backfill = reader.scan("", None, 10).unwrap();
+            assert_eq!(
+                backfill
+                    .iter()
+                    .map(|entry| entry.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["k1", "k2", "k3", "k4", "k5"]
+            );
+            let full_recent = reader.recent("", 10).unwrap();
+            assert_eq!(
+                full_recent
+                    .iter()
+                    .map(|entry| entry.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["k5", "k4", "k3", "k2", "k1"]
+            );
+        }
+        cleanup(&writer_path);
+        cleanup(&reader_path);
+    }
+
+    #[test]
+    fn namespace_checkpoint_map_round_trips_through_the_durable_slot() {
+        let db_path = path("ns-slot");
+        let scope = scope();
+        let peer = logical_db_model::PeerId::new();
+        let cache = KvCache::open(&db_path, scope, ReplicaId::new(), "sessions").unwrap();
+        assert!(cache.namespace_checkpoints(peer).unwrap().is_empty());
+        let mut map = logical_db_model::NamespaceCheckpoints::new();
+        map.insert(
+            "hot",
+            logical_db_model::NamespaceCheckpoint::new(vec![1, 2], 1_000).unwrap(),
+        )
+        .unwrap();
+        map.insert(
+            "cold",
+            logical_db_model::NamespaceCheckpoint::new(vec![3], 2_000).unwrap(),
+        )
+        .unwrap();
+        cache.store_namespace_checkpoints(peer, &map).unwrap();
+        let loaded = cache.namespace_checkpoints(peer).unwrap();
+        assert_eq!(loaded.get("hot").unwrap().cursor(), &[1, 2]);
+        assert_eq!(loaded.get("cold").unwrap().cursor(), &[3]);
+        let mut advanced = loaded.clone();
+        advanced
+            .insert(
+                "hot",
+                logical_db_model::NamespaceCheckpoint::new(vec![9], 3_000).unwrap(),
+            )
+            .unwrap();
+        cache.store_namespace_checkpoints(peer, &advanced).unwrap();
+        let reloaded = cache.namespace_checkpoints(peer).unwrap();
+        assert_eq!(reloaded.get("hot").unwrap().cursor(), &[9]);
+        assert_eq!(reloaded.get("cold").unwrap().cursor(), &[3]);
+        cleanup(&db_path);
+    }
+
+    #[test]
+    fn document_namespace_classifies_slots_for_sync_filtering() {
+        let db_path = path("ns-classify");
+        let scope = scope();
+        let replica = ReplicaId::new();
+        {
+            let first = KvCache::open(&db_path, scope, replica, "one").unwrap();
+            first
+                .put("shared", b"1", Some(Duration::from_secs(60)))
+                .unwrap();
+            assert_eq!(
+                first
+                    .document_namespace(document_for("one", "shared"))
+                    .unwrap(),
+                Some("one".to_owned())
+            );
+            assert_eq!(
+                first
+                    .document_namespace(document_for("two", "shared"))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(first.document_namespace(DocumentId::new()).unwrap(), None);
+        }
+        {
+            let second = KvCache::open(&db_path, scope, replica, "two").unwrap();
+            second
+                .put("shared", b"2", Some(Duration::from_secs(60)))
+                .unwrap();
+            assert_eq!(
+                second
+                    .document_namespace(document_for("two", "shared"))
+                    .unwrap(),
+                Some("two".to_owned())
+            );
+            assert_eq!(
+                second
+                    .document_namespace(document_for("one", "shared"))
+                    .unwrap(),
+                Some("one".to_owned())
+            );
+        }
         cleanup(&db_path);
     }
 }

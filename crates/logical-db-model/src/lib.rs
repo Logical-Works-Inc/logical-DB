@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -280,6 +280,438 @@ pub const fn retention_floor_valid(floor: u64, frontier: u64) -> bool {
     floor <= frontier
 }
 
+/// Maximum sync pages processed for one namespace in a single cycle.
+///
+/// This mirrors the sync engine ceiling so a namespace policy can never
+/// promise more pages than the driver below it will run.
+pub const MAX_NAMESPACE_PAGES_PER_CYCLE: u8 = 32;
+/// Maximum opaque service cursor bytes carried by one namespace checkpoint.
+///
+/// This matches the protocol and store checkpoint bounds so every cursor a
+/// namespace records stays acceptable to the pull request and to the durable
+/// slot that multiplexes it.
+pub const MAX_NAMESPACE_CURSOR_BYTES: usize = 4_096;
+/// Maximum encoded bytes of one multiplexed namespace checkpoint map.
+///
+/// The map shares the single durable checkpoint slot bound to one upstream,
+/// so the whole multiplex must fit where one global cursor fits.
+pub const MAX_NAMESPACE_MAP_BYTES: usize = 4_096;
+/// Layout version of one encoded namespace checkpoint.
+pub const NAMESPACE_CHECKPOINT_VERSION: u16 = 1;
+/// Layout version of one encoded namespace checkpoint map.
+pub const NAMESPACE_CHECKPOINT_MAP_VERSION: u16 = 1;
+/// Freshness horizon for a stored namespace cursor in milliseconds.
+///
+/// A cursor older than a day forces the explicit full-recovery pull rather
+/// than trusting a position the service may have expired while the device
+/// slept. Every installed page refreshes the horizon.
+pub const NAMESPACE_CHECKPOINT_TTL_MS: u64 = 86_400_000;
+/// Magic prefix rejecting foreign slot bytes before version checks.
+const NAMESPACE_MAP_MAGIC: [u8; 6] = *b"LDBNS1";
+
+/// Network condition gating a namespace sync domain.
+///
+/// [`NetworkCondition::Offline`] defers all work without touching the
+/// transport; [`NetworkCondition::Constrained`] runs one page per cycle so a
+/// metered link still makes progress; [`NetworkCondition::Online`] runs the
+/// full policy budget.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkCondition {
+    /// Run the full page budget every cycle.
+    #[default]
+    Online,
+    /// Run exactly one page per cycle.
+    Constrained,
+    /// Defer all work and report it as deferred.
+    Offline,
+}
+
+/// Per-namespace sync policy: page budget plus network condition.
+///
+/// Each namespace carries its own budget so a chatty namespace cannot spend
+/// the quiet namespace's pages: the driver runs every domain with its own
+/// limits against its own checkpoint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NamespacePolicy {
+    changes_per_page: u16,
+    bytes_per_page: u32,
+    pages_per_cycle: u8,
+    network: NetworkCondition,
+}
+
+impl NamespacePolicy {
+    /// Builds a validated policy mirroring the protocol page bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::PageTooLarge`] for a zero or over-limit budget.
+    pub fn new(
+        changes_per_page: u16,
+        bytes_per_page: u32,
+        pages_per_cycle: u8,
+        network: NetworkCondition,
+    ) -> Result<Self, ModelError> {
+        if changes_per_page == 0
+            || usize::from(changes_per_page) > MAX_CHANGES_PER_PAGE
+            || bytes_per_page == 0
+            || bytes_per_page as usize > MAX_PAGE_BYTES
+            || pages_per_cycle == 0
+            || pages_per_cycle > MAX_NAMESPACE_PAGES_PER_CYCLE
+        {
+            return Err(ModelError::PageTooLarge);
+        }
+        Ok(Self {
+            changes_per_page,
+            bytes_per_page,
+            pages_per_cycle,
+            network,
+        })
+    }
+
+    /// Returns the maximum changes requested in each page.
+    #[must_use]
+    pub const fn changes_per_page(self) -> u16 {
+        self.changes_per_page
+    }
+
+    /// Returns the maximum encoded change bytes requested in each page.
+    #[must_use]
+    pub const fn bytes_per_page(self) -> u32 {
+        self.bytes_per_page
+    }
+
+    /// Returns the maximum pull pages before yielding to the host.
+    #[must_use]
+    pub const fn pages_per_cycle(self) -> u8 {
+        self.pages_per_cycle
+    }
+
+    /// Returns the network condition gating this domain.
+    #[must_use]
+    pub const fn network(self) -> NetworkCondition {
+        self.network
+    }
+}
+
+impl Default for NamespacePolicy {
+    fn default() -> Self {
+        Self {
+            changes_per_page: 128,
+            bytes_per_page: 4 * 1_048_576,
+            pages_per_cycle: 16,
+            network: NetworkCondition::Online,
+        }
+    }
+}
+
+/// Validates a cache namespace name.
+///
+/// # Errors
+///
+/// Returns [`ModelError::InvalidIdentifierLength`] for an empty or oversized
+/// name.
+pub fn validate_namespace(namespace: &str) -> Result<(), ModelError> {
+    if namespace.is_empty() || namespace.len() > MAX_NAME_BYTES {
+        return Err(ModelError::InvalidIdentifierLength {
+            kind: "namespace",
+            actual: namespace.len(),
+            maximum: MAX_NAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// One namespace's durable sync position with an explicit expiry.
+///
+/// The cursor is the opaque service position for this namespace alone; the
+/// expiry is the local freshness horizon. An expired cursor takes the same
+/// explicit full-recovery transition as an expired global checkpoint instead
+/// of a partial page.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NamespaceCheckpoint {
+    version: u16,
+    expires_at_unix_ms: u64,
+    cursor: Vec<u8>,
+}
+
+impl NamespaceCheckpoint {
+    /// Records a cursor with a nonzero exclusive expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidIdentifierLength`] for an empty or
+    /// oversized cursor and [`ModelError::InvalidAuthorityExpiry`] for the
+    /// reserved zero expiry.
+    pub fn new(cursor: Vec<u8>, expires_at_unix_ms: u64) -> Result<Self, ModelError> {
+        if cursor.is_empty() || cursor.len() > MAX_NAMESPACE_CURSOR_BYTES {
+            return Err(ModelError::InvalidIdentifierLength {
+                kind: "namespace cursor",
+                actual: cursor.len(),
+                maximum: MAX_NAMESPACE_CURSOR_BYTES,
+            });
+        }
+        if expires_at_unix_ms == 0 {
+            return Err(ModelError::InvalidAuthorityExpiry);
+        }
+        Ok(Self {
+            version: NAMESPACE_CHECKPOINT_VERSION,
+            expires_at_unix_ms,
+            cursor,
+        })
+    }
+
+    /// Returns the checkpoint layout version.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Returns the exclusive expiry in milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms
+    }
+
+    /// Returns the opaque service cursor bytes.
+    #[must_use]
+    pub fn cursor(&self) -> &[u8] {
+        &self.cursor
+    }
+
+    /// Encodes the checkpoint as version plus expiry plus cursor.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(14 + self.cursor.len());
+        output.extend_from_slice(&self.version.to_be_bytes());
+        output.extend_from_slice(&self.expires_at_unix_ms.to_be_bytes());
+        let cursor_len = u32::try_from(self.cursor.len()).unwrap_or(u32::MAX);
+        output.extend_from_slice(&cursor_len.to_be_bytes());
+        output.extend_from_slice(&self.cursor);
+        output
+    }
+
+    /// Decodes checkpoint bytes, refusing bad lengths and versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidNamespaceCheckpointEncoding`] for a bad
+    /// length and [`ModelError::UnsupportedNamespaceCheckpointVersion`] for a
+    /// foreign version.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
+        if bytes.len() < 14 {
+            return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version != NAMESPACE_CHECKPOINT_VERSION {
+            return Err(ModelError::UnsupportedNamespaceCheckpointVersion { actual: version });
+        }
+        let expires_at_unix_ms = u64::from_be_bytes([
+            bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+        ]);
+        if expires_at_unix_ms == 0 {
+            return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+        }
+        let cursor_len = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+        let cursor_len = usize::try_from(cursor_len)
+            .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)?;
+        if cursor_len == 0 || cursor_len > MAX_NAMESPACE_CURSOR_BYTES {
+            return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+        }
+        if bytes.len() != 14 + cursor_len {
+            return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+        }
+        Ok(Self {
+            version,
+            expires_at_unix_ms,
+            cursor: bytes[14..].to_vec(),
+        })
+    }
+}
+
+/// Reports whether a namespace cursor passed its freshness horizon.
+///
+/// An expired cursor no longer addresses trusted log history and must take
+/// the explicit full-recovery transition instead of a partial page.
+#[must_use]
+pub const fn is_namespace_checkpoint_expired(
+    checkpoint: &NamespaceCheckpoint,
+    now_unix_ms: u64,
+) -> bool {
+    now_unix_ms >= checkpoint.expires_at_unix_ms
+}
+
+/// Multiplexed per-namespace checkpoints sharing one durable slot.
+///
+/// One upstream binding keeps one checkpoint slot; this map partitions that
+/// slot so every namespace carries its own cursor and expiry while the
+/// binding stays singular. Encoding is canonical (namespaces sort by name)
+/// and bounded to the slot limit, so it installs through the same atomic
+/// page path as any other checkpoint.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NamespaceCheckpoints {
+    entries: BTreeMap<String, NamespaceCheckpoint>,
+}
+
+impl NamespaceCheckpoints {
+    /// Creates an empty map for a peer with no namespace state yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Returns whether the map holds no namespace.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns how many namespaces carry checkpoints.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns the checkpoint recorded for a namespace, if any.
+    #[must_use]
+    pub fn get(&self, namespace: &str) -> Option<&NamespaceCheckpoint> {
+        self.entries.get(namespace)
+    }
+
+    /// Returns every namespaced checkpoint holder in canonical order.
+    #[must_use]
+    pub fn namespaces(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
+    /// Records a namespace checkpoint, replacing any previous entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidIdentifierLength`] for an empty or
+    /// oversized namespace.
+    pub fn insert(
+        &mut self,
+        namespace: &str,
+        checkpoint: NamespaceCheckpoint,
+    ) -> Result<(), ModelError> {
+        validate_namespace(namespace)?;
+        self.entries.insert(namespace.to_owned(), checkpoint);
+        Ok(())
+    }
+
+    /// Drops a namespace checkpoint, reporting whether one was stored.
+    pub fn remove(&mut self, namespace: &str) -> bool {
+        self.entries.remove(namespace).is_some()
+    }
+
+    /// Encodes the map as magic plus version plus canonical entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::NamespaceCheckpointMapTooLarge`] when the map
+    /// would not fit the single durable slot.
+    pub fn encode(&self) -> Result<Vec<u8>, ModelError> {
+        let mut output = Vec::new();
+        output.extend_from_slice(&NAMESPACE_MAP_MAGIC);
+        output.extend_from_slice(&NAMESPACE_CHECKPOINT_MAP_VERSION.to_be_bytes());
+        let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        output.extend_from_slice(&count.to_be_bytes());
+        for (namespace, checkpoint) in &self.entries {
+            let name_len = u32::try_from(namespace.len()).unwrap_or(u32::MAX);
+            output.extend_from_slice(&name_len.to_be_bytes());
+            output.extend_from_slice(namespace.as_bytes());
+            let encoded = checkpoint.encode();
+            let checkpoint_len = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
+            output.extend_from_slice(&checkpoint_len.to_be_bytes());
+            output.extend_from_slice(&encoded);
+        }
+        if output.len() > MAX_NAMESPACE_MAP_BYTES {
+            return Err(ModelError::NamespaceCheckpointMapTooLarge {
+                actual: output.len(),
+                maximum: MAX_NAMESPACE_MAP_BYTES,
+            });
+        }
+        Ok(output)
+    }
+
+    /// Decodes map bytes, refusing foreign, truncated, or non-canonical input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::InvalidNamespaceCheckpointEncoding`] for a bad
+    /// structure and [`ModelError::UnsupportedNamespaceCheckpointVersion`]
+    /// for a foreign map version.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
+        fn take<'bytes>(
+            bytes: &'bytes [u8],
+            cursor: &mut usize,
+            count: usize,
+        ) -> Result<&'bytes [u8], ModelError> {
+            let end = cursor
+                .checked_add(count)
+                .ok_or(ModelError::InvalidNamespaceCheckpointEncoding)?;
+            if end > bytes.len() {
+                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+            }
+            let slice = &bytes[*cursor..end];
+            *cursor = end;
+            Ok(slice)
+        }
+        fn take_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, ModelError> {
+            let raw = take(bytes, cursor, 2)?;
+            raw.try_into()
+                .map(u16::from_be_bytes)
+                .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)
+        }
+        fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<usize, ModelError> {
+            let raw = take(bytes, cursor, 4)?;
+            let value: u32 = raw
+                .try_into()
+                .map(u32::from_be_bytes)
+                .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)?;
+            usize::try_from(value).map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)
+        }
+        let mut cursor = 0_usize;
+        if take(bytes, &mut cursor, NAMESPACE_MAP_MAGIC.len())? != NAMESPACE_MAP_MAGIC {
+            return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+        }
+        let version = take_u16(bytes, &mut cursor)?;
+        if version != NAMESPACE_CHECKPOINT_MAP_VERSION {
+            return Err(ModelError::UnsupportedNamespaceCheckpointVersion { actual: version });
+        }
+        let count = take_u32(bytes, &mut cursor)?;
+        let mut entries = BTreeMap::new();
+        for _ in 0..count {
+            let name_len = take_u32(bytes, &mut cursor)?;
+            if name_len == 0 || name_len > MAX_NAME_BYTES {
+                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+            }
+            let name_bytes = take(bytes, &mut cursor, name_len)?;
+            let namespace = core::str::from_utf8(name_bytes)
+                .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)?;
+            if validate_namespace(namespace).is_err() {
+                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+            }
+            let checkpoint_len = take_u32(bytes, &mut cursor)?;
+            if checkpoint_len == 0 {
+                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+            }
+            let checkpoint_bytes = take(bytes, &mut cursor, checkpoint_len)?;
+            let checkpoint = NamespaceCheckpoint::decode(checkpoint_bytes)?;
+            if entries.insert(namespace.to_owned(), checkpoint).is_some() {
+                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+            }
+        }
+        if cursor != bytes.len() {
+            return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+        }
+        Ok(Self { entries })
+    }
+}
+
 /// Logical ownership scope independent from physical backend keys.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Scope {
@@ -430,6 +862,23 @@ pub enum ModelError {
         /// Observed baseline layout version.
         actual: u16,
     },
+    /// A namespace checkpoint record violated its versioned encoding.
+    #[error("namespace checkpoint encoding is malformed")]
+    InvalidNamespaceCheckpointEncoding,
+    /// A namespace checkpoint record used a foreign layout version.
+    #[error("namespace checkpoint version {actual} is unsupported")]
+    UnsupportedNamespaceCheckpointVersion {
+        /// Observed checkpoint layout version.
+        actual: u16,
+    },
+    /// A multiplexed namespace checkpoint map exceeded the durable slot bound.
+    #[error("namespace checkpoint map length {actual} exceeds maximum {maximum}")]
+    NamespaceCheckpointMapTooLarge {
+        /// Observed encoded byte count.
+        actual: usize,
+        /// Accepted encoded byte count.
+        maximum: usize,
+    },
 }
 
 #[cfg(test)]
@@ -505,5 +954,165 @@ mod tests {
         assert!(retention_floor_valid(0, 0));
         assert!(retention_floor_valid(2, 3));
         assert!(!retention_floor_valid(4, 3));
+    }
+
+    #[test]
+    fn namespace_checkpoint_codec_round_trips_and_fails_closed() {
+        let checkpoint = NamespaceCheckpoint::new(vec![9, 8, 7], 1_000).unwrap();
+        assert_eq!(checkpoint.version(), NAMESPACE_CHECKPOINT_VERSION);
+        assert_eq!(checkpoint.expires_at_unix_ms(), 1_000);
+        assert_eq!(checkpoint.cursor(), &[9, 8, 7]);
+        let encoded = checkpoint.encode();
+        assert_eq!(NamespaceCheckpoint::decode(&encoded), Ok(checkpoint));
+        assert_eq!(
+            NamespaceCheckpoint::decode(&[]),
+            Err(ModelError::InvalidNamespaceCheckpointEncoding)
+        );
+        assert_eq!(
+            NamespaceCheckpoint::decode(&encoded[..encoded.len() - 1]),
+            Err(ModelError::InvalidNamespaceCheckpointEncoding)
+        );
+        let mut foreign_version = encoded.clone();
+        foreign_version[0..2].copy_from_slice(&(NAMESPACE_CHECKPOINT_VERSION + 1).to_be_bytes());
+        assert_eq!(
+            NamespaceCheckpoint::decode(&foreign_version),
+            Err(ModelError::UnsupportedNamespaceCheckpointVersion {
+                actual: NAMESPACE_CHECKPOINT_VERSION + 1,
+            })
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            NamespaceCheckpoint::decode(&trailing),
+            Err(ModelError::InvalidNamespaceCheckpointEncoding)
+        );
+        assert!(matches!(
+            NamespaceCheckpoint::new(Vec::new(), 1),
+            Err(ModelError::InvalidIdentifierLength {
+                kind: "namespace cursor",
+                ..
+            })
+        ));
+        assert!(matches!(
+            NamespaceCheckpoint::new(vec![0; MAX_NAMESPACE_CURSOR_BYTES + 1], 1),
+            Err(ModelError::InvalidIdentifierLength { .. })
+        ));
+        assert_eq!(
+            NamespaceCheckpoint::new(vec![1], 0),
+            Err(ModelError::InvalidAuthorityExpiry)
+        );
+    }
+
+    #[test]
+    fn namespace_checkpoint_expiry_is_exclusive() {
+        let checkpoint = NamespaceCheckpoint::new(vec![1], 100).unwrap();
+        assert!(!is_namespace_checkpoint_expired(&checkpoint, 99));
+        assert!(is_namespace_checkpoint_expired(&checkpoint, 100));
+        assert!(is_namespace_checkpoint_expired(&checkpoint, 101));
+    }
+
+    #[test]
+    fn namespace_policy_validation_mirrors_page_bounds() {
+        let policy =
+            NamespacePolicy::new(128, 4 * 1_048_576, 16, NetworkCondition::Online).unwrap();
+        assert_eq!(policy.changes_per_page(), 128);
+        assert_eq!(policy.bytes_per_page(), 4 * 1_048_576);
+        assert_eq!(policy.pages_per_cycle(), 16);
+        assert_eq!(policy.network(), NetworkCondition::Online);
+        assert_eq!(NamespacePolicy::default(), policy);
+        for invalid in [
+            NamespacePolicy::new(0, 1_024, 1, NetworkCondition::Online),
+            NamespacePolicy::new(
+                u16::try_from(MAX_CHANGES_PER_PAGE + 1).unwrap(),
+                1_024,
+                1,
+                NetworkCondition::Online,
+            ),
+            NamespacePolicy::new(1, 0, 1, NetworkCondition::Online),
+            NamespacePolicy::new(
+                1,
+                u32::try_from(MAX_PAGE_BYTES + 1).unwrap(),
+                1,
+                NetworkCondition::Online,
+            ),
+            NamespacePolicy::new(1, 1_024, 0, NetworkCondition::Online),
+            NamespacePolicy::new(
+                1,
+                1_024,
+                MAX_NAMESPACE_PAGES_PER_CYCLE + 1,
+                NetworkCondition::Online,
+            ),
+        ] {
+            assert_eq!(invalid, Err(ModelError::PageTooLarge));
+        }
+    }
+
+    #[test]
+    fn namespace_map_partitions_checkpoints_within_one_binding() {
+        assert!(matches!(
+            validate_namespace(""),
+            Err(ModelError::InvalidIdentifierLength {
+                kind: "namespace",
+                ..
+            })
+        ));
+        assert!(validate_namespace("sessions").is_ok());
+        let mut map = NamespaceCheckpoints::new();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+        map.insert("hot", NamespaceCheckpoint::new(vec![1], 100).unwrap())
+            .unwrap();
+        map.insert("cold", NamespaceCheckpoint::new(vec![2], 200).unwrap())
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.namespaces(), vec!["cold".to_owned(), "hot".to_owned()]);
+        let encoded = map.encode().unwrap();
+        assert!(!encoded.is_empty());
+        assert!(encoded.len() <= MAX_NAMESPACE_MAP_BYTES);
+        let decoded = NamespaceCheckpoints::decode(&encoded).unwrap();
+        assert_eq!(decoded.get("hot").unwrap().cursor(), &[1]);
+        assert_eq!(decoded.get("cold").unwrap().cursor(), &[2]);
+        let mut advanced = decoded.clone();
+        advanced
+            .insert("hot", NamespaceCheckpoint::new(vec![3], 300).unwrap())
+            .unwrap();
+        assert_eq!(advanced.get("hot").unwrap().cursor(), &[3]);
+        assert_eq!(advanced.get("cold").unwrap().cursor(), &[2]);
+        assert!(advanced.remove("cold"));
+        assert!(!advanced.remove("cold"));
+        assert!(advanced.get("cold").is_none());
+        let empty_bytes = NamespaceCheckpoints::new().encode().unwrap();
+        assert!(!empty_bytes.is_empty());
+        assert!(
+            NamespaceCheckpoints::decode(&empty_bytes)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            NamespaceCheckpoints::decode(b"legacy-global-cursor"),
+            Err(ModelError::InvalidNamespaceCheckpointEncoding)
+        );
+        assert_eq!(
+            NamespaceCheckpoints::decode(&[]),
+            Err(ModelError::InvalidNamespaceCheckpointEncoding)
+        );
+        assert!(matches!(
+            map.insert("", NamespaceCheckpoint::new(vec![1], 1).unwrap()),
+            Err(ModelError::InvalidIdentifierLength { .. })
+        ));
+        let mut oversized = NamespaceCheckpoints::new();
+        for name in ["first", "second"] {
+            oversized
+                .insert(
+                    name,
+                    NamespaceCheckpoint::new(vec![7; MAX_NAMESPACE_CURSOR_BYTES], u64::MAX)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            oversized.encode(),
+            Err(ModelError::NamespaceCheckpointMapTooLarge { .. })
+        ));
     }
 }
