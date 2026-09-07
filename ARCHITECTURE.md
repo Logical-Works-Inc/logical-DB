@@ -24,6 +24,11 @@ application / LEM
         |     `-- logical-db-protocol    versioned transport-neutral messages
         `-- logical-db-platform          Windows/macOS/Linux data placement
 
+semantic layer (above model, below applications / LEM)
+  |-- logical-db-episode               content-hashed episode log + operators
+  |     `-- logical-db-cairn           typed world-token observation vocabulary
+  `-- consumed optionally by logical-db (semantics feature) and logical-db-e2e
+
 thin client
   `-- logical-db-http                    pooled async TLS/CBOR transport
         |-- logical-db-sync
@@ -49,7 +54,10 @@ journey checks offline convergence, indexes, cursors, and restart. Its retained
 `facade_fdb_journey` imports only the public facade and crosses real HTTP,
 Braid, and an official FDB cluster. `fdb-ambiguity-journey` enables official
 client fault injection and proves a post-commit unknown result, exact replay,
-single frontier advance, and invocation consumption.
+single frontier advance, and invocation consumption. The evidence verifier's
+allowed-dependency map must additionally declare the semantic edges
+(`logical-db-episode` on `logical-db-cairn`, facade `logical-db` on both, and
+`logical-db-e2e` on both); until declared it reports them as undeclared.
 
 ## Public API boundary
 

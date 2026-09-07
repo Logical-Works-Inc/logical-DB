@@ -1,0 +1,22 @@
+# Evidence: Cairn port. Source semantics from `cairn/quarantine/cairn_python/world_token.py`
+# and `cairn/crates/wm-core`; no Cairn code vendored, only the vocabulary re-expressed
+# in Logical-DB style bounds and errors.
+
+[package]
+name = "logical-db-cairn"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

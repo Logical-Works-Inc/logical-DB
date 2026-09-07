@@ -3,6 +3,11 @@
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
+//!
+//! The optional `semantics` feature re-exports the `logical-db-cairn` and
+//! `logical-db-episode` vocabularies for hosts that persist semantic
+//! observations. It stays off by default to preserve the minimal embedded
+//! footprint.
 
 #![forbid(unsafe_code)]
 
@@ -40,6 +45,13 @@ pub mod http {
         CredentialError, CredentialProvider, HttpError, HttpTransport, StaticBearer, Url,
     };
 }
+
+/// Opt-in semantic vocabularies; off by default to keep the embedded minimal.
+#[cfg(feature = "semantics")]
+pub use logical_db_cairn;
+/// Opt-in episode log; off by default to keep the embedded minimal.
+#[cfg(feature = "semantics")]
+pub use logical_db_episode;
 
 /// Types required only by hosts implementing a custom synchronization transport.
 pub mod transport {

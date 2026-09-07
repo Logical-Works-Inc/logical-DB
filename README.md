@@ -68,6 +68,14 @@ CredentialProvider, StaticBearer}` without coupling an app to internal crates.
 Custom transports implement the facade-exported `logical_db::transport::Transport`
 using its versioned push/pull types.
 
+Hosts that persist semantic observations enable the facade's `semantics`
+feature to reuse the `logical-db-cairn` observation vocabulary and the
+`logical-db-episode` content-hashed log through the same `Database` API. The
+feature stays off by default so embedded replicas keep their minimal
+footprint, and `logical-db-e2e` carries a network-free journey proving an
+episode snapshot round-trips through a document with its evidence-subset
+guard intact.
+
 ## Deployment shapes
 
 - **Embedded only:** app → `logical-db` → Automerge + redb. No daemon, network,

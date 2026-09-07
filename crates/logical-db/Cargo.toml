@@ -13,9 +13,12 @@ repository.workspace = true
 [features]
 default = []
 http = ["dep:logical-db-http"]
+semantics = ["dep:logical-db-cairn", "dep:logical-db-episode"]
 
 [dependencies]
+logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn", optional = true }
 logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
+logical-db-episode = { version = "0.1.0", path = "../logical-db-episode", optional = true }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http", optional = true }
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-platform = { version = "0.1.0", path = "../logical-db-platform" }

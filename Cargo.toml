@@ -20,6 +20,8 @@ members = [
   "crates/logical-db-platform",
   "crates/logical-db-daemon",
   "crates/logical-db-kv",
+  "crates/logical-db-cairn",
+  "crates/logical-db-episode",
 ]
 
 [workspace.package]
