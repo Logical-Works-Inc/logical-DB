@@ -56,13 +56,19 @@ impl StaticBearer {
     /// Refuses empty tokens or bytes invalid in an HTTP header.
     pub fn new(token: &str) -> Result<Self, CredentialError> {
         if token.is_empty() {
+            eprintln!("logical-db-http: new: Empty");
             return Err(CredentialError::Empty);
         }
         if token.len() > 4_096 || !valid_b64token(token.as_bytes()) {
+            eprintln!("logical-db-http: new: InvalidToken");
             return Err(CredentialError::InvalidToken);
         }
-        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| CredentialError::InvalidHeader)?;
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
+            eprintln!("logical-db-http: CredentialError::InvalidHeader: {error}");
+            CredentialError::InvalidHeader {
+                context: "BearerCredential::new",
+            }
+        })?;
         value.set_sensitive(true);
         Ok(Self { value })
     }
@@ -106,6 +112,7 @@ where
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
         {
+            eprintln!("logical-db-http: new: InvalidEndpoint");
             return Err(HttpError::InvalidEndpoint);
         }
         let loopback = endpoint.host_str().is_some_and(|host| {
@@ -115,6 +122,7 @@ where
                     .is_ok_and(|address| address.is_loopback())
         });
         if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
+            eprintln!("logical-db-http: new: InsecureEndpoint");
             return Err(HttpError::InsecureEndpoint);
         }
         if !endpoint.path().ends_with('/') {
@@ -138,9 +146,10 @@ where
     }
 
     fn route(&self, relative: &str) -> Result<Url, HttpError> {
-        self.endpoint
-            .join(relative)
-            .map_err(|_| HttpError::InvalidEndpoint)
+        self.endpoint.join(relative).map_err(|error| {
+            eprintln!("logical-db-http: HttpError::InvalidEndpoint: {error}");
+            HttpError::InvalidEndpoint
+        })
     }
 
     async fn send<Request, Reply>(
@@ -223,6 +232,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, HttpError> {
     ciborium::into_writer(value, &mut bytes)
         .map_err(|error| HttpError::Encode(error.to_string()))?;
     if bytes.len() > MAX_HTTP_BODY_BYTES {
+        eprintln!("logical-db-http: encode: BodyTooLarge");
         return Err(HttpError::BodyTooLarge);
     }
     Ok(bytes)
@@ -235,6 +245,7 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
             .headers()
             .get(RETRY_AFTER)
             .and_then(parse_retry_after);
+        eprintln!("logical-db-http: decode_response: Status");
         return Err(HttpError::Status {
             code: status.as_u16(),
             retry_after,
@@ -247,6 +258,7 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
         .and_then(|value| value.split(';').next())
         != Some(MEDIA_TYPE)
     {
+        eprintln!("logical-db-http: decode_response: MediaType");
         return Err(HttpError::MediaType);
     }
     if response
@@ -256,12 +268,14 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_HTTP_BODY_BYTES)
     {
+        eprintln!("logical-db-http: decode_response: BodyTooLarge");
         return Err(HttpError::BodyTooLarge);
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.try_next().await.map_err(HttpError::Network)? {
         if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
+            eprintln!("logical-db-http: decode_response: BodyTooLarge");
             return Err(HttpError::BodyTooLarge);
         }
         bytes.extend_from_slice(&chunk);
@@ -270,16 +284,18 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
     let value =
         ciborium::from_reader(&mut reader).map_err(|error| HttpError::Decode(error.to_string()))?;
     if reader.position() != bytes.len() as u64 {
+        eprintln!("logical-db-http: decode_response: TrailingData");
         return Err(HttpError::TrailingData);
     }
     Ok(value)
 }
 
 fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
-    value
+    let seconds = value
         .to_str()
         .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    seconds
         .filter(|seconds| *seconds <= MAX_RETRY_AFTER_SECONDS)
         .map(Duration::from_secs)
 }
@@ -292,7 +308,10 @@ pub enum CredentialError {
     Empty,
     /// Token cannot be represented as an HTTP header.
     #[error("credential token contains invalid header bytes")]
-    InvalidHeader,
+    InvalidHeader {
+        /// Credential construction boundary.
+        context: &'static str,
+    },
     /// Token violated the RFC 6750 bearer-token grammar or resource ceiling.
     #[error("credential token is not a bounded RFC 6750 b64token")]
     InvalidToken,

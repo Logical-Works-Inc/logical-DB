@@ -16,7 +16,12 @@ use logical_db::{
 use uuid::Uuid;
 
 fn required(name: &'static str) -> Result<String, io::Error> {
-    std::env::var(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, name))
+    std::env::var(name).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is unavailable: {error}"),
+        )
+    })
 }
 
 #[tokio::main]
@@ -61,12 +66,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "facade-http-braid-fdb".into(),
         ))))
     {
+        eprintln!("facade-fdb-journey: replica did not materialize verified state");
         return Err(io::Error::other("replica did not materialize verified state").into());
     }
     let retry = first
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
         .await?;
     if upload.pushed != 1 || download.pulled != 1 || retry.pushed != 0 {
+        eprintln!(
+            "facade-fdb-journey: unexpected counts pushed={} pulled={} retry={}",
+            upload.pushed, download.pulled, retry.pushed
+        );
         return Err(io::Error::other("journey report violated exact retry semantics").into());
     }
 

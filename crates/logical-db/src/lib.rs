@@ -27,7 +27,7 @@ pub use logical_db_platform::PlatformError;
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
 use logical_db_store::{
     CommitOutcome, EmbeddedStore, ExportDocument, ExportEntry, IndexHit, LocalChange, LocalCommit,
-    MAX_MATERIALIZED_PAGE_BYTES, MAX_SNAPSHOT_BYTES, MigrationIndexes,
+    MAX_MATERIALIZED_PAGE_BYTES, MAX_SNAPSHOT_BYTES, MigrationDocument, MigrationIndexes,
     RemoteChange as StoredRemoteChange, RemoteDocument, StoreError, decode_export, encode_export,
     restore_operation,
 };
@@ -68,6 +68,14 @@ pub struct Database {
     replica: ReplicaId,
     projections: Vec<Projection>,
 }
+
+type MaterializedRemoteDocument = (
+    DocumentId,
+    Option<DocumentRevision>,
+    Vec<u8>,
+    Vec<IndexEntry>,
+    bool,
+);
 
 type ProjectionFunction = dyn for<'document> Fn(&mut Reader<'document>) -> Result<Option<IndexValue>, CrdtError>
     + Send
@@ -134,6 +142,7 @@ impl Database {
         schema_version: u32,
         projections: Vec<Projection>,
     ) -> Result<Self, DatabaseError> {
+        eprintln!("logical-db: opening default database for application {application_id}");
         let path = logical_db_platform::default_database_path(application_id)?;
         let parent = path.parent().ok_or(DatabaseError::InvalidDefaultPath)?;
         std::fs::create_dir_all(parent)?;
@@ -219,6 +228,7 @@ impl Database {
         batch_size: usize,
     ) -> Result<(Self, MigrationReport), DatabaseError> {
         if !(1..=256).contains(&batch_size) {
+            eprintln!("logical-db: invalid schema migration batch size {batch_size}");
             return Err(DatabaseError::InvalidMigrationBatchSize(batch_size));
         }
         let digest = projection_digest(schema_version, &projections)?;
@@ -229,31 +239,17 @@ impl Database {
             documents: 0,
         };
         loop {
-            let page = store.migration_page(scope, schema_version, digest, batch_size)?;
-            if page.documents.is_empty() {
-                store.finish_schema_migration(scope, schema_version, digest)?;
-                break;
-            }
-            let prepared = page
-                .documents
-                .iter()
-                .map(|document| {
-                    let mut state = Document::load(&document.snapshot)?;
-                    let indexes = project_with(&projections, &mut state)?;
-                    Ok((document.document, document.revision, indexes))
-                })
-                .collect::<Result<Vec<_>, DatabaseError>>()?;
-            let updates = prepared
-                .iter()
-                .map(|(document, revision, indexes)| MigrationIndexes {
-                    document: *document,
-                    expected_revision: *revision,
-                    indexes,
-                })
-                .collect::<Vec<_>>();
-            store.apply_migration_page(scope, schema_version, digest, page.after, &updates)?;
+            let applied = migrate_schema_batch(
+                &store,
+                &projections,
+                scope,
+                schema_version,
+                digest,
+                batch_size,
+            )?;
+            let Some(document_count) = applied else { break };
             report.batches += 1;
-            report.documents += updates.len();
+            report.documents += document_count;
         }
         Ok((
             Self {
@@ -294,12 +290,13 @@ impl Database {
         request: OperationDigest,
         edit: impl FnOnce(&mut Editor<'_>) -> Result<T, CrdtError>,
     ) -> Result<EditOutcome<T>, DatabaseError> {
-        if let Some(existing) = self.store.operation(self.scope, operation)? {
+        let existing_operation = self.store.operation(self.scope, operation)?;
+        if let Some(existing) = existing_operation {
             if existing.document == document && existing.request == request {
-                let bytes = self
+                let stored_bytes = self
                     .store
-                    .load_change(self.scope, document, existing.digest)?
-                    .ok_or(DatabaseError::MissingChange(existing.digest))?;
+                    .load_change(self.scope, document, existing.digest)?;
+                let bytes = stored_bytes.ok_or(DatabaseError::MissingChange(existing.digest))?;
                 EncodedChange {
                     digest: existing.digest,
                     bytes,
@@ -310,6 +307,7 @@ impl Database {
                     digest: existing.digest,
                 }));
             }
+            eprintln!("logical-db: edit operation conflicts with an existing request");
             return Err(StoreError::OperationConflict.into());
         }
         let stored = self.store.load_snapshot(self.scope, document)?;
@@ -319,10 +317,15 @@ impl Database {
             None => Document::new(),
         };
         if state.is_deleted()? {
+            eprintln!("logical-db: edit refused for deleted document {document}");
             return Err(DatabaseError::DocumentDeleted);
         }
         let (value, mut changes) = state.edit(edit)?;
         if changes.len() != 1 {
+            eprintln!(
+                "logical-db: edit produced {} changes, expected one",
+                changes.len()
+            );
             return Err(DatabaseError::ChangeCardinality(changes.len()));
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
@@ -382,12 +385,13 @@ impl Database {
         operation: OperationId,
         request: OperationDigest,
     ) -> Result<DeleteOutcome, DatabaseError> {
-        if let Some(existing) = self.store.operation(self.scope, operation)? {
+        let existing_operation = self.store.operation(self.scope, operation)?;
+        if let Some(existing) = existing_operation {
             if existing.document == document && existing.request == request {
-                let bytes = self
+                let stored_bytes = self
                     .store
-                    .load_change(self.scope, document, existing.digest)?
-                    .ok_or(DatabaseError::MissingChange(existing.digest))?;
+                    .load_change(self.scope, document, existing.digest)?;
+                let bytes = stored_bytes.ok_or(DatabaseError::MissingChange(existing.digest))?;
                 EncodedChange {
                     digest: existing.digest,
                     bytes,
@@ -398,6 +402,7 @@ impl Database {
                     digest: existing.digest,
                 }));
             }
+            eprintln!("logical-db: delete operation conflicts with an existing request");
             return Err(StoreError::OperationConflict.into());
         }
         let stored = self.store.load_snapshot(self.scope, document)?;
@@ -408,6 +413,10 @@ impl Database {
         };
         let mut changes = state.delete()?;
         if changes.len() != 1 {
+            eprintln!(
+                "logical-db: delete produced {} changes, expected one",
+                changes.len()
+            );
             return Err(DatabaseError::ChangeCardinality(changes.len()));
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
@@ -640,30 +649,15 @@ impl Database {
         let mut prepared = Vec::with_capacity(grouped.len());
         let mut materialized_bytes = 0usize;
         for (document, encoded) in &grouped {
-            let stored = self.store.load_snapshot(self.scope, *document)?;
-            let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
-            let mut state = match stored {
-                Some(snapshot) => Document::load(&snapshot.bytes)?,
-                None => Document::new(),
-            };
-            state.apply(encoded)?;
-            let tombstoned = state.is_deleted()?;
-            let indexes = if tombstoned {
-                Vec::new()
-            } else {
-                self.project(&mut state)?
-            };
-            let snapshot = state.save()?;
-            if snapshot.len() > MAX_SNAPSHOT_BYTES {
-                return Err(DatabaseError::MaterializationBudgetExceeded);
-            }
+            let materialized = self.materialize_remote_document(*document, encoded)?;
             materialized_bytes = materialized_bytes
-                .checked_add(snapshot.len())
+                .checked_add(materialized.2.len())
                 .ok_or(DatabaseError::MaterializationBudgetExceeded)?;
             if materialized_bytes > MAX_MATERIALIZED_PAGE_BYTES {
+                eprintln!("logical-db: remote page exceeds materialization budget");
                 return Err(DatabaseError::MaterializationBudgetExceeded);
             }
-            prepared.push((*document, expected_revision, snapshot, indexes, tombstoned));
+            prepared.push(materialized);
         }
 
         let durable_documents = prepared
@@ -819,6 +813,7 @@ impl Database {
         let identity = export_identity(payload);
         let (scope, entries, documents) = decode_export(payload)?;
         if scope != self.scope {
+            eprintln!("logical-db: restore payload scope does not match database scope");
             return Err(DatabaseError::ExportScopeMismatch);
         }
         if entries.is_empty() && documents.is_empty() {
@@ -844,12 +839,17 @@ impl Database {
             .restore_cursor(self.scope)?
             .is_some_and(|cursor| cursor.payload != identity)
         {
+            eprintln!("logical-db: restore payload conflicts with active restore cursor");
             return Err(StoreError::RestoreInProgress.into());
         }
         let cursor = self.store.restore_begin(self.scope, &identity)?;
         let resumed = cursor.next > 0;
-        let start = usize::try_from(cursor.next).map_err(|_| StoreError::RestoreIncomplete)?;
+        let start = usize::try_from(cursor.next).map_err(|error| {
+            eprintln!("logical-db: restore cursor position is invalid: {error}");
+            StoreError::RestoreIncomplete
+        })?;
         if start > entries.len() {
+            eprintln!("logical-db: restore cursor exceeds payload entries");
             return Err(StoreError::RestoreIncomplete.into());
         }
         let mut current = loaded;
@@ -884,6 +884,7 @@ impl Database {
                     || committed.request != entry.request
                     || committed.digest != entry.digest
                 {
+                    eprintln!("logical-db: restore operation binding conflicts with stored state");
                     return Err(StoreError::OperationConflict.into());
                 }
                 let stored = self
@@ -891,6 +892,7 @@ impl Database {
                     .load_change(self.scope, entry.document, entry.digest)?
                     .ok_or(DatabaseError::MissingChange(entry.digest))?;
                 if stored != entry.bytes {
+                    eprintln!("logical-db: restore bytes differ from stored change");
                     return Err(StoreError::OperationConflict.into());
                 }
                 duplicate.insert(entry.operation);
@@ -908,6 +910,7 @@ impl Database {
         }
         for document in documents {
             if last_flag.get(&document.document) != Some(&document.tombstone) {
+                eprintln!("logical-db: restored document tombstone does not match export");
                 return Err(StoreError::InvalidExport.into());
             }
         }
@@ -925,48 +928,90 @@ impl Database {
         let mut applied = 0_usize;
         for (offset, entry) in entries.iter().enumerate() {
             let state = states.entry(entry.document).or_default();
-            state.apply(std::slice::from_ref(&EncodedChange {
-                digest: entry.digest,
-                bytes: entry.bytes.clone(),
-            }))?;
-            if offset < start {
-                continue;
-            }
-            let tombstoned = state.is_deleted()?;
-            let indexes = if tombstoned {
-                Vec::new()
-            } else {
-                self.project(state)?
-            };
-            let snapshot = state.save()?;
-            let expected = current.get(&entry.document).copied().flatten();
-            let change = LocalChange::new(
-                self.scope,
-                entry.document,
-                entry.operation,
-                entry.request,
-                entry.digest,
-                &entry.bytes,
-            )?;
-            let outcome = self.store.commit_local(LocalCommit {
-                change,
-                expected_revision: expected,
-                snapshot: &snapshot,
-                indexes: &indexes,
-                tombstone: tombstoned,
+            let did_apply = self.replay_restore_entry(entry, offset, start, state, current)?;
+            applied += usize::from(did_apply);
+            let next = u64::try_from(offset + 1).map_err(|error| {
+                eprintln!("logical-db: restore sequence overflow at offset {offset}: {error}");
+                StoreError::SequenceExhausted
             })?;
-            if matches!(outcome, CommitOutcome::Applied { .. }) {
-                let next = match expected {
-                    Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
-                    None => DocumentRevision::new(1),
-                };
-                current.insert(entry.document, Some(next));
-                applied += 1;
-            }
-            let next = u64::try_from(offset + 1).map_err(|_| StoreError::SequenceExhausted)?;
             self.store.restore_advance(self.scope, identity, next)?;
         }
         Ok(applied)
+    }
+
+    fn materialize_remote_document(
+        &self,
+        document: DocumentId,
+        encoded: &[EncodedChange],
+    ) -> Result<MaterializedRemoteDocument, DatabaseError> {
+        let stored = self.store.load_snapshot(self.scope, document)?;
+        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let mut state = match stored {
+            Some(snapshot) => Document::load(&snapshot.bytes)?,
+            None => Document::new(),
+        };
+        state.apply(encoded)?;
+        let tombstoned = state.is_deleted()?;
+        let indexes = if tombstoned {
+            Vec::new()
+        } else {
+            self.project(&mut state)?
+        };
+        let snapshot = state.save()?;
+        if snapshot.len() > MAX_SNAPSHOT_BYTES {
+            eprintln!("logical-db: remote page snapshot exceeds materialization budget");
+            return Err(DatabaseError::MaterializationBudgetExceeded);
+        }
+        Ok((document, expected_revision, snapshot, indexes, tombstoned))
+    }
+
+    fn replay_restore_entry(
+        &self,
+        entry: &ExportEntry,
+        offset: usize,
+        start: usize,
+        state: &mut Document,
+        current: &mut BTreeMap<DocumentId, Option<DocumentRevision>>,
+    ) -> Result<bool, DatabaseError> {
+        state.apply(std::slice::from_ref(&EncodedChange {
+            digest: entry.digest,
+            bytes: entry.bytes.clone(),
+        }))?;
+        if offset < start {
+            return Ok(false);
+        }
+        let tombstoned = state.is_deleted()?;
+        let indexes = if tombstoned {
+            Vec::new()
+        } else {
+            self.project(state)?
+        };
+        let snapshot = state.save()?;
+        let expected = current.get(&entry.document).copied().flatten();
+        let change = LocalChange::new(
+            self.scope,
+            entry.document,
+            entry.operation,
+            entry.request,
+            entry.digest,
+            &entry.bytes,
+        )?;
+        let outcome = self.store.commit_local(LocalCommit {
+            change,
+            expected_revision: expected,
+            snapshot: &snapshot,
+            indexes: &indexes,
+            tombstone: tombstoned,
+        })?;
+        if !matches!(outcome, CommitOutcome::Applied { .. }) {
+            return Ok(false);
+        }
+        let next = match expected {
+            Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+            None => DocumentRevision::new(1),
+        };
+        current.insert(entry.document, Some(next));
+        Ok(true)
     }
 
     /// Loads the durable restore cursor for this scope, when one is active.
@@ -1240,6 +1285,14 @@ pub enum DatabaseError {
     ExportScopeMismatch,
 }
 
+impl DatabaseError {
+    /// Preserves the storage boundary when adapting a durable failure.
+    #[must_use]
+    pub fn from_store(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
 /// Stable recovery decision for application-facing database failures.
 ///
 /// This keeps storage-engine variants private while allowing an embedding layer
@@ -1284,11 +1337,13 @@ fn check_restore_coverage(
     let mut covered = BTreeSet::new();
     for entry in entries {
         if !documented.contains(&entry.document) {
+            eprintln!("logical-db: export entry references an undocumented document");
             return Err(StoreError::InvalidExport.into());
         }
         covered.insert(entry.document);
     }
     if covered != documented {
+        eprintln!("logical-db: export document coverage is incomplete");
         return Err(StoreError::InvalidExport.into());
     }
     let mut bindings = BTreeMap::new();
@@ -1301,8 +1356,10 @@ fn check_restore_coverage(
         );
         if let Some(previous) = bindings.insert(entry.operation, binding.clone()) {
             if previous == binding {
+                eprintln!("logical-db: export repeats an operation binding");
                 return Err(StoreError::InvalidExport.into());
             }
+            eprintln!("logical-db: export contains conflicting operation bindings");
             return Err(StoreError::OperationConflict.into());
         }
     }
@@ -1316,6 +1373,7 @@ fn check_restore_coverage(
     for document in documents {
         let mut state = Document::load(&document.snapshot)?;
         if state.is_deleted()? != document.tombstone {
+            eprintln!("logical-db: restore tombstone state does not match export");
             return Err(StoreError::InvalidExport.into());
         }
     }
@@ -1331,6 +1389,7 @@ fn projection_digest(
     projections: &[Projection],
 ) -> Result<[u8; 32], DatabaseError> {
     if schema_version == 0 {
+        eprintln!("logical-db: schema version cannot be zero");
         return Err(DatabaseError::InvalidSchemaVersion);
     }
     let mut identities = BTreeSet::new();
@@ -1338,6 +1397,7 @@ fn projection_digest(
         .iter()
         .any(|projection| !identities.insert(projection.index))
     {
+        eprintln!("logical-db: projection identities must be unique");
         return Err(DatabaseError::DuplicateProjection);
     }
     let mut digest = Sha256::new();
@@ -1368,6 +1428,45 @@ fn project_with(
             Err(error) => Some(Err(DatabaseError::Crdt(error))),
         })
         .collect()
+}
+
+fn prepare_migration_documents(
+    projections: &[Projection],
+    documents: &[MigrationDocument],
+) -> Result<Vec<(DocumentId, DocumentRevision, Vec<IndexEntry>)>, DatabaseError> {
+    let mut prepared = Vec::with_capacity(documents.len());
+    for document in documents {
+        let mut state = Document::load(&document.snapshot)?;
+        let indexes = project_with(projections, &mut state)?;
+        prepared.push((document.document, document.revision, indexes));
+    }
+    Ok(prepared)
+}
+
+fn migrate_schema_batch(
+    store: &EmbeddedStore,
+    projections: &[Projection],
+    scope: Scope,
+    schema_version: u32,
+    digest: [u8; 32],
+    batch_size: usize,
+) -> Result<Option<usize>, DatabaseError> {
+    let page = store.migration_page(scope, schema_version, digest, batch_size)?;
+    if page.documents.is_empty() {
+        store.finish_schema_migration(scope, schema_version, digest)?;
+        return Ok(None);
+    }
+    let prepared = prepare_migration_documents(projections, &page.documents)?;
+    let updates = prepared
+        .iter()
+        .map(|(document, revision, indexes)| MigrationIndexes {
+            document: *document,
+            expected_revision: *revision,
+            indexes,
+        })
+        .collect::<Vec<_>>();
+    store.apply_migration_page(scope, schema_version, digest, page.after, &updates)?;
+    Ok(Some(updates.len()))
 }
 
 #[cfg(test)]

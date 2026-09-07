@@ -1,16 +1,26 @@
 //! Cairn semantic observations ported into Logical-DB.
 //!
+//! Evidence: S11 S12 S13 establish local-first, causal, and authenticated
+//! semantic records; S17 S22 bound hostile values and corruption handling;
+//! S23 S24 define stable request/error semantics; S25 S26 define canonical
+//! bytes and identifiers; S29 S30 support digest construction; S34 S35 S36
+//! S40 S41 map capability, admission, capsule, invocation, and proof concepts;
+//! S39 covers the bounded wire representation boundary; S14 S18 S42 inform
+//! transaction identity and exact retry boundaries at the integration edge.
+//! Source URLs are in
+//! `evidence/SOURCES.md`.
+//!
 //! Re-expresses the typed world-token vocabulary from
 //! `cairn/quarantine/cairn_python/world_token.py` (12 token kinds,
 //! 10 modalities, 9 link relations, 6 actionability levels), the
 //! authority-weight and content-hash concepts from
 //! `cairn/crates/wm-core`, and deny-first steering with trust-graded
 //! memory claims from the Cairn steering/memory broker (smb).
-//! All bounds fail closed; no I/O, no storage, no network.
+//! Bounds fail closed with rejection diagnostics; no storage or network access.
 
 #![forbid(unsafe_code)]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -50,7 +60,10 @@ macro_rules! string_vocab {
             pub fn parse(value: &str) -> Result<Self, CairnError> {
                 match value {
                     $($str => Ok(Self::$variant),)*
-                    _ => Err(CairnError::$err(value.to_owned())),
+                    _ => Err(CairnError::$err {
+                        value: value.to_owned(),
+                        context: concat!(stringify!($name), "::parse"),
+                    }),
                 }
             }
         }
@@ -106,9 +119,19 @@ pub fn digest_frame(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// Content-derived observation identity; the zero digest is rejected.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct EpisodeRef([u8; 32]);
+
+impl<'de> Deserialize<'de> for EpisodeRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = <[u8; 32]>::deserialize(deserializer)?;
+        Self::new(bytes).map_err(serde::de::Error::custom)
+    }
+}
 
 impl EpisodeRef {
     /// Wraps a non-zero 32-byte digest.
@@ -119,6 +142,7 @@ impl EpisodeRef {
     #[must_use = "the zero-digest rejection must be handled"]
     pub fn new(bytes: [u8; 32]) -> Result<Self, CairnError> {
         if bytes == [0; 32] {
+            eprintln!("logical-db-cairn: rejected zero episode reference");
             return Err(CairnError::ZeroId);
         }
         Ok(Self(bytes))
@@ -160,9 +184,14 @@ impl TokenLink {
     /// Returns [`CairnError::ZeroId`] or [`CairnError::InvalidConfidence`].
     pub fn validate(&self) -> Result<(), CairnError> {
         if self.target.into_bytes() == [0u8; 32] {
+            eprintln!("logical-db-cairn: rejected zero token-link target");
             return Err(CairnError::ZeroId);
         }
         if !(0.0..=1.0).contains(&self.confidence) {
+            eprintln!(
+                "logical-db-cairn: rejected token-link confidence {}",
+                self.confidence
+            );
             return Err(CairnError::InvalidConfidence(self.confidence));
         }
         Ok(())
@@ -196,21 +225,35 @@ impl Observation {
     /// Returns the [`CairnError`] matching the first bound violated.
     pub fn validate(&self) -> Result<(), CairnError> {
         if self.id.into_bytes() == [0u8; 32] {
+            eprintln!("logical-db-cairn: rejected observation with zero id");
             return Err(CairnError::ZeroId);
         }
         if !(0.0..=1.0).contains(&self.uncertainty) {
+            eprintln!(
+                "logical-db-cairn: rejected observation uncertainty {}",
+                self.uncertainty
+            );
             return Err(CairnError::InvalidConfidence(self.uncertainty));
         }
         if self.value.is_empty() {
+            eprintln!("logical-db-cairn: rejected empty observation value");
             return Err(CairnError::EmptyValue);
         }
         if self.value.len() > MAX_VALUE_BYTES {
+            eprintln!(
+                "logical-db-cairn: rejected observation value length {}",
+                self.value.len()
+            );
             return Err(CairnError::ValueTooLarge {
                 actual: self.value.len(),
                 maximum: MAX_VALUE_BYTES,
             });
         }
         if self.links.len() > MAX_LINKS {
+            eprintln!(
+                "logical-db-cairn: rejected observation link count {}",
+                self.links.len()
+            );
             return Err(CairnError::TooManyLinks {
                 actual: self.links.len(),
                 maximum: MAX_LINKS,
@@ -222,14 +265,34 @@ impl Observation {
         Ok(())
     }
 
-    /// SHA-256 over [`digest_frame`] of `kind`, `modality`, and `value`.
+    /// SHA-256 over the complete semantic content using the v1 schema.
     #[must_use]
     pub fn content_hash(&self) -> [u8; 32] {
+        let uncertainty = self.uncertainty.to_bits().to_le_bytes();
+        let links = self.link_digest();
         digest_frame(&[
+            b"logical-db-cairn-observation.v1",
             self.kind.as_str().as_bytes(),
             self.modality.as_str().as_bytes(),
+            &uncertainty,
+            self.actionability.as_str().as_bytes(),
             &self.value,
+            &links,
         ])
+    }
+
+    fn link_digest(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.links.len() * 68);
+        for link in &self.links {
+            let confidence = link.confidence.to_bits().to_le_bytes();
+            let digest = digest_frame(&[
+                link.relation.as_str().as_bytes(),
+                &link.target.into_bytes(),
+                &confidence,
+            ]);
+            bytes.extend_from_slice(&digest);
+        }
+        bytes
     }
 }
 
@@ -263,15 +326,24 @@ impl MemoryClaim {
     /// Returns the [`CairnError`] matching the first bound violated.
     pub fn validate(&self) -> Result<(), CairnError> {
         if self.claim.is_empty() {
+            eprintln!("logical-db-cairn: rejected empty memory claim");
             return Err(CairnError::EmptyValue);
         }
         if self.claim.len() > MAX_CLAIM_BYTES {
+            eprintln!(
+                "logical-db-cairn: rejected memory claim length {}",
+                self.claim.len()
+            );
             return Err(CairnError::ValueTooLarge {
                 actual: self.claim.len(),
                 maximum: MAX_CLAIM_BYTES,
             });
         }
         if !(0.0..=1.0).contains(&self.confidence) {
+            eprintln!(
+                "logical-db-cairn: rejected memory confidence {}",
+                self.confidence
+            );
             return Err(CairnError::InvalidConfidence(self.confidence));
         }
         Ok(())
@@ -331,20 +403,45 @@ impl SteeringDecision {
 #[derive(Debug, Error, PartialEq)]
 pub enum CairnError {
     /// Unknown token kind name.
-    #[error("invalid token kind {0:?}")]
-    InvalidKind(String),
+    #[error("invalid token kind {value:?} at {context}")]
+    InvalidKind {
+        /// Rejected wire value.
+        value: String,
+        /// Vocabulary boundary that rejected it.
+        context: &'static str,
+    },
     /// Unknown link relation name.
-    #[error("invalid link relation {0:?}")]
-    InvalidRelation(String),
+    #[error("invalid link relation {value:?} at {context}")]
+    InvalidRelation {
+        /// Rejected wire value.
+        value: String,
+        /// Vocabulary boundary that rejected it.
+        context: &'static str,
+    },
     /// Unknown modality name.
-    #[error("invalid modality {0:?}")]
-    InvalidModality(String),
+    #[error("invalid modality {value:?} at {context}")]
+    InvalidModality {
+        /// Rejected wire value.
+        value: String,
+        /// Vocabulary boundary that rejected it.
+        context: &'static str,
+    },
     /// Unknown actionability name.
-    #[error("invalid actionability {0:?}")]
-    InvalidActionability(String),
+    #[error("invalid actionability {value:?} at {context}")]
+    InvalidActionability {
+        /// Rejected wire value.
+        value: String,
+        /// Vocabulary boundary that rejected it.
+        context: &'static str,
+    },
     /// Unknown trust level name.
-    #[error("invalid trust level {0:?}")]
-    InvalidTrust(String),
+    #[error("invalid trust level {value:?} at {context}")]
+    InvalidTrust {
+        /// Rejected wire value.
+        value: String,
+        /// Vocabulary boundary that rejected it.
+        context: &'static str,
+    },
     /// Confidence or uncertainty outside `[0.0, 1.0]`.
     #[error("confidence {0} outside [0.0, 1.0]")]
     InvalidConfidence(f32),
@@ -454,9 +551,15 @@ mod tests {
         roundtrip(&[T::Observed, T::Inferred], T::as_str, T::parse);
         roundtrip(&[T::Predicted, T::Synthesized], T::as_str, T::parse);
         let bogus = K::parse("bogus");
-        assert_eq!(bogus, Err(CairnError::InvalidKind("bogus".into())));
+        assert_eq!(
+            bogus,
+            Err(CairnError::InvalidKind {
+                value: "bogus".into(),
+                context: "TokenKind::parse",
+            })
+        );
         let frobs = L::parse("frobs");
-        assert!(matches!(frobs, Err(CairnError::InvalidRelation(_))));
+        assert!(matches!(frobs, Err(CairnError::InvalidRelation { .. })));
     }
 
     #[test]
@@ -531,6 +634,15 @@ mod tests {
         let mut rekinded = observation();
         rekinded.kind = TokenKind::Event;
         assert_ne!(base.content_hash(), rekinded.content_hash());
+        let mut rescoped = observation();
+        rescoped.actionability = Actionability::Repair;
+        assert_ne!(base.content_hash(), rescoped.content_hash());
+        let mut uncertain = observation();
+        uncertain.uncertainty = 0.2;
+        assert_ne!(base.content_hash(), uncertain.content_hash());
+        let mut linked = observation();
+        linked.links.push(link(2, 0.9));
+        assert_ne!(base.content_hash(), linked.content_hash());
     }
 
     #[test]

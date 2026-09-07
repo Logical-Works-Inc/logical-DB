@@ -1,0 +1,57 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "monorepo-semantics-v1",
+  "actor": "application author using the public facade from a separate Cargo package",
+  "job": "persist and reopen an episode snapshot while rejecting invalid identities and metadata tampering",
+  "artifact": "logical-db semantics feature and external pr36-semantic-consumer executable",
+  "environment": {
+    "os": "macOS arm64",
+    "database": "fresh redb file in a path containing spaces and Unicode",
+    "consumer": "/Users/srinji/pr36-receipts/consumer"
+  },
+  "initial_state": {
+    "database": "absent",
+    "scope": "fixed account and application UUID pair",
+    "operation": "fixed operation ID and request digest"
+  },
+  "expectation": "the same snapshot survives process restart and exact retry; invalid bytes and changed immutable metadata are rejected without changing durable state",
+  "perturbation": "separate processes, duplicate operation, zero IDs, changed scope and clocks, mutated and truncated payload, legacy unversioned snapshot",
+  "actions": [
+    "write a snapshot through Database::edit",
+    "read in a second process",
+    "repeat the exact write operation",
+    "reject hostile data through public decoders and validation",
+    "read valid persisted state after refusals",
+    "attempt to read a legacy v0 snapshot"
+  ],
+  "observations": [
+    "write, read, retry, hostile, read each exited 0",
+    "legacy v0 read exited 1 with missing field `version`",
+    "the original decoder admitted zero IDs; the pre-fix consumer assertion exited 101"
+  ],
+  "external_state_diff": [
+    "one scoped snapshot persisted in the fresh redb file",
+    "exact retry preserved the same episode identity",
+    "hostile probes did not replace the persisted snapshot"
+  ],
+  "invariant": "v1 episode identity binds scope, all clocks, evidence, parents, kind, sequence, and payload; derived log indexes are rebuilt from validated episodes",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [
+    "zero identity admitted by derived deserialization",
+    "unbound scope and provenance metadata",
+    "untrusted serialized lookup index"
+  ],
+  "follow_up_experiments": [
+    "service-backed episode operators and comparative roadmap benchmarks remain separate work"
+  ],
+  "evidence": [
+    "crates/logical-db-e2e/tests/semantics_journey.rs",
+    "crates/logical-db-episode/src/lib.rs",
+    "/Users/srinji/pr36-receipts/consumer-journey.log"
+  ],
+  "limitations": [
+    "embedded semantic journey only; no episode-specific HTTP/service integration",
+    "legacy snapshots require explicit migration rather than silent reinterpretation",
+    "Keel numerical MI remains advisory and below 76 in multiple files"
+  ]
+}

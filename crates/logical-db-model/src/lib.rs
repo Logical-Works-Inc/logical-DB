@@ -10,6 +10,9 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod namespace_wire;
+use namespace_wire::{take, take_checkpoint, take_namespace, take_u16, take_u32};
 use uuid::Uuid;
 
 /// Maximum UTF-8 bytes in a user-controlled display-independent name.
@@ -249,10 +252,12 @@ impl SnapshotBaseline {
     /// [`ModelError::UnsupportedSnapshotVersion`] for a foreign version.
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
         if bytes.len() != SNAPSHOT_BASELINE_BYTES {
+            eprintln!("logical-db-model: decode: InvalidSnapshotEncoding");
             return Err(ModelError::InvalidSnapshotEncoding);
         }
         let version = u16::from_be_bytes([bytes[0], bytes[1]]);
         if version != SNAPSHOT_BASELINE_VERSION {
+            eprintln!("logical-db-model: decode: UnsupportedSnapshotVersion");
             return Err(ModelError::UnsupportedSnapshotVersion { actual: version });
         }
         let position = u64::from_be_bytes([
@@ -359,6 +364,7 @@ impl NamespacePolicy {
             || pages_per_cycle == 0
             || pages_per_cycle > MAX_NAMESPACE_PAGES_PER_CYCLE
         {
+            eprintln!("logical-db-model: new: PageTooLarge");
             return Err(ModelError::PageTooLarge);
         }
         Ok(Self {
@@ -413,8 +419,10 @@ impl Default for NamespacePolicy {
 /// name.
 pub fn validate_namespace(namespace: &str) -> Result<(), ModelError> {
     if namespace.is_empty() || namespace.len() > MAX_NAME_BYTES {
+        eprintln!("logical-db-model: validate_namespace: InvalidIdentifierLength");
         return Err(ModelError::InvalidIdentifierLength {
             kind: "namespace",
+            context: "validate_namespace",
             actual: namespace.len(),
             maximum: MAX_NAME_BYTES,
         });
@@ -445,13 +453,16 @@ impl NamespaceCheckpoint {
     /// reserved zero expiry.
     pub fn new(cursor: Vec<u8>, expires_at_unix_ms: u64) -> Result<Self, ModelError> {
         if cursor.is_empty() || cursor.len() > MAX_NAMESPACE_CURSOR_BYTES {
+            eprintln!("logical-db-model: new: InvalidIdentifierLength");
             return Err(ModelError::InvalidIdentifierLength {
                 kind: "namespace cursor",
+                context: "NamespaceCheckpoint::new",
                 actual: cursor.len(),
                 maximum: MAX_NAMESPACE_CURSOR_BYTES,
             });
         }
         if expires_at_unix_ms == 0 {
+            eprintln!("logical-db-model: new: InvalidAuthorityExpiry");
             return Err(ModelError::InvalidAuthorityExpiry);
         }
         Ok(Self {
@@ -500,25 +511,32 @@ impl NamespaceCheckpoint {
     /// foreign version.
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
         if bytes.len() < 14 {
+            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         let version = u16::from_be_bytes([bytes[0], bytes[1]]);
         if version != NAMESPACE_CHECKPOINT_VERSION {
+            eprintln!("logical-db-model: decode: UnsupportedNamespaceCheckpointVersion");
             return Err(ModelError::UnsupportedNamespaceCheckpointVersion { actual: version });
         }
         let expires_at_unix_ms = u64::from_be_bytes([
             bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
         ]);
         if expires_at_unix_ms == 0 {
+            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         let cursor_len = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
-        let cursor_len = usize::try_from(cursor_len)
-            .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)?;
+        let cursor_len = usize::try_from(cursor_len).map_err(|error| {
+            eprintln!("logical-db-model: ModelError::InvalidNamespaceCheckpointEncoding: {error}");
+            ModelError::InvalidNamespaceCheckpointEncoding
+        })?;
         if cursor_len == 0 || cursor_len > MAX_NAMESPACE_CURSOR_BYTES {
+            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         if bytes.len() != 14 + cursor_len {
+            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         Ok(Self {
@@ -629,6 +647,7 @@ impl NamespaceCheckpoints {
             output.extend_from_slice(&encoded);
         }
         if output.len() > MAX_NAMESPACE_MAP_BYTES {
+            eprintln!("logical-db-model: encode: NamespaceCheckpointMapTooLarge");
             return Err(ModelError::NamespaceCheckpointMapTooLarge {
                 actual: output.len(),
                 maximum: MAX_NAMESPACE_MAP_BYTES,
@@ -645,67 +664,36 @@ impl NamespaceCheckpoints {
     /// structure and [`ModelError::UnsupportedNamespaceCheckpointVersion`]
     /// for a foreign map version.
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
-        fn take<'bytes>(
-            bytes: &'bytes [u8],
-            cursor: &mut usize,
-            count: usize,
-        ) -> Result<&'bytes [u8], ModelError> {
-            let end = cursor
-                .checked_add(count)
-                .ok_or(ModelError::InvalidNamespaceCheckpointEncoding)?;
-            if end > bytes.len() {
-                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
-            }
-            let slice = &bytes[*cursor..end];
-            *cursor = end;
-            Ok(slice)
-        }
-        fn take_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, ModelError> {
-            let raw = take(bytes, cursor, 2)?;
-            raw.try_into()
-                .map(u16::from_be_bytes)
-                .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)
-        }
-        fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<usize, ModelError> {
-            let raw = take(bytes, cursor, 4)?;
-            let value: u32 = raw
-                .try_into()
-                .map(u32::from_be_bytes)
-                .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)?;
-            usize::try_from(value).map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)
-        }
         let mut cursor = 0_usize;
         if take(bytes, &mut cursor, NAMESPACE_MAP_MAGIC.len())? != NAMESPACE_MAP_MAGIC {
+            eprintln!(
+                "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
+            );
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         let version = take_u16(bytes, &mut cursor)?;
         if version != NAMESPACE_CHECKPOINT_MAP_VERSION {
+            eprintln!(
+                "logical-db-model: NamespaceCheckpoints::decode: UnsupportedNamespaceCheckpointVersion"
+            );
             return Err(ModelError::UnsupportedNamespaceCheckpointVersion { actual: version });
         }
         let count = take_u32(bytes, &mut cursor)?;
         let mut entries = BTreeMap::new();
         for _ in 0..count {
-            let name_len = take_u32(bytes, &mut cursor)?;
-            if name_len == 0 || name_len > MAX_NAME_BYTES {
-                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
-            }
-            let name_bytes = take(bytes, &mut cursor, name_len)?;
-            let namespace = core::str::from_utf8(name_bytes)
-                .map_err(|_| ModelError::InvalidNamespaceCheckpointEncoding)?;
-            if validate_namespace(namespace).is_err() {
-                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
-            }
-            let checkpoint_len = take_u32(bytes, &mut cursor)?;
-            if checkpoint_len == 0 {
-                return Err(ModelError::InvalidNamespaceCheckpointEncoding);
-            }
-            let checkpoint_bytes = take(bytes, &mut cursor, checkpoint_len)?;
-            let checkpoint = NamespaceCheckpoint::decode(checkpoint_bytes)?;
+            let namespace = take_namespace(bytes, &mut cursor)?;
+            let checkpoint = take_checkpoint(bytes, &mut cursor)?;
             if entries.insert(namespace.to_owned(), checkpoint).is_some() {
+                eprintln!(
+                    "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
+                );
                 return Err(ModelError::InvalidNamespaceCheckpointEncoding);
             }
         }
         if cursor != bytes.len() {
+            eprintln!(
+                "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
+            );
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         Ok(Self { entries })
@@ -783,13 +771,16 @@ impl AuthorityDecision {
     ) -> Result<Self, ModelError> {
         let decision_id = decision_id.into();
         if decision_id.is_empty() || decision_id.len() > MAX_NAME_BYTES {
+            eprintln!("logical-db-model: new: InvalidIdentifierLength");
             return Err(ModelError::InvalidIdentifierLength {
                 kind: "authority decision",
+                context: "AuthorityDecision::new",
                 actual: decision_id.len(),
                 maximum: MAX_NAME_BYTES,
             });
         }
         if expires_at_unix_ms == 0 {
+            eprintln!("logical-db-model: new: InvalidAuthorityExpiry");
             return Err(ModelError::InvalidAuthorityExpiry);
         }
         Ok(Self {
@@ -827,10 +818,12 @@ impl AuthorityDecision {
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ModelError {
     /// A caller-controlled identifier violated its encoded bound.
-    #[error("{kind} length {actual} is outside the maximum {maximum}")]
+    #[error("{context}: {kind} length {actual} is outside the maximum {maximum}")]
     InvalidIdentifierLength {
         /// Semantic identifier class.
         kind: &'static str,
+        /// Boundary that rejected the identifier.
+        context: &'static str,
         /// Observed byte count.
         actual: usize,
         /// Accepted byte count.

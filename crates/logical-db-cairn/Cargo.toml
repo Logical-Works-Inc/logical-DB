@@ -1,6 +1,13 @@
-# Evidence: Cairn port. Source semantics from `cairn/quarantine/cairn_python/world_token.py`
-# and `cairn/crates/wm-core`; no Cairn code vendored, only the vocabulary re-expressed
-# in Logical-DB style bounds and errors.
+# Evidence: S11 S12 S13 establish local-first, causal, and authenticated
+# semantic records; S17 S22 bound hostile values and corruption handling;
+# S23 S24 define stable request/error semantics; S25 S26 define canonical
+# bytes and identifiers; S29 S30 support digest construction; S34 S35 S36
+# S40 S41 map capability, admission, capsule, invocation, and proof concepts;
+# S39 covers the bounded wire representation boundary; S14 S18 S42 inform
+# transaction identity and exact retry boundaries at the integration edge.
+# Source semantics from
+# `cairn/quarantine/cairn_python/world_token.py` and `cairn/crates/wm-core`;
+# URLs are in ../../evidence/SOURCES.md.
 
 [package]
 name = "logical-db-cairn"

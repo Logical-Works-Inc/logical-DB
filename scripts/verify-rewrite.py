@@ -52,6 +52,8 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-service",
     },
     "logical-db-e2e": {
+        "logical-db-cairn",
+        "logical-db-episode",
         "logical-db",
         "logical-db-http",
         "logical-db-model",
@@ -69,6 +71,8 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-store-fdb",
     },
     "logical-db": {
+        "logical-db-cairn",
+        "logical-db-episode",
         "logical-db-model",
         "logical-db-crdt",
         "logical-db-http",
@@ -78,6 +82,8 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-sync",
     },
     "logical-db-kv": {"logical-db", "logical-db-model"},
+    "logical-db-cairn": set(),
+    "logical-db-episode": {"logical-db-cairn"},
 }
 
 

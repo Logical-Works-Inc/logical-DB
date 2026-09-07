@@ -57,7 +57,7 @@ client fault injection and proves a post-commit unknown result, exact replay,
 single frontier advance, and invocation consumption. The evidence verifier's
 allowed-dependency map must additionally declare the semantic edges
 (`logical-db-episode` on `logical-db-cairn`, facade `logical-db` on both, and
-`logical-db-e2e` on both); until declared it reports them as undeclared.
+`logical-db-e2e` on both); these semantic edges are declared in the verifier.
 
 ## Public API boundary
 

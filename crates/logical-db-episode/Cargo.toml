@@ -1,6 +1,10 @@
-# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
-# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
-# ../../evidence/SOURCES.md.
+# Evidence: S02 S03 S04 S05 define opaque progress, ordered changes, and
+# explicit conflict provenance; S09 S10 S11 S12 S13 cover resumable logs,
+# conflict visibility, CRDT causality, local-first ownership, and convergence;
+# S17 S19 S20 S22 cover bounds, atomicity, recovery, and corruption refusal;
+# S23 S24 define idempotent operations and typed errors; S25 S26 define
+# canonical content identities; S34 S35 S36 cover capability-bound records
+# and admission evidence. Source URLs are in ../../evidence/SOURCES.md.
 
 [package]
 name = "logical-db-episode"
@@ -17,6 +21,7 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ciborium.workspace = true
 sha2.workspace = true
 
 [lints]

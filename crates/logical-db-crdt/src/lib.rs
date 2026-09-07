@@ -151,6 +151,7 @@ impl EncodedChange {
     /// Returns a typed size, decode, or digest error.
     pub fn validate(&self) -> Result<(), CrdtError> {
         if !is_nonempty_bounded(self.bytes.len(), MAX_CHANGE_BYTES) {
+            eprintln!("logical-db-crdt: validate: InvalidChangeSize");
             return Err(CrdtError::InvalidChangeSize(self.bytes.len()));
         }
         decode_change(self).map(|_| ())
@@ -179,6 +180,7 @@ impl Document {
     /// document verification.
     pub fn load(bytes: &[u8]) -> Result<Self, CrdtError> {
         if !is_nonempty_bounded(bytes.len(), MAX_SNAPSHOT_BYTES) {
+            eprintln!("logical-db-crdt: load: InvalidSnapshotSize");
             return Err(CrdtError::InvalidSnapshotSize(bytes.len()));
         }
         Ok(Self {
@@ -197,6 +199,7 @@ impl Document {
     pub fn save(&mut self) -> Result<Vec<u8>, CrdtError> {
         let snapshot = self.inner.save_and_verify()?;
         if !is_nonempty_bounded(snapshot.len(), MAX_SNAPSHOT_BYTES) {
+            eprintln!("logical-db-crdt: save: InvalidSnapshotSize");
             return Err(CrdtError::InvalidSnapshotSize(snapshot.len()));
         }
         Ok(snapshot)
@@ -235,6 +238,7 @@ impl Document {
             Ok(value) => value,
             Err(error) => {
                 self.inner.rollback();
+                eprintln!("logical-db-crdt: edit: error");
                 return Err(error);
             }
         };
@@ -255,17 +259,20 @@ impl Document {
     /// Returns a decode, digest, dependency, or Automerge application failure.
     pub fn apply(&mut self, changes: &[EncodedChange]) -> Result<(), CrdtError> {
         if !is_at_most(changes.len(), MAX_CHANGES_PER_PAGE) {
+            eprintln!("logical-db-crdt: apply: ChangePageTooLarge");
             return Err(CrdtError::ChangePageTooLarge);
         }
         let mut aggregate_bytes = 0usize;
         for change in changes {
             if !is_nonempty_bounded(change.bytes.len(), MAX_CHANGE_BYTES) {
+                eprintln!("logical-db-crdt: apply: InvalidChangeSize");
                 return Err(CrdtError::InvalidChangeSize(change.bytes.len()));
             }
             aggregate_bytes = aggregate_bytes
                 .checked_add(change.bytes.len())
                 .ok_or(CrdtError::ChangePageTooLarge)?;
             if !is_at_most(aggregate_bytes, MAX_PAGE_BYTES) {
+                eprintln!("logical-db-crdt: apply: ChangePageTooLarge");
                 return Err(CrdtError::ChangePageTooLarge);
             }
         }
@@ -320,6 +327,7 @@ impl Document {
         };
         if let Err(error) = staged {
             self.inner.rollback();
+            eprintln!("logical-db-crdt: delete: error");
             return Err(error);
         }
         self.inner.commit();
@@ -649,9 +657,13 @@ impl Editor<'_> {
         replacement: &str,
     ) -> Result<(), CrdtError> {
         if replacement.len() > MAX_CHANGE_BYTES {
+            eprintln!("logical-db-crdt: splice_text: ScalarTooLarge");
             return Err(CrdtError::ScalarTooLarge(replacement.len()));
         }
-        let delete = isize::try_from(delete).map_err(|_| CrdtError::InvalidSequenceRange)?;
+        let delete = isize::try_from(delete).map_err(|error| {
+            eprintln!("logical-db-crdt: CrdtError::InvalidSequenceRange: {error}");
+            CrdtError::InvalidSequenceRange
+        })?;
         self.document
             .splice_text(&text.0, position, delete, replacement)?;
         Ok(())
@@ -761,6 +773,7 @@ fn encode_change(change: &Change) -> EncodedChange {
 fn decode_change(encoded: &EncodedChange) -> Result<Change, CrdtError> {
     let change = Change::from_bytes(encoded.bytes.clone())?;
     if hash_digest(change.hash()) != encoded.digest {
+        eprintln!("logical-db-crdt: decode_change: DigestMismatch");
         return Err(CrdtError::DigestMismatch);
     }
     Ok(change)

@@ -10,6 +10,7 @@ use std::{future::Future, sync::Arc};
 
 use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, EncodedChange};
+use logical_db_model::OperationId;
 use logical_db_model::{Effect, OperationDigest, Scope, SnapshotBaseline, is_behind_retention};
 use logical_db_protocol::{
     ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest,
@@ -137,12 +138,9 @@ pub trait ServiceStore: Send + Sync {
     /// override this with their durable per-scope floor.
     fn retention_floor(
         &self,
-        scope: Scope,
+        _scope: Scope,
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-        async move {
-            let _ = scope;
-            Ok(0)
-        }
+        async { Ok(0) }
     }
 
     /// Reads a bounded ordered page after a durable scoped position.
@@ -244,14 +242,17 @@ pub fn prune_decision(
         return Ok(floor);
     }
     if requested_up_to > frontier {
+        eprintln!("logical-db-service: prune_decision: BeyondFrontier");
         return Err(PruneRefusal::BeyondFrontier { frontier });
     }
     if let Some(min_live) = min_live
         && requested_up_to > min_live
     {
+        eprintln!("logical-db-service: prune_decision: LiveCheckpoint");
         return Err(PruneRefusal::LiveCheckpoint { min_live });
     }
     if requested_up_to > consumed_through {
+        eprintln!("logical-db-service: prune_decision: PendingOperations");
         return Err(PruneRefusal::PendingOperations { consumed_through });
     }
     Ok(requested_up_to)
@@ -444,9 +445,11 @@ impl CheckpointCodec {
     /// Refuses an all-zero key or zero TTL.
     pub fn new(key: [u8; 32], ttl_ms: u64) -> Result<Self, CheckpointError> {
         if key == [0; 32] {
+            eprintln!("logical-db-service: new: WeakKey");
             return Err(CheckpointError::WeakKey);
         }
         if ttl_ms == 0 {
+            eprintln!("logical-db-service: new: InvalidTtl");
             return Err(CheckpointError::InvalidTtl);
         }
         Ok(Self { key, ttl_ms })
@@ -482,20 +485,26 @@ impl CheckpointCodec {
     ) -> Result<u64, CheckpointError> {
         let bytes = token.as_wire();
         if bytes.len() != CHECKPOINT_BYTES || &bytes[..4] != CHECKPOINT_MAGIC {
+            eprintln!("logical-db-service: open: Malformed");
             return Err(CheckpointError::Malformed);
         }
         let mut mac = self.mac();
         mac.update(&bytes[..CHECKPOINT_BODY_BYTES]);
         mac.verify_slice(&bytes[CHECKPOINT_BODY_BYTES..])
-            .map_err(|_| CheckpointError::InvalidMac)?;
+            .map_err(|error| {
+                eprintln!("logical-db-service: CheckpointError::InvalidMac: {error}");
+                CheckpointError::InvalidMac
+            })?;
         if bytes[4..20] != *scope.account().as_uuid().as_bytes()
             || bytes[20..36] != *scope.space().as_uuid().as_bytes()
         {
+            eprintln!("logical-db-service: open: WrongScope");
             return Err(CheckpointError::WrongScope);
         }
         let position = decode_u64(&bytes[36..44])?;
         let expires = decode_u64(&bytes[44..52])?;
         if now_unix_ms >= expires {
+            eprintln!("logical-db-service: open: Expired");
             return Err(CheckpointError::Expired);
         }
         Ok(position)
@@ -621,29 +630,12 @@ where
                 });
                 continue;
             }
-            let outcome = match self
+            let accepted = self
                 .store
                 .accept(change, &grant)
                 .await
-                .map_err(ServiceError::Store)?
-            {
-                AcceptResult::Accepted => PushOutcome::Accepted { operation },
-                AcceptResult::Duplicate | AcceptResult::RecoveredUnknownCommit => {
-                    PushOutcome::Duplicate { operation }
-                }
-                AcceptResult::Conflict => PushOutcome::Rejected {
-                    operation,
-                    code: RejectionCode::OperationConflict,
-                },
-                AcceptResult::StaleAuthority => PushOutcome::Rejected {
-                    operation,
-                    code: RejectionCode::StaleAuthority,
-                },
-                AcceptResult::InvocationConsumed => PushOutcome::Rejected {
-                    operation,
-                    code: RejectionCode::InvocationConsumed,
-                },
-            };
+                .map_err(ServiceError::Store)?;
+            let outcome = push_outcome(operation, accepted);
             outcomes.push(outcome);
         }
         Ok(PushResponse {
@@ -686,13 +678,17 @@ where
             frontier,
             now_unix_ms,
         ) else {
+            eprintln!("logical-db-service: pull: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         let checkpoint_position = match &request.after {
             Some(token) => match self.checkpoints.open(request.scope, token, now_unix_ms) {
                 Ok(position) => Some(position),
                 Err(CheckpointError::Expired) => return Ok(ServicePull::CheckpointExpired),
-                Err(error) => return Err(ServiceError::Checkpoint(error)),
+                Err(error) => {
+                    eprintln!("logical-db-service: pull checkpoint: {error}");
+                    return Err(ServiceError::Checkpoint(error));
+                }
             },
             None => None,
         };
@@ -715,9 +711,13 @@ where
         let stored = match result {
             PageResult::Page(stored) => stored,
             PageResult::BehindFloor => return Ok(ServicePull::CheckpointExpired),
-            PageResult::StaleAuthority => return Err(ServiceError::StaleAuthority),
+            PageResult::StaleAuthority => {
+                eprintln!("logical-db-service: pull: StaleAuthority");
+                return Err(ServiceError::StaleAuthority);
+            }
         };
         if !valid_stored_page(after, frontier, &stored) {
+            eprintln!("logical-db-service: pull: CorruptStoreData");
             return Err(ServiceError::CorruptStoreData);
         }
         if stored
@@ -725,6 +725,7 @@ where
             .iter()
             .any(|change| change.scope != request.scope)
         {
+            eprintln!("logical-db-service: pull: CrossScopeStoreData");
             return Err(ServiceError::CrossScopeStoreData);
         }
         for change in &stored.changes {
@@ -733,7 +734,10 @@ where
                 bytes: change.bytes.clone(),
             }
             .validate()
-            .map_err(|_| ServiceError::CorruptStoreData)?;
+            .map_err(|error| {
+                eprintln!("logical-db-service: ServiceError::CorruptStoreData: {error}");
+                ServiceError::CorruptStoreData
+            })?;
         }
         let checkpoint = self
             .checkpoints
@@ -778,6 +782,7 @@ where
             self.policy
                 .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
         else {
+            eprintln!("logical-db-service: seal_snapshot: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         self.store
@@ -808,6 +813,7 @@ where
             self.policy
                 .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
         else {
+            eprintln!("logical-db-service: mark_consumed: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         self.store
@@ -842,12 +848,34 @@ where
             self.policy
                 .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
         else {
+            eprintln!("logical-db-service: prune: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         self.store
             .prune(scope, up_to, min_live, request, &grant)
             .await
             .map_err(ServiceError::Store)
+    }
+}
+
+fn push_outcome(operation: OperationId, accepted: AcceptResult) -> PushOutcome {
+    match accepted {
+        AcceptResult::Accepted => PushOutcome::Accepted { operation },
+        AcceptResult::Duplicate | AcceptResult::RecoveredUnknownCommit => {
+            PushOutcome::Duplicate { operation }
+        }
+        AcceptResult::Conflict => PushOutcome::Rejected {
+            operation,
+            code: RejectionCode::OperationConflict,
+        },
+        AcceptResult::StaleAuthority => PushOutcome::Rejected {
+            operation,
+            code: RejectionCode::StaleAuthority,
+        },
+        AcceptResult::InvocationConsumed => PushOutcome::Rejected {
+            operation,
+            code: RejectionCode::InvocationConsumed,
+        },
     }
 }
 
@@ -890,10 +918,10 @@ pub enum ServiceError<StoreError> {
 }
 
 fn decode_u64(bytes: &[u8]) -> Result<u64, CheckpointError> {
-    bytes
-        .try_into()
-        .map(u64::from_be_bytes)
-        .map_err(|_| CheckpointError::Malformed)
+    bytes.try_into().map(u64::from_be_bytes).map_err(|error| {
+        eprintln!("logical-db-service: CheckpointError::Malformed: {error}");
+        CheckpointError::Malformed
+    })
 }
 
 #[cfg(test)]
@@ -1035,33 +1063,25 @@ mod tests {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     impl ServiceStore for Memory {
         type Error = Infallible;
-        async fn accept(
+        fn accept(
             &self,
             change: &ChangeEnvelope,
             _grant: &impl ExecutionGrant,
-        ) -> Result<AcceptResult, Self::Error> {
-            let mut operations = self.operations.lock().unwrap();
-            if let Some(existing) = operations.get(&change.operation) {
-                return Ok(if *existing == (change.request, change.digest) {
-                    AcceptResult::Duplicate
-                } else {
-                    AcceptResult::Conflict
-                });
-            }
-            operations.insert(change.operation, (change.request, change.digest));
-            self.changes.lock().unwrap().push(change.clone());
-            Ok(AcceptResult::Accepted)
+        ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            std::future::ready(Ok(self.accept_result(change)))
         }
-        async fn frontier(&self, scope: Scope) -> Result<u64, Self::Error> {
-            Ok(self.scope_frontier(scope))
+        fn frontier(&self, scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            std::future::ready(Ok(self.frontier_result(scope)))
         }
-        async fn retention_floor(&self, scope: Scope) -> Result<u64, Self::Error> {
-            Ok(self.retention_state(scope).floor)
+        fn retention_floor(
+            &self,
+            scope: Scope,
+        ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            std::future::ready(Ok(self.retention_floor_result(scope)))
         }
-        async fn page(
+        fn page(
             &self,
             scope: Scope,
             request: OperationDigest,
@@ -1069,21 +1089,106 @@ mod tests {
             max_changes: u16,
             max_bytes: u32,
             grant: &impl ExecutionGrant,
-        ) -> Result<PageResult, Self::Error> {
+        ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            std::future::ready(Ok(self.page_result(
+                scope,
+                request,
+                after,
+                max_changes,
+                max_bytes,
+                grant,
+            )))
+        }
+    }
+
+    impl RetentionStore for Memory {
+        fn consumed_through(
+            &self,
+            scope: Scope,
+        ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            std::future::ready(Ok(self.consumed_through_result(scope)))
+        }
+        fn snapshot_baseline(
+            &self,
+            scope: Scope,
+        ) -> impl Future<Output = Result<Option<SnapshotBaseline>, Self::Error>> + Send {
+            std::future::ready(Ok(self.snapshot_baseline_result(scope)))
+        }
+        fn seal_snapshot(
+            &self,
+            scope: Scope,
+            baseline: SnapshotBaseline,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
+            std::future::ready(Ok(
+                self.seal_snapshot_result(scope, baseline, request, grant)
+            ))
+        }
+        fn mark_consumed(
+            &self,
+            scope: Scope,
+            through: u64,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+            std::future::ready(Ok(self.mark_consumed_result(scope, through, request, grant)))
+        }
+        fn prune(
+            &self,
+            scope: Scope,
+            up_to: u64,
+            min_live: Option<u64>,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
+            std::future::ready(Ok(self.prune_result(scope, up_to, min_live, request, grant)))
+        }
+    }
+
+    impl Memory {
+        fn accept_result(&self, change: &ChangeEnvelope) -> AcceptResult {
+            let mut operations = self.operations.lock().unwrap();
+            if let Some(existing) = operations.get(&change.operation) {
+                return if *existing == (change.request, change.digest) {
+                    AcceptResult::Duplicate
+                } else {
+                    AcceptResult::Conflict
+                };
+            }
+            operations.insert(change.operation, (change.request, change.digest));
+            self.changes.lock().unwrap().push(change.clone());
+            AcceptResult::Accepted
+        }
+        fn frontier_result(&self, scope: Scope) -> u64 {
+            self.scope_frontier(scope)
+        }
+        fn retention_floor_result(&self, scope: Scope) -> u64 {
+            self.retention_state(scope).floor
+        }
+        fn page_result(
+            &self,
+            scope: Scope,
+            request: OperationDigest,
+            after: u64,
+            max_changes: u16,
+            max_bytes: u32,
+            grant: &impl ExecutionGrant,
+        ) -> PageResult {
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
                 || grant.request() != request
             {
-                return Ok(PageResult::StaleAuthority);
+                return PageResult::StaleAuthority;
             }
             let floor = self.retention_state(scope).floor;
             if after < floor {
-                return Ok(PageResult::BehindFloor);
+                return PageResult::BehindFloor;
             }
             let changes = self.changes.lock().unwrap();
             let frontier = floor + Self::retained_count(&changes, scope);
             if grant.frontier() != frontier {
-                return Ok(PageResult::StaleAuthority);
+                return PageResult::StaleAuthority;
             }
             let skip = usize::try_from(after - floor).unwrap_or(usize::MAX);
             let mut bytes = 0usize;
@@ -1100,37 +1205,30 @@ mod tests {
                 .collect::<Vec<_>>();
             let position = after + page.len() as u64;
             let more = frontier > position;
-            Ok(PageResult::Page(StoredPage {
+            PageResult::Page(StoredPage {
                 changes: page,
                 position,
                 more,
-            }))
+            })
         }
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    impl RetentionStore for Memory {
-        async fn consumed_through(&self, scope: Scope) -> Result<u64, Self::Error> {
-            Ok(self.retention_state(scope).consumed)
+        fn consumed_through_result(&self, scope: Scope) -> u64 {
+            self.retention_state(scope).consumed
         }
-        async fn snapshot_baseline(
-            &self,
-            scope: Scope,
-        ) -> Result<Option<SnapshotBaseline>, Self::Error> {
-            Ok(self.retention_state(scope).baseline)
+        fn snapshot_baseline_result(&self, scope: Scope) -> Option<SnapshotBaseline> {
+            self.retention_state(scope).baseline
         }
-        async fn seal_snapshot(
+        fn seal_snapshot_result(
             &self,
             scope: Scope,
             baseline: SnapshotBaseline,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
-        ) -> Result<SealResult, Self::Error> {
+        ) -> SealResult {
             let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
-                return Ok(SealResult::StaleAuthority);
+                return SealResult::StaleAuthority;
             };
             if baseline.position() > frontier {
-                return Ok(SealResult::BeyondFrontier { frontier });
+                return SealResult::BeyondFrontier { frontier };
             }
             self.retention
                 .lock()
@@ -1138,51 +1236,51 @@ mod tests {
                 .entry(scope)
                 .or_default()
                 .baseline = Some(baseline);
-            Ok(SealResult::Sealed {
+            SealResult::Sealed {
                 position: baseline.position(),
-            })
+            }
         }
-        async fn mark_consumed(
+        fn mark_consumed_result(
             &self,
             scope: Scope,
             through: u64,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
-        ) -> Result<ConsumedResult, Self::Error> {
+        ) -> ConsumedResult {
             let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
-                return Ok(ConsumedResult::StaleAuthority);
+                return ConsumedResult::StaleAuthority;
             };
             if through > frontier {
-                return Ok(ConsumedResult::BeyondFrontier { frontier });
+                return ConsumedResult::BeyondFrontier { frontier };
             }
             let mut retention = self.retention.lock().unwrap();
             let state = retention.entry(scope).or_default();
             if through <= state.consumed {
-                return Ok(ConsumedResult::Unchanged {
+                return ConsumedResult::Unchanged {
                     consumed_through: state.consumed,
-                });
+                };
             }
             state.consumed = through;
-            Ok(ConsumedResult::Advanced {
+            ConsumedResult::Advanced {
                 consumed_through: through,
-            })
+            }
         }
-        async fn prune(
+        fn prune_result(
             &self,
             scope: Scope,
             up_to: u64,
             min_live: Option<u64>,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
-        ) -> Result<PruneResult, Self::Error> {
+        ) -> PruneResult {
             let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
-                return Ok(PruneResult::StaleAuthority);
+                return PruneResult::StaleAuthority;
             };
             let state = self.retention_state(scope);
             let through =
                 match prune_decision(frontier, state.floor, up_to, min_live, state.consumed) {
                     Ok(through) => through,
-                    Err(refusal) => return Ok(PruneResult::Refused(refusal)),
+                    Err(refusal) => return PruneResult::Refused(refusal),
                 };
             if through > state.floor {
                 let floor = state.floor;
@@ -1201,10 +1299,10 @@ mod tests {
                     .or_default()
                     .floor = through;
             }
-            Ok(PruneResult::Pruned(PruneReceipt {
+            PruneResult::Pruned(PruneReceipt {
                 pruned_through: through,
                 floor: through.max(state.floor),
-            }))
+            })
         }
     }
 
@@ -1223,6 +1321,32 @@ mod tests {
             digest: encoded.digest,
             bytes: encoded.bytes,
         }
+    }
+
+    #[test]
+    fn recovered_and_refused_admissions_keep_their_wire_meaning() {
+        let operation = OperationId::new();
+        let recovered = AcceptResult::RecoveredUnknownCommit;
+        let stale = AcceptResult::StaleAuthority;
+        let consumed = AcceptResult::InvocationConsumed;
+        assert_eq!(
+            push_outcome(operation, recovered),
+            PushOutcome::Duplicate { operation }
+        );
+        assert_eq!(
+            push_outcome(operation, stale),
+            PushOutcome::Rejected {
+                operation,
+                code: RejectionCode::StaleAuthority
+            }
+        );
+        assert_eq!(
+            push_outcome(operation, consumed),
+            PushOutcome::Rejected {
+                operation,
+                code: RejectionCode::InvocationConsumed
+            }
+        );
     }
 
     #[test]

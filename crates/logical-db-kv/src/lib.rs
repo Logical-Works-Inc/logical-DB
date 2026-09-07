@@ -306,6 +306,7 @@ impl KvCache {
     pub fn put(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Result<(), KvError> {
         validate_key(key)?;
         if value.len() > MAX_VALUE_BYTES {
+            eprintln!("logical-db-kv: cache value exceeds {MAX_VALUE_BYTES} byte limit");
             return Err(KvError::ValueTooLarge {
                 actual: value.len(),
                 maximum: MAX_VALUE_BYTES,
@@ -333,11 +334,13 @@ impl KvCache {
     /// commit fails.
     pub fn put_many(&self, entries: &[BatchPut]) -> Result<(), KvError> {
         if entries.is_empty() || entries.len() > MAX_BATCH_PUT {
+            eprintln!("logical-db-kv: invalid batch count {}", entries.len());
             return Err(KvError::InvalidBatchSize(entries.len()));
         }
         for entry in entries {
             validate_key(&entry.key)?;
             if entry.value.len() > MAX_VALUE_BYTES {
+                eprintln!("logical-db-kv: cache value exceeds {MAX_VALUE_BYTES} byte limit");
                 return Err(KvError::ValueTooLarge {
                     actual: entry.value.len(),
                     maximum: MAX_VALUE_BYTES,
@@ -355,6 +358,7 @@ impl KvCache {
             if let Err(error) = self.put_absolute(&entry.key, &entry.value, expires_at_ms, sequence)
             {
                 self.rollback(&entries[..applied], &priors[..applied]);
+                eprintln!("logical-db-kv: batch write failed after {applied} entries: {error}");
                 return Err(error);
             }
         }
@@ -440,9 +444,11 @@ impl KvCache {
         limit: usize,
     ) -> Result<Vec<CacheEntry>, KvError> {
         if limit == 0 || limit > MAX_PAGE_LIMIT {
+            eprintln!("logical-db-kv: invalid scan limit {limit}");
             return Err(KvError::InvalidScanLimit(limit));
         }
         if after.is_some_and(|cursor| cursor.len() > logical_db_model::MAX_NAME_BYTES) {
+            eprintln!("logical-db-kv: invalid key or cursor length");
             return Err(KvError::InvalidKey);
         }
         let now = now_ms();
@@ -486,6 +492,7 @@ impl KvCache {
     /// [`KvError::Database`] for a durable failure.
     pub fn recent(&self, prefix: &str, limit: usize) -> Result<Vec<CacheEntry>, KvError> {
         if limit == 0 || limit > MAX_PAGE_LIMIT {
+            eprintln!("logical-db-kv: invalid scan limit {limit}");
             return Err(KvError::InvalidScanLimit(limit));
         }
         let now = now_ms();
@@ -543,6 +550,7 @@ impl KvCache {
     /// `1..=256`, or [`KvError::Database`] for a durable failure.
     pub fn evict_expired(&self, limit: usize) -> Result<usize, KvError> {
         if limit == 0 || limit > MAX_PAGE_LIMIT {
+            eprintln!("logical-db-kv: invalid eviction limit {limit}");
             return Err(KvError::InvalidEvictionLimit(limit));
         }
         let now = now_ms();
@@ -695,15 +703,19 @@ impl KvCache {
         for (entry, prior) in entries.iter().zip(priors.iter()).rev() {
             match prior {
                 Some(value) => {
-                    let _ = self.put_absolute(
+                    if let Err(error) = self.put_absolute(
                         &entry.key,
                         &value.value,
                         value.expires_at_ms,
                         self.next_sequence(now_ms()),
-                    );
+                    ) {
+                        eprintln!("logical-db-kv: rollback prior value failed: {error}");
+                    }
                 }
                 None => {
-                    let _ = self.clear_if_live(&entry.key);
+                    if let Err(error) = self.clear_if_live(&entry.key) {
+                        eprintln!("logical-db-kv: rollback newly inserted value failed: {error}");
+                    }
                 }
             }
         }
@@ -896,6 +908,7 @@ enum Decoded {
 
 fn validate_key(key: &str) -> Result<(), KvError> {
     if key.is_empty() || key.len() > logical_db_model::MAX_NAME_BYTES {
+        eprintln!("logical-db-kv: invalid key or cursor length");
         return Err(KvError::InvalidKey);
     }
     Ok(())
@@ -903,6 +916,10 @@ fn validate_key(key: &str) -> Result<(), KvError> {
 
 fn validate_namespace(namespace: &str) -> Result<(), KvError> {
     if namespace.is_empty() || namespace.len() > logical_db_model::MAX_NAME_BYTES {
+        eprintln!(
+            "logical-db-kv: invalid namespace length {}",
+            namespace.len()
+        );
         return Err(KvError::InvalidNamespace);
     }
     Ok(())

@@ -167,13 +167,18 @@ pub fn prepare_request(
     let capsule = Capsule::from_bytes(capsule_bytes).map_err(BraidAdapterError::Capsule)?;
     let required = capability_for(scope, effect, request);
     if !capsule.grants.iter().any(|grant| grant == &required) {
+        eprintln!("logical-db-braid: prepare_request: MissingExactGrant");
         return Err(BraidAdapterError::MissingExactGrant);
     }
     validate_operation_policy(&capsule, registry, &required, effect)?;
-    let frontier_value =
-        i64::try_from(frontier).map_err(|_| BraidAdapterError::Frontier(frontier))?;
-    let expiry_value = i64::try_from(expires_at_unix_ms)
-        .map_err(|_| BraidAdapterError::Expiry(expires_at_unix_ms))?;
+    let frontier_value = i64::try_from(frontier).map_err(|error| {
+        eprintln!("logical-db-braid: BraidAdapterError::Frontier: {error}");
+        BraidAdapterError::Frontier(frontier)
+    })?;
+    let expiry_value = i64::try_from(expires_at_unix_ms).map_err(|error| {
+        eprintln!("logical-db-braid: BraidAdapterError::Expiry: {error}");
+        BraidAdapterError::Expiry(expires_at_unix_ms)
+    })?;
     let facts = request_facts(scope, effect, request, frontier_value, expiry_value);
     let snapshot = FlowSnapshot::new(facts.clone());
     let predicate = request_predicate(&facts)?;
@@ -213,6 +218,7 @@ fn validate_operation_policy(
         EffectClass::Irreversible | EffectClass::Egress
     ) && capsule.confirm != ConfirmPolicy::HumanConfirm
     {
+        eprintln!("logical-db-braid: validate_operation_policy: EffectPolicyMismatch");
         return Err(BraidAdapterError::EffectPolicyMismatch);
     }
     let mut exposures = Vec::with_capacity(capsule.braid.strands.len());
@@ -239,6 +245,7 @@ fn validate_operation_policy(
             || spec.egress_ceiling != required_ceiling
             || incoming != Exposure::Vault
         {
+            eprintln!("logical-db-braid: validate_operation_policy: EffectPolicyMismatch");
             return Err(BraidAdapterError::EffectPolicyMismatch);
         }
         matched = true;
@@ -431,6 +438,7 @@ impl BraidAuthority {
     /// Returns [`BraidAdapterError::GrantCount`] outside `1..=256`.
     pub fn new(grants: Vec<BraidGrant>) -> Result<Self, BraidAdapterError> {
         if grants.is_empty() || grants.len() > 256 {
+            eprintln!("logical-db-braid: new: GrantCount");
             return Err(BraidAdapterError::GrantCount(grants.len()));
         }
         Ok(Self { grants })

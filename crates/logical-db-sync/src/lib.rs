@@ -162,6 +162,7 @@ impl SyncLimits {
         };
         request.validate()?;
         if self.pages_per_cycle == 0 || usize::from(self.pages_per_cycle) > MAX_PAGES_PER_CYCLE {
+            eprintln!("logical-db-sync: pages per cycle exceeds the configured bound");
             return Err(ProtocolError::PageLimit);
         }
         Ok(self)
@@ -246,6 +247,7 @@ where
 {
     let limits = limits.validate().map_err(SyncError::Protocol)?;
     if cancelled() {
+        eprintln!("logical-db-sync: synchronization cancelled before binding");
         return Err(SyncError::Cancelled);
     }
     replica.bind_upstream(peer).map_err(SyncError::Replica)?;
@@ -263,6 +265,7 @@ where
     };
 
     if cancelled() {
+        eprintln!("logical-db-sync: synchronization cancelled before pull");
         return Err(SyncError::Cancelled);
     }
     let durable_checkpoint = replica.checkpoint(peer).map_err(SyncError::Replica)?;
@@ -272,52 +275,21 @@ where
         .map_err(SyncError::Protocol)?;
     let mut restarted_after_expiry = false;
     while report.pages < usize::from(limits.pages_per_cycle) {
-        let request = PullRequest {
-            protocol: PROTOCOL_VERSION,
-            scope: replica.scope(),
-            replica: replica.replica(),
-            request: pull_request_digest(
-                replica.scope(),
-                replica.replica(),
-                after.as_ref(),
-                limits,
-            ),
-            after: after.clone(),
-            max_changes: limits.changes_per_page,
-            max_bytes: limits.bytes_per_page,
+        let Some(page) = pull_and_install(
+            replica,
+            peer,
+            transport,
+            limits,
+            &mut after,
+            &mut restarted_after_expiry,
+        )
+        .await?
+        else {
+            report.full_resync = true;
+            continue;
         };
-        request.validate().map_err(SyncError::Protocol)?;
-        let page = match transport
-            .pull(request)
-            .await
-            .map_err(SyncError::Transport)?
-        {
-            PullResult::Page(page) => page,
-            PullResult::CheckpointExpired if after.is_some() && !restarted_after_expiry => {
-                after = None;
-                report.full_resync = true;
-                restarted_after_expiry = true;
-                continue;
-            }
-            PullResult::CheckpointExpired => {
-                return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
-            }
-        };
-        page.validate(replica.scope())
-            .map_err(SyncError::Protocol)?;
-        let inbound = page
-            .changes
-            .iter()
-            .map(|change| InboundChange {
-                document: change.document,
-                digest: change.digest,
-                bytes: change.bytes.clone(),
-            })
-            .collect::<Vec<_>>();
-        replica
-            .install(peer, &inbound, page.checkpoint.as_wire())
-            .map_err(SyncError::Replica)?;
-        report.pulled += inbound.len();
+        let inbound = page.changes.len();
+        report.pulled += inbound;
         report.pages += 1;
         let download_more = page.more;
         report.more = upload_more || download_more;
@@ -326,6 +298,7 @@ where
             return Ok(report);
         }
         if cancelled() {
+            eprintln!("logical-db-sync: synchronization cancelled between pull pages");
             return Err(SyncError::Cancelled);
         }
     }
@@ -362,6 +335,7 @@ where
         pending.push(change);
     }
     if pending.is_empty() {
+        eprintln!("logical-db-sync: pending upload cannot fit within byte limit");
         return Err(SyncError::Protocol(ProtocolError::PageLimit));
     }
     let request = PushRequest {
@@ -388,6 +362,7 @@ where
     response.validate(&request).map_err(SyncError::Protocol)?;
     for outcome in &response.outcomes {
         if let PushOutcome::Rejected { operation, code } = outcome {
+            eprintln!("logical-db-sync: upload rejected operation {operation}: {code:?}");
             return Err(SyncError::Rejected {
                 operation: *operation,
                 code: *code,
@@ -423,6 +398,136 @@ fn pull_request_digest(
     digest.update(limits.changes_per_page.to_be_bytes());
     digest.update(limits.bytes_per_page.to_be_bytes());
     OperationDigest::new(digest.finalize().into())
+}
+
+async fn fetch_page<T: Transport>(
+    transport: &mut T,
+    request: PullRequest,
+) -> Result<PullResult, T::Error> {
+    transport.pull(request).await
+}
+
+async fn pull_and_install<R, T>(
+    replica: &R,
+    peer: PeerId,
+    transport: &mut T,
+    limits: SyncLimits,
+    after: &mut Option<Checkpoint>,
+    restarted: &mut bool,
+) -> Result<Option<PullPage>, SyncError<R::Error, T::Error>>
+where
+    R: ReplicaPort,
+    T: Transport,
+{
+    let request = PullRequest {
+        protocol: PROTOCOL_VERSION,
+        scope: replica.scope(),
+        replica: replica.replica(),
+        request: pull_request_digest(replica.scope(), replica.replica(), after.as_ref(), limits),
+        after: after.clone(),
+        max_changes: limits.changes_per_page,
+        max_bytes: limits.bytes_per_page,
+    };
+    request.validate().map_err(SyncError::Protocol)?;
+    let pulled = fetch_page(transport, request)
+        .await
+        .map_err(SyncError::Transport)?;
+    let page = match pulled {
+        PullResult::Page(page) => page,
+        PullResult::CheckpointExpired if after.is_some() && !*restarted => {
+            *after = None;
+            *restarted = true;
+            return Ok(None);
+        }
+        PullResult::CheckpointExpired => {
+            eprintln!("logical-db-sync: checkpoint expired during synchronization");
+            return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
+        }
+    };
+    page.validate(replica.scope())
+        .map_err(SyncError::Protocol)?;
+    let inbound = page
+        .changes
+        .iter()
+        .map(|change| InboundChange {
+            document: change.document,
+            digest: change.digest,
+            bytes: change.bytes.clone(),
+        })
+        .collect::<Vec<_>>();
+    replica
+        .install(peer, &inbound, page.checkpoint.as_wire())
+        .map_err(SyncError::Replica)?;
+    Ok(Some(page))
+}
+
+struct NamespacePullContext<'a, F> {
+    namespace: &'a str,
+    is_mine: &'a F,
+    checkpoints: &'a mut NamespaceCheckpoints,
+    now_unix_ms: u64,
+    policy: NamespacePolicy,
+    after: &'a mut Option<Checkpoint>,
+    restarted: &'a mut bool,
+}
+
+async fn pull_namespace_page<R, T, F>(
+    replica: &R,
+    peer: PeerId,
+    transport: &mut T,
+    context: &mut NamespacePullContext<'_, F>,
+) -> Result<Option<(usize, bool)>, NamespaceSyncError<R::Error, T::Error>>
+where
+    R: ReplicaPort,
+    T: Transport,
+    F: Fn(DocumentId) -> bool,
+{
+    let request = PullRequest {
+        protocol: PROTOCOL_VERSION,
+        scope: replica.scope(),
+        replica: replica.replica(),
+        request: namespace_pull_digest(
+            replica.scope(),
+            replica.replica(),
+            context.namespace,
+            context.after.as_ref(),
+            context.policy,
+        ),
+        after: context.after.clone(),
+        max_changes: context.policy.changes_per_page(),
+        max_bytes: context.policy.bytes_per_page(),
+    };
+    request.validate().map_err(NamespaceSyncError::Protocol)?;
+    let pulled = fetch_page(transport, request)
+        .await
+        .map_err(NamespaceSyncError::Transport)?;
+    let page = match pulled {
+        PullResult::Page(page) => page,
+        PullResult::CheckpointExpired if context.after.is_some() && !*context.restarted => {
+            *context.after = None;
+            *context.restarted = true;
+            return Ok(None);
+        }
+        PullResult::CheckpointExpired => {
+            eprintln!("logical-db-sync: namespace checkpoint expired during pull");
+            return Err(NamespaceSyncError::Protocol(
+                ProtocolError::InvalidCheckpoint,
+            ));
+        }
+    };
+    page.validate(replica.scope())
+        .map_err(NamespaceSyncError::Protocol)?;
+    let installed = install_namespace_page(
+        replica,
+        peer,
+        context.namespace,
+        &page,
+        context.is_mine,
+        context.checkpoints,
+        context.now_unix_ms,
+    )?;
+    *context.after = Some(page.checkpoint);
+    Ok(Some((installed, page.more)))
 }
 
 /// Layout version of one encoded orchestrator state blob.
@@ -612,6 +717,7 @@ where
         return Ok(report);
     }
     if cancelled() {
+        eprintln!("logical-db-sync: namespace synchronization cancelled before binding");
         return Err(NamespaceSyncError::Cancelled);
     }
     replica
@@ -625,59 +731,27 @@ where
         report.full_resync = true;
     }
     while report.pages < usize::from(effective_pages(policy)) {
-        let request = PullRequest {
-            protocol: PROTOCOL_VERSION,
-            scope: replica.scope(),
-            replica: replica.replica(),
-            request: namespace_pull_digest(
-                replica.scope(),
-                replica.replica(),
-                namespace,
-                after.as_ref(),
-                policy,
-            ),
-            after: after.clone(),
-            max_changes: policy.changes_per_page(),
-            max_bytes: policy.bytes_per_page(),
-        };
-        request.validate().map_err(NamespaceSyncError::Protocol)?;
-        let page = match transport
-            .pull(request)
-            .await
-            .map_err(NamespaceSyncError::Transport)?
-        {
-            PullResult::Page(page) => page,
-            PullResult::CheckpointExpired if after.is_some() && !restarted_after_expiry => {
-                after = None;
-                report.full_resync = true;
-                restarted_after_expiry = true;
-                continue;
-            }
-            PullResult::CheckpointExpired => {
-                return Err(NamespaceSyncError::Protocol(
-                    ProtocolError::InvalidCheckpoint,
-                ));
-            }
-        };
-        page.validate(replica.scope())
-            .map_err(NamespaceSyncError::Protocol)?;
-        let installed = install_namespace_page(
-            replica,
-            peer,
+        let mut context = NamespacePullContext {
             namespace,
-            &page,
-            &is_mine,
-            &mut checkpoints,
+            is_mine: &is_mine,
+            checkpoints: &mut checkpoints,
             now_unix_ms,
-        )?;
-        report.pulled += installed;
+            policy,
+            after: &mut after,
+            restarted: &mut restarted_after_expiry,
+        };
+        let Some(page) = pull_namespace_page(replica, peer, transport, &mut context).await? else {
+            report.full_resync = true;
+            continue;
+        };
+        report.pulled += page.0;
         report.pages += 1;
-        report.more = page.more;
-        after = Some(page.checkpoint);
-        if !page.more {
+        report.more = page.1;
+        if !page.1 {
             return Ok(report);
         }
         if cancelled() {
+            eprintln!("logical-db-sync: namespace synchronization cancelled between pull pages");
             return Err(NamespaceSyncError::Cancelled);
         }
     }
@@ -718,6 +792,7 @@ where
         return Ok(report);
     }
     if cancelled() {
+        eprintln!("logical-db-sync: namespace upload cancelled before binding");
         return Err(NamespaceSyncError::Cancelled);
     }
     replica
@@ -750,6 +825,7 @@ where
         pending.push(change);
     }
     if pending.is_empty() {
+        eprintln!("logical-db-sync: namespace upload cannot fit within byte limit");
         return Err(NamespaceSyncError::Protocol(ProtocolError::PageLimit));
     }
     let request = PushRequest {
@@ -778,6 +854,7 @@ where
         .map_err(NamespaceSyncError::Protocol)?;
     for outcome in &response.outcomes {
         if let PushOutcome::Rejected { operation, code } = outcome {
+            eprintln!("logical-db-sync: namespace upload rejected operation {operation}: {code:?}");
             return Err(NamespaceSyncError::Rejected {
                 operation: *operation,
                 code: *code,
@@ -938,6 +1015,7 @@ impl OrchestratorPolicy {
         max_backoff_ms: u64,
     ) -> Result<Self, ProtocolError> {
         if max_cycles == 0 || base_backoff_ms == 0 || max_backoff_ms == 0 {
+            eprintln!("logical-db-sync: orchestrator policy contains an empty budget");
             return Err(ProtocolError::PageLimit);
         }
         Ok(Self {
@@ -1037,13 +1115,16 @@ impl OrchestratorState {
     /// [`OrchestratorStateError::UnsupportedVersion`] for a foreign version.
     pub fn decode(bytes: &[u8]) -> Result<Self, OrchestratorStateError> {
         if bytes.len() != ORCHESTRATOR_STATE_BYTES {
+            eprintln!("logical-db-sync: orchestrator state has an invalid length");
             return Err(OrchestratorStateError::Malformed);
         }
         if bytes[0..ORCHESTRATOR_STATE_MAGIC.len()] != ORCHESTRATOR_STATE_MAGIC {
+            eprintln!("logical-db-sync: orchestrator state magic is invalid");
             return Err(OrchestratorStateError::Malformed);
         }
         let version = u16::from_be_bytes([bytes[8], bytes[9]]);
         if version != ORCHESTRATOR_STATE_VERSION {
+            eprintln!("logical-db-sync: unsupported orchestrator state version {version}");
             return Err(OrchestratorStateError::UnsupportedVersion { actual: version });
         }
         Ok(Self {
@@ -1081,6 +1162,19 @@ pub enum OrchestratorStateError {
         /// Observed state layout version.
         actual: u16,
     },
+    /// A decoding failure with the source boundary retained for diagnostics.
+    Context {
+        /// Decoder boundary that rejected the state.
+        at: &'static str,
+    },
+}
+
+impl OrchestratorStateError {
+    /// Creates a contextual state error for a caller-owned decoder boundary.
+    #[must_use]
+    pub const fn at(at: &'static str) -> Self {
+        Self::Context { at }
+    }
 }
 
 impl fmt::Display for OrchestratorStateError {
@@ -1093,6 +1187,7 @@ impl fmt::Display for OrchestratorStateError {
                     "orchestrator state version {actual} is unsupported"
                 )
             }
+            Self::Context { at } => write!(formatter, "orchestrator state error at {at}"),
         }
     }
 }
@@ -1113,11 +1208,13 @@ pub struct RetrySignal<'signal, TransportError> {
     pub retry_after: &'signal dyn Fn(&TransportError) -> Option<Duration>,
 }
 
-fn never_retryable<TransportError>(_: &TransportError) -> bool {
+fn never_retryable<TransportError>(error: &TransportError) -> bool {
+    std::hint::black_box(error);
     false
 }
 
-fn no_retry_hint<TransportError>(_: &TransportError) -> Option<Duration> {
+fn no_retry_hint<TransportError>(error: &TransportError) -> Option<Duration> {
+    std::hint::black_box(error);
     None
 }
 
@@ -1281,6 +1378,7 @@ impl SyncOrchestrator {
         T: Transport,
     {
         if cancelled() {
+            eprintln!("logical-db-sync: orchestrator run cancelled before cycle");
             return Err(SyncError::Cancelled);
         }
         let mut report = RunReport::default();
@@ -1290,6 +1388,7 @@ impl SyncOrchestrator {
         }
         loop {
             if cancelled() {
+                eprintln!("logical-db-sync: orchestrator run cancelled between cycles");
                 return Err(SyncError::Cancelled);
             }
             match synchronize(replica, self.peer, transport, limits, &mut cancelled).await {
@@ -1311,7 +1410,14 @@ impl SyncOrchestrator {
                     report.more = true;
                     return Ok(report);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    eprintln!(
+                        "logical-db-sync: namespace run failed (replica={}, transport={})",
+                        std::any::type_name::<R::Error>(),
+                        std::any::type_name::<T::Error>(),
+                    );
+                    return Err(error);
+                }
             }
         }
     }
@@ -1411,6 +1517,7 @@ impl SyncOrchestrator {
             ..NamespaceRunReport::default()
         };
         if cancelled() {
+            eprintln!("logical-db-sync: namespace orchestrator run cancelled before send");
             return Err(NamespaceSyncError::Cancelled);
         }
         let now_unix_ms = domain.now_unix_ms();
@@ -1441,11 +1548,19 @@ impl SyncOrchestrator {
                 report.more = true;
                 return Ok(report);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                eprintln!(
+                    "logical-db-sync: namespace upload failed (replica={}, transport={})",
+                    std::any::type_name::<R::Error>(),
+                    std::any::type_name::<T::Error>()
+                );
+                return Err(error);
+            }
         };
         report.send = send;
         loop {
             if cancelled() {
+                eprintln!("logical-db-sync: namespace run cancelled between cycles");
                 return Err(NamespaceSyncError::Cancelled);
             }
             match synchronize_namespace(
@@ -1475,7 +1590,14 @@ impl SyncOrchestrator {
                     report.more = true;
                     return Ok(report);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    eprintln!(
+                        "logical-db-sync: namespace cycle failed (replica={}, transport={})",
+                        std::any::type_name::<R::Error>(),
+                        std::any::type_name::<T::Error>(),
+                    );
+                    return Err(error);
+                }
             }
         }
     }
@@ -1512,7 +1634,7 @@ fn defer_transport<TransportError>(
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{convert::Infallible, future::Future};
 
     use logical_db_model::{AccountId, SpaceId};
     use logical_db_protocol::RejectionCode;
@@ -1572,14 +1694,19 @@ mod tests {
         pulls: std::collections::VecDeque<PullResult>,
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     impl Transport for Wire {
         type Error = Infallible;
-        async fn push(&mut self, _request: PushRequest) -> Result<PushResponse, Self::Error> {
-            Ok(self.push.take().unwrap())
+        fn push(
+            &mut self,
+            _request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
+            std::future::ready(Ok(self.push.take().unwrap()))
         }
-        async fn pull(&mut self, _request: PullRequest) -> Result<PullResult, Self::Error> {
-            Ok(self.pulls.pop_front().unwrap())
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
+            std::future::ready(Ok(self.pulls.pop_front().unwrap()))
         }
     }
 
@@ -2055,10 +2182,12 @@ mod tests {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     impl Transport for PositionalLog {
         type Error = Infallible;
-        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+        fn push(
+            &mut self,
+            request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
             let mut outcomes = Vec::with_capacity(request.changes.len());
             for change in &request.changes {
                 self.pushed_operations.borrow_mut().push(change.operation);
@@ -2073,12 +2202,15 @@ mod tests {
                     });
                 }
             }
-            Ok(PushResponse {
+            std::future::ready(Ok(PushResponse {
                 protocol: PROTOCOL_VERSION,
                 outcomes,
-            })
+            }))
         }
-        async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error> {
+        fn pull(
+            &mut self,
+            request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             self.pulls.set(self.pulls.get() + 1);
             self.pull_afters
                 .borrow_mut()
@@ -2097,7 +2229,7 @@ mod tests {
                 Some(checkpoint) => Self::position(checkpoint),
             };
             if position < self.floor {
-                return Ok(PullResult::CheckpointExpired);
+                return std::future::ready(Ok(PullResult::CheckpointExpired));
             }
             let start = usize::try_from(position).unwrap();
             let entries = self.entries.borrow();
@@ -2124,12 +2256,12 @@ mod tests {
             }
             let next = start + changes.len();
             let more = next < entries.len();
-            Ok(PullResult::Page(PullPage {
+            std::future::ready(Ok(PullResult::Page(PullPage {
                 protocol: PROTOCOL_VERSION,
                 changes,
                 checkpoint: Checkpoint::from_wire(Self::position_bytes(next as u64)).unwrap(),
                 more,
-            }))
+            })))
         }
     }
 
@@ -2495,14 +2627,16 @@ mod tests {
         }
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     impl Transport for ScriptWire {
         type Error = Infallible;
-        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+        fn push(
+            &mut self,
+            request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
             for change in &request.changes {
                 self.pushed.borrow_mut().push(change.operation);
             }
-            Ok(PushResponse {
+            std::future::ready(Ok(PushResponse {
                 protocol: PROTOCOL_VERSION,
                 outcomes: request
                     .changes
@@ -2511,14 +2645,17 @@ mod tests {
                         operation: change.operation,
                     })
                     .collect(),
-            })
+            }))
         }
-        async fn pull(&mut self, _request: PullRequest) -> Result<PullResult, Self::Error> {
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             self.pulls_seen.set(self.pulls_seen.get() + 1);
-            Ok(self
+            std::future::ready(Ok(self
                 .pulls
                 .pop_front()
-                .expect("orchestrator pulled past the scripted pages"))
+                .expect("orchestrator pulled past the scripted pages")))
         }
     }
 
@@ -2605,18 +2742,21 @@ mod tests {
         pulls_seen: Cell<usize>,
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     impl Transport for FlakyTransport {
         type Error = WireFault;
-        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+        fn push(
+            &mut self,
+            request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
             if self.faults_left > 0 {
                 self.faults_left -= 1;
-                return Err(self.fault);
+                eprintln!("logical-db-sync test transport: scripted push fault");
+                return std::future::ready(Err(self.fault));
             }
             for change in &request.changes {
                 self.pushes.borrow_mut().push(change.operation);
             }
-            Ok(PushResponse {
+            std::future::ready(Ok(PushResponse {
                 protocol: PROTOCOL_VERSION,
                 outcomes: request
                     .changes
@@ -2625,20 +2765,24 @@ mod tests {
                         operation: change.operation,
                     })
                     .collect(),
-            })
+            }))
         }
-        async fn pull(&mut self, _request: PullRequest) -> Result<PullResult, Self::Error> {
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             if self.faults_left > 0 {
                 self.faults_left -= 1;
-                return Err(self.fault);
+                eprintln!("logical-db-sync test transport: scripted pull fault");
+                return std::future::ready(Err(self.fault));
             }
             self.pulls_seen.set(self.pulls_seen.get() + 1);
-            Ok(PullResult::Page(PullPage {
+            std::future::ready(Ok(PullResult::Page(PullPage {
                 protocol: PROTOCOL_VERSION,
                 changes: Vec::new(),
                 checkpoint: Checkpoint::from_wire(vec![7]).unwrap(),
                 more: false,
-            }))
+            })))
         }
     }
 
@@ -2647,10 +2791,12 @@ mod tests {
         pushes: RefCell<Vec<OperationId>>,
     }
 
-    #[allow(clippy::unused_async_trait_impl)]
     impl Transport for ServiceLog {
         type Error = Infallible;
-        async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
+        fn push(
+            &mut self,
+            request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
             let mut entries = self.entries.borrow_mut();
             let mut outcomes = Vec::with_capacity(request.changes.len());
             for change in &request.changes {
@@ -2672,12 +2818,15 @@ mod tests {
                     });
                 }
             }
-            Ok(PushResponse {
+            std::future::ready(Ok(PushResponse {
                 protocol: PROTOCOL_VERSION,
                 outcomes,
-            })
+            }))
         }
-        async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error> {
+        fn pull(
+            &mut self,
+            request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             let position = match &request.after {
                 None => 0_u64,
                 Some(checkpoint) => PositionalLog::position(checkpoint),
@@ -2700,13 +2849,13 @@ mod tests {
                 .collect::<Vec<_>>();
             let next = start + changes.len();
             let more = next < entries.len();
-            Ok(PullResult::Page(PullPage {
+            std::future::ready(Ok(PullResult::Page(PullPage {
                 protocol: PROTOCOL_VERSION,
                 changes,
                 checkpoint: Checkpoint::from_wire(PositionalLog::position_bytes(next as u64))
                     .unwrap(),
                 more,
-            }))
+            })))
         }
     }
 

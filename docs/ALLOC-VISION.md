@@ -1,5 +1,14 @@
 # ALLOC Vision: the application ledger of record
 
+> Evidence: S02 S03 S04 S05 cover opaque progress, ordered changes, and
+> explicit conflict provenance; S09 S10 S11 S12 S13 cover resumable logs,
+> conflict visibility, CRDT causality, local-first ownership, and convergence;
+> S14 S15 S16 S17 S18 cover transactional ordering, keyspaces, indirection,
+> bounds, and unknown commit outcomes; S19 S20 S21 S22 cover atomicity, WAL,
+> locking, and corruption refusal; S23 S24 S25 S26 cover idempotent APIs,
+> typed errors, canonical bytes, and identifiers. Source URLs are in
+> `evidence/SOURCES.md`.
+
 ALLOC (Application Ledger of record with Ontology, Clocks, and Checkpoints):
 data and its meaning share one content-addressed ledger, so every read cites
 the immutable changes that produced it.
@@ -7,7 +16,8 @@ the immutable changes that produced it.
 ## What is data here
 
 - A change is immutable and content-addressed. Episode identity is
-  `sha256(schema|seq|kind|payload)` (`crates/logical-db-episode`); CRDT edits
+  SHA-256 over a v1 framed schema, sequence, kind, scope, all seven clocks,
+  evidence, parents, and payload (`crates/logical-db-episode`); CRDT edits
   carry an `OperationDigest` over the change bytes (`README.md` facade example).
   Identity is recomputed on read; mismatch is refused.
 - Projection is deterministic. `Projection` maps document state to `IndexValue`

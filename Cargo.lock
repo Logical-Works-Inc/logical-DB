@@ -1285,6 +1285,7 @@ dependencies = [
 name = "logical-db-episode"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "logical-db-cairn",
  "serde",
  "sha2",

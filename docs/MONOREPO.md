@@ -1,6 +1,13 @@
 # Dev monorepo strategy
 
-> Evidence: S01-S28 per `evidence/SOURCES.md`; crate headers in
+> Evidence: S11 S12 S13 cover local-first ownership, causal records, and
+> convergence; S14 S15 S16 S17 S18 cover transactions, keyspaces, directory
+> indirection, limits, and retry outcomes; S19 S20 S21 S22 cover atomicity,
+> WAL, locking, and corruption refusal; S23 S24 S25 S26 cover HTTP semantics,
+> typed errors, canonical bytes, and identifiers; S27 S28 cover platform file
+> data and write boundaries; S31 S37 pin client dependency surfaces. Source
+> URLs are in
+> `evidence/SOURCES.md`; crate headers in
 > `crates/logical-db-cairn/src/lib.rs` and
 > `crates/logical-db-episode/src/lib.rs`.
 
@@ -21,11 +28,16 @@
 | `cairn/quarantine/cairn_python/world_token.py` | `logical-db-cairn` | Typed world-token vocabulary: 12 token kinds, 10 modalities, 9 link relations, 6 actionability levels |
 | `cairn/crates/wm-core` | `logical-db-cairn` | Authority-weight and content-hash concepts |
 | Cairn steering/memory broker (smb) | `logical-db-cairn` | Deny-first steering, trust-graded memory claims |
-| `LOGICAL-EVENT-MEMORY` `src/lib.rs`, wire v0 | `logical-db-episode` | Episode wire: identity `sha256(schema\|seq\|kind\|payload)` |
+| `LOGICAL-EVENT-MEMORY` `src/lib.rs`, wire v0 | `logical-db-episode` | Versioned v1 episode wire: scoped identity covers every immutable field |
 | `LOGICAL-EVENT-MEMORY` operators, `LocalWorld` | `logical-db-episode` | Operators and local-world record over an in-memory vector |
 
-Both crates are pure types plus bounded validation: no I/O, no storage, no
-network. All bounds fail closed.
+Both crates provide types and bounded validation, with rejection diagnostics
+on stderr and no storage or network access. Episode and log snapshots carry
+explicit v1 schema versions; legacy
+unversioned snapshots are rejected. Log snapshots serialize episodes only and
+rebuild the lookup index after validation. IDs reject zero values on decode;
+conversions between episode and observation IDs are fallible. Bounds reject
+oversized input before retaining it.
 
 ## Dependency DAG position
 

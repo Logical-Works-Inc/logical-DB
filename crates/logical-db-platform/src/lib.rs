@@ -62,7 +62,9 @@ fn platform_data_root() -> Result<PathBuf, PlatformError> {
             .map(|home| home.join(".local").join("share"));
     }
     #[allow(unreachable_code)]
-    Err(PlatformError::MissingDataRoot)
+    Err(PlatformError::MissingDataRoot {
+        context: "unsupported platform",
+    })
 }
 
 fn absolute_data_root(value: OsString) -> Result<PathBuf, PlatformError> {
@@ -77,7 +79,7 @@ fn absolute_data_root(value: OsString) -> Result<PathBuf, PlatformError> {
 fn nonempty_env(name: &'static str) -> Result<OsString, PlatformError> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
-        .ok_or(PlatformError::MissingDataRoot)
+        .ok_or(PlatformError::MissingDataRoot { context: name })
 }
 
 fn validate_application_id(value: &str) -> Result<(), PlatformError> {
@@ -89,6 +91,7 @@ fn validate_application_id(value: &str) -> Result<(), PlatformError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     {
+        eprintln!("logical-db-platform: validate_application_id: InvalidApplicationId");
         return Err(PlatformError::InvalidApplicationId);
     }
     Ok(())
@@ -101,8 +104,11 @@ pub enum PlatformError {
     #[error("application identifier must be bounded ASCII without path separators")]
     InvalidApplicationId,
     /// The process has no usable native per-user data root.
-    #[error("native per-user data root is unavailable")]
-    MissingDataRoot,
+    #[error("native per-user data root is unavailable: {context}")]
+    MissingDataRoot {
+        /// Required environment variable or unsupported platform.
+        context: &'static str,
+    },
     /// A process environment variable would place state relative to the CWD.
     #[error("native per-user data root must be absolute")]
     RelativeDataRoot,
