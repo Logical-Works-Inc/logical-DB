@@ -10,8 +10,8 @@ use std::{collections::BTreeSet, path::Path};
 
 pub use logical_db_model::MAX_SNAPSHOT_BYTES;
 use logical_db_model::{
-    ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue, MAX_CHANGE_BYTES,
-    OperationDigest, OperationId, PeerId, ReplicaId, Scope,
+    AccountId, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue,
+    MAX_CHANGE_BYTES, OperationDigest, OperationId, PeerId, ReplicaId, Scope, SpaceId,
 };
 use redb::{
     CommitError, Database, DatabaseError, Durability, ReadableDatabase, ReadableTable,
@@ -38,6 +38,18 @@ const KIND_EVENT_SEQUENCE: u8 = 12;
 const KIND_EVENT: u8 = 13;
 const KIND_MIGRATION: u8 = 14;
 const KIND_UPSTREAM: u8 = 15;
+const KIND_TOMBSTONE: u8 = 16;
+const KIND_RESTORE: u8 = 17;
+/// Magic prefix identifying a versioned logical export payload.
+const EXPORT_MAGIC: [u8; 5] = [b'L', b'D', b'B', b'E', 0x01];
+/// Version of the logical export payload defined in this module.
+pub const EXPORT_VERSION: u16 = 1;
+/// Maximum total bytes of one versioned logical export payload.
+pub const MAX_EXPORT_BYTES: usize = 67_108_864;
+const EXPORT_HEADER_BYTES: usize = 5 + 16 + 16;
+const EXPORT_ENTRY_PREFIX_BYTES: usize = 16 + 16 + 32 + 32 + 4;
+const EXPORT_DOCUMENT_PREFIX_BYTES: usize = 16 + 1 + 4;
+const RESTORE_MARKER_BYTES: usize = 32 + 8;
 /// Maximum aggregate snapshot state retained while installing or migrating one page.
 pub const MAX_MATERIALIZED_PAGE_BYTES: usize = 67_108_864;
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
@@ -78,7 +90,9 @@ impl<'a> LocalChange<'a> {
         bytes: &'a [u8],
     ) -> Result<Self, StoreError> {
         if !is_nonempty_bounded(bytes.len(), MAX_CHANGE_BYTES) {
-            return Err(StoreError::InvalidChangeSize(bytes.len()));
+            let error = StoreError::InvalidChangeSize(bytes.len());
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         Ok(Self {
             scope,
@@ -102,6 +116,12 @@ pub struct LocalCommit<'a> {
     pub snapshot: &'a [u8],
     /// Complete materialized index set for the successor snapshot.
     pub indexes: &'a [IndexEntry],
+    /// Whether the successor snapshot carries a first-class tombstone.
+    ///
+    /// Tombstoned documents keep their snapshot, change, operation, outbox,
+    /// and event rows; only secondary-index rows are cleared and reads
+    /// report absent. The flag is monotonic: once set it is never removed.
+    pub tombstone: bool,
 }
 
 /// Latest complete snapshot and its optimistic concurrency marker.
@@ -135,6 +155,11 @@ pub struct RemoteDocument<'a> {
     pub snapshot: &'a [u8],
     /// Complete materialized index set for the merged snapshot.
     pub indexes: &'a [IndexEntry],
+    /// Whether the merged snapshot carries a first-class tombstone.
+    ///
+    /// The flag is monotonic: installation sets it but never clears it, so
+    /// a late tombstone page converges to absent without resurrection.
+    pub tombstone: bool,
 }
 
 /// One stable secondary-index result.
@@ -184,6 +209,50 @@ pub struct MigrationIndexes<'a> {
     pub expected_revision: DocumentRevision,
     /// Complete target-schema index set.
     pub indexes: &'a [IndexEntry],
+}
+
+/// One ordered commit replayed by a versioned logical export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportEntry {
+    /// Document changed by the replayed commit.
+    pub document: DocumentId,
+    /// Original retryable logical operation identity, reused for exact retry.
+    pub operation: OperationId,
+    /// Canonical caller request identity bound to the operation.
+    pub request: OperationDigest,
+    /// Immutable CRDT change identity.
+    pub digest: ChangeDigest,
+    /// Canonical CRDT change bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// One document snapshot carried by a versioned logical export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportDocument {
+    /// Document ordered by its portable identifier.
+    pub document: DocumentId,
+    /// Whether the exported snapshot carries a first-class tombstone.
+    pub tombstone: bool,
+    /// Complete verified snapshot after the last exported change.
+    pub snapshot: Vec<u8>,
+}
+
+/// One bounded document page of a resumable logical export scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportScanPage {
+    /// Durable cursor the page was read from.
+    pub after: Option<DocumentId>,
+    /// Ordered documents following `after`.
+    pub documents: Vec<ExportDocument>,
+}
+
+/// Durable cursor of an interrupted versioned restore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestoreCursor {
+    /// Identity of the export payload the cursor belongs to.
+    pub payload: [u8; 32],
+    /// Index of the next history entry to replay.
+    pub next: u64,
 }
 
 /// Durable result of a local commit or exact retry.
@@ -244,39 +313,47 @@ impl EmbeddedStore {
         let database = Database::create(path)?;
         {
             let transaction = database.begin_read()?;
-            let normal = transaction
-                .list_tables()?
+            let tables = transaction.list_tables()?;
+            let normal = tables
                 .map(|table| table.name().to_owned())
                 .collect::<Vec<_>>();
             let multimaps = transaction.list_multimap_tables()?.count();
             if multimaps != 0 || normal.iter().any(|name| name != DATA.name()) {
-                return Err(StoreError::UnsupportedSchema);
+                let error = StoreError::UnsupportedSchema;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
             }
         }
         let mut transaction = database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            let existing_replica = table
-                .get(REPLICA_KEY)?
+        let mut table = transaction.open_table(DATA)?;
+        let existing_replica = {
+            let replica_value = table.get(REPLICA_KEY)?;
+            replica_value
                 .map(|value| decode_uuid(value.value()).map(ReplicaId::from_uuid))
-                .transpose()?;
-            match existing_replica {
-                Some(existing) if existing != replica => {
-                    return Err(StoreError::ReplicaMismatch {
-                        expected: existing,
-                        actual: replica,
-                    });
+                .transpose()?
+        };
+        match existing_replica {
+            Some(existing) if existing != replica => {
+                let error = StoreError::ReplicaMismatch {
+                    expected: existing,
+                    actual: replica,
+                };
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            Some(_) => {}
+            None => {
+                let mut entries = table.iter()?;
+                if entries.next().transpose()?.is_some() {
+                    let error = StoreError::MissingReplicaBinding;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
-                Some(_) => {}
-                None => {
-                    if table.iter()?.next().transpose()?.is_some() {
-                        return Err(StoreError::MissingReplicaBinding);
-                    }
-                    table.insert(REPLICA_KEY, replica.as_uuid().as_bytes().as_slice())?;
-                }
+                table.insert(REPLICA_KEY, replica.as_uuid().as_bytes().as_slice())?;
             }
         }
+        drop(table);
         transaction.commit()?;
         Ok(Self { database, replica })
     }
@@ -301,39 +378,43 @@ impl EmbeddedStore {
         digest: [u8; 32],
     ) -> Result<(), StoreError> {
         if version == 0 {
-            return Err(StoreError::InvalidSchemaVersion);
+            let error = StoreError::InvalidSchemaVersion;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let key = key_schema(scope);
         let expected = schema_value(version, digest);
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            if table.get(key_migration(scope).as_slice())?.is_some() {
-                return Err(StoreError::MigrationInProgress);
+        let mut table = transaction.open_table(DATA)?;
+        let migration_marker = table.get(key_migration(scope).as_slice())?.is_some();
+        if migration_marker {
+            let error = StoreError::MigrationInProgress;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        let existing = {
+            let value = table.get(key.as_slice())?;
+            value.map(|value| value.value().to_vec())
+        };
+        match existing.as_deref() {
+            Some(existing) if existing == expected => return Ok(()),
+            Some(_) => {
+                let error = StoreError::SchemaMigrationRequired;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
             }
-            let existing = table
-                .get(key.as_slice())?
-                .map(|value| value.value().to_vec());
-            match existing.as_deref() {
-                Some(existing) if existing == expected => return Ok(()),
-                Some(_) => return Err(StoreError::SchemaMigrationRequired),
-                None => {
-                    let scope_prefix = scope_prefix(scope);
-                    let scope_end =
-                        next_prefix(&scope_prefix).ok_or(StoreError::CorruptInternalValue)?;
-                    if table
-                        .range(scope_prefix.as_slice()..scope_end.as_slice())?
-                        .next()
-                        .transpose()?
-                        .is_some()
-                    {
-                        return Err(StoreError::SchemaMigrationRequired);
-                    }
-                    table.insert(key.as_slice(), expected.as_slice())?;
+            None => {
+                let has_scope_entries = scope_has_records(&table, scope)?;
+                if has_scope_entries {
+                    let error = StoreError::SchemaMigrationRequired;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
+                table.insert(key.as_slice(), expected.as_slice())?;
             }
         }
+        drop(table);
         transaction.commit()?;
         Ok(())
     }
@@ -354,29 +435,31 @@ impl EmbeddedStore {
         digest: [u8; 32],
     ) -> Result<(), StoreError> {
         if version == 0 {
-            return Err(StoreError::InvalidSchemaVersion);
+            let error = StoreError::InvalidSchemaVersion;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let target = schema_value(version, digest);
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            let key = key_migration(scope);
-            let marker = table
-                .get(key.as_slice())?
-                .map(|value| value.value().to_vec());
-            match marker.as_deref() {
-                Some(value) => {
-                    let (existing, _) = decode_migration(value)?;
-                    if existing != target {
-                        return Err(StoreError::MigrationTargetMismatch);
-                    }
-                }
-                None => {
-                    table.insert(key.as_slice(), encode_migration(target, None).as_slice())?;
+        let mut table = transaction.open_table(DATA)?;
+        let key = key_migration(scope);
+        let marker_value = table.get(key.as_slice())?;
+        let marker = marker_value.map(|value| value.value().to_vec());
+        match marker.as_deref() {
+            Some(value) => {
+                let (existing, _) = decode_migration(value)?;
+                if existing != target {
+                    let error = StoreError::MigrationTargetMismatch;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
             }
+            None => {
+                table.insert(key.as_slice(), encode_migration(target, None).as_slice())?;
+            }
         }
+        drop(table);
         transaction.commit()?;
         Ok(())
     }
@@ -395,17 +478,20 @@ impl EmbeddedStore {
         limit: usize,
     ) -> Result<MigrationPage, StoreError> {
         if !(1..=256).contains(&limit) {
-            return Err(StoreError::InvalidMigrationLimit(limit));
+            let error = StoreError::InvalidMigrationLimit(limit);
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let target = schema_value(version, digest);
         let transaction = self.database.begin_read()?;
         let table = transaction.open_table(DATA)?;
-        let marker = table
-            .get(key_migration(scope).as_slice())?
-            .ok_or(StoreError::MigrationNotInProgress)?;
+        let marker_value = table.get(key_migration(scope).as_slice())?;
+        let marker = marker_value.ok_or(StoreError::MigrationNotInProgress)?;
         let (existing, after) = decode_migration(marker.value())?;
         if existing != target {
-            return Err(StoreError::MigrationTargetMismatch);
+            let error = StoreError::MigrationTargetMismatch;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let row_prefix = prefix(scope, KIND_SNAPSHOT);
         let end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
@@ -416,11 +502,14 @@ impl EmbeddedStore {
         }
         let mut documents = Vec::with_capacity(limit);
         let mut materialized_bytes = 0usize;
-        for entry in table.range(start.as_slice()..end.as_slice())?.take(limit) {
+        let entries = table.range(start.as_slice()..end.as_slice())?;
+        for entry in entries.take(limit) {
             let (key, value) = entry?;
             let snapshot_bytes = value.value().len();
             if !is_nonempty_bounded(snapshot_bytes, MAX_SNAPSHOT_BYTES) {
-                return Err(StoreError::CorruptInternalValue);
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
             }
             let Some(next_bytes) = add_materialized_bytes(materialized_bytes, snapshot_bytes)
             else {
@@ -428,10 +517,7 @@ impl EmbeddedStore {
             };
             let document =
                 decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)?;
-            let revision = table
-                .get(key_revision(scope, document).as_slice())?
-                .ok_or(StoreError::CorruptInternalValue)
-                .and_then(|value| decode_revision(value.value()))?;
+            let revision = stored_revision(&table, scope, document)?;
             documents.push(MigrationDocument {
                 document,
                 revision,
@@ -458,13 +544,17 @@ impl EmbeddedStore {
         documents: &[MigrationIndexes<'_>],
     ) -> Result<(), StoreError> {
         if documents.is_empty() || !is_at_most(documents.len(), 256) {
-            return Err(StoreError::InvalidMigrationPage);
+            let error = StoreError::InvalidMigrationPage;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let target = schema_value(version, digest);
         let mut previous = after;
         for document in documents {
             if previous.is_some_and(|cursor| document.document <= cursor) {
-                return Err(StoreError::InvalidMigrationPage);
+                let error = StoreError::InvalidMigrationPage;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
             }
             validate_indexes(document.indexes)?;
             previous = Some(document.document);
@@ -472,62 +562,68 @@ impl EmbeddedStore {
         let last = previous.ok_or(StoreError::InvalidMigrationPage)?;
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            let marker_key = key_migration(scope);
-            let marker = table
-                .get(marker_key.as_slice())?
-                .ok_or(StoreError::MigrationNotInProgress)?
-                .value()
-                .to_vec();
-            let (existing, durable_after) = decode_migration(&marker)?;
-            if existing != target {
-                return Err(StoreError::MigrationTargetMismatch);
-            }
-            if durable_after != after {
-                return Err(StoreError::StaleMigrationPage);
-            }
-            let row_prefix = prefix(scope, KIND_SNAPSHOT);
-            let row_end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
-            let mut row_start = row_prefix.clone();
-            if let Some(document) = durable_after {
-                row_start.extend_from_slice(document.as_uuid().as_bytes());
-                row_start.push(0);
-            }
-            let expected_documents = table
-                .range(row_start.as_slice()..row_end.as_slice())?
-                .take(documents.len())
-                .map(|entry| {
-                    let (key, _value) = entry?;
-                    if key.value().len() != row_prefix.len() + 16 {
-                        return Err(StoreError::CorruptInternalValue);
-                    }
-                    decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?;
-            if expected_documents.len() != documents.len()
-                || expected_documents
-                    .iter()
-                    .zip(documents)
-                    .any(|(expected, supplied)| *expected != supplied.document)
-            {
-                return Err(StoreError::InvalidMigrationPage);
-            }
-            for document in documents {
-                let revision = table
-                    .get(key_revision(scope, document.document).as_slice())?
-                    .ok_or(StoreError::CorruptInternalValue)
-                    .and_then(|value| decode_revision(value.value()))?;
-                if revision != document.expected_revision {
-                    return Err(StoreError::StaleDocument);
-                }
-                replace_indexes(&mut table, scope, document.document, document.indexes)?;
-            }
-            table.insert(
-                marker_key.as_slice(),
-                encode_migration(target, Some(last)).as_slice(),
-            )?;
+        let mut table = transaction.open_table(DATA)?;
+        let marker_key = key_migration(scope);
+        let marker = {
+            let marker_value = table.get(marker_key.as_slice())?;
+            let marker_value = marker_value.ok_or(StoreError::MigrationNotInProgress)?;
+            marker_value.value().to_vec()
+        };
+        let (existing, durable_after) = decode_migration(&marker)?;
+        if existing != target {
+            let error = StoreError::MigrationTargetMismatch;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
+        if durable_after != after {
+            let error = StoreError::StaleMigrationPage;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        let row_prefix = prefix(scope, KIND_SNAPSHOT);
+        let row_end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
+        let mut row_start = row_prefix.clone();
+        if let Some(document) = durable_after {
+            row_start.extend_from_slice(document.as_uuid().as_bytes());
+            row_start.push(0);
+        }
+        let expected_entries = table.range(row_start.as_slice()..row_end.as_slice())?;
+        let expected_documents = expected_entries
+            .take(documents.len())
+            .map(|entry| {
+                let (key, _value) = entry?;
+                if key.value().len() != row_prefix.len() + 16 {
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
+                }
+                decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        if expected_documents.len() != documents.len()
+            || expected_documents
+                .iter()
+                .zip(documents)
+                .any(|(expected, supplied)| *expected != supplied.document)
+        {
+            let error = StoreError::InvalidMigrationPage;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        for document in documents {
+            let revision = stored_revision(&table, scope, document.document)?;
+            if revision != document.expected_revision {
+                let error = StoreError::StaleDocument;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            replace_indexes(&mut table, scope, document.document, document.indexes)?;
+        }
+        table.insert(
+            marker_key.as_slice(),
+            encode_migration(target, Some(last)).as_slice(),
+        )?;
+        drop(table);
         transaction.commit()?;
         Ok(())
     }
@@ -547,38 +643,139 @@ impl EmbeddedStore {
         let target = schema_value(version, digest);
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            let marker_key = key_migration(scope);
-            let marker = table
-                .get(marker_key.as_slice())?
-                .ok_or(StoreError::MigrationNotInProgress)?
-                .value()
-                .to_vec();
-            let (existing, after) = decode_migration(&marker)?;
-            if existing != target {
-                return Err(StoreError::MigrationTargetMismatch);
-            }
-            let row_prefix = prefix(scope, KIND_SNAPSHOT);
-            let end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
-            let mut start = row_prefix;
-            if let Some(document) = after {
-                start.extend_from_slice(document.as_uuid().as_bytes());
-                start.push(0);
-            }
-            if table
-                .range(start.as_slice()..end.as_slice())?
-                .next()
-                .transpose()?
-                .is_some()
-            {
-                return Err(StoreError::MigrationIncomplete);
-            }
-            table.insert(key_schema(scope).as_slice(), target.as_slice())?;
-            table.remove(marker_key.as_slice())?;
+        let mut table = transaction.open_table(DATA)?;
+        let marker_key = key_migration(scope);
+        let marker = {
+            let marker_value = table.get(marker_key.as_slice())?;
+            let marker_value = marker_value.ok_or(StoreError::MigrationNotInProgress)?;
+            marker_value.value().to_vec()
+        };
+        let (existing, after) = decode_migration(&marker)?;
+        if existing != target {
+            let error = StoreError::MigrationTargetMismatch;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
+        let row_prefix = prefix(scope, KIND_SNAPSHOT);
+        let end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
+        let mut start = row_prefix;
+        if let Some(document) = after {
+            start.extend_from_slice(document.as_uuid().as_bytes());
+            start.push(0);
+        }
+        let mut remaining_entries = table.range(start.as_slice()..end.as_slice())?;
+        let has_remaining = remaining_entries.next().transpose()?.is_some();
+        if has_remaining {
+            let error = StoreError::MigrationIncomplete;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        table.insert(key_schema(scope).as_slice(), target.as_slice())?;
+        table.remove(marker_key.as_slice())?;
+        drop(table);
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Reads the next bounded document page for a versioned logical export.
+    ///
+    /// Documents arrive in stable identifier order with their complete
+    /// snapshot and tombstone flag, so an interrupted export resumes from
+    /// `after` without re-reading the prefix. Snapshots stay bounded by the
+    /// same aggregate materialized budget as migration pages.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an invalid page size, an active schema migration, or malformed
+    /// durable state.
+    pub fn export_scan(
+        &self,
+        scope: Scope,
+        after: Option<DocumentId>,
+        limit: usize,
+    ) -> Result<ExportScanPage, StoreError> {
+        if !(1..=256).contains(&limit) {
+            let error = StoreError::InvalidExportLimit(limit);
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        let row_prefix = prefix(scope, KIND_SNAPSHOT);
+        let end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
+        let mut start = row_prefix.clone();
+        if let Some(document) = after {
+            start.extend_from_slice(document.as_uuid().as_bytes());
+            start.push(0);
+        }
+        let mut documents = Vec::new();
+        let mut materialized_bytes = 0usize;
+        for entry in table.range(start.as_slice()..end.as_slice())?.take(limit) {
+            let (key, value) = entry?;
+            if key.value().len() != row_prefix.len() + 16 {
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            let snapshot = value.value();
+            if !is_nonempty_bounded(snapshot.len(), MAX_SNAPSHOT_BYTES) {
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            let Some(next_bytes) = add_materialized_bytes(materialized_bytes, snapshot.len())
+            else {
+                break;
+            };
+            documents.push(export_document(
+                &table,
+                scope,
+                key.value(),
+                row_prefix.len(),
+                snapshot,
+            )?);
+            materialized_bytes = next_bytes;
+        }
+        Ok(ExportScanPage { after, documents })
+    }
+
+    /// Reads the full ordered commit history including acknowledged entries.
+    ///
+    /// Unlike [`EmbeddedStore::outbox_page`], acknowledgement only advances
+    /// the transport cursor and never hides history from an export: a backup
+    /// must replay every commit to reproduce outbox and event cursors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, decode, read, or table error.
+    pub fn history_page(
+        &self,
+        scope: Scope,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<OutboxEntry>, StoreError> {
+        if !(1..=256).contains(&limit) {
+            let error = StoreError::InvalidOutboxLimit(limit);
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        if after == u64::MAX {
+            return Ok(Vec::new());
+        }
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        let start = key_outbox(scope, after + 1);
+        let end = prefix(scope, KIND_SEQUENCE);
+        table
+            .range(start.as_slice()..end.as_slice())?
+            .take(limit)
+            .map(|entry| {
+                let (key, value) = entry?;
+                let sequence = decode_sequence_key(key.value())?;
+                decode_outbox(sequence, value.value())
+            })
+            .collect()
     }
 
     /// Atomically saves a document snapshot, immutable change, operation
@@ -590,7 +787,9 @@ impl EmbeddedStore {
     /// for different change bytes returns [`StoreError::OperationConflict`].
     pub fn commit_local(&self, commit: LocalCommit<'_>) -> Result<CommitOutcome, StoreError> {
         if !is_nonempty_bounded(commit.snapshot.len(), MAX_SNAPSHOT_BYTES) {
-            return Err(StoreError::InvalidSnapshotSize(commit.snapshot.len()));
+            let error = StoreError::InvalidSnapshotSize(commit.snapshot.len());
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         validate_indexes(commit.indexes)?;
 
@@ -598,90 +797,79 @@ impl EmbeddedStore {
         let operation_key = key_operation(scope, commit.change.operation);
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        let sequence = {
-            let mut table = transaction.open_table(DATA)?;
-            ensure_not_migrating(&table, scope)?;
-            if let Some(existing) = table.get(operation_key.as_slice())? {
-                let existing = decode_operation(existing.value())?;
-                if existing.document == commit.change.document
-                    && existing.request == commit.change.request
-                    && existing.digest == commit.change.digest
-                {
-                    let change_key = key_change(scope, existing.document, existing.digest);
-                    let existing_bytes = table
-                        .get(change_key.as_slice())?
-                        .ok_or(StoreError::CorruptInternalValue)?;
-                    if existing_bytes.value() == commit.change.bytes {
-                        return Ok(CommitOutcome::Duplicate {
-                            sequence: existing.sequence,
-                        });
-                    }
-                }
-                return Err(StoreError::OperationConflict);
-            }
+        let mut table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        if let Some(sequence) = existing_local_sequence(&table, &commit, &operation_key)? {
+            return Ok(CommitOutcome::Duplicate { sequence });
+        }
 
-            let revision_key = key_revision(scope, commit.change.document);
-            let current_revision = table
-                .get(revision_key.as_slice())?
-                .map(|value| decode_revision(value.value()))
-                .transpose()?;
-            if current_revision != commit.expected_revision {
-                return Err(StoreError::StaleDocument);
-            }
-            let next_revision = match current_revision {
-                Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
-                None => DocumentRevision::new(1),
-            };
-
-            let sequence_key = key_sequence(scope);
-            let previous = table
-                .get(sequence_key.as_slice())?
-                .map(|value| decode_u64(value.value()))
-                .transpose()?
-                .unwrap_or(0);
-            let sequence = previous
-                .checked_add(1)
-                .ok_or(StoreError::SequenceExhausted)?;
-            let event_sequence = table
-                .get(key_event_sequence(scope).as_slice())?
-                .map(|value| decode_u64(value.value()))
-                .transpose()?
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or(StoreError::SequenceExhausted)?;
-
-            let document_key = key_snapshot(scope, commit.change.document);
-            let change_key = key_change(scope, commit.change.document, commit.change.digest);
-            let outbox_key = key_outbox(scope, sequence);
-            let operation_value = encode_operation(
-                commit.change.document,
-                commit.change.request,
-                commit.change.digest,
-                sequence,
-            );
-            let outbox_value = encode_outbox(commit.change);
-            let sequence_value = sequence.to_be_bytes();
-
-            table.insert(document_key.as_slice(), commit.snapshot)?;
-            table.insert(change_key.as_slice(), commit.change.bytes)?;
-            table.insert(operation_key.as_slice(), operation_value.as_slice())?;
-            table.insert(outbox_key.as_slice(), outbox_value.as_slice())?;
-            table.insert(sequence_key.as_slice(), sequence_value.as_slice())?;
-            table.insert(
-                revision_key.as_slice(),
-                next_revision.get().to_be_bytes().as_slice(),
-            )?;
-            replace_indexes(&mut table, scope, commit.change.document, commit.indexes)?;
-            table.insert(
-                key_event(scope, event_sequence).as_slice(),
-                encode_event(commit.change.document, commit.change.digest).as_slice(),
-            )?;
-            table.insert(
-                key_event_sequence(scope).as_slice(),
-                event_sequence.to_be_bytes().as_slice(),
-            )?;
-            sequence
+        let revision_key = key_revision(scope, commit.change.document);
+        let current_revision = table
+            .get(revision_key.as_slice())?
+            .map(|value| decode_revision(value.value()))
+            .transpose()?;
+        if current_revision != commit.expected_revision {
+            let error = StoreError::StaleDocument;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        let next_revision = match current_revision {
+            Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+            None => DocumentRevision::new(1),
         };
+        check_tombstone_transition(&table, scope, commit.change.document, commit.tombstone)?;
+
+        let sequence_key = key_sequence(scope);
+        let previous = table
+            .get(sequence_key.as_slice())?
+            .map(|value| decode_u64(value.value()))
+            .transpose()?
+            .unwrap_or(0);
+        let sequence = previous
+            .checked_add(1)
+            .ok_or(StoreError::SequenceExhausted)?;
+        let event_sequence = table
+            .get(key_event_sequence(scope).as_slice())?
+            .map(|value| decode_u64(value.value()))
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(StoreError::SequenceExhausted)?;
+
+        let document_key = key_snapshot(scope, commit.change.document);
+        let change_key = key_change(scope, commit.change.document, commit.change.digest);
+        let outbox_key = key_outbox(scope, sequence);
+        let operation_value = encode_operation(
+            commit.change.document,
+            commit.change.request,
+            commit.change.digest,
+            sequence,
+        );
+        let outbox_value = encode_outbox(commit.change);
+        let sequence_value = sequence.to_be_bytes();
+
+        table.insert(document_key.as_slice(), commit.snapshot)?;
+        table.insert(change_key.as_slice(), commit.change.bytes)?;
+        table.insert(operation_key.as_slice(), operation_value.as_slice())?;
+        table.insert(outbox_key.as_slice(), outbox_value.as_slice())?;
+        table.insert(sequence_key.as_slice(), sequence_value.as_slice())?;
+        table.insert(
+            revision_key.as_slice(),
+            next_revision.get().to_be_bytes().as_slice(),
+        )?;
+        if commit.tombstone {
+            write_tombstone(&mut table, scope, commit.change.document)?;
+        }
+        replace_indexes(&mut table, scope, commit.change.document, commit.indexes)?;
+        table.insert(
+            key_event(scope, event_sequence).as_slice(),
+            encode_event(commit.change.document, commit.change.digest).as_slice(),
+        )?;
+        table.insert(
+            key_event_sequence(scope).as_slice(),
+            event_sequence.to_be_bytes().as_slice(),
+        )?;
+        drop(table);
         transaction.commit()?;
         Ok(CommitOutcome::Applied { sequence })
     }
@@ -705,22 +893,7 @@ impl EmbeddedStore {
             .map(|value| decode_operation(value.value()))
             .transpose()?;
         if let Some(committed) = committed {
-            if table
-                .get(key_change(scope, committed.document, committed.digest).as_slice())?
-                .is_none()
-            {
-                return Err(StoreError::CorruptInternalValue);
-            }
-            let outbox = table
-                .get(key_outbox(scope, committed.sequence).as_slice())?
-                .ok_or(StoreError::CorruptInternalValue)?;
-            let outbox = decode_outbox(committed.sequence, outbox.value())?;
-            if outbox.document != committed.document
-                || outbox.operation != operation
-                || outbox.digest != committed.digest
-            {
-                return Err(StoreError::CorruptInternalValue);
-            }
+            verify_operation_links(&table, scope, operation, committed)?;
         }
         Ok(committed)
     }
@@ -743,7 +916,9 @@ impl EmbeddedStore {
             .get(snapshot_key.as_slice())?
             .map(|value| {
                 if !is_nonempty_bounded(value.value().len(), MAX_SNAPSHOT_BYTES) {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 Ok(value.value().to_vec())
             })
@@ -759,6 +934,22 @@ impl EmbeddedStore {
         }
     }
 
+    /// Returns whether a first-class tombstone is durably recorded.
+    ///
+    /// The flag is monotonic: once a local delete or a remote tombstone page
+    /// commits it, neither restarts nor later non-tombstone pages clear it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed read or table error when durable state cannot be read.
+    pub fn is_tombstoned(&self, scope: Scope, document: DocumentId) -> Result<bool, StoreError> {
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        Ok(table
+            .get(key_tombstone(scope, document).as_slice())?
+            .is_some_and(|value| value.value() == [1_u8]))
+    }
+
     /// Reads a bounded ordered page from the durable local outbox.
     ///
     /// # Errors
@@ -771,7 +962,9 @@ impl EmbeddedStore {
         limit: usize,
     ) -> Result<Vec<OutboxEntry>, StoreError> {
         if !(1..=256).contains(&limit) {
-            return Err(StoreError::InvalidOutboxLimit(limit));
+            let error = StoreError::InvalidOutboxLimit(limit);
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         if after == u64::MAX {
             return Ok(Vec::new());
@@ -812,7 +1005,9 @@ impl EmbeddedStore {
         limit: usize,
     ) -> Result<Vec<ChangeEvent>, StoreError> {
         if !(1..=256).contains(&limit) {
-            return Err(StoreError::InvalidEventLimit(limit));
+            let error = StoreError::InvalidEventLimit(limit);
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         if after == u64::MAX {
             return Ok(Vec::new());
@@ -836,13 +1031,17 @@ impl EmbeddedStore {
                     .get(key_change(scope, event.document, event.digest).as_slice())?
                     .ok_or(StoreError::CorruptInternalValue)?;
                 if !is_nonempty_bounded(change.value().len(), MAX_CHANGE_BYTES) {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 let snapshot = table
                     .get(key_snapshot(scope, event.document).as_slice())?
                     .ok_or(StoreError::CorruptInternalValue)?;
                 if !is_nonempty_bounded(snapshot.value().len(), MAX_SNAPSHOT_BYTES) {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 let revision = table
                     .get(key_revision(scope, event.document).as_slice())?
@@ -871,7 +1070,9 @@ impl EmbeddedStore {
             .get(key.as_slice())?
             .map(|value| {
                 if !is_nonempty_bounded(value.value().len(), MAX_CHANGE_BYTES) {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 Ok(value.value().to_vec())
             })
@@ -893,7 +1094,9 @@ impl EmbeddedStore {
         limit: usize,
     ) -> Result<Vec<IndexHit>, StoreError> {
         if !(1..=256).contains(&limit) {
-            return Err(StoreError::InvalidIndexLimit(limit));
+            let error = StoreError::InvalidIndexLimit(limit);
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let encoded = encode_index_value(value)?;
         let row_prefix = index_row_prefix(scope, index, &encoded);
@@ -912,10 +1115,14 @@ impl EmbeddedStore {
             .map(|entry| {
                 let (key, value) = entry?;
                 if key.value().len() != row_prefix.len() + 16 {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 if value.value() != [1_u8] {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 let document =
                     decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)?;
@@ -923,13 +1130,17 @@ impl EmbeddedStore {
                     .get(key_index_reverse(scope, document, index).as_slice())?
                     .ok_or(StoreError::CorruptInternalValue)?;
                 if reverse.value() != encoded.as_slice() {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 let snapshot = table
                     .get(key_snapshot(scope, document).as_slice())?
                     .ok_or(StoreError::CorruptInternalValue)?;
                 if !is_nonempty_bounded(snapshot.value().len(), MAX_SNAPSHOT_BYTES) {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 let revision = table
                     .get(key_revision(scope, document).as_slice())?
@@ -955,29 +1166,30 @@ impl EmbeddedStore {
     ) -> Result<(), StoreError> {
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            ensure_not_migrating(&table, scope)?;
-            bind_upstream_in_table(&mut table, scope, peer)?;
-            let highest = table
-                .get(key_sequence(scope).as_slice())?
-                .map(|value| decode_u64(value.value()))
-                .transpose()?
-                .unwrap_or(0);
-            if through > highest {
-                return Err(StoreError::InvalidAcknowledgement { through, highest });
-            }
-            let current = table
-                .get(key_outbox_ack(scope).as_slice())?
-                .map(|value| decode_u64(value.value()))
-                .transpose()?
-                .unwrap_or(0);
-            let acknowledged = current.max(through);
-            table.insert(
-                key_outbox_ack(scope).as_slice(),
-                acknowledged.to_be_bytes().as_slice(),
-            )?;
+        let mut table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        bind_upstream_in_table(&mut table, scope, peer)?;
+        let highest_value = table.get(key_sequence(scope).as_slice())?;
+        let highest = highest_value
+            .map(|value| decode_u64(value.value()))
+            .transpose()?
+            .unwrap_or(0);
+        if through > highest {
+            let error = StoreError::InvalidAcknowledgement { through, highest };
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
+        let current_value = table.get(key_outbox_ack(scope).as_slice())?;
+        let current = current_value
+            .map(|value| decode_u64(value.value()))
+            .transpose()?
+            .unwrap_or(0);
+        let acknowledged = current.max(through);
+        table.insert(
+            key_outbox_ack(scope).as_slice(),
+            acknowledged.to_be_bytes().as_slice(),
+        )?;
+        drop(table);
         transaction.commit()?;
         Ok(())
     }
@@ -995,11 +1207,10 @@ impl EmbeddedStore {
     pub fn bind_upstream(&self, scope: Scope, peer: PeerId) -> Result<(), StoreError> {
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut table = transaction.open_table(DATA)?;
-            ensure_not_migrating(&table, scope)?;
-            bind_upstream_in_table(&mut table, scope, peer)?;
-        }
+        let mut table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        bind_upstream_in_table(&mut table, scope, peer)?;
+        drop(table);
         transaction.commit()?;
         Ok(())
     }
@@ -1016,7 +1227,9 @@ impl EmbeddedStore {
             .get(key_checkpoint(scope, peer).as_slice())?
             .map(|value| {
                 if !is_nonempty_bounded(value.value().len(), MAX_CHECKPOINT_BYTES) {
-                    return Err(StoreError::CorruptInternalValue);
+                    let error = StoreError::CorruptInternalValue;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
                 }
                 Ok(value.value().to_vec())
             })
@@ -1042,67 +1255,213 @@ impl EmbeddedStore {
 
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
-        {
+        let mut table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        bind_upstream_in_table(&mut table, scope, peer)?;
+        for document in documents {
+            let revision_key = key_revision(scope, document.document);
+            let current_value = table.get(revision_key.as_slice())?;
+            let current = current_value
+                .map(|value| decode_revision(value.value()))
+                .transpose()?;
+            if current != document.expected_revision {
+                let error = StoreError::StaleDocument;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+        }
+        let mut new_changes = Vec::new();
+        for change in changes {
+            let key = key_change(scope, change.document, change.digest);
+            let existing = table
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec());
+            if let Some(existing) = existing {
+                if existing != change.bytes {
+                    let error = StoreError::ChangeDigestConflict;
+                    eprintln!("logical-db-store: {error:?}");
+                    return Err(error);
+                }
+            } else {
+                table.insert(key.as_slice(), change.bytes)?;
+                new_changes.push((change.document, change.digest));
+            }
+        }
+        for document in documents {
+            install_remote_document(&mut table, scope, document)?;
+        }
+        let event_sequence_value = table.get(key_event_sequence(scope).as_slice())?;
+        let mut event_sequence = event_sequence_value
+            .map(|value| decode_u64(value.value()))
+            .transpose()?
+            .unwrap_or(0);
+        for (document, digest) in new_changes {
+            event_sequence = event_sequence
+                .checked_add(1)
+                .ok_or(StoreError::SequenceExhausted)?;
+            table.insert(
+                key_event(scope, event_sequence).as_slice(),
+                encode_event(document, digest).as_slice(),
+            )?;
+        }
+        table.insert(
+            key_event_sequence(scope).as_slice(),
+            event_sequence.to_be_bytes().as_slice(),
+        )?;
+        table.insert(key_checkpoint(scope, peer).as_slice(), checkpoint)?;
+        drop(table);
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Starts a versioned restore or resumes the matching interrupted one.
+    ///
+    /// The payload identity binds the durable cursor to one exact export:
+    /// resuming with different bytes fails closed instead of interleaving two
+    /// histories. The cursor survives process death; a crash between a commit
+    /// and its cursor advance replays one exact-retry duplicate on retry.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an active migration, a different in-progress payload, or a
+    /// storage failure.
+    pub fn restore_begin(
+        &self,
+        scope: Scope,
+        payload: &[u8; 32],
+    ) -> Result<RestoreCursor, StoreError> {
+        let mut transaction = self.database.begin_write()?;
+        transaction.set_durability(Durability::Immediate)?;
+        let cursor = {
             let mut table = transaction.open_table(DATA)?;
             ensure_not_migrating(&table, scope)?;
-            bind_upstream_in_table(&mut table, scope, peer)?;
-            for document in documents {
-                let revision_key = key_revision(scope, document.document);
-                let current = table
-                    .get(revision_key.as_slice())?
-                    .map(|value| decode_revision(value.value()))
-                    .transpose()?;
-                if current != document.expected_revision {
-                    return Err(StoreError::StaleDocument);
+            let existing = table
+                .get(key_restore(scope).as_slice())?
+                .map(|value| value.value().to_vec());
+            match existing {
+                None => {
+                    let cursor = RestoreCursor {
+                        payload: *payload,
+                        next: 0,
+                    };
+                    table.insert(
+                        key_restore(scope).as_slice(),
+                        encode_restore_cursor(cursor).as_slice(),
+                    )?;
+                    cursor
                 }
-            }
-            let mut new_changes = Vec::new();
-            for change in changes {
-                let key = key_change(scope, change.document, change.digest);
-                if let Some(existing) = table.get(key.as_slice())? {
-                    if existing.value() != change.bytes {
-                        return Err(StoreError::ChangeDigestConflict);
+                Some(raw) => {
+                    let existing = decode_restore_cursor(&raw)?;
+                    if existing.payload != *payload {
+                        let error = StoreError::RestoreInProgress;
+                        eprintln!("logical-db-store: {error:?}");
+                        return Err(error);
                     }
-                } else {
-                    table.insert(key.as_slice(), change.bytes)?;
-                    new_changes.push((change.document, change.digest));
+                    existing
                 }
             }
-            for document in documents {
-                let next = match document.expected_revision {
-                    Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
-                    None => DocumentRevision::new(1),
-                };
-                table.insert(
-                    key_snapshot(scope, document.document).as_slice(),
-                    document.snapshot,
-                )?;
-                table.insert(
-                    key_revision(scope, document.document).as_slice(),
-                    next.get().to_be_bytes().as_slice(),
-                )?;
-                replace_indexes(&mut table, scope, document.document, document.indexes)?;
-            }
-            let mut event_sequence = table
-                .get(key_event_sequence(scope).as_slice())?
-                .map(|value| decode_u64(value.value()))
-                .transpose()?
-                .unwrap_or(0);
-            for (document, digest) in new_changes {
-                event_sequence = event_sequence
-                    .checked_add(1)
-                    .ok_or(StoreError::SequenceExhausted)?;
-                table.insert(
-                    key_event(scope, event_sequence).as_slice(),
-                    encode_event(document, digest).as_slice(),
-                )?;
-            }
-            table.insert(
-                key_event_sequence(scope).as_slice(),
-                event_sequence.to_be_bytes().as_slice(),
-            )?;
-            table.insert(key_checkpoint(scope, peer).as_slice(), checkpoint)?;
+        };
+        transaction.commit()?;
+        Ok(cursor)
+    }
+
+    /// Loads the durable restore cursor for a scope, when one is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed read or corruption error.
+    pub fn restore_cursor(&self, scope: Scope) -> Result<Option<RestoreCursor>, StoreError> {
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        table
+            .get(key_restore(scope).as_slice())?
+            .map(|value| decode_restore_cursor(value.value()))
+            .transpose()
+    }
+
+    /// Advances the durable restore cursor past one replayed history entry.
+    ///
+    /// Each advance is its own immediate transaction so a crash replays at
+    /// most one entry, which the commit path short-circuits as an exact
+    /// duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a missing cursor, a foreign payload identity, or a storage
+    /// failure.
+    pub fn restore_advance(
+        &self,
+        scope: Scope,
+        payload: &[u8; 32],
+        next: u64,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.database.begin_write()?;
+        transaction.set_durability(Durability::Immediate)?;
+        let mut table = transaction.open_table(DATA)?;
+        let existing = {
+            let existing_value = table.get(key_restore(scope).as_slice())?;
+            let existing_value = existing_value.ok_or(StoreError::RestoreNotInProgress)?;
+            decode_restore_cursor(existing_value.value())?
+        };
+        if existing.payload != *payload {
+            let error = StoreError::RestoreInProgress;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
+        table.insert(
+            key_restore(scope).as_slice(),
+            encode_restore_cursor(RestoreCursor {
+                payload: *payload,
+                next,
+            })
+            .as_slice(),
+        )?;
+        drop(table);
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Verifies every replayed document revision and clears the cursor.
+    ///
+    /// Verification and removal share one immediate transaction: the cursor
+    /// only clears when durable state proves the full replay landed.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a missing or foreign cursor, or any revision that diverges
+    /// from the replayed expectation.
+    pub fn restore_finish(
+        &self,
+        scope: Scope,
+        payload: &[u8; 32],
+        expected: &[(DocumentId, DocumentRevision)],
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.database.begin_write()?;
+        transaction.set_durability(Durability::Immediate)?;
+        let mut table = transaction.open_table(DATA)?;
+        let existing = {
+            let existing_value = table.get(key_restore(scope).as_slice())?;
+            let existing_value = existing_value.ok_or(StoreError::RestoreNotInProgress)?;
+            decode_restore_cursor(existing_value.value())?
+        };
+        if existing.payload != *payload {
+            let error = StoreError::RestoreInProgress;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        for (document, revision) in expected {
+            let current_value = table.get(key_revision(scope, *document).as_slice())?;
+            let current = current_value
+                .map(|value| decode_revision(value.value()))
+                .transpose()?;
+            if current != Some(*revision) {
+                let error = StoreError::RestoreIncomplete;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+        }
+        table.remove(key_restore(scope).as_slice())?;
+        drop(table);
         transaction.commit()?;
         Ok(())
     }
@@ -1142,6 +1501,13 @@ pub enum StoreError {
     /// The document changed after its input snapshot was read.
     #[error("document changed before the successor snapshot committed")]
     StaleDocument,
+    /// A non-tombstone successor was attempted on a deleted document.
+    ///
+    /// Tombstones are monotonic: only another tombstone commit may follow.
+    /// Callers holding fresh writes for a deleted document must reconcile
+    /// against its conflict candidates instead of overwriting absence.
+    #[error("document is deleted and only accepts further tombstones")]
+    DocumentDeleted,
     /// A scope consumed every possible monotonic sequence.
     #[error("scope sequence is exhausted")]
     SequenceExhausted,
@@ -1235,6 +1601,152 @@ pub enum StoreError {
     /// Target schema publication was attempted before every snapshot was rebuilt.
     #[error("schema migration still has unprocessed documents")]
     MigrationIncomplete,
+    /// An export scan page was requested with an empty or excessive limit.
+    #[error("export scan limit {0} is outside 1..=256")]
+    InvalidExportLimit(usize),
+    /// A logical export payload or one of its fields violates size bounds.
+    #[error("logical export byte length {0} is outside local bounds")]
+    InvalidExportSize(usize),
+    /// A logical export payload declares an unsupported version.
+    #[error("logical export version {0} is not supported")]
+    UnknownExportVersion(u16),
+    /// A logical export payload is structurally malformed.
+    #[error("logical export payload is malformed")]
+    InvalidExport,
+    /// A second restore payload was attempted while another restore holds the scope cursor.
+    #[error("a versioned restore is already in progress for this scope")]
+    RestoreInProgress,
+    /// A restore cursor was advanced or finalized without an active restore.
+    #[error("no versioned restore is in progress for this scope")]
+    RestoreNotInProgress,
+    /// A restore cannot finalize because durable revisions diverge from its replay.
+    #[error("versioned restore cannot finalize before its replayed revisions match")]
+    RestoreIncomplete,
+}
+
+fn existing_local_sequence(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    commit: &LocalCommit<'_>,
+    operation_key: &[u8],
+) -> Result<Option<u64>, StoreError> {
+    let scope = commit.change.scope;
+    let stored_operation = table.get(operation_key)?;
+    let Some(existing) = stored_operation else {
+        return Ok(None);
+    };
+    let existing = decode_operation(existing.value())?;
+    if existing.document == commit.change.document
+        && existing.request == commit.change.request
+        && existing.digest == commit.change.digest
+    {
+        let change_key = key_change(scope, existing.document, existing.digest);
+        let existing_bytes = table
+            .get(change_key.as_slice())?
+            .ok_or(StoreError::CorruptInternalValue)?;
+        if existing_bytes.value() == commit.change.bytes {
+            return Ok(Some(existing.sequence));
+        }
+    }
+    let error = StoreError::OperationConflict;
+    eprintln!("logical-db-store: {error:?}");
+    Err(error)
+}
+
+fn stored_revision(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+    document: DocumentId,
+) -> Result<DocumentRevision, StoreError> {
+    let value = table.get(key_revision(scope, document).as_slice())?;
+    let value = value.ok_or(StoreError::CorruptInternalValue)?;
+    decode_revision(value.value())
+}
+
+fn scope_has_records(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+) -> Result<bool, StoreError> {
+    let scope_prefix = scope_prefix(scope);
+    let scope_end = next_prefix(&scope_prefix).ok_or(StoreError::CorruptInternalValue)?;
+    let mut scope_entries = table.range(scope_prefix.as_slice()..scope_end.as_slice())?;
+    let has_scope_entries = scope_entries.next().transpose()?.is_some();
+    Ok(has_scope_entries)
+}
+
+fn export_document(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+    key: &[u8],
+    prefix_length: usize,
+    snapshot: &[u8],
+) -> Result<ExportDocument, StoreError> {
+    let document = decode_uuid(&key[prefix_length..]).map(DocumentId::from_uuid)?;
+    let tombstone = table
+        .get(key_tombstone(scope, document).as_slice())?
+        .is_some_and(|value| value.value() == [1_u8]);
+    Ok(ExportDocument {
+        document,
+        tombstone,
+        snapshot: snapshot.to_vec(),
+    })
+}
+
+fn install_remote_document(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    document: &RemoteDocument<'_>,
+) -> Result<(), StoreError> {
+    let next = match document.expected_revision {
+        Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+        None => DocumentRevision::new(1),
+    };
+    table.insert(
+        key_snapshot(scope, document.document).as_slice(),
+        document.snapshot,
+    )?;
+    table.insert(
+        key_revision(scope, document.document).as_slice(),
+        next.get().to_be_bytes().as_slice(),
+    )?;
+    if document.tombstone {
+        write_tombstone(table, scope, document.document)?;
+    }
+    replace_indexes(table, scope, document.document, document.indexes)?;
+    Ok(())
+}
+
+fn verify_operation_links(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+    operation: OperationId,
+    committed: CommittedOperation,
+) -> Result<(), StoreError> {
+    if table
+        .get(key_change(scope, committed.document, committed.digest).as_slice())?
+        .is_none()
+    {
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let outbox = table
+        .get(key_outbox(scope, committed.sequence).as_slice())?
+        .ok_or(StoreError::CorruptInternalValue)?;
+    let outbox = decode_outbox(committed.sequence, outbox.value())?;
+    if outbox.document != committed.document
+        || outbox.operation != operation
+        || outbox.digest != committed.digest
+    {
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn malformed_store<E: std::fmt::Debug>(cause: E) -> StoreError {
+    eprintln!("logical-db-store: malformed durable value; cause={cause:?}");
+    StoreError::CorruptInternalValue
 }
 
 fn ensure_not_migrating(
@@ -1276,7 +1788,9 @@ fn bind_upstream_in_table(
             if key.value().len() != checkpoint_prefix.len() + 16
                 || !is_nonempty_bounded(value.value().len(), MAX_CHECKPOINT_BYTES)
             {
-                return Err(StoreError::CorruptInternalValue);
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
             }
             decode_uuid(&key.value()[checkpoint_prefix.len()..]).map(PeerId::from_uuid)
         })
@@ -1289,18 +1803,26 @@ fn bind_upstream_in_table(
                 .transpose()?
                 .unwrap_or(0);
             if acknowledged != 0 {
-                return Err(StoreError::UnattributedLegacyAcknowledgement);
+                let error = StoreError::UnattributedLegacyAcknowledgement;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
             }
             requested
         }
         [peer] => *peer,
-        [_, _, ..] => return Err(StoreError::AmbiguousLegacyUpstream),
+        [_, _, ..] => {
+            let error = StoreError::AmbiguousLegacyUpstream;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
     };
     if configured != requested {
-        return Err(StoreError::UpstreamMismatch {
+        let error = StoreError::UpstreamMismatch {
             configured,
             requested,
-        });
+        };
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     table.insert(
         upstream_key.as_slice(),
@@ -1333,11 +1855,13 @@ fn decode_migration(
     bytes: &[u8],
 ) -> Result<([u8; SCHEMA_VALUE_BYTES], Option<DocumentId>), StoreError> {
     if bytes.len() != MIGRATION_VALUE_BYTES || bytes[0] > 1 {
-        return Err(StoreError::CorruptInternalValue);
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     let target = bytes[1..=SCHEMA_VALUE_BYTES]
         .try_into()
-        .map_err(|_| StoreError::CorruptInternalValue)?;
+        .map_err(malformed_store)?;
     let cursor = match bytes[0] {
         0 if bytes[1 + SCHEMA_VALUE_BYTES..]
             .iter()
@@ -1346,7 +1870,11 @@ fn decode_migration(
             None
         }
         1 => Some(decode_uuid(&bytes[1 + SCHEMA_VALUE_BYTES..]).map(DocumentId::from_uuid)?),
-        _ => return Err(StoreError::CorruptInternalValue),
+        _ => {
+            let error = StoreError::CorruptInternalValue;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
     };
     Ok((target, cursor))
 }
@@ -1432,6 +1960,16 @@ fn key_migration(scope: Scope) -> Vec<u8> {
     prefix(scope, KIND_MIGRATION)
 }
 
+fn key_tombstone(scope: Scope, document: DocumentId) -> Vec<u8> {
+    let mut key = prefix(scope, KIND_TOMBSTONE);
+    key.extend_from_slice(document.as_uuid().as_bytes());
+    key
+}
+
+fn key_restore(scope: Scope) -> Vec<u8> {
+    prefix(scope, KIND_RESTORE)
+}
+
 fn index_row_prefix(scope: Scope, index: IndexId, encoded_value: &[u8]) -> Vec<u8> {
     let mut key = prefix(scope, KIND_INDEX);
     key.extend_from_slice(index.as_uuid().as_bytes());
@@ -1462,14 +2000,45 @@ fn key_index_reverse(scope: Scope, document: DocumentId, index: IndexId) -> Vec<
     key
 }
 
+fn check_tombstone_transition(
+    table: &Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    document: DocumentId,
+    tombstone: bool,
+) -> Result<(), StoreError> {
+    if !tombstone
+        && table
+            .get(key_tombstone(scope, document).as_slice())?
+            .is_some()
+    {
+        let error = StoreError::DocumentDeleted;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_tombstone(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    document: DocumentId,
+) -> Result<(), StoreError> {
+    table.insert(key_tombstone(scope, document).as_slice(), [1_u8].as_slice())?;
+    Ok(())
+}
+
 fn validate_indexes(indexes: &[IndexEntry]) -> Result<(), StoreError> {
     if !is_at_most(indexes.len(), MAX_INDEXES_PER_DOCUMENT) {
-        return Err(StoreError::InvalidIndexes);
+        let error = StoreError::InvalidIndexes;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     let mut identities = BTreeSet::new();
     for entry in indexes {
         if !identities.insert(entry.index) || encode_index_value(&entry.value).is_err() {
-            return Err(StoreError::InvalidIndexes);
+            let error = StoreError::InvalidIndexes;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
     }
     Ok(())
@@ -1492,7 +2061,9 @@ fn replace_indexes(
         .collect::<Result<Vec<_>, StoreError>>()?;
     for (reverse_key, encoded_value) in previous {
         if reverse_key.len() != reverse_prefix.len() + 16 {
-            return Err(StoreError::CorruptInternalValue);
+            let error = StoreError::CorruptInternalValue;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         let index = decode_uuid(&reverse_key[reverse_prefix.len()..]).map(IndexId::from_uuid)?;
         table.remove(key_index_row(scope, index, &encoded_value, document).as_slice())?;
@@ -1538,7 +2109,9 @@ fn encode_index_value(value: &IndexValue) -> Result<Vec<u8>, StoreError> {
         }
     }
     if !is_at_most(encoded.len(), MAX_INDEX_VALUE_BYTES) {
-        return Err(StoreError::InvalidIndexes);
+        let error = StoreError::InvalidIndexes;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     Ok(encoded)
 }
@@ -1563,15 +2136,21 @@ fn validate_remote_page(
     checkpoint: &[u8],
 ) -> Result<(), StoreError> {
     if !is_nonempty_bounded(checkpoint.len(), MAX_CHECKPOINT_BYTES) {
-        return Err(StoreError::InvalidCheckpointSize(checkpoint.len()));
+        let error = StoreError::InvalidCheckpointSize(checkpoint.len());
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     if !is_at_most(changes.len(), MAX_REMOTE_CHANGES) {
-        return Err(StoreError::InvalidRemotePage);
+        let error = StoreError::InvalidRemotePage;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     let mut total_change_bytes = 0usize;
     for change in changes {
         if !is_nonempty_bounded(change.bytes.len(), MAX_CHANGE_BYTES) {
-            return Err(StoreError::InvalidChangeSize(change.bytes.len()));
+            let error = StoreError::InvalidChangeSize(change.bytes.len());
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         total_change_bytes = total_change_bytes
             .checked_add(change.bytes.len())
@@ -1582,12 +2161,16 @@ fn validate_remote_page(
     let mut materialized_bytes = 0usize;
     for document in documents {
         if !is_nonempty_bounded(document.snapshot.len(), MAX_SNAPSHOT_BYTES) {
-            return Err(StoreError::InvalidSnapshotSize(document.snapshot.len()));
+            let error = StoreError::InvalidSnapshotSize(document.snapshot.len());
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         materialized_bytes = add_materialized_bytes(materialized_bytes, document.snapshot.len())
             .ok_or(StoreError::InvalidRemotePage)?;
         if !seen_documents.insert(document.document) {
-            return Err(StoreError::InvalidRemotePage);
+            let error = StoreError::InvalidRemotePage;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
         }
         validate_indexes(document.indexes)?;
     }
@@ -1595,7 +2178,9 @@ fn validate_remote_page(
         .iter()
         .any(|change| !seen_documents.contains(&change.document))
     {
-        return Err(StoreError::InvalidRemotePage);
+        let error = StoreError::InvalidRemotePage;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     Ok(())
 }
@@ -1638,17 +2223,19 @@ fn encode_operation(
 
 fn decode_operation(bytes: &[u8]) -> Result<CommittedOperation, StoreError> {
     if bytes.len() != OPERATION_VALUE_BYTES {
-        return Err(StoreError::CorruptInternalValue);
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
     let request = bytes[16..48]
         .try_into()
         .map(OperationDigest::new)
-        .map_err(|_| StoreError::CorruptInternalValue)?;
+        .map_err(malformed_store)?;
     let digest = bytes[48..80]
         .try_into()
         .map(ChangeDigest::new)
-        .map_err(|_| StoreError::CorruptInternalValue)?;
+        .map_err(malformed_store)?;
     Ok(CommittedOperation {
         document,
         request,
@@ -1667,14 +2254,16 @@ fn encode_outbox(change: LocalChange<'_>) -> [u8; OUTBOX_VALUE_BYTES] {
 
 fn decode_outbox(sequence: u64, bytes: &[u8]) -> Result<OutboxEntry, StoreError> {
     if bytes.len() != OUTBOX_VALUE_BYTES {
-        return Err(StoreError::CorruptInternalValue);
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
     let operation = decode_uuid(&bytes[16..32]).map(OperationId::from_uuid)?;
     let digest = bytes[32..]
         .try_into()
         .map(ChangeDigest::new)
-        .map_err(|_| StoreError::CorruptInternalValue)?;
+        .map_err(malformed_store)?;
     Ok(OutboxEntry {
         sequence,
         document,
@@ -1692,13 +2281,15 @@ fn encode_event(document: DocumentId, digest: ChangeDigest) -> [u8; EVENT_VALUE_
 
 fn decode_event(sequence: u64, bytes: &[u8]) -> Result<ChangeEvent, StoreError> {
     if bytes.len() != EVENT_VALUE_BYTES {
-        return Err(StoreError::CorruptInternalValue);
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
     let digest = bytes[16..]
         .try_into()
         .map(ChangeDigest::new)
-        .map_err(|_| StoreError::CorruptInternalValue)?;
+        .map_err(malformed_store)?;
     Ok(ChangeEvent {
         sequence,
         document,
@@ -1716,7 +2307,9 @@ fn decode_sequence_key_for_kind(bytes: &[u8], kind: u8) -> Result<u64, StoreErro
         || bytes[..FORMAT.len()] != *FORMAT
         || bytes[kind_offset] != kind
     {
-        return Err(StoreError::CorruptInternalValue);
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
     }
     decode_u64(&bytes[bytes.len() - 8..])
 }
@@ -1725,7 +2318,7 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, StoreError> {
     bytes
         .try_into()
         .map(u64::from_be_bytes)
-        .map_err(|_| StoreError::CorruptInternalValue)
+        .map_err(malformed_store)
 }
 
 fn decode_revision(bytes: &[u8]) -> Result<DocumentRevision, StoreError> {
@@ -1733,7 +2326,310 @@ fn decode_revision(bytes: &[u8]) -> Result<DocumentRevision, StoreError> {
 }
 
 fn decode_uuid(bytes: &[u8]) -> Result<uuid::Uuid, StoreError> {
-    uuid::Uuid::from_slice(bytes).map_err(|_| StoreError::CorruptInternalValue)
+    uuid::Uuid::from_slice(bytes).map_err(malformed_store)
+}
+
+/// Encodes one versioned logical export payload.
+///
+/// The payload is a logical dump — ordered commit history plus document
+/// snapshots with tombstone flags — never a file copy: the store refuses
+/// foreign files through replica binding, so restore replays these entries
+/// through the commit path instead.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidExportSize`] when a field or the assembled
+/// payload would exceed the export budget.
+pub fn encode_export(
+    scope: Scope,
+    entries: &[ExportEntry],
+    documents: &[ExportDocument],
+) -> Result<Vec<u8>, StoreError> {
+    let entry_count = u32::try_from(entries.len()).map_err(malformed_store)?;
+    let document_count = u32::try_from(documents.len()).map_err(malformed_store)?;
+    let mut payload = Vec::new();
+    push_bounded(&mut payload, &EXPORT_MAGIC)?;
+    push_bounded(&mut payload, scope.account().as_uuid().as_bytes())?;
+    push_bounded(&mut payload, scope.space().as_uuid().as_bytes())?;
+    push_bounded(&mut payload, &entry_count.to_be_bytes())?;
+    for entry in entries {
+        encode_export_entry(&mut payload, entry)?;
+    }
+    push_bounded(&mut payload, &document_count.to_be_bytes())?;
+    for document in documents {
+        encode_export_document(&mut payload, document)?;
+    }
+    Ok(payload)
+}
+
+/// Decodes one versioned logical export payload with bounds before allocation.
+///
+/// Length prefixes are validated against the remaining input and the resource
+/// ceilings before any buffer is allocated; unknown versions, truncation, and
+/// trailing bytes fail closed.
+///
+/// # Errors
+///
+/// Returns a typed size, version, or structure failure without allocating
+/// beyond the validated bounds.
+pub fn decode_export(
+    bytes: &[u8],
+) -> Result<(Scope, Vec<ExportEntry>, Vec<ExportDocument>), StoreError> {
+    if bytes.len() > MAX_EXPORT_BYTES {
+        let error = StoreError::InvalidExportSize(bytes.len());
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    if bytes.len() < EXPORT_HEADER_BYTES {
+        let error = StoreError::InvalidExport;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    if bytes[..EXPORT_MAGIC.len()] != EXPORT_MAGIC {
+        if bytes[..4] == *b"LDBE" {
+            let error = StoreError::UnknownExportVersion(u16::from(bytes[4]));
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+        let error = StoreError::InvalidExport;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let account = decode_uuid(&bytes[5..21]).map(AccountId::from_uuid)?;
+    let space = decode_uuid(&bytes[21..37]).map(SpaceId::from_uuid)?;
+    let scope = Scope::new(account, space);
+    let mut position = EXPORT_HEADER_BYTES;
+    let entry_count = usize::try_from(read_u32(bytes, &mut position)?).map_err(malformed_store)?;
+    if entry_count.saturating_mul(EXPORT_ENTRY_PREFIX_BYTES) > bytes.len().saturating_sub(position)
+    {
+        let error = StoreError::InvalidExport;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let mut entries = Vec::new();
+    for _ in 0..entry_count {
+        entries.push(decode_export_entry(bytes, &mut position)?);
+    }
+    let document_count =
+        usize::try_from(read_u32(bytes, &mut position)?).map_err(malformed_store)?;
+    if document_count.saturating_mul(EXPORT_DOCUMENT_PREFIX_BYTES)
+        > bytes.len().saturating_sub(position)
+    {
+        let error = StoreError::InvalidExport;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let mut documents = Vec::new();
+    for _ in 0..document_count {
+        documents.push(decode_export_document(bytes, &mut position)?);
+    }
+    if position != bytes.len() {
+        let error = StoreError::InvalidExport;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    Ok((scope, entries, documents))
+}
+
+fn encode_export_entry(payload: &mut Vec<u8>, entry: &ExportEntry) -> Result<(), StoreError> {
+    if entry.bytes.len() > MAX_CHANGE_BYTES {
+        let error = StoreError::InvalidExportSize(entry.bytes.len());
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    push_bounded(payload, entry.document.as_uuid().as_bytes())?;
+    push_bounded(payload, entry.operation.as_uuid().as_bytes())?;
+    push_bounded(payload, &entry.request.into_bytes())?;
+    push_bounded(payload, &entry.digest.into_bytes())?;
+    let change_len = u32::try_from(entry.bytes.len()).map_err(malformed_store)?;
+    push_bounded(payload, &change_len.to_be_bytes())?;
+    push_bounded(payload, &entry.bytes)?;
+    Ok(())
+}
+
+fn encode_export_document(
+    payload: &mut Vec<u8>,
+    document: &ExportDocument,
+) -> Result<(), StoreError> {
+    if document.snapshot.len() > MAX_SNAPSHOT_BYTES {
+        let error = StoreError::InvalidExportSize(document.snapshot.len());
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    push_bounded(payload, document.document.as_uuid().as_bytes())?;
+    push_bounded(payload, &[u8::from(document.tombstone)])?;
+    let snapshot_len = u32::try_from(document.snapshot.len()).map_err(malformed_store)?;
+    push_bounded(payload, &snapshot_len.to_be_bytes())?;
+    push_bounded(payload, &document.snapshot)?;
+    Ok(())
+}
+
+fn decode_export_entry(bytes: &[u8], position: &mut usize) -> Result<ExportEntry, StoreError> {
+    let document_bytes = read_array::<16>(bytes, position)?;
+    let document_uuid = decode_uuid(&document_bytes)?;
+    let document = DocumentId::from_uuid(document_uuid);
+    let operation_bytes = read_array::<16>(bytes, position)?;
+    let operation_uuid = decode_uuid(&operation_bytes)?;
+    let operation = OperationId::from_uuid(operation_uuid);
+    let request = read_array::<32>(bytes, position).map(OperationDigest::new)?;
+    let digest = read_array::<32>(bytes, position).map(ChangeDigest::new)?;
+    let change_len = usize::try_from(read_u32(bytes, position)?).map_err(malformed_store)?;
+    if change_len > MAX_CHANGE_BYTES {
+        let error = StoreError::InvalidExportSize(change_len);
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let change = read_bytes(bytes, position, change_len)?;
+    Ok(ExportEntry {
+        document,
+        operation,
+        request,
+        digest,
+        bytes: change,
+    })
+}
+
+fn decode_export_document(
+    bytes: &[u8],
+    position: &mut usize,
+) -> Result<ExportDocument, StoreError> {
+    let document_bytes = read_array::<16>(bytes, position)?;
+    let document_uuid = decode_uuid(&document_bytes)?;
+    let document = DocumentId::from_uuid(document_uuid);
+    let tombstone = match read_array::<1>(bytes, position)? {
+        [0] => false,
+        [1] => true,
+        _ => {
+            let error = StoreError::InvalidExport;
+            eprintln!("logical-db-store: {error:?}");
+            return Err(error);
+        }
+    };
+    let snapshot_len = usize::try_from(read_u32(bytes, position)?).map_err(malformed_store)?;
+    if snapshot_len > MAX_SNAPSHOT_BYTES {
+        let error = StoreError::InvalidExportSize(snapshot_len);
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let snapshot = read_bytes(bytes, position, snapshot_len)?;
+    Ok(ExportDocument {
+        document,
+        tombstone,
+        snapshot,
+    })
+}
+
+/// Derives the deterministic operation binding for a remotely installed change.
+///
+/// Export must replay changes that arrived through synchronization and
+/// therefore carry no local operation receipt. The binding is a
+/// non-cryptographic deterministic function of the document and change
+/// digest, so every retry of the same restore replays the exact same
+/// identities and short-circuits as duplicates. A collision with a live
+/// operation fails closed through [`StoreError::OperationConflict`].
+#[must_use]
+pub fn restore_operation(
+    document: DocumentId,
+    digest: ChangeDigest,
+) -> (OperationId, OperationDigest) {
+    let operation_tag: &[u8] = b"logical-db-restore-op-v1";
+    let request_tag: &[u8] = b"logical-db-restore-req-v1";
+    let document = document.as_uuid();
+    let digest = digest.into_bytes();
+    let first = fnv1a64(
+        0x9e37_79b9_7f4a_7c15,
+        &[operation_tag, document.as_bytes(), digest.as_slice()],
+    );
+    let second = fnv1a64(
+        0x6a09_e667_f3bc_c909,
+        &[operation_tag, document.as_bytes(), digest.as_slice()],
+    );
+    let mut operation = [0_u8; 16];
+    operation[..8].copy_from_slice(&first.to_be_bytes());
+    operation[8..].copy_from_slice(&second.to_be_bytes());
+    let mut request = [0_u8; 32];
+    for (slot, seed) in request.chunks_mut(8).zip([
+        0x510e_527f_ade6_82d1,
+        0x9b05_688c_2b3e_6c1f,
+        0x1f83_d9ab_fb41_bd6b,
+        0x5be0_cd19_137e_2179,
+    ]) {
+        slot.copy_from_slice(
+            &fnv1a64(seed, &[request_tag, document.as_bytes(), digest.as_slice()]).to_be_bytes(),
+        );
+    }
+    (
+        OperationId::from_uuid(uuid::Uuid::from_bytes(operation)),
+        OperationDigest::new(request),
+    )
+}
+
+fn fnv1a64(seed: u64, parts: &[&[u8]]) -> u64 {
+    let mut hash = seed;
+    for part in parts {
+        for byte in *part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn push_bounded(payload: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
+    if payload.len().saturating_add(bytes.len()) > MAX_EXPORT_BYTES {
+        let error = StoreError::InvalidExportSize(payload.len().saturating_add(bytes.len()));
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    payload.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn read_array<const LENGTH: usize>(
+    bytes: &[u8],
+    position: &mut usize,
+) -> Result<[u8; LENGTH], StoreError> {
+    let end = position
+        .checked_add(LENGTH)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(StoreError::InvalidExport)?;
+    let value: [u8; LENGTH] = bytes[*position..end].try_into().map_err(malformed_store)?;
+    *position = end;
+    Ok(value)
+}
+
+fn read_bytes(bytes: &[u8], position: &mut usize, length: usize) -> Result<Vec<u8>, StoreError> {
+    let end = position
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(StoreError::InvalidExport)?;
+    let value = bytes[*position..end].to_vec();
+    *position = end;
+    Ok(value)
+}
+
+fn read_u32(bytes: &[u8], position: &mut usize) -> Result<u32, StoreError> {
+    read_array(bytes, position).map(u32::from_be_bytes)
+}
+
+fn encode_restore_cursor(cursor: RestoreCursor) -> [u8; RESTORE_MARKER_BYTES] {
+    let mut value = [0_u8; RESTORE_MARKER_BYTES];
+    value[..32].copy_from_slice(&cursor.payload);
+    value[32..].copy_from_slice(&cursor.next.to_be_bytes());
+    value
+}
+
+fn decode_restore_cursor(bytes: &[u8]) -> Result<RestoreCursor, StoreError> {
+    if bytes.len() != RESTORE_MARKER_BYTES {
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    let payload: [u8; 32] = bytes[..32].try_into().map_err(malformed_store)?;
+    Ok(RestoreCursor {
+        payload,
+        next: decode_u64(&bytes[32..])?,
+    })
 }
 
 #[cfg(test)]
@@ -1825,6 +2721,7 @@ mod tests {
                         index,
                         value: IndexValue::Text("old".into()),
                     }],
+                    tombstone: false,
                 })
                 .unwrap();
         }
@@ -1847,6 +2744,7 @@ mod tests {
                         expected_revision: None,
                         snapshot: b"verified-snapshot",
                         indexes: &[],
+                        tombstone: false,
                     })
                     .unwrap(),
                 CommitOutcome::Applied { sequence: 1 }
@@ -1877,6 +2775,7 @@ mod tests {
                         expected_revision: Some(DocumentRevision::new(1)),
                         snapshot: b"verified-snapshot",
                         indexes: &[],
+                        tombstone: false,
                     })
                     .unwrap(),
                 CommitOutcome::Duplicate { sequence: 1 }
@@ -1900,6 +2799,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"first",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert!(matches!(
@@ -1908,6 +2808,7 @@ mod tests {
                 expected_revision: Some(DocumentRevision::new(1)),
                 snapshot: b"second",
                 indexes: &[],
+                tombstone: false,
             }),
             Err(StoreError::OperationConflict)
         ));
@@ -1929,6 +2830,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"first",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert!(matches!(
@@ -1937,6 +2839,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"stale",
                 indexes: &[],
+                tombstone: false,
             }),
             Err(StoreError::StaleDocument)
         ));
@@ -2002,6 +2905,7 @@ mod tests {
                                 expected_revision: None,
                                 snapshot: b"concurrent-snapshot",
                                 indexes: &[],
+                                tombstone: false,
                             })
                             .unwrap();
                         let sequence = match outcome {
@@ -2131,6 +3035,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"snapshot",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         {
@@ -2201,6 +3106,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"state-before-binding",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert!(matches!(
@@ -2364,6 +3270,7 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"snapshot-one",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(
@@ -2411,6 +3318,7 @@ mod tests {
                 expected_revision: Some(DocumentRevision::new(1)),
                 snapshot: b"snapshot-two",
                 indexes: &[],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(store.outbox_page(scope, 0, 10).unwrap()[0].sequence, 2);
@@ -2533,6 +3441,7 @@ mod tests {
                     index,
                     value: value.clone(),
                 }],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(
@@ -2586,6 +3495,7 @@ mod tests {
                         index,
                         value: IndexValue::Text("note".into()),
                     }],
+                    tombstone: false,
                 })
                 .unwrap();
         }
@@ -2624,6 +3534,7 @@ mod tests {
                     index,
                     value: IndexValue::Text("task".into()),
                 }],
+                tombstone: false,
             })
             .unwrap();
         assert_eq!(
@@ -2768,6 +3679,7 @@ mod tests {
                     expected_revision: None,
                     snapshot: b"remote-snapshot",
                     indexes: &indexes,
+                    tombstone: false,
                 }],
                 &changes,
                 b"checkpoint-one",
@@ -2797,6 +3709,7 @@ mod tests {
                     expected_revision: Some(DocumentRevision::new(1)),
                     snapshot: b"remote-snapshot-two",
                     indexes: &indexes,
+                    tombstone: false,
                 }],
                 &changes,
                 b"checkpoint-two",
@@ -2841,12 +3754,14 @@ mod tests {
                 expected_revision: None,
                 snapshot: b"x",
                 indexes: &[],
+                tombstone: false,
             },
             RemoteDocument {
                 document,
                 expected_revision: None,
                 snapshot: b"y",
                 indexes: &[],
+                tombstone: false,
             },
         ];
         assert!(matches!(
@@ -2863,6 +3778,7 @@ mod tests {
                     expected_revision: None,
                     snapshot: b"x",
                     indexes: &[],
+                    tombstone: false,
                 }],
                 &[RemoteChange {
                     document: other,
@@ -2899,6 +3815,8 @@ mod tests {
             key_event_sequence(scope),
             key_event(scope, 1),
             key_migration(scope),
+            key_tombstone(scope, document),
+            key_restore(scope),
             key_index_row(scope, index, &[1], document),
             key_index_reverse(scope, document, index),
         ];
@@ -2996,6 +3914,427 @@ mod tests {
             store.apply_migration_page(scope, 2, [2; 32], None, &excessive),
             Err(StoreError::InvalidMigrationPage)
         ));
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tombstone_flag_commits_restarts_and_guards_resurrection() {
+        let path = test_path("tombstone-flag");
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let replica = ReplicaId::new();
+        {
+            let store = EmbeddedStore::open(&path, replica).unwrap();
+            assert!(!store.is_tombstoned(scope, document).unwrap());
+            assert!(!store.is_tombstoned(scope, DocumentId::new()).unwrap());
+            store
+                .commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 1, 2),
+                    expected_revision: None,
+                    snapshot: b"snapshot",
+                    indexes: &[],
+                    tombstone: true,
+                })
+                .unwrap();
+            assert!(store.is_tombstoned(scope, document).unwrap());
+            assert!(matches!(
+                store.commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 3, 4),
+                    expected_revision: Some(DocumentRevision::new(1)),
+                    snapshot: b"resurrect",
+                    indexes: &[],
+                    tombstone: false,
+                }),
+                Err(StoreError::DocumentDeleted)
+            ));
+            store
+                .commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 5, 6),
+                    expected_revision: Some(DocumentRevision::new(1)),
+                    snapshot: b"snapshot-two",
+                    indexes: &[],
+                    tombstone: true,
+                })
+                .unwrap();
+            assert!(store.is_tombstoned(scope, document).unwrap());
+        }
+        {
+            let store = EmbeddedStore::open(&path, replica).unwrap();
+            assert!(store.is_tombstoned(scope, document).unwrap());
+            assert_eq!(store.outbox_page(scope, 0, 10).unwrap().len(), 2);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn remote_install_sets_tombstone_flag_monotonically() {
+        let path = test_path("tombstone-remote");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let document = DocumentId::new();
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: None,
+                    snapshot: b"snapshot",
+                    indexes: &[],
+                    tombstone: false,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: ChangeDigest::new([1; 32]),
+                    bytes: b"change-one",
+                }],
+                b"checkpoint-one",
+            )
+            .unwrap();
+        assert!(!store.is_tombstoned(scope, document).unwrap());
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: Some(DocumentRevision::new(1)),
+                    snapshot: b"snapshot-two",
+                    indexes: &[],
+                    tombstone: true,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: ChangeDigest::new([2; 32]),
+                    bytes: b"change-two",
+                }],
+                b"checkpoint-two",
+            )
+            .unwrap();
+        assert!(store.is_tombstoned(scope, document).unwrap());
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: Some(DocumentRevision::new(2)),
+                    snapshot: b"snapshot-three",
+                    indexes: &[],
+                    tombstone: false,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: ChangeDigest::new([3; 32]),
+                    bytes: b"change-three",
+                }],
+                b"checkpoint-three",
+            )
+            .unwrap();
+        assert!(store.is_tombstoned(scope, document).unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn export_scan_pages_documents_in_order_with_tombstone_flags() {
+        let path = test_path("export-scan");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        store.bind_schema(scope, 1, [1; 32]).unwrap();
+        let documents = [
+            DocumentId::from_uuid(uuid::Uuid::from_u128(3)),
+            DocumentId::from_uuid(uuid::Uuid::from_u128(1)),
+            DocumentId::from_uuid(uuid::Uuid::from_u128(2)),
+        ];
+        store
+            .commit_local(LocalCommit {
+                change: change(scope, documents[0], OperationId::new(), 1, 11),
+                expected_revision: None,
+                snapshot: b"snapshot-three",
+                indexes: &[],
+                tombstone: false,
+            })
+            .unwrap();
+        store
+            .commit_local(LocalCommit {
+                change: change(scope, documents[1], OperationId::new(), 2, 12),
+                expected_revision: None,
+                snapshot: b"snapshot-one",
+                indexes: &[],
+                tombstone: false,
+            })
+            .unwrap();
+        store
+            .commit_local(LocalCommit {
+                change: change(scope, documents[2], OperationId::new(), 3, 13),
+                expected_revision: None,
+                snapshot: b"snapshot-two",
+                indexes: &[],
+                tombstone: true,
+            })
+            .unwrap();
+        let first = store.export_scan(scope, None, 2).unwrap();
+        assert_eq!(first.after, None);
+        assert_eq!(first.documents.len(), 2);
+        assert_eq!(first.documents[0].document, documents[1]);
+        assert_eq!(first.documents[0].snapshot, b"snapshot-one");
+        assert!(!first.documents[0].tombstone);
+        assert_eq!(first.documents[1].document, documents[2]);
+        assert_eq!(first.documents[1].snapshot, b"snapshot-two");
+        assert!(first.documents[1].tombstone);
+        let cursor = Some(first.documents[1].document);
+        let second = store.export_scan(scope, cursor, 2).unwrap();
+        assert_eq!(second.after, cursor);
+        assert_eq!(second.documents.len(), 1);
+        assert_eq!(second.documents[0].document, documents[0]);
+        assert!(!second.documents[0].tombstone);
+        let done = store.export_scan(scope, Some(documents[0]), 2).unwrap();
+        assert_eq!(done.after, Some(documents[0]));
+        assert!(done.documents.is_empty());
+        assert!(matches!(
+            store.export_scan(scope, None, 0),
+            Err(StoreError::InvalidExportLimit(0))
+        ));
+        assert!(matches!(
+            store.export_scan(scope, None, 257),
+            Err(StoreError::InvalidExportLimit(257))
+        ));
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn history_page_keeps_acknowledged_commits_while_outbox_advances() {
+        let path = test_path("export-history");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let document = DocumentId::new();
+        let first_operation = OperationId::new();
+        let second_operation = OperationId::new();
+        store
+            .commit_local(LocalCommit {
+                change: change(scope, document, first_operation, 1, 11),
+                expected_revision: None,
+                snapshot: b"snapshot-one",
+                indexes: &[],
+                tombstone: false,
+            })
+            .unwrap();
+        store
+            .commit_local(LocalCommit {
+                change: change(scope, document, second_operation, 2, 12),
+                expected_revision: Some(DocumentRevision::new(1)),
+                snapshot: b"snapshot-two",
+                indexes: &[],
+                tombstone: false,
+            })
+            .unwrap();
+        store.acknowledge_outbox(scope, peer, 1).unwrap();
+        let history = store.history_page(scope, 0, 256).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].operation, first_operation);
+        assert_eq!(history[0].sequence, 1);
+        assert_eq!(history[1].operation, second_operation);
+        assert_eq!(history[1].sequence, 2);
+        assert_eq!(store.outbox_page(scope, 0, 256).unwrap().len(), 1);
+        assert!(matches!(
+            store.history_page(scope, 0, 0),
+            Err(StoreError::InvalidOutboxLimit(0))
+        ));
+        let remote_digest = ChangeDigest::new([21; 32]);
+        store
+            .install_remote_page(
+                scope,
+                peer,
+                &[RemoteDocument {
+                    document,
+                    expected_revision: Some(DocumentRevision::new(2)),
+                    snapshot: b"snapshot-remote",
+                    indexes: &[],
+                    tombstone: false,
+                }],
+                &[RemoteChange {
+                    document,
+                    digest: remote_digest,
+                    bytes: b"remote-change",
+                }],
+                b"checkpoint-remote",
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_change(scope, document, remote_digest).unwrap(),
+            Some(b"remote-change".to_vec())
+        );
+        assert_eq!(store.history_page(scope, 0, 256).unwrap().len(), 2);
+        let events = store.changes_since(scope, 0, 256).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].digest, remote_digest);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn export_codec_round_trips_and_refuses_hostile_inputs() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let entries = vec![ExportEntry {
+            document,
+            operation: OperationId::new(),
+            request: OperationDigest::new([7; 32]),
+            digest: ChangeDigest::new([9; 32]),
+            bytes: b"change".to_vec(),
+        }];
+        let documents = vec![ExportDocument {
+            document,
+            tombstone: false,
+            snapshot: b"snap".to_vec(),
+        }];
+        let bytes = encode_export(scope, &entries, &documents).unwrap();
+        let (decoded_scope, decoded_entries, decoded_documents) = decode_export(&bytes).unwrap();
+        assert_eq!(decoded_scope, scope);
+        assert_eq!(decoded_entries, entries);
+        assert_eq!(decoded_documents, documents);
+        assert!(
+            decode_export(&encode_export(scope, &[], &[]).unwrap())
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert!(matches!(
+            decode_export(&vec![0_u8; MAX_EXPORT_BYTES + 1]),
+            Err(StoreError::InvalidExportSize(_))
+        ));
+        let mut damaged = bytes.clone();
+        damaged[0] ^= 0xff;
+        assert!(matches!(
+            decode_export(&damaged),
+            Err(StoreError::InvalidExport)
+        ));
+        let mut future = bytes.clone();
+        future[4] = 2;
+        assert!(matches!(
+            decode_export(&future),
+            Err(StoreError::UnknownExportVersion(2))
+        ));
+        assert!(matches!(
+            decode_export(&bytes[..bytes.len() - 1]),
+            Err(StoreError::InvalidExport)
+        ));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_export(&trailing),
+            Err(StoreError::InvalidExport)
+        ));
+        assert!(matches!(decode_export(&[]), Err(StoreError::InvalidExport)));
+    }
+
+    #[test]
+    fn restore_cursor_survives_reopen_and_finalizes_revision_checked() {
+        let path = test_path("restore-cursor");
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let digest_a = [7_u8; 32];
+        let digest_b = [9_u8; 32];
+        {
+            let store = EmbeddedStore::open(&path, replica).unwrap();
+            assert_eq!(store.restore_cursor(scope).unwrap(), None);
+            assert!(matches!(
+                store.restore_advance(scope, &digest_a, 1),
+                Err(StoreError::RestoreNotInProgress)
+            ));
+            assert!(matches!(
+                store.restore_finish(scope, &digest_a, &[]),
+                Err(StoreError::RestoreNotInProgress)
+            ));
+            assert_eq!(
+                store.restore_begin(scope, &digest_a).unwrap(),
+                RestoreCursor {
+                    payload: digest_a,
+                    next: 0,
+                }
+            );
+            assert_eq!(store.restore_begin(scope, &digest_a).unwrap().next, 0);
+            assert!(matches!(
+                store.restore_begin(scope, &digest_b),
+                Err(StoreError::RestoreInProgress)
+            ));
+            store.restore_advance(scope, &digest_a, 3).unwrap();
+            assert!(matches!(
+                store.restore_advance(scope, &digest_b, 4),
+                Err(StoreError::RestoreInProgress)
+            ));
+        }
+        {
+            let store = EmbeddedStore::open(&path, replica).unwrap();
+            assert_eq!(
+                store.restore_cursor(scope).unwrap(),
+                Some(RestoreCursor {
+                    payload: digest_a,
+                    next: 3,
+                })
+            );
+            assert!(matches!(
+                store.restore_finish(scope, &digest_b, &[]),
+                Err(StoreError::RestoreInProgress)
+            ));
+            let document = DocumentId::new();
+            store
+                .commit_local(LocalCommit {
+                    change: change(scope, document, OperationId::new(), 1, 2),
+                    expected_revision: None,
+                    snapshot: b"snapshot",
+                    indexes: &[],
+                    tombstone: false,
+                })
+                .unwrap();
+            assert!(matches!(
+                store.restore_finish(scope, &digest_a, &[(document, DocumentRevision::new(2))]),
+                Err(StoreError::RestoreIncomplete)
+            ));
+            assert_eq!(
+                store.restore_cursor(scope).unwrap(),
+                Some(RestoreCursor {
+                    payload: digest_a,
+                    next: 3,
+                })
+            );
+            store
+                .restore_finish(scope, &digest_a, &[(document, DocumentRevision::new(1))])
+                .unwrap();
+            assert_eq!(store.restore_cursor(scope).unwrap(), None);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn restore_operation_synthesis_is_deterministic_and_committable() {
+        let path = test_path("restore-operation");
+        let store = EmbeddedStore::open(&path, ReplicaId::new()).unwrap();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let digest = ChangeDigest::new([4; 32]);
+        let (operation, request) = restore_operation(document, digest);
+        assert_eq!(restore_operation(document, digest), (operation, request));
+        assert_ne!(
+            restore_operation(document, ChangeDigest::new([5; 32])).0,
+            operation
+        );
+        assert_ne!(restore_operation(DocumentId::new(), digest).0, operation);
+        store
+            .commit_local(LocalCommit {
+                change: LocalChange::new(scope, document, operation, request, digest, b"change")
+                    .unwrap(),
+                expected_revision: None,
+                snapshot: b"snapshot",
+                indexes: &[],
+                tombstone: false,
+            })
+            .unwrap();
         drop(store);
         fs::remove_file(path).unwrap();
     }

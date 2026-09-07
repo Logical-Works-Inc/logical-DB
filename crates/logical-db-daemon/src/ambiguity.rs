@@ -85,14 +85,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
-    let network_builder = FdbApiBuilder::default()
-        .build()?
-        .set_option(NetworkOption::ClientBuggifyEnable)?
-        .set_option(NetworkOption::ClientBuggifySectionActivatedProbability(100))?
-        .set_option(NetworkOption::ClientBuggifySectionFiredProbability(12))?;
+    let network_builder = FdbApiBuilder::default().build()?;
+    let network_builder = network_builder.set_option(NetworkOption::ClientBuggifyEnable)?;
+    let network_builder =
+        network_builder.set_option(NetworkOption::ClientBuggifySectionActivatedProbability(100))?;
+    let network_builder =
+        network_builder.set_option(NetworkOption::ClientBuggifySectionFiredProbability(12))?;
+    #[allow(unsafe_code)]
     // SAFETY: this dedicated test process boots exactly one FDB network and
     // retains the auto-stop guard beyond every database, store, and future.
-    #[allow(unsafe_code)]
     let network = unsafe { network_builder.boot()? };
     let database = Database::new_compat(Some(&cluster_file)).await?;
     let scope = Scope::new(AccountId::new(), SpaceId::new());
@@ -108,44 +109,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let replica = ReplicaId::new();
 
     for attempt in 0_u16..512 {
-        let mut document = Document::new();
-        let ((), mut encoded) = document.edit(|editor| {
-            editor.put(
-                &Object::root(),
-                "attempt",
-                Scalar::Integer(i64::from(attempt)),
-            )?;
-            editor.put(
-                &Object::root(),
-                "full-fdb-chunk-probe",
-                Scalar::Bytes(vec![0xa5; FULL_FDB_CHUNK_PROBE_BYTES]),
-            )
-        })?;
-        let encoded = encoded
-            .pop()
-            .ok_or_else(|| io::Error::other("missing CRDT change"))?;
-        let request_byte = u8::try_from(attempt % 256).expect("modulo 256 fits u8");
-        let request = OperationDigest::new([request_byte; 32]);
-        let change = ChangeEnvelope {
-            scope,
-            document: DocumentId::new(),
-            replica,
-            operation: OperationId::new(),
-            request,
-            digest: encoded.digest,
-            bytes: encoded.bytes,
+        let change = match ambiguity_probe_change(scope, replica, attempt) {
+            Ok(change) => change,
+            Err(error) => {
+                eprintln!("fdb-ambiguity: could not build attempt {attempt}: {error}");
+                return Err(error);
+            }
         };
+        let request = change.request;
         let Ok(frontier) = store.frontier(scope).await else {
             continue;
         };
         let grant = fixture_grant(scope, Effect::Write, request, frontier);
         match store.accept(&change, &grant).await {
             Ok(AcceptResult::RecoveredUnknownCommit) => {
-                let (observed, rebound) =
-                    verify_recovered_write(&store, scope, frontier, &change, &grant).await?;
-                let (observed, continuation) =
-                    append_continuation_record(&store, scope, observed).await?;
-                verify_page(&store, scope, observed, &change, &continuation, &rebound).await?;
+                let observed =
+                    complete_recovery_path(&store, scope, frontier, &change, &grant).await?;
                 println!(
                     "PASS fdb-commit-unknown-recovered attempt={attempt} frontier={observed} invocation=consumed page=bounded scope=isolated"
                 );
@@ -155,6 +134,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             Ok(AcceptResult::Accepted) | Err(_) => {}
             Ok(other) => {
+                eprintln!("fdb-ambiguity: unexpected acceptance result: {other:?}");
                 return Err(
                     io::Error::other(format!("unexpected acceptance result: {other:?}")).into(),
                 );
@@ -162,6 +142,53 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     Err(io::Error::other("FDB buggify did not exercise a post-commit unknown result").into())
+}
+
+async fn complete_recovery_path(
+    store: &FdbServiceStore,
+    scope: Scope,
+    frontier: u64,
+    change: &ChangeEnvelope,
+    grant: &impl ExecutionGrant,
+) -> Result<u64, Box<dyn Error>> {
+    let (observed, rebound) = verify_recovered_write(store, scope, frontier, change, grant).await?;
+    let (observed, continuation) = append_continuation_record(store, scope, observed).await?;
+    verify_page(store, scope, observed, change, &continuation, &rebound).await?;
+    Ok(observed)
+}
+
+fn ambiguity_probe_change(
+    scope: Scope,
+    replica: ReplicaId,
+    attempt: u16,
+) -> Result<ChangeEnvelope, Box<dyn Error>> {
+    let mut document = Document::new();
+    let ((), mut encoded) = document.edit(|editor| {
+        editor.put(
+            &Object::root(),
+            "attempt",
+            Scalar::Integer(i64::from(attempt)),
+        )?;
+        editor.put(
+            &Object::root(),
+            "full-fdb-chunk-probe",
+            Scalar::Bytes(vec![0xa5; FULL_FDB_CHUNK_PROBE_BYTES]),
+        )
+    })?;
+    let encoded = encoded
+        .pop()
+        .ok_or_else(|| io::Error::other("missing CRDT change"))?;
+    let request_byte = u8::try_from(attempt % 256).map_err(io::Error::other)?;
+    let request = OperationDigest::new([request_byte; 32]);
+    Ok(ChangeEnvelope {
+        scope,
+        document: DocumentId::new(),
+        replica,
+        operation: OperationId::new(),
+        request,
+        digest: encoded.digest,
+        bytes: encoded.bytes,
+    })
 }
 
 async fn append_continuation_record(
@@ -174,6 +201,7 @@ async fn append_continuation_record(
             continue;
         };
         if frontier < minimum_frontier {
+            eprintln!("fdb-ambiguity: frontier regressed from {minimum_frontier} to {frontier}");
             return Err(io::Error::other("durable frontier regressed").into());
         }
         let mut document = Document::new();
@@ -237,6 +265,10 @@ async fn verify_recovered_write(
     }
     let observed = observed.ok_or_else(|| io::Error::other("frontier retry budget exhausted"))?;
     if observed != frontier + 1 {
+        eprintln!(
+            "fdb-ambiguity: recovered frontier expected={} observed={observed}",
+            frontier + 1
+        );
         return Err(io::Error::other("unknown recovery advanced more than once").into());
     }
     let mut exact_retry = None;
@@ -250,6 +282,7 @@ async fn verify_recovered_write(
         exact_retry,
         Some(AcceptResult::Duplicate | AcceptResult::RecoveredUnknownCommit)
     ) {
+        eprintln!("fdb-ambiguity: exact retry result was {exact_retry:?}");
         return Err(io::Error::other("exact retry was not a durable duplicate").into());
     }
     let mut collision = change.clone();
@@ -267,6 +300,7 @@ async fn verify_recovered_write(
         }
     }
     if collision_result != Some(AcceptResult::Conflict) {
+        eprintln!("fdb-ambiguity: collision result was {collision_result:?}");
         return Err(io::Error::other("operation collision was accepted as an exact retry").into());
     }
     let mut rebound = change.clone();
@@ -279,6 +313,7 @@ async fn verify_recovered_write(
         }
     }
     if reused != Some(AcceptResult::InvocationConsumed) {
+        eprintln!("fdb-ambiguity: reused invocation result was {reused:?}");
         return Err(io::Error::other("runnable invocation was reusable").into());
     }
     Ok((observed, rebound))
@@ -314,6 +349,10 @@ async fn verify_page(
             || page.changes.len() > usize::from(count)
             || page.more != (page.position < observed)
         {
+            eprintln!(
+                "fdb-ambiguity: page bounds failed after={after} position={} observed={observed}",
+                page.position
+            );
             return Err(io::Error::other("ordered FDB page violated its bounds").into());
         }
         returned = returned
@@ -327,6 +366,10 @@ async fn verify_page(
         }
         for returned_change in &page.changes {
             if !operations.insert(returned_change.operation) {
+                eprintln!(
+                    "fdb-ambiguity: repeated operation {}",
+                    returned_change.operation
+                );
                 return Err(io::Error::other("ordered FDB pages repeated an operation").into());
             }
             recovered_change_count += usize::from(returned_change == change);
@@ -345,6 +388,9 @@ async fn verify_page(
         || recovered_change_count != 1
         || continuation_change_count != 1
     {
+        eprintln!(
+            "fdb-ambiguity: incomplete pages pages={pages} after={after} observed={observed} returned={returned}"
+        );
         return Err(io::Error::other("ordered FDB pages lost their frontier").into());
     }
     let mut byte_ceiling_proven = false;
@@ -364,6 +410,7 @@ async fn verify_page(
         }
     }
     if !byte_ceiling_proven {
+        eprintln!("fdb-ambiguity: one-byte page accepted an oversized change");
         return Err(io::Error::other("page byte ceiling was not enforced").into());
     }
     let rebound_request = page_fixture_request(scope, 0, 1, bytes);
@@ -388,8 +435,17 @@ async fn read_page_with_retry(
             Ok(PageResult::Page(page)) => return Ok(page),
             Ok(PageResult::StaleAuthority) => {
                 let durable = store.frontier(scope).await;
+                eprintln!("fdb-ambiguity: stale page authority after={after} durable={durable:?}");
                 return Err(io::Error::other(format!(
                     "page authority became stale after={after} expected_frontier={} durable_frontier={durable:?}",
+                    grant.frontier()
+                ))
+                .into());
+            }
+            Ok(PageResult::BehindFloor) => {
+                eprintln!("fdb-ambiguity: page checkpoint expired after={after}");
+                return Err(io::Error::other(format!(
+                    "page checkpoint expired after={after} expected_frontier={}",
                     grant.frontier()
                 ))
                 .into());
@@ -448,6 +504,7 @@ async fn verify_rebound_grants(
     };
     for invalid in [wrong_scope, wrong_effect, wrong_request] {
         if store.accept(rebound, &invalid).await? != AcceptResult::StaleAuthority {
+            eprintln!("fdb-ambiguity: accept admitted an invalid rebound grant");
             return Err(io::Error::other("accept admitted a rebound grant").into());
         }
     }
@@ -459,6 +516,7 @@ async fn verify_rebound_grants(
         }
     }
     if foreign_frontier != Some(0) {
+        eprintln!("fdb-ambiguity: foreign scope frontier was {foreign_frontier:?}");
         return Err(io::Error::other("scope tuple axis leaked a frontier").into());
     }
     let stale = ForgedGrant {
@@ -479,6 +537,7 @@ async fn verify_rebound_grants(
         }
     }
     if stale_result != Some(PageResult::StaleAuthority) {
+        eprintln!("fdb-ambiguity: stale page grant result was {stale_result:?}");
         return Err(io::Error::other("page ignored its justified frontier").into());
     }
     Ok(())

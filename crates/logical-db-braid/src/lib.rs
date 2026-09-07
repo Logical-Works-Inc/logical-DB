@@ -167,13 +167,18 @@ pub fn prepare_request(
     let capsule = Capsule::from_bytes(capsule_bytes).map_err(BraidAdapterError::Capsule)?;
     let required = capability_for(scope, effect, request);
     if !capsule.grants.iter().any(|grant| grant == &required) {
+        eprintln!("logical-db-braid: prepare_request: MissingExactGrant");
         return Err(BraidAdapterError::MissingExactGrant);
     }
     validate_operation_policy(&capsule, registry, &required, effect)?;
-    let frontier_value =
-        i64::try_from(frontier).map_err(|_| BraidAdapterError::Frontier(frontier))?;
-    let expiry_value = i64::try_from(expires_at_unix_ms)
-        .map_err(|_| BraidAdapterError::Expiry(expires_at_unix_ms))?;
+    let frontier_value = i64::try_from(frontier).map_err(|error| {
+        eprintln!("logical-db-braid: BraidAdapterError::Frontier: {error}");
+        BraidAdapterError::Frontier(frontier)
+    })?;
+    let expiry_value = i64::try_from(expires_at_unix_ms).map_err(|error| {
+        eprintln!("logical-db-braid: BraidAdapterError::Expiry: {error}");
+        BraidAdapterError::Expiry(expires_at_unix_ms)
+    })?;
     let facts = request_facts(scope, effect, request, frontier_value, expiry_value);
     let snapshot = FlowSnapshot::new(facts.clone());
     let predicate = request_predicate(&facts)?;
@@ -213,6 +218,7 @@ fn validate_operation_policy(
         EffectClass::Irreversible | EffectClass::Egress
     ) && capsule.confirm != ConfirmPolicy::HumanConfirm
     {
+        eprintln!("logical-db-braid: validate_operation_policy: EffectPolicyMismatch");
         return Err(BraidAdapterError::EffectPolicyMismatch);
     }
     let mut exposures = Vec::with_capacity(capsule.braid.strands.len());
@@ -239,6 +245,7 @@ fn validate_operation_policy(
             || spec.egress_ceiling != required_ceiling
             || incoming != Exposure::Vault
         {
+            eprintln!("logical-db-braid: validate_operation_policy: EffectPolicyMismatch");
             return Err(BraidAdapterError::EffectPolicyMismatch);
         }
         matched = true;
@@ -431,6 +438,7 @@ impl BraidAuthority {
     /// Returns [`BraidAdapterError::GrantCount`] outside `1..=256`.
     pub fn new(grants: Vec<BraidGrant>) -> Result<Self, BraidAdapterError> {
         if grants.is_empty() || grants.len() > 256 {
+            eprintln!("logical-db-braid: new: GrantCount");
             return Err(BraidAdapterError::GrantCount(grants.len()));
         }
         Ok(Self { grants })
@@ -801,6 +809,173 @@ mod tests {
         assert!(
             authority
                 .authorize(scope, Effect::Read, request, 12, 29)
+                .is_none()
+        );
+    }
+
+    fn confirmed_dangerous_material(
+        scope: Scope,
+        effect: Effect,
+        request: OperationDigest,
+    ) -> (Vec<u8>, TermRegistry, Capability) {
+        let (operation_effect, _) = operation_policy(effect);
+        let capability = capability_for(scope, effect, request);
+        let mut registry = TermRegistry::new(1);
+        registry
+            .insert(TermSpec {
+                id: "request".into(),
+                inputs: vec![],
+                output: TypeTag::Bool,
+                capability: None,
+                effect: EffectClass::Pure,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: None,
+                cost: 1,
+            })
+            .unwrap();
+        registry
+            .insert(TermSpec {
+                id: "invoke".into(),
+                inputs: vec![TypeTag::Bool],
+                output: TypeTag::Bool,
+                capability: Some(capability.clone()),
+                effect: operation_effect,
+                source_exposure: Exposure::Vault,
+                egress_ceiling: Some(Exposure::Vault),
+                cost: 1,
+            })
+            .unwrap();
+        let mut builder = Builder::new(&registry, "externally confirmed request");
+        let source = builder.strand("request", &[]).unwrap();
+        let sink = builder.strand("invoke", &[source]).unwrap();
+        builder
+            .output(sink)
+            .budget_tight()
+            .confirm(ConfirmPolicy::HumanConfirm);
+        let capsule = builder.build().unwrap();
+        (capsule.to_bytes(), registry, capability)
+    }
+
+    #[test]
+    fn fabricated_confirmation_is_rejected_for_write_evidence() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([11; 32]);
+        let (bytes, registry, capability) =
+            confirmed_dangerous_material(scope, Effect::Write, request);
+        let mut tampered = Capsule::from_bytes(&bytes).unwrap();
+        tampered.confirm = ConfirmPolicy::None;
+        let result = prepare_request(
+            &tampered.to_bytes(),
+            &registry,
+            &[capability],
+            RequestBinding::new(scope, Effect::Write, request, 0, 1),
+        );
+        assert!(
+            matches!(result, Err(BraidAdapterError::Rejected(_))),
+            "independent admission must refuse a write strand without human confirm"
+        );
+    }
+
+    #[test]
+    fn local_fabrication_cannot_mint_sync_evidence() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([12; 32]);
+        assert!(matches!(
+            prepare_local_request(scope, Effect::Sync, request, 3, 20),
+            Err(BraidAdapterError::Build(
+                braid_sdk::BuildError::ConfirmRequired { .. }
+            ))
+        ));
+        let policy = LocalBraidAuthority::new(scope, 20);
+        assert!(
+            policy
+                .authorize(scope, Effect::Sync, request, 3, 19)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn external_write_grant_lookup_is_exact_across_scope_effect_and_expiry() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([13; 32]);
+        let (bytes, registry, capability) =
+            confirmed_dangerous_material(scope, Effect::Write, request);
+        let grant = prepare_request(
+            &bytes,
+            &registry,
+            &[capability],
+            RequestBinding::new(scope, Effect::Write, request, 5, 100),
+        )
+        .unwrap();
+        let expected_id = grant.invocation_id();
+        let authority = BraidAuthority::new(vec![grant]).unwrap();
+        assert_eq!(
+            authority
+                .authorize(scope, Effect::Write, request, 5, 99)
+                .unwrap()
+                .invocation_id(),
+            expected_id
+        );
+        assert!(
+            authority
+                .authorize(scope, Effect::Write, request, 5, 100)
+                .is_none()
+        );
+        assert!(
+            authority
+                .authorize(
+                    Scope::new(AccountId::new(), SpaceId::new()),
+                    Effect::Write,
+                    request,
+                    5,
+                    99
+                )
+                .is_none()
+        );
+        assert!(
+            authority
+                .authorize(scope, Effect::Sync, request, 5, 99)
+                .is_none()
+        );
+        assert!(
+            authority
+                .authorize(scope, Effect::Write, OperationDigest::new([14; 32]), 5, 99)
+                .is_none()
+        );
+        assert!(
+            authority
+                .authorize(scope, Effect::Write, request, 6, 99)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn external_sync_grant_authorizes_exact_sync_evidence() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let request = OperationDigest::new([15; 32]);
+        let (bytes, registry, capability) =
+            confirmed_dangerous_material(scope, Effect::Sync, request);
+        let grant = prepare_request(
+            &bytes,
+            &registry,
+            &[capability],
+            RequestBinding::new(scope, Effect::Sync, request, 5, 100),
+        )
+        .unwrap();
+        let authority = BraidAuthority::new(vec![grant]).unwrap();
+        assert!(
+            authority
+                .authorize(scope, Effect::Sync, request, 5, 99)
+                .is_some()
+        );
+        assert!(
+            authority
+                .authorize(scope, Effect::Sync, request, 5, 100)
+                .is_none()
+        );
+        assert!(
+            authority
+                .authorize(scope, Effect::Write, request, 5, 99)
                 .is_none()
         );
     }

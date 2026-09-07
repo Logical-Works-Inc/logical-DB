@@ -1192,7 +1192,9 @@ name = "logical-db"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "logical-db-cairn",
  "logical-db-crdt",
+ "logical-db-episode",
  "logical-db-http",
  "logical-db-model",
  "logical-db-platform",
@@ -1220,6 +1222,16 @@ dependencies = [
  "logical-db-service",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "logical-db-cairn"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -1256,13 +1268,28 @@ name = "logical-db-e2e"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "ciborium",
  "logical-db",
+ "logical-db-cairn",
+ "logical-db-episode",
  "logical-db-http",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-server",
  "logical-db-service",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "logical-db-episode"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "logical-db-cairn",
+ "serde",
+ "sha2",
+ "thiserror",
  "uuid",
 ]
 
@@ -1281,6 +1308,17 @@ dependencies = [
  "serde_bytes",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "logical-db-kv"
+version = "0.1.0"
+dependencies = [
+ "logical-db",
+ "logical-db-model",
+ "sha2",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

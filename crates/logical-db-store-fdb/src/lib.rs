@@ -11,12 +11,18 @@ use foundationdb_tuple::Subspace;
 #[cfg(any(feature = "fdb", test))]
 use logical_db_model::{
     ChangeDigest, DocumentId, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES,
-    OperationDigest, OperationId, ReplicaId, Scope,
+    OperationDigest, OperationId, ReplicaId, Scope, SnapshotBaseline,
 };
 #[cfg(any(feature = "fdb", test))]
 use logical_db_protocol::ChangeEnvelope;
 #[cfg(any(feature = "fdb", test))]
 use thiserror::Error;
+
+#[cfg(any(feature = "fdb", test))]
+fn malformed_data<E: std::fmt::Debug>(cause: E) -> FdbDataError {
+    eprintln!("logical-db-store-fdb: malformed durable value; cause={cause:?}");
+    FdbDataError::InvalidManifest { at: "manifest" }
+}
 
 #[cfg(any(feature = "fdb", test))]
 const FORMAT_VERSION: i64 = 3;
@@ -28,6 +34,10 @@ const CHUNK_BYTES: usize = 65_536;
 const MANIFEST_BYTES: usize = 118;
 #[cfg(any(feature = "fdb", test))]
 const OPERATION_BYTES: usize = 158;
+#[cfg(any(feature = "fdb", test))]
+const RETENTION_VERSION: u16 = 1;
+#[cfg(any(feature = "fdb", test))]
+const RETENTION_BYTES: usize = 18;
 
 #[cfg(any(feature = "fdb", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,11 +70,13 @@ fn logical_page_more(
     stopped_at_page_boundary: bool,
 ) -> Result<bool, DataError> {
     if position > frontier || (stopped_at_page_boundary && position == frontier) {
-        return Err(DataError::InvalidManifest);
+        eprintln!("logical-db-store-fdb: page position exceeded frontier");
+        return Err(DataError::InvalidManifest { at: "manifest" });
     }
     let more = position < frontier;
     if more && !range_more && !stopped_at_page_boundary {
-        return Err(DataError::InvalidManifest);
+        eprintln!("logical-db-store-fdb: page continuity marker missing");
+        return Err(DataError::InvalidManifest { at: "manifest" });
     }
     Ok(more)
 }
@@ -121,9 +133,10 @@ fn encode_manifest(
     invocation_id: [u8; 32],
 ) -> Result<[u8; OPERATION_BYTES], DataError> {
     if !(1..=MAX_CHANGE_BYTES).contains(&change.bytes.len()) {
-        return Err(DataError::InvalidManifest);
+        eprintln!("logical-db-store-fdb: change manifest size is invalid");
+        return Err(DataError::InvalidManifest { at: "manifest" });
     }
-    let byte_len = u32::try_from(change.bytes.len()).map_err(|_| DataError::InvalidManifest)?;
+    let byte_len = u32::try_from(change.bytes.len()).map_err(malformed_data)?;
     let chunks = chunk_count(change.bytes.len());
     let mut bytes = [0; OPERATION_BYTES];
     bytes[..16].copy_from_slice(change.document.as_uuid().as_bytes());
@@ -141,7 +154,8 @@ fn encode_manifest(
 #[cfg(any(feature = "fdb", test))]
 fn decode_manifest(bytes: &[u8], sequence: u64) -> Result<Record, DataError> {
     if bytes.len() != MANIFEST_BYTES {
-        return Err(DataError::InvalidManifest);
+        eprintln!("logical-db-store-fdb: manifest length is invalid");
+        return Err(DataError::InvalidManifest { at: "manifest" });
     }
     decode_record(bytes, sequence)
 }
@@ -149,16 +163,130 @@ fn decode_manifest(bytes: &[u8], sequence: u64) -> Result<Record, DataError> {
 #[cfg(any(feature = "fdb", test))]
 fn decode_operation(bytes: &[u8]) -> Result<OperationRecord, DataError> {
     if bytes.len() != OPERATION_BYTES {
-        return Err(DataError::InvalidManifest);
+        eprintln!("logical-db-store-fdb: operation record length is invalid");
+        return Err(DataError::InvalidManifest { at: "manifest" });
     }
     let record = decode_record(&bytes[..MANIFEST_BYTES], decode_u64(&bytes[118..126])?)?;
-    let invocation_id = bytes[126..158]
-        .try_into()
-        .map_err(|_| DataError::InvalidManifest)?;
+    let invocation_id = bytes[126..158].try_into().map_err(malformed_data)?;
     Ok(OperationRecord {
         record,
         invocation_id,
     })
+}
+
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+#[cfg(any(feature = "fdb", test))]
+fn encode_retention(floor: u64, consumed_through: u64) -> [u8; RETENTION_BYTES] {
+    let mut bytes = [0; RETENTION_BYTES];
+    bytes[..2].copy_from_slice(&RETENTION_VERSION.to_be_bytes());
+    bytes[2..10].copy_from_slice(&floor.to_be_bytes());
+    bytes[10..18].copy_from_slice(&consumed_through.to_be_bytes());
+    bytes
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn decode_retention(bytes: &[u8]) -> Result<(u64, u64), DataError> {
+    if bytes.len() != RETENTION_BYTES {
+        eprintln!("logical-db-store-fdb: retention record length is invalid");
+        return Err(DataError::InvalidManifest { at: "manifest" });
+    }
+    if decode_u16(&bytes[..2])? != RETENTION_VERSION {
+        eprintln!("logical-db-store-fdb: retention record version is invalid");
+        return Err(DataError::InvalidManifest { at: "manifest" });
+    }
+    Ok((decode_u64(&bytes[2..10])?, decode_u64(&bytes[10..18])?))
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotBaseline, DataError> {
+    SnapshotBaseline::decode(bytes).map_err(malformed_data)
+}
+
+/// Durable collection view mirroring one scope's tuple subspaces.
+#[cfg(test)]
+struct CollectionView<'a> {
+    /// Log sequence to manifest bytes.
+    manifests: &'a BTreeMap<u64, Vec<u8>>,
+    /// Log sequence and chunk index to chunk bytes.
+    chunks: &'a BTreeMap<(u64, u16), Vec<u8>>,
+    /// Operation identity to operation record bytes.
+    operations: &'a BTreeMap<OperationId, Vec<u8>>,
+    /// Invocation identity to invocation binding bytes.
+    invocations: &'a BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+#[cfg(test)]
+fn check_collection_consistency(view: &CollectionView<'_>) -> Result<(), DataError> {
+    for (sequence, manifest) in view.manifests {
+        let record = validate_record_links(view, *sequence, manifest)?;
+        validate_chunks(view, *sequence, record)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_record_links(
+    view: &CollectionView<'_>,
+    sequence: u64,
+    manifest: &[u8],
+) -> Result<Record, DataError> {
+    let record = decode_manifest(manifest, sequence)?;
+    let operation_bytes = view
+        .operations
+        .get(&record.operation)
+        .ok_or(DataError::InvalidManifest { at: "manifest" })?;
+    let operation = decode_operation(operation_bytes)?;
+    if operation.record != record {
+        eprintln!("logical-db-store-fdb: operation manifest identity mismatch");
+        return Err(DataError::InvalidManifest { at: "manifest" });
+    }
+    let invocation = view
+        .invocations
+        .get(&operation.invocation_id)
+        .ok_or(DataError::MissingInvocation)?;
+    if invocation.as_slice() != invocation_binding_record(&record) {
+        eprintln!("logical-db-store-fdb: invocation binding mismatch");
+        return Err(DataError::InvalidInvocation);
+    }
+    Ok(record)
+}
+
+#[cfg(test)]
+fn validate_chunks(
+    view: &CollectionView<'_>,
+    sequence: u64,
+    record: Record,
+) -> Result<(), DataError> {
+    let mut total = 0usize;
+    for index in 0..record.chunks {
+        let chunk = view
+            .chunks
+            .get(&(sequence, index))
+            .ok_or(DataError::MissingChunk)?;
+        if chunk.is_empty() || chunk.len() > CHUNK_BYTES {
+            eprintln!("logical-db-store-fdb: chunk length is invalid");
+            return Err(DataError::InvalidChunk);
+        }
+        total = total
+            .checked_add(chunk.len())
+            .ok_or(DataError::InvalidManifest { at: "manifest" })?;
+    }
+    if total != record.byte_len {
+        eprintln!("logical-db-store-fdb: chunk total does not match manifest");
+        return Err(DataError::InvalidChunk);
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn invocation_binding_record(record: &Record) -> [u8; 80] {
+    let mut binding = [0_u8; 80];
+    binding[..16].copy_from_slice(record.operation.as_uuid().as_bytes());
+    binding[16..48].copy_from_slice(&record.request.into_bytes());
+    binding[48..].copy_from_slice(&record.digest.into_bytes());
+    binding
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -170,15 +298,6 @@ fn invocation_binding(change: &ChangeEnvelope) -> [u8; 80] {
     binding
 }
 
-#[cfg(feature = "fdb")]
-fn invocation_binding_record(record: &Record) -> [u8; 80] {
-    let mut binding = [0_u8; 80];
-    binding[..16].copy_from_slice(record.operation.as_uuid().as_bytes());
-    binding[16..48].copy_from_slice(&record.request.into_bytes());
-    binding[48..].copy_from_slice(&record.digest.into_bytes());
-    binding
-}
-
 #[cfg(any(feature = "fdb", test))]
 fn decode_record(bytes: &[u8], sequence: u64) -> Result<Record, DataError> {
     let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
@@ -187,16 +306,16 @@ fn decode_record(bytes: &[u8], sequence: u64) -> Result<Record, DataError> {
     let request = bytes[48..80]
         .try_into()
         .map(OperationDigest::new)
-        .map_err(|_| DataError::InvalidManifest)?;
+        .map_err(malformed_data)?;
     let digest = bytes[80..112]
         .try_into()
         .map(ChangeDigest::new)
-        .map_err(|_| DataError::InvalidManifest)?;
-    let byte_len =
-        usize::try_from(decode_u32(&bytes[112..116])?).map_err(|_| DataError::InvalidManifest)?;
+        .map_err(malformed_data)?;
+    let byte_len = usize::try_from(decode_u32(&bytes[112..116])?).map_err(malformed_data)?;
     let chunks = decode_u16(&bytes[116..118])?;
     if !(1..=MAX_CHANGE_BYTES).contains(&byte_len) || chunks != chunk_count(byte_len) {
-        return Err(DataError::InvalidManifest);
+        eprintln!("logical-db-store-fdb: record bounds do not match manifest");
+        return Err(DataError::InvalidManifest { at: "manifest" });
     }
     Ok(Record {
         document,
@@ -218,7 +337,7 @@ fn chunk_count(byte_len: usize) -> u16 {
 
 #[cfg(any(feature = "fdb", test))]
 fn decode_uuid(bytes: &[u8]) -> Result<uuid::Uuid, DataError> {
-    uuid::Uuid::from_slice(bytes).map_err(|_| DataError::InvalidManifest)
+    uuid::Uuid::from_slice(bytes).map_err(malformed_data)
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -226,7 +345,7 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, DataError> {
     bytes
         .try_into()
         .map(u64::from_be_bytes)
-        .map_err(|_| DataError::InvalidManifest)
+        .map_err(malformed_data)
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -234,7 +353,7 @@ fn decode_u32(bytes: &[u8]) -> Result<u32, DataError> {
     bytes
         .try_into()
         .map(u32::from_be_bytes)
-        .map_err(|_| DataError::InvalidManifest)
+        .map_err(malformed_data)
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -242,7 +361,7 @@ fn decode_u16(bytes: &[u8]) -> Result<u16, DataError> {
     bytes
         .try_into()
         .map(u16::from_be_bytes)
-        .map_err(|_| DataError::InvalidManifest)
+        .map_err(malformed_data)
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -251,24 +370,23 @@ fn decode_u16(bytes: &[u8]) -> Result<u16, DataError> {
 pub enum FdbDataError {
     /// Operation or log manifest violated its fixed binary format.
     #[error("FoundationDB service manifest is malformed")]
-    InvalidManifest,
+    InvalidManifest {
+        /// Stable diagnostic location for malformed manifest bytes.
+        at: &'static str,
+    },
     #[cfg(feature = "fdb")]
     #[error("FoundationDB service sequence is exhausted")]
     /// Monotonic scoped log position exhausted its signed tuple domain.
     SequenceExhausted,
-    #[cfg(feature = "fdb")]
     #[error("FoundationDB service change chunk is missing")]
     /// Manifest referenced a chunk key that did not exist.
     MissingChunk,
-    #[cfg(feature = "fdb")]
     #[error("FoundationDB service change chunk is malformed")]
     /// Chunk size, count, or aggregate length did not match its manifest.
     InvalidChunk,
-    #[cfg(feature = "fdb")]
     #[error("FoundationDB service invocation marker is missing")]
     /// Operation record referenced no atomically written invocation marker.
     MissingInvocation,
-    #[cfg(feature = "fdb")]
     #[error("FoundationDB service invocation marker is malformed")]
     /// Invocation marker did not bind operation, request, and change identity.
     InvalidInvocation,
@@ -285,17 +403,19 @@ type DataError = FdbDataError;
 mod runtime {
     use super::{
         CHUNK_BYTES, DataError, FORMAT_VERSION, KIND_LOG, MANIFEST_BYTES, Record, decode_manifest,
-        decode_operation, decode_u64, encode_manifest, invocation_binding,
-        invocation_binding_record, logical_page_more, page_read_plan, valid_page_limits,
+        decode_operation, decode_retention, decode_u64, encode_manifest, encode_retention,
+        invocation_binding, invocation_binding_record, logical_page_more, page_read_plan,
+        valid_page_limits,
     };
     use foundationdb::{
         Database, FdbBindingError, KeySelector, RangeOption, options::TransactionOption,
     };
     use foundationdb_tuple::Subspace;
-    use logical_db_model::{Effect, OperationDigest, Scope};
+    use logical_db_model::{Effect, OperationDigest, Scope, SnapshotBaseline};
     use logical_db_protocol::ChangeEnvelope;
     use logical_db_service::{
-        AcceptResult, ExecutionGrant, PageResult, ServiceStore, StoreFailureClass, StoredPage,
+        AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneResult,
+        RetentionStore, SealResult, ServiceStore, StoreFailureClass, StoredPage, prune_decision,
     };
     use thiserror::Error;
 
@@ -303,6 +423,8 @@ mod runtime {
     const KIND_SEQUENCE: i64 = 2;
     const KIND_CHUNK: i64 = 4;
     const KIND_INVOCATION: i64 = 5;
+    const KIND_RETENTION: i64 = 6;
+    const KIND_SNAPSHOT: i64 = 7;
     const TRANSACTION_TIMEOUT_MS: i32 = 4_000;
     const TRANSACTION_RETRY_LIMIT: i32 = 8;
 
@@ -310,6 +432,7 @@ mod runtime {
     struct PageSpaces {
         scope: Subspace,
         sequence_key: Vec<u8>,
+        retention_key: Vec<u8>,
         log: Subspace,
         chunk: Subspace,
     }
@@ -340,6 +463,7 @@ mod runtime {
         /// Returns the native option failure or refuses an empty global root.
         pub fn new(database: Database, root: Subspace) -> Result<Self, FdbStoreError> {
             if root.bytes().is_empty() {
+                eprintln!("logical-db-store-fdb: directory root is empty");
                 return Err(FdbStoreError::UnallocatedRoot);
             }
             Ok(Self { database, root })
@@ -380,6 +504,7 @@ mod runtime {
             grant: &impl ExecutionGrant,
         ) -> Result<AcceptResult, Self::Error> {
             if change.validate().is_err() {
+                eprintln!("logical-db-store-fdb: change envelope validation failed");
                 return Err(FdbStoreError::InvalidChangeEnvelope);
             }
             if grant.scope() != change.scope
@@ -394,6 +519,7 @@ mod runtime {
             let scope_space = self.scope_space(change.scope);
             let operation_key = scope_space.pack(&(KIND_OPERATION, change.operation.as_uuid()));
             let sequence_key = scope_space.pack(&(KIND_SEQUENCE,));
+            let retention_key = scope_space.pack(&(KIND_RETENTION,));
             let invocation_key = scope_space.pack(&(KIND_INVOCATION, invocation_id.as_slice()));
             let log_space = scope_space.subspace(&(KIND_LOG,));
             let chunk_space = scope_space.subspace(&(KIND_CHUNK,));
@@ -402,72 +528,26 @@ mod runtime {
                     let change = change.clone();
                     let operation_key = operation_key.clone();
                     let sequence_key = sequence_key.clone();
+                    let retention_key = retention_key.clone();
                     let invocation_key = invocation_key.clone();
                     let scope_space = scope_space.clone();
                     let log_space = log_space.clone();
                     let chunk_space = chunk_space.clone();
                     async move {
-                        configure_transaction(&transaction)?;
-                        if let Some(existing) = transaction.get(&operation_key, false).await? {
-                            let operation = decode_operation(existing.as_ref()).map_err(binding)?;
-                            let stored_invocation_key = scope_space
-                                .pack(&(KIND_INVOCATION, operation.invocation_id.as_slice()));
-                            let stored_binding = transaction
-                                .get(&stored_invocation_key, false)
-                                .await?
-                                .ok_or_else(|| binding(DataError::MissingInvocation))?;
-                            if stored_binding.as_ref()
-                                != invocation_binding_record(&operation.record)
-                            {
-                                return Err(binding(DataError::InvalidInvocation));
-                            }
-                            let record = operation.record;
-                            let exact_bytes = load_change_bytes(
-                                &transaction,
-                                &chunk_space,
-                                record.sequence,
-                                &record,
-                            )
-                            .await?;
-                            return Ok(if record.matches(&change) && exact_bytes == change.bytes {
-                                if bool::from(maybe_committed) {
-                                    AcceptResult::RecoveredUnknownCommit
-                                } else {
-                                    AcceptResult::Duplicate
-                                }
-                            } else {
-                                AcceptResult::Conflict
-                            });
-                        }
-                        if transaction.get(&invocation_key, false).await?.is_some() {
-                            return Ok(AcceptResult::InvocationConsumed);
-                        }
-                        let previous = transaction
-                            .get(&sequence_key, false)
-                            .await?
-                            .map(|value| decode_u64(value.as_ref()).map_err(binding))
-                            .transpose()?
-                            .unwrap_or(0);
-                        if previous != expected_frontier {
-                            return Ok(AcceptResult::StaleAuthority);
-                        }
-                        let sequence = previous
-                            .checked_add(1)
-                            .filter(|value| i64::try_from(*value).is_ok())
-                            .ok_or_else(|| binding(DataError::SequenceExhausted))?;
-                        let manifest =
-                            encode_manifest(&change, sequence, invocation_id).map_err(binding)?;
-                        for (index, bytes) in change.bytes.chunks(CHUNK_BYTES).enumerate() {
-                            let index = u16::try_from(index)
-                                .map_err(|_| binding(DataError::InvalidManifest))?;
-                            transaction.set(&chunk_space.pack(&(sequence, index)), bytes);
-                        }
-                        transaction.set(&log_space.pack(&(sequence,)), &manifest[..MANIFEST_BYTES]);
-                        transaction.set(&operation_key, &manifest);
-                        transaction.set(&sequence_key, &sequence.to_be_bytes());
-                        let invocation_record = invocation_binding(&change);
-                        transaction.set(&invocation_key, &invocation_record);
-                        Ok(AcceptResult::Accepted)
+                        let operation = AcceptOperation {
+                            expected_frontier,
+                            invocation_id,
+                            change,
+                            maybe_committed: bool::from(maybe_committed),
+                            operation_key,
+                            sequence_key,
+                            retention_key,
+                            invocation_key,
+                            scope_space,
+                            log_space,
+                            chunk_space,
+                        };
+                        accept_transaction(&transaction, operation).await
                     }
                 })
                 .await
@@ -493,6 +573,29 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        async fn retention_floor(&self, scope: Scope) -> Result<u64, Self::Error> {
+            let retention_key = self.scope_space(scope).pack(&(KIND_RETENTION,));
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let retention_key = retention_key.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        transaction
+                            .get(&retention_key, false)
+                            .await?
+                            .map(|value| {
+                                decode_retention(value.as_ref())
+                                    .map(|(floor, _)| floor)
+                                    .map_err(binding)
+                            })
+                            .transpose()
+                            .map(|value| value.unwrap_or(0))
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
         async fn page(
             &self,
             scope: Scope,
@@ -503,6 +606,7 @@ mod runtime {
             grant: &impl ExecutionGrant,
         ) -> Result<PageResult, Self::Error> {
             if !valid_page_limits(max_changes, max_bytes) {
+                eprintln!("logical-db-store-fdb: page limits are invalid");
                 return Err(FdbStoreError::InvalidPageLimits);
             }
             if grant.scope() != scope
@@ -515,6 +619,7 @@ mod runtime {
             let scope_space = self.scope_space(scope);
             let spaces = PageSpaces {
                 sequence_key: scope_space.pack(&(KIND_SEQUENCE,)),
+                retention_key: scope_space.pack(&(KIND_RETENTION,)),
                 log: scope_space.subspace(&(KIND_LOG,)),
                 chunk: scope_space.subspace(&(KIND_CHUNK,)),
                 scope: scope_space,
@@ -539,6 +644,367 @@ mod runtime {
         }
     }
 
+    #[allow(async_fn_in_trait)]
+    impl RetentionStore for FdbServiceStore {
+        async fn consumed_through(&self, scope: Scope) -> Result<u64, Self::Error> {
+            let retention_key = self.scope_space(scope).pack(&(KIND_RETENTION,));
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let retention_key = retention_key.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        transaction
+                            .get(&retention_key, false)
+                            .await?
+                            .map(|value| {
+                                decode_retention(value.as_ref())
+                                    .map(|(_, consumed)| consumed)
+                                    .map_err(binding)
+                            })
+                            .transpose()
+                            .map(|value| value.unwrap_or(0))
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
+        async fn snapshot_baseline(
+            &self,
+            scope: Scope,
+        ) -> Result<Option<SnapshotBaseline>, Self::Error> {
+            use super::decode_snapshot;
+
+            let snapshot_key = self.scope_space(scope).pack(&(KIND_SNAPSHOT,));
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let snapshot_key = snapshot_key.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        transaction
+                            .get(&snapshot_key, false)
+                            .await?
+                            .map(|value| decode_snapshot(value.as_ref()).map_err(binding))
+                            .transpose()
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
+        async fn seal_snapshot(
+            &self,
+            scope: Scope,
+            baseline: SnapshotBaseline,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Result<SealResult, Self::Error> {
+            if grant.scope() != scope
+                || grant.effect() != Effect::Sync
+                || grant.request() != request
+            {
+                return Ok(SealResult::StaleAuthority);
+            }
+            let expected_frontier = grant.frontier();
+            let position = baseline.position();
+            let encoded = baseline.encode();
+            let scope_space = self.scope_space(scope);
+            let sequence_key = scope_space.pack(&(KIND_SEQUENCE,));
+            let snapshot_key = scope_space.pack(&(KIND_SNAPSHOT,));
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let sequence_key = sequence_key.clone();
+                    let snapshot_key = snapshot_key.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        let frontier = read_frontier(&transaction, &sequence_key).await?;
+                        if frontier != expected_frontier {
+                            return Ok(SealResult::StaleAuthority);
+                        }
+                        if position > frontier {
+                            return Ok(SealResult::BeyondFrontier { frontier });
+                        }
+                        transaction.set(&snapshot_key, &encoded);
+                        Ok(SealResult::Sealed { position })
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
+        async fn mark_consumed(
+            &self,
+            scope: Scope,
+            through: u64,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Result<ConsumedResult, Self::Error> {
+            if grant.scope() != scope
+                || grant.effect() != Effect::Sync
+                || grant.request() != request
+            {
+                return Ok(ConsumedResult::StaleAuthority);
+            }
+            let expected_frontier = grant.frontier();
+            let scope_space = self.scope_space(scope);
+            let sequence_key = scope_space.pack(&(KIND_SEQUENCE,));
+            let retention_key = scope_space.pack(&(KIND_RETENTION,));
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let sequence_key = sequence_key.clone();
+                    let retention_key = retention_key.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        let frontier = read_frontier(&transaction, &sequence_key).await?;
+                        if frontier != expected_frontier {
+                            return Ok(ConsumedResult::StaleAuthority);
+                        }
+                        if through > frontier {
+                            return Ok(ConsumedResult::BeyondFrontier { frontier });
+                        }
+                        let (floor, consumed) =
+                            read_retention(&transaction, &retention_key).await?;
+                        if through <= consumed {
+                            return Ok(ConsumedResult::Unchanged {
+                                consumed_through: consumed,
+                            });
+                        }
+                        transaction.set(&retention_key, &encode_retention(floor, through));
+                        Ok(ConsumedResult::Advanced {
+                            consumed_through: through,
+                        })
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
+        async fn prune(
+            &self,
+            scope: Scope,
+            up_to: u64,
+            min_live: Option<u64>,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Result<PruneResult, Self::Error> {
+            if grant.scope() != scope
+                || grant.effect() != Effect::Sync
+                || grant.request() != request
+            {
+                return Ok(PruneResult::StaleAuthority);
+            }
+            let expected_frontier = grant.frontier();
+            let scope_space = self.scope_space(scope);
+            let sequence_key = scope_space.pack(&(KIND_SEQUENCE,));
+            let retention_key = scope_space.pack(&(KIND_RETENTION,));
+            let log_space = scope_space.subspace(&(KIND_LOG,));
+            let chunk_space = scope_space.subspace(&(KIND_CHUNK,));
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let sequence_key = sequence_key.clone();
+                    let retention_key = retention_key.clone();
+                    let log_space = log_space.clone();
+                    let chunk_space = chunk_space.clone();
+                    async move {
+                        let operation = PruneOperation {
+                            expected_frontier,
+                            up_to,
+                            min_live,
+                            sequence_key,
+                            retention_key,
+                            log_space,
+                            chunk_space,
+                        };
+                        prune_transaction(&transaction, operation).await
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+    }
+
+    struct AcceptOperation {
+        expected_frontier: u64,
+        invocation_id: [u8; 32],
+        change: ChangeEnvelope,
+        maybe_committed: bool,
+        operation_key: Vec<u8>,
+        sequence_key: Vec<u8>,
+        retention_key: Vec<u8>,
+        invocation_key: Vec<u8>,
+        scope_space: Subspace,
+        log_space: Subspace,
+        chunk_space: Subspace,
+    }
+
+    async fn accept_transaction(
+        transaction: &foundationdb::RetryableTransaction,
+        operation: AcceptOperation,
+    ) -> Result<AcceptResult, FdbBindingError> {
+        let AcceptOperation {
+            expected_frontier,
+            invocation_id,
+            change,
+            maybe_committed,
+            operation_key,
+            sequence_key,
+            retention_key,
+            invocation_key,
+            scope_space,
+            log_space,
+            chunk_space,
+        } = operation;
+        configure_transaction(transaction)?;
+        if let Some(result) = existing_accept_result(
+            transaction,
+            &scope_space,
+            &chunk_space,
+            &operation_key,
+            &retention_key,
+            &change,
+            maybe_committed,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+        if transaction.get(&invocation_key, false).await?.is_some() {
+            return Ok(AcceptResult::InvocationConsumed);
+        }
+        let previous = transaction
+            .get(&sequence_key, false)
+            .await?
+            .map(|value| decode_u64(value.as_ref()).map_err(binding))
+            .transpose()?
+            .unwrap_or(0);
+        if previous != expected_frontier {
+            return Ok(AcceptResult::StaleAuthority);
+        }
+        let sequence = previous
+            .checked_add(1)
+            .filter(|value| i64::try_from(*value).is_ok())
+            .ok_or_else(|| binding(DataError::SequenceExhausted))?;
+        let manifest = encode_manifest(&change, sequence, invocation_id).map_err(binding)?;
+        for (index, bytes) in change.bytes.chunks(CHUNK_BYTES).enumerate() {
+            let index = u16::try_from(index).map_err(binding_invalid)?;
+            transaction.set(&chunk_space.pack(&(sequence, index)), bytes);
+        }
+        transaction.set(&log_space.pack(&(sequence,)), &manifest[..MANIFEST_BYTES]);
+        transaction.set(&operation_key, &manifest);
+        transaction.set(&sequence_key, &sequence.to_be_bytes());
+        let invocation_record = invocation_binding(&change);
+        transaction.set(&invocation_key, &invocation_record);
+        Ok(AcceptResult::Accepted)
+    }
+
+    struct PruneOperation {
+        expected_frontier: u64,
+        up_to: u64,
+        min_live: Option<u64>,
+        sequence_key: Vec<u8>,
+        retention_key: Vec<u8>,
+        log_space: Subspace,
+        chunk_space: Subspace,
+    }
+
+    async fn prune_transaction(
+        transaction: &foundationdb::RetryableTransaction,
+        operation: PruneOperation,
+    ) -> Result<PruneResult, FdbBindingError> {
+        let PruneOperation {
+            expected_frontier,
+            up_to,
+            min_live,
+            sequence_key,
+            retention_key,
+            log_space,
+            chunk_space,
+        } = operation;
+        configure_transaction(transaction)?;
+        let frontier = read_frontier(transaction, &sequence_key).await?;
+        if frontier != expected_frontier {
+            return Ok(PruneResult::StaleAuthority);
+        }
+        let (floor, consumed) = read_retention(transaction, &retention_key).await?;
+        let through = match prune_decision(frontier, floor, up_to, min_live, consumed) {
+            Ok(value) => value,
+            Err(refusal) => return Ok(PruneResult::Refused(refusal)),
+        };
+        if through > floor {
+            let log_begin = log_space.pack(&(floor.saturating_add(1),));
+            let log_end = through
+                .checked_add(1)
+                .map_or_else(|| log_space.range().1, |next| log_space.pack(&(next,)));
+            transaction.clear_range(&log_begin, &log_end);
+            let chunk_begin = chunk_space.pack(&(floor.saturating_add(1),));
+            let chunk_end = through
+                .checked_add(1)
+                .map_or_else(|| chunk_space.range().1, |next| chunk_space.pack(&(next,)));
+            transaction.clear_range(&chunk_begin, &chunk_end);
+            transaction.set(&retention_key, &encode_retention(through, consumed));
+        }
+        Ok(PruneResult::Pruned(PruneReceipt {
+            pruned_through: through,
+            floor: through.max(floor),
+        }))
+    }
+
+    async fn existing_accept_result(
+        transaction: &foundationdb::RetryableTransaction,
+        scope_space: &Subspace,
+        chunk_space: &Subspace,
+        operation_key: &[u8],
+        retention_key: &[u8],
+        change: &ChangeEnvelope,
+        maybe_committed: bool,
+    ) -> Result<Option<AcceptResult>, FdbBindingError> {
+        let Some(existing) = transaction.get(operation_key, false).await? else {
+            return Ok(None);
+        };
+        let operation = decode_operation(existing.as_ref()).map_err(binding)?;
+        let stored_invocation_key =
+            scope_space.pack(&(KIND_INVOCATION, operation.invocation_id.as_slice()));
+        let stored_binding = transaction
+            .get(&stored_invocation_key, false)
+            .await?
+            .ok_or_else(|| binding(DataError::MissingInvocation))?;
+        if stored_binding.as_ref() != invocation_binding_record(&operation.record) {
+            eprintln!("logical-db-store-fdb: retry invocation binding mismatch");
+            return Err(binding(DataError::InvalidInvocation));
+        }
+        let record = operation.record;
+        let floor = transaction
+            .get(retention_key, false)
+            .await?
+            .map(|value| {
+                decode_retention(value.as_ref())
+                    .map(|(floor, _)| floor)
+                    .map_err(binding)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let exact_bytes = if record.sequence <= floor {
+            // Chunks below the floor were collected by design; the manifest
+            // digest remains the content identity for the retry decision.
+            None
+        } else {
+            Some(load_change_bytes(transaction, chunk_space, record.sequence, &record).await?)
+        };
+        let exact_retry = record.matches(change)
+            && exact_bytes
+                .as_ref()
+                .is_none_or(|bytes| *bytes == change.bytes);
+        Ok(Some(if exact_retry {
+            if maybe_committed {
+                AcceptResult::RecoveredUnknownCommit
+            } else {
+                AcceptResult::Duplicate
+            }
+        } else {
+            AcceptResult::Conflict
+        }))
+    }
+
     async fn load_page(
         transaction: &foundationdb::RetryableTransaction,
         spaces: &PageSpaces,
@@ -553,8 +1019,22 @@ mod runtime {
         if frontier != query.frontier {
             return Ok(PageResult::StaleAuthority);
         }
+        let floor = transaction
+            .get(&spaces.retention_key, false)
+            .await?
+            .map(|value| {
+                decode_retention(value.as_ref())
+                    .map(|(floor, _)| floor)
+                    .map_err(binding)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if query.after < floor {
+            return Ok(PageResult::BehindFloor);
+        }
         if query.after > frontier {
-            return Err(binding(DataError::InvalidManifest));
+            eprintln!("logical-db-store-fdb: page cursor exceeds frontier");
+            return Err(binding(DataError::InvalidManifest { at: "manifest" }));
         }
         let begin = spaces.log.pack(&(query.after.saturating_add(1),));
         let (_, end) = spaces.log.range();
@@ -580,6 +1060,28 @@ mod runtime {
         Ok(())
     }
 
+    async fn read_frontier(
+        transaction: &foundationdb::RetryableTransaction,
+        key: &[u8],
+    ) -> Result<u64, FdbBindingError> {
+        let value = transaction.get(key, false).await?;
+        let decoded = value
+            .map(|bytes| decode_u64(bytes.as_ref()).map_err(binding))
+            .transpose()?;
+        Ok(decoded.unwrap_or(0))
+    }
+
+    async fn read_retention(
+        transaction: &foundationdb::RetryableTransaction,
+        key: &[u8],
+    ) -> Result<(u64, u64), FdbBindingError> {
+        let value = transaction.get(key, false).await?;
+        let decoded = value
+            .map(|bytes| decode_retention(bytes.as_ref()).map_err(binding))
+            .transpose()?;
+        Ok(decoded.unwrap_or((0, 0)))
+    }
+
     async fn materialize_page(
         transaction: &foundationdb::RetryableTransaction,
         spaces: &PageSpaces,
@@ -597,35 +1099,66 @@ mod runtime {
                 stopped_at_page_boundary = true;
                 break;
             }
-            let (sequence,) = spaces
-                .log
-                .unpack::<(u64,)>(&key)
-                .map_err(|_| binding(DataError::InvalidManifest))?;
+            let (sequence,) = spaces.log.unpack::<(u64,)>(&key).map_err(binding_invalid)?;
             if position.checked_add(1) != Some(sequence) {
-                return Err(binding(DataError::InvalidManifest));
+                eprintln!("logical-db-store-fdb: log sequence is not contiguous");
+                return Err(binding(DataError::InvalidManifest { at: "manifest" }));
             }
-            let record = decode_manifest(&value, sequence).map_err(binding)?;
-            verify_operation(transaction, &spaces.scope, &record).await?;
-            let next_bytes = aggregate
-                .checked_add(record.byte_len)
-                .ok_or_else(|| binding(DataError::InvalidManifest))?;
+            let record = match decode_manifest(&value, sequence).map_err(binding) {
+                Ok(record) => record,
+                Err(error) => {
+                    eprintln!("logical-db-store-fdb: manifest decode failed; error={error:?}");
+                    return Err(error);
+                }
+            };
+            if let Err(error) = verify_operation(transaction, &spaces.scope, &record).await {
+                eprintln!("logical-db-store-fdb: transaction operation failed; error={error:?}");
+                return Err(error);
+            }
+            let Some(next_bytes) = aggregate.checked_add(record.byte_len) else {
+                eprintln!("logical-db-store-fdb: page byte total overflowed");
+                return Err(binding(DataError::InvalidManifest { at: "manifest" }));
+            };
             if next_bytes > query.max_bytes as usize {
                 if changes.is_empty() {
+                    eprintln!("logical-db-store-fdb: one change exceeds page limit");
                     return Err(binding(DataError::ChangeExceedsPage));
                 }
                 stopped_at_page_boundary = true;
                 break;
             }
-            let bytes = load_change_bytes(transaction, &spaces.chunk, sequence, &record).await?;
+            let bytes = match load_change_bytes(transaction, &spaces.chunk, sequence, &record).await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("logical-db-store-fdb: change load failed; error={error:?}");
+                    return Err(error);
+                }
+            };
             changes.push(record.envelope(query.scope, bytes));
             aggregate = next_bytes;
             position = sequence;
         }
-        if position == frontier && log_has_entry_after(transaction, &spaces.log, frontier).await? {
-            return Err(binding(DataError::InvalidManifest));
+        let has_entry = match log_has_entry_after(transaction, &spaces.log, frontier).await {
+            Ok(has_entry) => has_entry,
+            Err(error) => {
+                eprintln!("logical-db-store-fdb: frontier tail probe failed; error={error:?}");
+                return Err(error);
+            }
+        };
+        if position == frontier && has_entry {
+            eprintln!("logical-db-store-fdb: log extends beyond declared frontier");
+            return Err(binding(DataError::InvalidManifest { at: "manifest" }));
         }
-        let more = logical_page_more(frontier, position, range_more, stopped_at_page_boundary)
-            .map_err(binding)?;
+        let more = match logical_page_more(frontier, position, range_more, stopped_at_page_boundary)
+            .map_err(binding)
+        {
+            Ok(more) => more,
+            Err(error) => {
+                eprintln!("logical-db-store-fdb: page continuation check failed; error={error:?}");
+                return Err(error);
+            }
+        };
         Ok(PageResult::Page(StoredPage {
             changes,
             position,
@@ -659,10 +1192,11 @@ mod runtime {
         let operation_bytes = transaction
             .get(&operation_key, false)
             .await?
-            .ok_or_else(|| binding(DataError::InvalidManifest))?;
+            .ok_or_else(|| binding(DataError::InvalidManifest { at: "manifest" }))?;
         let operation = decode_operation(operation_bytes.as_ref()).map_err(binding)?;
         if operation.record != *record {
-            return Err(binding(DataError::InvalidManifest));
+            eprintln!("logical-db-store-fdb: operation record does not match manifest");
+            return Err(binding(DataError::InvalidManifest { at: "manifest" }));
         }
         let invocation_key =
             scope_space.pack(&(KIND_INVOCATION, operation.invocation_id.as_slice()));
@@ -671,6 +1205,7 @@ mod runtime {
             .await?
             .ok_or_else(|| binding(DataError::MissingInvocation))?;
         if invocation.as_ref() != invocation_binding_record(record) {
+            eprintln!("logical-db-store-fdb: operation invocation binding mismatch");
             return Err(binding(DataError::InvalidInvocation));
         }
         Ok(())
@@ -689,11 +1224,13 @@ mod runtime {
                 .await?
                 .ok_or_else(|| binding(DataError::MissingChunk))?;
             if chunk.is_empty() || chunk.len() > CHUNK_BYTES {
+                eprintln!("logical-db-store-fdb: loaded chunk length is invalid");
                 return Err(binding(DataError::InvalidChunk));
             }
             bytes.extend_from_slice(chunk.as_ref());
         }
         if bytes.len() != record.byte_len {
+            eprintln!("logical-db-store-fdb: loaded bytes do not match manifest");
             return Err(binding(DataError::InvalidChunk));
         }
         Ok(bytes)
@@ -701,6 +1238,11 @@ mod runtime {
 
     fn binding(error: DataError) -> FdbBindingError {
         FdbBindingError::new_custom_error(Box::new(error))
+    }
+
+    fn binding_invalid<E: std::fmt::Debug>(cause: E) -> FdbBindingError {
+        eprintln!("logical-db-store-fdb: invalid transaction value; cause={cause:?}");
+        binding(DataError::InvalidManifest { at: "manifest" })
     }
 
     fn classify_transaction(error: FdbBindingError) -> FdbStoreError {
@@ -738,6 +1280,7 @@ mod runtime {
         #[error("FoundationDB client rejected configuration: {0}")]
         Client(#[from] foundationdb::FdbError),
         /// Directory layer did not allocate a nonempty application subspace.
+
         #[error("FoundationDB adapter requires a directory-allocated nonempty root")]
         UnallocatedRoot,
         /// Caller bypassed the versioned protocol's per-change envelope bounds.
@@ -844,6 +1387,7 @@ pub use runtime::{FdbServiceStore, FdbStoreError};
 #[cfg(test)]
 mod tests {
     use logical_db_model::{AccountId, SpaceId};
+    use std::collections::BTreeMap;
 
     use super::*;
 
@@ -933,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_and_chunk_boundaries_fail_closed_without_a_cluster() {
+    fn page_limits_and_frontiers_fail_closed_without_a_cluster() {
         assert_eq!(CHUNK_BYTES, 65_536);
         assert!(valid_page_limits(1, 1));
         assert!(valid_page_limits(
@@ -964,16 +1508,20 @@ mod tests {
         assert_eq!(logical_page_more(10, 9, false, true), Ok(true));
         assert_eq!(
             logical_page_more(10, 11, false, false),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         assert_eq!(
             logical_page_more(10, 10, false, true),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         assert_eq!(
             logical_page_more(10, 9, false, false),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
+    }
+
+    #[test]
+    fn manifest_chunk_bounds_reject_inconsistent_lengths() {
         assert_eq!(chunk_count(0), 0);
         assert_eq!(chunk_count(1), 1);
         assert_eq!(chunk_count(CHUNK_BYTES), 1);
@@ -981,11 +1529,11 @@ mod tests {
         assert_eq!(chunk_count(usize::MAX), u16::MAX);
         assert_eq!(
             encode_manifest(&change(0), 1, [1; 32]),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         assert_eq!(
             encode_manifest(&change(MAX_CHANGE_BYTES + 1), 1, [1; 32]),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         let encoded = encode_manifest(&change(1), u64::MAX, [2; 32]).unwrap();
         assert_eq!(
@@ -994,44 +1542,207 @@ mod tests {
         );
         assert_eq!(
             decode_operation(&encoded[..OPERATION_BYTES - 1]),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         assert_eq!(
             decode_manifest(&encoded[..MANIFEST_BYTES - 1], 1),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         let mut zero_length = encoded;
         zero_length[112..116].copy_from_slice(&0_u32.to_be_bytes());
         zero_length[116..118].copy_from_slice(&0_u16.to_be_bytes());
         assert_eq!(
             decode_operation(&zero_length),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         let mut zero_chunks = encoded;
         zero_chunks[116..118].copy_from_slice(&0_u16.to_be_bytes());
         assert_eq!(
             decode_operation(&zero_chunks),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         let mut wrong_chunks = encoded;
         wrong_chunks[116..118].copy_from_slice(&2_u16.to_be_bytes());
         assert_eq!(
             decode_operation(&wrong_chunks),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
         let mut hostile_length = encoded;
         hostile_length[112..116].copy_from_slice(&u32::MAX.to_be_bytes());
         hostile_length[116..118].copy_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(
             decode_operation(&hostile_length),
-            Err(DataError::InvalidManifest)
+            Err(DataError::InvalidManifest { at: "manifest" })
         );
+    }
+
+    #[test]
+    fn scalar_record_codecs_reject_truncation() {
         assert_eq!(decode_u64(&41_u64.to_be_bytes()).unwrap(), 41);
         assert_eq!(decode_u32(&42_u32.to_be_bytes()).unwrap(), 42);
         assert_eq!(decode_u16(&43_u16.to_be_bytes()).unwrap(), 43);
-        assert_eq!(decode_u64(&[0; 7]), Err(DataError::InvalidManifest));
-        assert_eq!(decode_u32(&[0; 3]), Err(DataError::InvalidManifest));
-        assert_eq!(decode_u16(&[0; 1]), Err(DataError::InvalidManifest));
-        assert_eq!(decode_uuid(&[0; 15]), Err(DataError::InvalidManifest));
+        assert_eq!(
+            decode_u64(&[0; 7]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        assert_eq!(
+            decode_u32(&[0; 3]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        assert_eq!(
+            decode_u16(&[0; 1]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        assert_eq!(
+            decode_uuid(&[0; 15]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+    }
+
+    #[test]
+    fn retention_record_codec_is_versioned_and_fail_closed() {
+        assert_eq!(RETENTION_BYTES, 18);
+        assert_eq!(RETENTION_VERSION, 1);
+        let encoded = encode_retention(7, 9);
+        assert_eq!(decode_retention(&encoded), Ok((7, 9)));
+        assert_eq!(
+            decode_retention(&[0; 18]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        assert_eq!(
+            decode_retention(&encoded[..RETENTION_BYTES - 1]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        let mut unknown = encoded;
+        unknown[..2].copy_from_slice(&(RETENTION_VERSION + 1).to_be_bytes());
+        assert_eq!(
+            decode_retention(&unknown),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        let mut regressed = encoded;
+        regressed[2..10].copy_from_slice(&u64::MAX.to_be_bytes());
+        regressed[10..18].copy_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(decode_retention(&regressed), Ok((u64::MAX, 0)));
+    }
+
+    #[test]
+    fn snapshot_record_round_trips_through_the_versioned_model_codec() {
+        use logical_db_model::SnapshotBaseline;
+
+        let baseline = SnapshotBaseline::new(41);
+        let encoded = baseline.encode();
+        assert_eq!(decode_snapshot(&encoded), Ok(baseline));
+        assert_eq!(
+            decode_snapshot(&encoded[..encoded.len() - 1]),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        let mut foreign = encoded;
+        foreign[..2].copy_from_slice(&0_u16.to_be_bytes());
+        assert_eq!(
+            decode_snapshot(&foreign),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+    }
+
+    struct CollectionAtlas {
+        manifests: BTreeMap<u64, Vec<u8>>,
+        chunks: BTreeMap<(u64, u16), Vec<u8>>,
+        operations: BTreeMap<OperationId, Vec<u8>>,
+        invocations: BTreeMap<[u8; 32], Vec<u8>>,
+    }
+
+    fn build_atlas(sequences: &[u64]) -> (CollectionAtlas, Vec<Record>) {
+        let mut atlas = CollectionAtlas {
+            manifests: BTreeMap::new(),
+            chunks: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            invocations: BTreeMap::new(),
+        };
+        let mut records = Vec::new();
+        for (index, sequence) in sequences.iter().enumerate() {
+            let byte_len = 3 + index;
+            let change = change(byte_len);
+            let tag = u8::try_from(index).unwrap();
+            let invocation_id = [tag.wrapping_add(1); 32];
+            let manifest = encode_manifest(&change, *sequence, invocation_id).unwrap();
+            let record = decode_operation(&manifest).unwrap().record;
+            let mut remaining = byte_len;
+            for chunk_index in 0..record.chunks {
+                let take = remaining.min(CHUNK_BYTES);
+                atlas
+                    .chunks
+                    .insert((*sequence, chunk_index), vec![tag.wrapping_add(9); take]);
+                remaining -= take;
+            }
+            atlas
+                .manifests
+                .insert(*sequence, manifest[..MANIFEST_BYTES].to_vec());
+            atlas.operations.insert(record.operation, manifest.to_vec());
+            atlas
+                .invocations
+                .insert(invocation_id, invocation_binding(&change).to_vec());
+            records.push(record);
+        }
+        (atlas, records)
+    }
+
+    fn atlas_view(atlas: &CollectionAtlas) -> CollectionView<'_> {
+        CollectionView {
+            manifests: &atlas.manifests,
+            chunks: &atlas.chunks,
+            operations: &atlas.operations,
+            invocations: &atlas.invocations,
+        }
+    }
+
+    #[test]
+    fn prune_plan_keeps_idempotency_axes_while_dropping_the_pruned_prefix() {
+        use logical_db_service::{PruneRefusal, prune_decision};
+
+        let (mut atlas, _records) = build_atlas(&[1, 2, 3, 4]);
+        assert_eq!(check_collection_consistency(&atlas_view(&atlas)), Ok(()));
+        assert_eq!(prune_decision(4, 0, 2, None, 4), Ok(2));
+        assert_eq!(
+            prune_decision(4, 0, 2, None, 1),
+            Err(PruneRefusal::PendingOperations {
+                consumed_through: 1
+            })
+        );
+        atlas.manifests.remove(&1);
+        atlas.manifests.remove(&2);
+        atlas.chunks.retain(|(sequence, _), _| *sequence > 2);
+        assert!(!atlas.manifests.contains_key(&1));
+        assert!(!atlas.manifests.contains_key(&2));
+        assert!(atlas.chunks.keys().all(|(sequence, _)| *sequence > 2));
+        assert_eq!(atlas.operations.len(), 4);
+        assert_eq!(atlas.invocations.len(), 4);
+        assert_eq!(check_collection_consistency(&atlas_view(&atlas)), Ok(()));
+    }
+
+    #[test]
+    fn collection_consistency_checker_rejects_each_broken_cross_reference() {
+        let (mut atlas, records) = build_atlas(&[1, 2]);
+        assert_eq!(check_collection_consistency(&atlas_view(&atlas)), Ok(()));
+        let missing_chunk = atlas.chunks.remove(&(2, 0)).unwrap();
+        assert_eq!(
+            check_collection_consistency(&atlas_view(&atlas)),
+            Err(DataError::MissingChunk)
+        );
+        atlas.chunks.insert((2, 0), missing_chunk);
+        assert_eq!(check_collection_consistency(&atlas_view(&atlas)), Ok(()));
+        let missing_operation = atlas.operations.remove(&records[1].operation).unwrap();
+        assert_eq!(
+            check_collection_consistency(&atlas_view(&atlas)),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
+        atlas
+            .operations
+            .insert(records[1].operation, missing_operation);
+        assert_eq!(check_collection_consistency(&atlas_view(&atlas)), Ok(()));
+        atlas.manifests.insert(2, vec![7; MANIFEST_BYTES]);
+        assert_eq!(
+            check_collection_consistency(&atlas_view(&atlas)),
+            Err(DataError::InvalidManifest { at: "manifest" })
+        );
     }
 }

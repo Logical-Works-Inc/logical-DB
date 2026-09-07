@@ -15,6 +15,14 @@ use logical_db_model::{
 };
 use thiserror::Error;
 
+/// Reserved root property carrying the monotonic document tombstone.
+///
+/// A present value means the document is deleted: reads report absent while
+/// the snapshot and its conflict candidates are retained. Application edits
+/// through [`Editor`] are refused on this property so user state can never
+/// collide with or clear the marker; only [`Document::delete`] advances it.
+pub const TOMBSTONE_PROPERTY: &str = "__logical_db_tombstone";
+
 /// Opaque object handle valid only for the document that produced it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Object(ObjId);
@@ -143,6 +151,7 @@ impl EncodedChange {
     /// Returns a typed size, decode, or digest error.
     pub fn validate(&self) -> Result<(), CrdtError> {
         if !is_nonempty_bounded(self.bytes.len(), MAX_CHANGE_BYTES) {
+            eprintln!("logical-db-crdt: validate: InvalidChangeSize");
             return Err(CrdtError::InvalidChangeSize(self.bytes.len()));
         }
         decode_change(self).map(|_| ())
@@ -171,6 +180,7 @@ impl Document {
     /// document verification.
     pub fn load(bytes: &[u8]) -> Result<Self, CrdtError> {
         if !is_nonempty_bounded(bytes.len(), MAX_SNAPSHOT_BYTES) {
+            eprintln!("logical-db-crdt: load: InvalidSnapshotSize");
             return Err(CrdtError::InvalidSnapshotSize(bytes.len()));
         }
         Ok(Self {
@@ -189,6 +199,7 @@ impl Document {
     pub fn save(&mut self) -> Result<Vec<u8>, CrdtError> {
         let snapshot = self.inner.save_and_verify()?;
         if !is_nonempty_bounded(snapshot.len(), MAX_SNAPSHOT_BYTES) {
+            eprintln!("logical-db-crdt: save: InvalidSnapshotSize");
             return Err(CrdtError::InvalidSnapshotSize(snapshot.len()));
         }
         Ok(snapshot)
@@ -227,6 +238,7 @@ impl Document {
             Ok(value) => value,
             Err(error) => {
                 self.inner.rollback();
+                eprintln!("logical-db-crdt: edit: error");
                 return Err(error);
             }
         };
@@ -247,17 +259,20 @@ impl Document {
     /// Returns a decode, digest, dependency, or Automerge application failure.
     pub fn apply(&mut self, changes: &[EncodedChange]) -> Result<(), CrdtError> {
         if !is_at_most(changes.len(), MAX_CHANGES_PER_PAGE) {
+            eprintln!("logical-db-crdt: apply: ChangePageTooLarge");
             return Err(CrdtError::ChangePageTooLarge);
         }
         let mut aggregate_bytes = 0usize;
         for change in changes {
             if !is_nonempty_bounded(change.bytes.len(), MAX_CHANGE_BYTES) {
+                eprintln!("logical-db-crdt: apply: InvalidChangeSize");
                 return Err(CrdtError::InvalidChangeSize(change.bytes.len()));
             }
             aggregate_bytes = aggregate_bytes
                 .checked_add(change.bytes.len())
                 .ok_or(CrdtError::ChangePageTooLarge)?;
             if !is_at_most(aggregate_bytes, MAX_PAGE_BYTES) {
+                eprintln!("logical-db-crdt: apply: ChangePageTooLarge");
                 return Err(CrdtError::ChangePageTooLarge);
             }
         }
@@ -281,6 +296,56 @@ impl Document {
             .inner
             .get(&object.0, property)?
             .map(|(value, object)| item_from(value, object)))
+    }
+
+    /// Stages a first-class tombstone marker and returns its immutable change.
+    ///
+    /// The marker is a monotonic counter, so every delete — including a repeat
+    /// on an already deleted document — produces exactly one change that
+    /// merges without resurrecting the value on any replica. The snapshot and
+    /// its conflict candidates are retained; absence is a read rule enforced
+    /// above this boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError::Automerge`] when the marker mutation fails.
+    pub fn delete(&mut self) -> Result<Vec<EncodedChange>, CrdtError> {
+        let before = self.inner.get_heads();
+        let present = self
+            .inner
+            .get(&ROOT, TOMBSTONE_PROPERTY)
+            .map_err(CrdtError::from)?
+            .is_some();
+        let staged = if present {
+            self.inner
+                .increment(&ROOT, TOMBSTONE_PROPERTY, 1)
+                .map_err(CrdtError::from)
+        } else {
+            self.inner
+                .put(&ROOT, TOMBSTONE_PROPERTY, ScalarValue::Counter(1.into()))
+                .map_err(CrdtError::from)
+        };
+        if let Err(error) = staged {
+            self.inner.rollback();
+            eprintln!("logical-db-crdt: delete: error");
+            return Err(error);
+        }
+        self.inner.commit();
+        Ok(self
+            .inner
+            .get_changes(&before)
+            .into_iter()
+            .map(|change| encode_change(&change))
+            .collect())
+    }
+
+    /// Returns whether a tombstone marker is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError::Automerge`] when the marker cannot be read.
+    pub fn is_deleted(&mut self) -> Result<bool, CrdtError> {
+        Ok(self.inner.get(&ROOT, TOMBSTONE_PROPERTY)?.is_some())
     }
 }
 
@@ -423,6 +488,19 @@ impl Reader<'_> {
     pub fn text(&mut self, object: &Object) -> Result<String, CrdtError> {
         Ok(self.document.text(&object.0)?)
     }
+
+    /// Returns whether a tombstone marker is present on the read document.
+    ///
+    /// Conflict candidates stay inspectable through [`Reader::conflicts`]
+    /// after deletion; this flag tells the caller above the boundary to
+    /// report the document absent instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Automerge access failure.
+    pub fn is_deleted(&mut self) -> Result<bool, CrdtError> {
+        Ok(self.document.get(&ROOT, TOMBSTONE_PROPERTY)?.is_some())
+    }
 }
 
 /// Mutable view whose lifetime cannot outlive its document edit.
@@ -438,6 +516,7 @@ impl Editor<'_> {
     /// Returns a property, numeric portability, object, or Automerge failure.
     pub fn put(&mut self, object: &Object, property: &str, value: Scalar) -> Result<(), CrdtError> {
         validate_property(property)?;
+        validate_writable_property(property)?;
         validate_scalar(&value)?;
         self.document
             .put(&object.0, property, ScalarValue::from(value))?;
@@ -451,6 +530,7 @@ impl Editor<'_> {
     /// Returns a property, object, or Automerge failure.
     pub fn delete(&mut self, object: &Object, property: &str) -> Result<(), CrdtError> {
         validate_property(property)?;
+        validate_writable_property(property)?;
         self.document.delete(&object.0, property)?;
         Ok(())
     }
@@ -467,6 +547,7 @@ impl Editor<'_> {
         kind: ObjectKind,
     ) -> Result<Object, CrdtError> {
         validate_property(property)?;
+        validate_writable_property(property)?;
         Ok(Object(self.document.put_object(
             &object.0,
             property,
@@ -543,6 +624,7 @@ impl Editor<'_> {
         delta: i64,
     ) -> Result<(), CrdtError> {
         validate_property(property)?;
+        validate_writable_property(property)?;
         self.document.increment(&object.0, property, delta)?;
         Ok(())
     }
@@ -575,9 +657,13 @@ impl Editor<'_> {
         replacement: &str,
     ) -> Result<(), CrdtError> {
         if replacement.len() > MAX_CHANGE_BYTES {
+            eprintln!("logical-db-crdt: splice_text: ScalarTooLarge");
             return Err(CrdtError::ScalarTooLarge(replacement.len()));
         }
-        let delete = isize::try_from(delete).map_err(|_| CrdtError::InvalidSequenceRange)?;
+        let delete = isize::try_from(delete).map_err(|error| {
+            eprintln!("logical-db-crdt: CrdtError::InvalidSequenceRange: {error}");
+            CrdtError::InvalidSequenceRange
+        })?;
         self.document
             .splice_text(&text.0, position, delete, replacement)?;
         Ok(())
@@ -640,6 +726,14 @@ fn validate_property(property: &str) -> Result<(), CrdtError> {
     }
 }
 
+fn validate_writable_property(property: &str) -> Result<(), CrdtError> {
+    if property == TOMBSTONE_PROPERTY {
+        Err(CrdtError::InvalidProperty)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_scalar(value: &Scalar) -> Result<(), CrdtError> {
     match value {
         Scalar::Number(number) if !number.is_finite() => Err(CrdtError::NonFiniteNumber),
@@ -679,6 +773,7 @@ fn encode_change(change: &Change) -> EncodedChange {
 fn decode_change(encoded: &EncodedChange) -> Result<Change, CrdtError> {
     let change = Change::from_bytes(encoded.bytes.clone())?;
     if hash_digest(change.hash()) != encoded.digest {
+        eprintln!("logical-db-crdt: decode_change: DigestMismatch");
         return Err(CrdtError::DigestMismatch);
     }
     Ok(change)
@@ -1014,5 +1109,94 @@ mod tests {
             document.apply(&excessive),
             Err(CrdtError::ChangePageTooLarge)
         ));
+    }
+
+    #[test]
+    fn reserved_tombstone_property_is_rejected_for_application_writes() {
+        let mut document = Document::new();
+        assert!(matches!(
+            document.edit(|editor| {
+                editor.put(&Object::root(), TOMBSTONE_PROPERTY, Scalar::Boolean(true))
+            }),
+            Err(CrdtError::InvalidProperty)
+        ));
+        assert!(matches!(
+            document.edit(|editor| editor.delete(&Object::root(), TOMBSTONE_PROPERTY)),
+            Err(CrdtError::InvalidProperty)
+        ));
+        assert!(matches!(
+            document.edit(|editor| editor.put_object(
+                &Object::root(),
+                TOMBSTONE_PROPERTY,
+                ObjectKind::Map
+            )),
+            Err(CrdtError::InvalidProperty)
+        ));
+        assert!(matches!(
+            document.edit(|editor| editor.increment(&Object::root(), TOMBSTONE_PROPERTY, 1)),
+            Err(CrdtError::InvalidProperty)
+        ));
+        assert!(!document.is_deleted().unwrap());
+        let ((), changes) = document
+            .edit(|editor| editor.put(&Object::root(), "ok", Scalar::Integer(1)))
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn document_delete_marks_tombstone_with_exactly_one_change() {
+        let mut document = Document::new();
+        assert!(!document.is_deleted().unwrap());
+        assert!(!document.reader().is_deleted().unwrap());
+        let changes = document.delete().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(document.is_deleted().unwrap());
+        assert!(document.reader().is_deleted().unwrap());
+        let snapshot = document.save().unwrap();
+        let mut restored = Document::load(&snapshot).unwrap();
+        assert!(restored.is_deleted().unwrap());
+        assert!(restored.reader().is_deleted().unwrap());
+        let again = restored.delete().unwrap();
+        assert_eq!(again.len(), 1);
+        assert!(restored.is_deleted().unwrap());
+    }
+
+    #[test]
+    fn tombstone_survives_merge_and_concurrent_edits_stay_inspectable() {
+        let mut origin = Document::new();
+        origin
+            .edit(|editor| editor.put(&Object::root(), "title", Scalar::String("base".into())))
+            .unwrap();
+        let snapshot = origin.save().unwrap();
+        let mut deleter = Document::load(&snapshot).unwrap();
+        let mut editor_side = Document::load(&snapshot).unwrap();
+        let tombstone_changes = deleter.delete().unwrap();
+        let ((), edit_changes) = editor_side
+            .edit(|editor| editor.put(&Object::root(), "title", Scalar::String("rival".into())))
+            .unwrap();
+        deleter.apply(&edit_changes).unwrap();
+        editor_side.apply(&tombstone_changes).unwrap();
+        assert!(deleter.is_deleted().unwrap());
+        assert!(editor_side.is_deleted().unwrap());
+        assert!(deleter.reader().is_deleted().unwrap());
+        assert!(editor_side.reader().is_deleted().unwrap());
+        for side in [&mut deleter, &mut editor_side] {
+            let values = side.reader().conflicts(&Object::root(), "title").unwrap();
+            assert!(
+                values
+                    .iter()
+                    .any(|value| value.value == Item::Scalar(Scalar::String("rival".into())))
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_document_delete_applies_cleanly_to_an_empty_replica() {
+        let mut deleter = Document::new();
+        let tombstone_changes = deleter.delete().unwrap();
+        let mut late = Document::new();
+        assert!(!late.is_deleted().unwrap());
+        late.apply(&tombstone_changes).unwrap();
+        assert!(late.is_deleted().unwrap());
     }
 }

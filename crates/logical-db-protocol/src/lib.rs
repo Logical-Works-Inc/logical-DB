@@ -41,6 +41,7 @@ impl Checkpoint {
     /// exceeds the opaque-token bound.
     pub fn from_wire(bytes: Vec<u8>) -> Result<Self, ProtocolError> {
         if bytes.is_empty() || bytes.len() > MAX_CHECKPOINT_BYTES {
+            eprintln!("logical-db-protocol: from_wire: InvalidCheckpoint");
             return Err(ProtocolError::InvalidCheckpoint);
         }
         Ok(Self(bytes))
@@ -85,6 +86,7 @@ impl ChangeEnvelope {
     /// empty or exceeds the per-change bound.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.bytes.is_empty() || self.bytes.len() > MAX_CHANGE_BYTES {
+            eprintln!("logical-db-protocol: validate: InvalidChangeSize");
             return Err(ProtocolError::InvalidChangeSize(self.bytes.len()));
         }
         Ok(())
@@ -118,6 +120,7 @@ impl PushRequest {
             .iter()
             .any(|change| change.replica != self.replica)
         {
+            eprintln!("logical-db-protocol: validate: ReplicaMismatch");
             return Err(ProtocolError::ReplicaMismatch);
         }
         Ok(())
@@ -185,6 +188,7 @@ impl PushResponse {
     pub fn validate(&self, request: &PushRequest) -> Result<(), ProtocolError> {
         validate_protocol(self.protocol)?;
         if self.outcomes.len() != request.changes.len() {
+            eprintln!("logical-db-protocol: validate: OutcomeMismatch");
             return Err(ProtocolError::OutcomeMismatch);
         }
         for (outcome, change) in self.outcomes.iter().zip(&request.changes) {
@@ -194,6 +198,7 @@ impl PushResponse {
                 | PushOutcome::Rejected { operation, .. } => operation,
             };
             if *operation != change.operation {
+                eprintln!("logical-db-protocol: validate: OutcomeMismatch");
                 return Err(ProtocolError::OutcomeMismatch);
             }
         }
@@ -230,9 +235,11 @@ impl PullRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_protocol(self.protocol)?;
         if self.max_changes == 0 || usize::from(self.max_changes) > MAX_CHANGES_PER_PAGE {
+            eprintln!("logical-db-protocol: validate: PageLimit");
             return Err(ProtocolError::PageLimit);
         }
         if self.max_bytes == 0 || self.max_bytes as usize > MAX_PAGE_BYTES {
+            eprintln!("logical-db-protocol: validate: PageLimit");
             return Err(ProtocolError::PageLimit);
         }
         Ok(())
@@ -264,6 +271,7 @@ impl PullPage {
         validate_protocol(self.protocol)?;
         validate_page(&self.changes)?;
         if self.more && self.changes.is_empty() {
+            eprintln!("logical-db-protocol: validate: NonProgressPage");
             return Err(ProtocolError::NonProgressPage);
         }
         if self
@@ -271,6 +279,7 @@ impl PullPage {
             .iter()
             .any(|change| change.scope != expected_scope)
         {
+            eprintln!("logical-db-protocol: validate: ScopeMismatch");
             return Err(ProtocolError::ScopeMismatch);
         }
         Ok(())
@@ -281,8 +290,13 @@ impl PullPage {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ProtocolError {
     /// Sender and receiver do not implement the same protocol.
-    #[error("unsupported protocol version {0}")]
-    UnsupportedVersion(u16),
+    #[error("{context}: unsupported protocol version {actual}")]
+    UnsupportedVersion {
+        /// Observed wire version.
+        actual: u16,
+        /// Protocol admission boundary.
+        context: &'static str,
+    },
     /// A checkpoint violated its opaque wire bounds.
     #[error("checkpoint is empty or exceeds the wire limit")]
     InvalidCheckpoint,
@@ -310,12 +324,16 @@ fn validate_protocol(version: u16) -> Result<(), ProtocolError> {
     if version == PROTOCOL_VERSION {
         Ok(())
     } else {
-        Err(ProtocolError::UnsupportedVersion(version))
+        Err(ProtocolError::UnsupportedVersion {
+            actual: version,
+            context: "validate_protocol",
+        })
     }
 }
 
 fn validate_page(changes: &[ChangeEnvelope]) -> Result<(), ProtocolError> {
     if changes.len() > MAX_CHANGES_PER_PAGE {
+        eprintln!("logical-db-protocol: validate_page: PageLimit");
         return Err(ProtocolError::PageLimit);
     }
     let mut bytes = 0usize;
@@ -323,6 +341,7 @@ fn validate_page(changes: &[ChangeEnvelope]) -> Result<(), ProtocolError> {
         change.validate()?;
         bytes = bytes.saturating_add(change.bytes.len());
         if bytes > MAX_PAGE_BYTES {
+            eprintln!("logical-db-protocol: validate_page: PageLimit");
             return Err(ProtocolError::PageLimit);
         }
     }
@@ -335,6 +354,7 @@ where
 {
     let bytes = deserialize_bounded_bytes(deserializer, MAX_CHECKPOINT_BYTES, "checkpoint bytes")?;
     if bytes.is_empty() {
+        eprintln!("logical-db-protocol: deserialize_checkpoint_bytes: custom");
         return Err(D::Error::custom("checkpoint must not be empty"));
     }
     Ok(bytes)
@@ -346,6 +366,7 @@ where
 {
     let bytes = deserialize_bounded_bytes(deserializer, MAX_CHANGE_BYTES, "change bytes")?;
     if bytes.is_empty() {
+        eprintln!("logical-db-protocol: deserialize_change_bytes: custom");
         return Err(D::Error::custom("change bytes must not be empty"));
     }
     Ok(bytes)
@@ -373,12 +394,14 @@ where
             let mut aggregate_bytes = 0usize;
             while let Some(change) = sequence.next_element::<ChangeEnvelope>()? {
                 if changes.len() == MAX_CHANGES_PER_PAGE {
+                    eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("change page count exceeds limit"));
                 }
                 aggregate_bytes = aggregate_bytes
                     .checked_add(change.bytes.len())
                     .ok_or_else(|| A::Error::custom("change page byte count overflow"))?;
                 if aggregate_bytes > MAX_PAGE_BYTES {
+                    eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("change page bytes exceed limit"));
                 }
                 changes.push(change);
@@ -421,7 +444,14 @@ where
         where
             E: serde::de::Error,
         {
-            self.visit_byte_buf(value.to_vec())
+            if value.len() > self.maximum {
+                eprintln!(
+                    "logical-db-protocol: borrowed bytes exceed {}",
+                    self.maximum
+                );
+                return Err(E::invalid_length(value.len(), &self));
+            }
+            Ok(value.to_vec())
         }
 
         fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
@@ -436,6 +466,7 @@ where
             E: serde::de::Error,
         {
             if value.len() > self.maximum {
+                eprintln!("logical-db-protocol: visit_byte_buf: invalid_length");
                 return Err(E::invalid_length(value.len(), &self));
             }
             Ok(value)
@@ -449,6 +480,7 @@ where
             let mut values = Vec::with_capacity(capacity);
             while let Some(value) = sequence.next_element()? {
                 if values.len() == self.maximum {
+                    eprintln!("logical-db-protocol: visit_seq: invalid_length");
                     return Err(A::Error::invalid_length(
                         self.maximum.saturating_add(1),
                         &self,
@@ -460,7 +492,8 @@ where
         }
     }
 
-    deserializer.deserialize_byte_buf(BytesVisitor { maximum, expecting })
+    let visitor = BytesVisitor { maximum, expecting };
+    deserializer.deserialize_byte_buf(visitor)
 }
 
 fn deserialize_bounded_vec<'de, D, T>(
@@ -496,6 +529,7 @@ where
             let mut values = Vec::with_capacity(capacity);
             while let Some(value) = sequence.next_element()? {
                 if values.len() == self.maximum {
+                    eprintln!("logical-db-protocol: visit_seq: invalid_length");
                     return Err(A::Error::invalid_length(
                         self.maximum.saturating_add(1),
                         &self,
@@ -519,6 +553,34 @@ mod tests {
     use logical_db_model::{AccountId, SpaceId};
 
     use super::*;
+
+    #[test]
+    fn mixed_push_outcomes_preserve_operation_correlation() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let request = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![envelope(replica, scope), envelope(replica, scope)],
+        };
+        let duplicate = PushOutcome::Duplicate {
+            operation: request.changes[0].operation,
+        };
+        let rejected = PushOutcome::Rejected {
+            operation: request.changes[1].operation,
+            code: RejectionCode::Forbidden,
+        };
+        let mut response = PushResponse {
+            protocol: PROTOCOL_VERSION,
+            outcomes: vec![duplicate, rejected],
+        };
+        assert_eq!(response.validate(&request), Ok(()));
+        response.outcomes.swap(0, 1);
+        assert_eq!(
+            response.validate(&request),
+            Err(ProtocolError::OutcomeMismatch)
+        );
+    }
 
     fn envelope(replica: ReplicaId, scope: Scope) -> ChangeEnvelope {
         ChangeEnvelope {
@@ -680,7 +742,7 @@ mod tests {
         };
         assert!(matches!(
             pull(PROTOCOL_VERSION + 1, 1, 1).validate(),
-            Err(ProtocolError::UnsupportedVersion(_))
+            Err(ProtocolError::UnsupportedVersion { .. })
         ));
         assert_eq!(
             pull(PROTOCOL_VERSION, 0, 1).validate(),
@@ -850,7 +912,7 @@ mod tests {
                 ..valid
             }
             .validate(&request),
-            Err(ProtocolError::UnsupportedVersion(_))
+            Err(ProtocolError::UnsupportedVersion { .. })
         ));
         let page = PullPage {
             protocol: PROTOCOL_VERSION + 1,
@@ -860,7 +922,7 @@ mod tests {
         };
         assert!(matches!(
             page.validate(scope),
-            Err(ProtocolError::UnsupportedVersion(_))
+            Err(ProtocolError::UnsupportedVersion { .. })
         ));
     }
 }

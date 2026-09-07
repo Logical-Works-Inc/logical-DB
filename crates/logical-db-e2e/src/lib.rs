@@ -366,7 +366,8 @@ mod tests {
         ));
         drop(reopened);
 
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
         fs::set_permissions(&path, permissions).unwrap();
         if let Ok(read_only) = Database::open(&path, scope, replica) {
@@ -382,13 +383,7 @@ mod tests {
             );
             drop(read_only);
         }
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        // This test is compiled only on Windows, where clearing the read-only
-        // file attribute is the precise cleanup operation and does not alter
-        // Unix mode bits.
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        fs::set_permissions(&path, permissions).unwrap();
+        fs::set_permissions(&path, original_permissions).unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
     }

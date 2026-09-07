@@ -1,0 +1,29 @@
+# Evidence: S11 S12 S13 establish local-first, causal, and authenticated
+# semantic records; S17 S22 bound hostile values and corruption handling;
+# S23 S24 define stable request/error semantics; S25 S26 define canonical
+# bytes and identifiers; S29 S30 support digest construction; S34 S35 S36
+# S40 S41 map capability, admission, capsule, invocation, and proof concepts;
+# S39 covers the bounded wire representation boundary; S14 S18 S42 inform
+# transaction identity and exact retry boundaries at the integration edge.
+# Source semantics from
+# `cairn/quarantine/cairn_python/world_token.py` and `cairn/crates/wm-core`;
+# URLs are in ../../evidence/SOURCES.md.
+
+[package]
+name = "logical-db-cairn"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

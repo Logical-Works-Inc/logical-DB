@@ -31,7 +31,7 @@ impl BearerAuthenticator {
         validate_bearer_token(token)?;
         Ok(Self {
             key,
-            expected_tag: bearer_tag(key, token),
+            expected_tag: bearer_tag(key, token)?,
             scope,
         })
     }
@@ -45,17 +45,21 @@ impl Authenticator for BearerAuthenticator {
         authorization: &HeaderValue,
         now_unix_ms: u64,
     ) -> Result<Self::Policy, AuthenticationError> {
-        let token = authorization
-            .as_bytes()
-            .strip_prefix(b"Bearer ")
-            .ok_or(AuthenticationError::Unauthorized)?;
-        let mut verifier = <HmacSha256 as KeyInit>::new_from_slice(&self.key)
-            .map_err(|_| AuthenticationError::Forbidden)?;
+        let token = authorization.as_bytes().strip_prefix(b"Bearer ").ok_or(
+            AuthenticationError::Malformed {
+                context: "bearer scheme",
+            },
+        )?;
+        let mut verifier = <HmacSha256 as KeyInit>::new_from_slice(&self.key).map_err(|error| {
+            eprintln!("logical-db-daemon: HMAC verifier initialization failed: {error}");
+            AuthenticationError::Forbidden
+        })?;
         verifier.update(b"logical-db/standalone/bearer/v1\0");
         verifier.update(token);
-        verifier
-            .verify_slice(&self.expected_tag)
-            .map_err(|_| AuthenticationError::Unauthorized)?;
+        verifier.verify_slice(&self.expected_tag).map_err(|error| {
+            eprintln!("logical-db-daemon: bearer verification failed: {error}");
+            AuthenticationError::Unauthorized
+        })?;
         let expires_at = now_unix_ms
             .checked_add(60_000)
             .ok_or(AuthenticationError::Forbidden)?;
@@ -63,20 +67,29 @@ impl Authenticator for BearerAuthenticator {
     }
 }
 
-fn bearer_tag(key: [u8; 32], token: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <HmacSha256 as KeyInit>::new_from_slice(&key).expect("HMAC accepts every key length");
+fn bearer_tag(key: [u8; 32], token: &[u8]) -> Result<[u8; 32], io::Error> {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&key)
+        .map_err(|error| io::Error::other(format!("HMAC initialization failed: {error}")))?;
     mac.update(b"logical-db/standalone/bearer/v1\0");
     mac.update(token);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 fn required(name: &'static str) -> Result<String, io::Error> {
-    std::env::var(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, name))
+    std::env::var(name).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is unavailable: {error}"),
+        )
+    })
 }
 
 fn parse_key(value: &str) -> Result<[u8; 32], io::Error> {
     if value.len() != 64 {
+        eprintln!(
+            "logical-db-daemon: checkpoint key length was {}",
+            value.len()
+        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "checkpoint key must contain 64 hexadecimal characters",
@@ -85,6 +98,7 @@ fn parse_key(value: &str) -> Result<[u8; 32], io::Error> {
     let mut key = [0; 32];
     let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
     if !remainder.is_empty() {
+        eprintln!("logical-db-daemon: checkpoint key ended in a partial octet");
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "checkpoint key must contain complete hexadecimal octets",
@@ -92,11 +106,16 @@ fn parse_key(value: &str) -> Result<[u8; 32], io::Error> {
     }
     for (index, pair) in pairs.iter().enumerate() {
         let pair = std::str::from_utf8(pair)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid checkpoint key"))?;
-        key[index] = u8::from_str_radix(pair, 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid checkpoint key"))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        key[index] = u8::from_str_radix(pair, 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid checkpoint key octet {index}: {error}"),
+            )
+        })?;
     }
     if key == [0; 32] {
+        eprintln!("logical-db-daemon: checkpoint key was all zero");
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "checkpoint key must be nonzero",
@@ -121,6 +140,10 @@ fn validate_bearer_token(token: &[u8]) -> Result<(), io::Error> {
     if valid {
         Ok(())
     } else {
+        eprintln!(
+            "logical-db-daemon: rejected bearer token length {} or invalid alphabet",
+            token.len()
+        );
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "bearer token must be 32..=4096 RFC 6750 b64token bytes",
@@ -129,9 +152,10 @@ fn validate_bearer_token(token: &[u8]) -> Result<(), io::Error> {
 }
 
 fn parse_non_nil_uuid(value: &str, name: &'static str) -> Result<Uuid, io::Error> {
-    let value =
-        Uuid::parse_str(value).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, name))?;
+    let value = Uuid::parse_str(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{name}: {error}")))?;
     if value.is_nil() {
+        eprintln!("logical-db-daemon: rejected nil UUID for {name}");
         return Err(io::Error::new(io::ErrorKind::InvalidInput, name));
     }
     Ok(value)
@@ -150,20 +174,30 @@ async fn shutdown_signal() {
             return;
         }
     }
-    let _ = tokio::signal::ctrl_c().await;
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("logical-db-daemon: ctrl-c signal listener failed: {error}");
+    }
+}
+
+fn ensure_loopback(address: &SocketAddr) -> Result<(), io::Error> {
+    if address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the daemon has no TLS terminator and therefore binds only to loopback",
+        ))
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let bind = std::env::var("LOGICAL_DB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let bind = std::env::var("LOGICAL_DB_BIND").unwrap_or_else(|error| {
+        eprintln!("logical-db-daemon: LOGICAL_DB_BIND defaulted: {error}");
+        "127.0.0.1:8080".into()
+    });
     let address: SocketAddr = bind.parse()?;
-    if !address.ip().is_loopback() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the daemon has no TLS terminator and therefore binds only to loopback",
-        )
-        .into());
-    }
+    ensure_loopback(&address)?;
     let cluster_file = required("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     let bearer = required("LOGICAL_DB_BEARER_TOKEN")?;
     let key = parse_key(&required("LOGICAL_DB_CHECKPOINT_KEY_HEX")?)?;
@@ -178,11 +212,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?),
     );
 
+    #[allow(unsafe_code)]
     // SAFETY: FoundationDB requires exactly one network bootstrap per process.
     // This composition root calls it once, retains the returned guard until the
     // listener and all database-owning router state have been dropped, and does
     // not expose the guard or any FFI handle through its safe public libraries.
-    #[allow(unsafe_code)]
     let network = unsafe { foundationdb::boot() };
     let database = foundationdb::Database::new_compat(Some(&cluster_file)).await?;
     let transaction = database.create_trx()?;
@@ -216,8 +250,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use logical_db_model::{Effect, OperationDigest};
-    use logical_db_service::Authority;
+    use std::{
+        convert::Infallible,
+        future::{Future, ready},
+    };
+
+    use logical_db_crdt::{Document, Object, Scalar};
+    use logical_db_model::{DocumentId, Effect, OperationDigest, OperationId, ReplicaId};
+    use logical_db_protocol::{
+        ChangeEnvelope, PROTOCOL_VERSION, PullRequest, PushOutcome, PushRequest, RejectionCode,
+    };
+    use logical_db_service::{
+        AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ProtocolService,
+        ServiceError, ServiceStore,
+    };
 
     use super::*;
 
@@ -232,6 +278,107 @@ mod tests {
 
     fn request(seed: u8) -> OperationDigest {
         OperationDigest::new([seed; 32])
+    }
+
+    /// Store double that must never be contacted: the default composition
+    /// refuses write and sync authorization before any durable work.
+    struct RefusedStore;
+
+    impl ServiceStore for RefusedStore {
+        type Error = Infallible;
+
+        fn accept(
+            &self,
+            _change: &ChangeEnvelope,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Ok(0))
+        }
+
+        fn page(
+            &self,
+            _scope: Scope,
+            _request: OperationDigest,
+            _after: u64,
+            _max_changes: u16,
+            _max_bytes: u32,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+    }
+
+    fn default_push_request(scope: Scope, replica: ReplicaId) -> (PushRequest, OperationId) {
+        let mut document = Document::new();
+        let ((), mut changes) = document
+            .edit(|editor| editor.put(&Object::root(), "field", Scalar::Integer(7)))
+            .unwrap();
+        let encoded = changes.pop().unwrap();
+        let operation = OperationId::new();
+        let request = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![ChangeEnvelope {
+                scope,
+                document: DocumentId::new(),
+                replica,
+                operation,
+                request: OperationDigest::new([8; 32]),
+                digest: encoded.digest,
+                bytes: encoded.bytes,
+            }],
+        };
+        (request, operation)
+    }
+
+    #[tokio::test]
+    async fn default_composition_refuses_writes_and_sync_end_to_end() {
+        let expected_scope = scope(41);
+        let authentication =
+            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", expected_scope)
+                .unwrap();
+        let policy = authentication
+            .authenticate(
+                &HeaderValue::from_static("Bearer correct-correct-correct-correct-0041"),
+                1_000,
+            )
+            .unwrap();
+        let service = ProtocolService::new(
+            RefusedStore,
+            policy,
+            CheckpointCodec::new([7; 32], 60_000).unwrap(),
+        );
+        let replica = ReplicaId::new();
+        let (push, operation) = default_push_request(expected_scope, replica);
+        let response = service.push(&push, 2_000).await.unwrap();
+        assert!(matches!(
+            response.outcomes.as_slice(),
+            [PushOutcome::Rejected {
+                operation: outcome,
+                code: RejectionCode::Forbidden
+            }] if *outcome == operation
+        ));
+        let pull = PullRequest {
+            protocol: PROTOCOL_VERSION,
+            scope: expected_scope,
+            replica,
+            request: OperationDigest::new([3; 32]),
+            after: None,
+            max_changes: 16,
+            max_bytes: 1_048_576,
+        };
+        assert!(matches!(
+            service.pull(&pull, 2_000).await,
+            Err(ServiceError::Forbidden)
+        ));
     }
 
     #[test]
@@ -307,6 +454,18 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn daemon_binds_only_to_loopback() {
+        for loopback in ["127.0.0.1:8080", "[::1]:8080"] {
+            let address: SocketAddr = loopback.parse().unwrap();
+            assert!(ensure_loopback(&address).is_ok());
+        }
+        for public in ["0.0.0.0:8080", "192.0.2.1:8080", "[::]:8080"] {
+            let address: SocketAddr = public.parse().unwrap();
+            assert!(ensure_loopback(&address).is_err());
+        }
     }
 
     #[test]

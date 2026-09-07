@@ -96,6 +96,11 @@ pub enum AuthenticationError {
     Unauthorized,
     /// Credential is valid but barred from the service itself.
     Forbidden,
+    /// Credential bytes did not have the required scheme or encoding.
+    Malformed {
+        /// Authentication boundary that rejected the representation.
+        context: &'static str,
+    },
 }
 
 struct ApiState<Store, Authentication, Time> {
@@ -265,6 +270,7 @@ where
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let authorization = values.next().ok_or(ApiError::Unauthorized)?;
     if values.next().is_some() {
+        eprintln!("logical-db-server: authenticate: Unauthorized");
         return Err(ApiError::Unauthorized);
     }
     state
@@ -273,6 +279,10 @@ where
         .map_err(|error| match error {
             AuthenticationError::Unauthorized => ApiError::Unauthorized,
             AuthenticationError::Forbidden => ApiError::Forbidden,
+            AuthenticationError::Malformed { context } => {
+                eprintln!("logical-db-server: authentication rejected at {context}");
+                ApiError::Unauthorized
+            }
         })
 }
 
@@ -282,6 +292,7 @@ fn validate_representation(headers: &HeaderMap) -> Result<(), ApiError> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next());
     if content_type != Some(MEDIA_TYPE) {
+        eprintln!("logical-db-server: validate_representation: UnsupportedMediaType");
         return Err(ApiError::UnsupportedMediaType);
     }
     let accept = headers
@@ -289,6 +300,7 @@ fn validate_representation(headers: &HeaderMap) -> Result<(), ApiError> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next());
     if !matches!(accept, Some(MEDIA_TYPE | "*/*")) {
+        eprintln!("logical-db-server: validate_representation: NotAcceptable");
         return Err(ApiError::NotAcceptable);
     }
     Ok(())
@@ -296,9 +308,21 @@ fn validate_representation(headers: &HeaderMap) -> Result<(), ApiError> {
 
 fn decode<Value: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Value, ApiError> {
     let mut reader = Cursor::new(body);
-    let value = ciborium::from_reader(&mut reader).map_err(|_| ApiError::Malformed)?;
+    let value = ciborium::from_reader(&mut reader).map_err(|error| {
+        eprintln!(
+            "logical-db-server: CBOR decode category {:?}, body bytes {}",
+            std::mem::discriminant(&error),
+            body.len()
+        );
+        ApiError::Malformed {
+            context: "CBOR decode",
+        }
+    })?;
     if reader.position() != body.len() as u64 {
-        return Err(ApiError::Malformed);
+        eprintln!("logical-db-server: decode: Malformed");
+        return Err(ApiError::Malformed {
+            context: "trailing CBOR bytes",
+        });
     }
     Ok(value)
 }
@@ -308,8 +332,15 @@ fn encode_response<Value: serde::Serialize>(
     value: &Value,
 ) -> Result<Response, ApiError> {
     let mut body = Vec::new();
-    ciborium::into_writer(value, &mut body).map_err(|_| ApiError::Internal)?;
+    ciborium::into_writer(value, &mut body).map_err(|error| {
+        eprintln!(
+            "logical-db-server: CBOR encode category {:?}",
+            std::mem::discriminant(&error)
+        );
+        ApiError::Internal
+    })?;
     if body.len() > MAX_HTTP_BODY_BYTES {
+        eprintln!("logical-db-server: encode_response: Internal");
         return Err(ApiError::Internal);
     }
     Ok((
@@ -328,7 +359,9 @@ where
     Store: ServiceStore,
 {
     match error {
-        ServiceError::Protocol(_) | ServiceError::Checkpoint(_) => ApiError::Malformed,
+        ServiceError::Protocol(_) | ServiceError::Checkpoint(_) => ApiError::Malformed {
+            context: "service protocol or checkpoint",
+        },
         ServiceError::Forbidden => ApiError::Forbidden,
         ServiceError::StaleAuthority => ApiError::Unavailable,
         ServiceError::Store(error) => match Store::classify_error(error) {
@@ -345,7 +378,7 @@ enum ApiError {
     Forbidden,
     UnsupportedMediaType,
     NotAcceptable,
-    Malformed,
+    Malformed { context: &'static str },
     CheckpointExpired,
     Busy,
     Deadline,
@@ -361,7 +394,10 @@ impl IntoResponse for ApiError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
-            Self::Malformed => StatusCode::BAD_REQUEST,
+            Self::Malformed { context } => {
+                eprintln!("logical-db-server: malformed request at {context}");
+                StatusCode::BAD_REQUEST
+            }
             Self::CheckpointExpired => StatusCode::GONE,
             Self::Busy | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Deadline => StatusCode::GATEWAY_TIMEOUT,
@@ -404,7 +440,7 @@ mod tests {
         Scope, SpaceId,
     };
     use logical_db_protocol::{
-        ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse,
+        ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
     use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, StoredPage};
     use tokio::sync::Notify;
@@ -470,48 +506,93 @@ mod tests {
         ) -> Result<Self::Policy, AuthenticationError> {
             if authorization.as_bytes() == b"Bearer integration-test" {
                 Ok(Allow)
+            } else if !authorization.as_bytes().starts_with(b"Bearer ") {
+                Err(AuthenticationError::Malformed {
+                    context: "bearer scheme",
+                })
             } else {
                 Err(AuthenticationError::Unauthorized)
             }
         }
     }
 
-    struct FixedClock;
-
-    impl Clock for FixedClock {
-        fn now_unix_ms(&self) -> Option<u64> {
-            Some(1_000)
-        }
+    /// Test double with the default composition's exact posture: one bound
+    /// scope, a short expiry, and read/scan effects only. Write and sync
+    /// authorization always fails, mirroring `LocalBraidAuthority`.
+    struct DefaultComposition {
+        scope: Scope,
+        expires_at_unix_ms: u64,
     }
 
-    #[derive(Clone, Copy)]
-    enum ClassifiedStoreError {
-        Transient,
-        Permanent,
-    }
+    impl Authority for DefaultComposition {
+        type Grant = Grant;
 
-    struct ClassifiedStore;
-
-    impl ServiceStore for ClassifiedStore {
-        type Error = ClassifiedStoreError;
-
-        fn classify_error(error: &Self::Error) -> StoreFailureClass {
-            match error {
-                ClassifiedStoreError::Transient => StoreFailureClass::Transient,
-                ClassifiedStoreError::Permanent => StoreFailureClass::Permanent,
+        fn authorize(
+            &self,
+            scope: Scope,
+            effect: Effect,
+            request: OperationDigest,
+            frontier: u64,
+            now_unix_ms: u64,
+        ) -> Option<Self::Grant> {
+            if scope != self.scope
+                || !matches!(effect, Effect::Read | Effect::Scan)
+                || now_unix_ms >= self.expires_at_unix_ms
+            {
+                return None;
             }
+            Some(Grant {
+                scope,
+                effect,
+                request,
+                frontier,
+            })
         }
+    }
+
+    struct DefaultAuthentication {
+        scope: Scope,
+    }
+
+    impl Authenticator for DefaultAuthentication {
+        type Policy = DefaultComposition;
+
+        fn authenticate(
+            &self,
+            authorization: &HeaderValue,
+            now_unix_ms: u64,
+        ) -> Result<Self::Policy, AuthenticationError> {
+            if authorization.as_bytes() != b"Bearer default-composition" {
+                eprintln!("logical-db-server: authenticate: Unauthorized");
+                return Err(AuthenticationError::Unauthorized);
+            }
+            let expires_at = now_unix_ms
+                .checked_add(60_000)
+                .ok_or(AuthenticationError::Forbidden)?;
+            Ok(DefaultComposition {
+                scope: self.scope,
+                expires_at_unix_ms: expires_at,
+            })
+        }
+    }
+
+    /// Store double reporting every invocation already consumed, as the
+    /// durable adapter does after a grant's single use.
+    struct ConsumedInvocations;
+
+    impl ServiceStore for ConsumedInvocations {
+        type Error = Infallible;
 
         fn accept(
             &self,
             _change: &ChangeEnvelope,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
-            ready(Err(ClassifiedStoreError::Permanent))
+            ready(Ok(AcceptResult::InvocationConsumed))
         }
 
         fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-            ready(Err(ClassifiedStoreError::Permanent))
+            ready(Ok(0))
         }
 
         fn page(
@@ -523,21 +604,68 @@ mod tests {
             _max_bytes: u32,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
-            ready(Err(ClassifiedStoreError::Permanent))
+            ready(Ok(PageResult::StaleAuthority))
+        }
+    }
+
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now_unix_ms(&self) -> Option<u64> {
+            Some(1_000)
+        }
+    }
+
+    type ClassifiedStoreError = std::io::ErrorKind;
+
+    struct ClassifiedStore;
+
+    impl ServiceStore for ClassifiedStore {
+        type Error = ClassifiedStoreError;
+
+        fn classify_error(error: &Self::Error) -> StoreFailureClass {
+            match error {
+                ClassifiedStoreError::WouldBlock => StoreFailureClass::Transient,
+                _ => StoreFailureClass::Permanent,
+            }
+        }
+
+        fn accept(
+            &self,
+            _change: &ChangeEnvelope,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            ready(Err(ClassifiedStoreError::InvalidData))
+        }
+
+        fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Err(ClassifiedStoreError::InvalidData))
+        }
+
+        fn page(
+            &self,
+            _scope: Scope,
+            _request: OperationDigest,
+            _after: u64,
+            _max_changes: u16,
+            _max_bytes: u32,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            ready(Err(ClassifiedStoreError::InvalidData))
         }
     }
 
     #[test]
     fn only_explicitly_transient_store_failures_are_retryable() {
         let transient = map_service_error::<ClassifiedStore>(&ServiceError::Store(
-            ClassifiedStoreError::Transient,
+            ClassifiedStoreError::WouldBlock,
         ))
         .into_response();
         assert_eq!(transient.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(transient.headers().get(RETRY_AFTER).unwrap(), "1");
 
         let permanent = map_service_error::<ClassifiedStore>(&ServiceError::Store(
-            ClassifiedStoreError::Permanent,
+            ClassifiedStoreError::InvalidData,
         ))
         .into_response();
         assert_eq!(permanent.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -669,10 +797,14 @@ mod tests {
     }
 
     fn request(path: &str, body: Vec<u8>) -> Request<Body> {
+        request_as(path, body, "Bearer integration-test")
+    }
+
+    fn request_as(path: &str, body: Vec<u8>, authorization: &str) -> Request<Body> {
         Request::post(path)
             .header(CONTENT_TYPE, MEDIA_TYPE)
             .header(ACCEPT, MEDIA_TYPE)
-            .header(AUTHORIZATION, "Bearer integration-test")
+            .header(AUTHORIZATION, authorization)
             .body(Body::from(body))
             .unwrap()
     }
@@ -790,6 +922,10 @@ mod tests {
         let response = app.clone().oneshot(ambiguous).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        let malformed = request_as("/v1/changes:push", vec![0x80], "Basic invalid");
+        let response = app.clone().oneshot(malformed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         let response = app
             .oneshot(
                 Request::post("/v1/changes:push")
@@ -860,5 +996,95 @@ mod tests {
             first.await.unwrap().unwrap().status(),
             StatusCode::GATEWAY_TIMEOUT
         );
+    }
+
+    #[tokio::test]
+    async fn default_composition_refuses_writes_and_sync_over_http() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let app = router(
+            Memory::default(),
+            DefaultAuthentication { scope },
+            CheckpointCodec::new([9; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let change = change(scope, replica);
+        let push = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![change.clone()],
+        };
+        let response = app
+            .clone()
+            .oneshot(request_as(
+                "/v1/changes:push",
+                encode(&push),
+                "Bearer default-composition",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        let response: PushResponse = ciborium::from_reader(body.as_ref()).unwrap();
+        assert!(matches!(
+            response.outcomes.as_slice(),
+            [PushOutcome::Rejected { operation, code: RejectionCode::Forbidden }]
+                if *operation == change.operation
+        ));
+
+        let pull = PullRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([3; 32]),
+            after: None,
+            max_changes: 16,
+            max_bytes: 1_048_576,
+        };
+        let response = app
+            .oneshot(request_as(
+                "/v1/changes:pull",
+                encode(&pull),
+                "Bearer default-composition",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn consumed_invocation_surfaces_as_typed_rejection_over_http() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let app = router(
+            ConsumedInvocations,
+            Bearer,
+            CheckpointCodec::new([9; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let change = change(scope, replica);
+        let push = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica,
+            changes: vec![change.clone()],
+        };
+        let response = app
+            .oneshot(request("/v1/changes:push", encode(&push)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        let response: PushResponse = ciborium::from_reader(body.as_ref()).unwrap();
+        assert!(matches!(
+            response.outcomes.as_slice(),
+            [PushOutcome::Rejected {
+                operation,
+                code: RejectionCode::InvocationConsumed
+            }] if *operation == change.operation
+        ));
     }
 }
