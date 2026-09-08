@@ -127,8 +127,20 @@ jobs:
               --exec "configure new single memory"; then break; fi
             sleep 1
           done
-          "${FDB_LIBRARY_ROOT}/fdbcli.x86_64" -C "${cluster_file}" \
-            --exec "status minimal"
+          for _attempt in {1..40}; do
+            status=$("${FDB_LIBRARY_ROOT}/fdbcli.x86_64" -C "${cluster_file}" \
+              --exec "status minimal" 2>&1 || true)
+            if grep --fixed-strings --line-regexp --quiet \
+              "The database is available." <<< "${status}"; then
+              echo "${status}"
+              break
+            fi
+            if [[ "${_attempt}" == 40 ]]; then
+              echo "${status}"
+              exit 1
+            fi
+            sleep 1
+          done
           export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
           cargo run -p logical-db-daemon --bin fdb-ambiguity-journey \
             --features fdb --locked
