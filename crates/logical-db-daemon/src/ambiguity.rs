@@ -8,18 +8,22 @@ use std::{collections::HashSet, error::Error, io};
 
 use foundationdb::{Database, api::FdbApiBuilder, options::NetworkOption};
 use foundationdb_tuple::Subspace;
-use logical_db_crdt::{Document, Object, Scalar};
+use logical_db_crdt::{Document, EncodedChange, Object, Scalar};
 use logical_db_model::{
-    AccountId, ActionDigest, DocumentId, Effect, MAX_PAGE_BYTES, OperationDigest, OperationId,
-    ReplicaId, Scope, SpaceId,
+    AccountId, ActionDigest, BaselineDigest, DocumentId, Effect, MAX_PAGE_BYTES, OperationDigest,
+    OperationId, ReplicaId, Scope, SnapshotArtifact, SnapshotBaseline, SnapshotRecord, SpaceId,
 };
-use logical_db_protocol::{ChangeEnvelope, PageAction, write_action};
+use logical_db_protocol::{
+    ChangeEnvelope, PageAction, mark_consumed_action, prune_action, seal_snapshot_action,
+    write_action,
+};
 use logical_db_protocol::{
     PROTOCOL_VERSION, PushOutcome, PushRequest, PushResponse, RejectionCode,
 };
 use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
 use logical_db_service::{
-    AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ServiceStore, StoredPage,
+    AcceptResult, Authority, CheckpointCodec, ConsumedResult, ExecutionGrant, PageResult,
+    PruneReceipt, PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore, StoredPage,
 };
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
 use sha2::{Digest, Sha256};
@@ -154,6 +158,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let replica = ReplicaId::new();
     verify_http_action_binding(http_store, &audit_store, scope, replica).await?;
     let store = FdbServiceStore::new(database, root)?;
+    verify_live_baseline_retention(&store, replica).await?;
 
     for attempt in 0_u16..512 {
         let change = match ambiguity_probe_change(scope, replica, attempt) {
@@ -189,6 +194,492 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     Err(io::Error::other("FDB buggify did not exercise a post-commit unknown result").into())
+}
+
+async fn verify_live_baseline_retention(
+    store: &FdbServiceStore,
+    replica: ReplicaId,
+) -> Result<(), Box<dyn Error>> {
+    let scope = Scope::new(AccountId::new(), SpaceId::new());
+    let artifact_one = seed_and_build_first(store, scope, replica).await?;
+    seal_first_baseline(store, scope, &artifact_one).await?;
+    finish_baseline_retention(store, scope, replica, &artifact_one).await
+}
+
+async fn seed_and_build_first(
+    store: &FdbServiceStore,
+    scope: Scope,
+    replica: ReplicaId,
+) -> Result<SnapshotArtifact, Box<dyn Error>> {
+    let initial_frontier = read_frontier_with_retry(store, scope).await?;
+    if initial_frontier != 0 {
+        eprintln!(
+            "fdb-ambiguity: baseline journey scope was not fresh frontier={initial_frontier}"
+        );
+        return Err(io::Error::other(format!(
+            "baseline journey scope was not fresh: frontier={initial_frontier}"
+        ))
+        .into());
+    }
+
+    let first = ambiguity_probe_change(scope, replica, 700)?;
+    let first_frontier = accept_seed_with_retry(store, &first, 0).await?;
+    if first_frontier != 1 {
+        eprintln!("fdb-ambiguity: baseline journey first seed frontier={first_frontier}");
+        return Err(io::Error::other(format!(
+            "baseline journey first seed frontier={first_frontier}"
+        ))
+        .into());
+    }
+    let second = tombstone_probe_change(scope, replica, &first, 701)?;
+    let second_frontier = accept_seed_with_retry(store, &second, 1).await?;
+    if second_frontier != 2 || read_frontier_with_retry(store, scope).await? != 2 {
+        eprintln!(
+            "fdb-ambiguity: baseline journey seed frontier did not reach two: {second_frontier}"
+        );
+        return Err(io::Error::other(format!(
+            "baseline journey seed frontier did not reach two: {second_frontier}"
+        ))
+        .into());
+    }
+
+    let consume_request = OperationDigest::new([0x91; 32]);
+    let consume_action = mark_consumed_action(scope, consume_request, 2);
+    let consume_grant = fixture_grant(scope, Effect::Sync, consume_action, 2);
+    let consumed = mark_consumed_with_retry(store, scope, consume_request, &consume_grant).await?;
+    if consumed
+        != (ConsumedResult::Advanced {
+            consumed_through: 2,
+        })
+        && consumed
+            != (ConsumedResult::Unchanged {
+                consumed_through: 2,
+            })
+    {
+        eprintln!("fdb-ambiguity: baseline journey consumed result was {consumed:?}");
+        return Err(
+            io::Error::other(format!("baseline journey consumed result was {consumed:?}")).into(),
+        );
+    }
+    if read_consumed_with_retry(store, scope).await? != 2 {
+        eprintln!("fdb-ambiguity: baseline journey consumption did not reach two");
+        return Err(io::Error::other("baseline journey consumption did not reach two").into());
+    }
+
+    let missing_request = OperationDigest::new([0x92; 32]);
+    let missing_action = prune_action(scope, missing_request, 2, None);
+    let missing_grant = fixture_grant(scope, Effect::Sync, missing_action, 2);
+    let missing = prune_with_retry(store, scope, missing_request, &missing_grant).await?;
+    if missing != PruneResult::Refused(PruneRefusal::MissingBaseline) {
+        eprintln!("fdb-ambiguity: baseline journey missing-baseline result was {missing:?}");
+        return Err(io::Error::other(format!(
+            "baseline journey missing-baseline result was {missing:?}"
+        ))
+        .into());
+    }
+    if read_frontier_with_retry(store, scope).await? != 2
+        || read_floor_with_retry(store, scope).await? != 0
+    {
+        eprintln!("fdb-ambiguity: missing baseline prune changed frontier or floor");
+        return Err(io::Error::other("missing baseline prune changed frontier or floor").into());
+    }
+
+    let artifact_one = build_snapshot_with_retry(store, scope, 1).await?;
+    if artifact_one.baseline.position() != 1
+        || artifact_one.documents.len() != 1
+        || artifact_one.documents[0].document != first.document
+        || artifact_one.documents[0].tombstone
+    {
+        eprintln!("fdb-ambiguity: first state-bearing artifact was incomplete");
+        return Err(io::Error::other("first state-bearing artifact was incomplete").into());
+    }
+    let mut first_state = Document::load(&artifact_one.documents[0].snapshot)?;
+    if first_state.is_deleted()? {
+        eprintln!("fdb-ambiguity: first state-bearing artifact was unexpectedly deleted");
+        return Err(io::Error::other("first state-bearing artifact lost live state").into());
+    }
+    Ok(artifact_one)
+}
+
+async fn seal_first_baseline(
+    store: &FdbServiceStore,
+    scope: Scope,
+    artifact_one: &SnapshotArtifact,
+) -> Result<(), Box<dyn Error>> {
+    let mut corrupt_artifact = artifact_one.clone();
+    let mut corrupt_digest = corrupt_artifact.baseline.digest().into_bytes();
+    corrupt_digest[0] ^= 1;
+    corrupt_artifact.baseline = SnapshotBaseline::new(
+        corrupt_artifact.baseline.position(),
+        BaselineDigest::new(corrupt_digest),
+        corrupt_artifact.baseline.document_count(),
+        corrupt_artifact.baseline.byte_len(),
+    );
+    let corrupt_request = OperationDigest::new([0x93; 32]);
+    let corrupt_action = seal_snapshot_action(scope, corrupt_request, &corrupt_artifact.baseline);
+    let corrupt_grant = fixture_grant(scope, Effect::Sync, corrupt_action, 2);
+    let corrupt_result = store
+        .seal_snapshot(scope, &corrupt_artifact, corrupt_request, &corrupt_grant)
+        .await;
+    if !matches!(
+        corrupt_result,
+        Err(FdbStoreError::Corruption(FdbDataError::BaselineCorrupt))
+    ) {
+        eprintln!("fdb-ambiguity: corrupt baseline seal result was {corrupt_result:?}");
+        return Err(io::Error::other(format!(
+            "corrupt baseline seal result was {corrupt_result:?}"
+        ))
+        .into());
+    }
+    if read_snapshot_with_retry(store, scope).await?.is_some()
+        || read_floor_with_retry(store, scope).await? != 0
+    {
+        eprintln!("fdb-ambiguity: corrupt baseline seal changed pointer or floor");
+        return Err(io::Error::other("corrupt baseline seal changed pointer or floor").into());
+    }
+
+    let artifact_one_request = OperationDigest::new([0x94; 32]);
+    let artifact_one_action =
+        seal_snapshot_action(scope, artifact_one_request, &artifact_one.baseline);
+    let artifact_one_grant = fixture_grant(scope, Effect::Sync, artifact_one_action, 2);
+    if seal_snapshot_with_retry(
+        store,
+        scope,
+        artifact_one,
+        artifact_one_request,
+        &artifact_one_grant,
+    )
+    .await?
+        != (SealResult::Sealed { position: 1 })
+    {
+        eprintln!("fdb-ambiguity: first state-bearing baseline did not seal");
+        return Err(io::Error::other("first state-bearing baseline did not seal").into());
+    }
+    if !matches!(
+        read_snapshot_with_retry(store, scope).await?,
+        Some(SnapshotRecord::State(ref baseline)) if baseline == &artifact_one.baseline
+    ) {
+        eprintln!("fdb-ambiguity: first state-bearing baseline pointer was wrong");
+        return Err(io::Error::other("first state-bearing baseline pointer was wrong").into());
+    }
+    Ok(())
+}
+
+async fn finish_baseline_retention(
+    store: &FdbServiceStore,
+    scope: Scope,
+    replica: ReplicaId,
+    artifact_one: &SnapshotArtifact,
+) -> Result<(), Box<dyn Error>> {
+    let behind_request = OperationDigest::new([0x95; 32]);
+    let behind_action = prune_action(scope, behind_request, 2, None);
+    let behind_grant = fixture_grant(scope, Effect::Sync, behind_action, 2);
+    let behind = prune_with_retry(store, scope, behind_request, &behind_grant).await?;
+    if behind != PruneResult::Refused(PruneRefusal::BaselineBehind { position: 1 }) {
+        eprintln!("fdb-ambiguity: behind baseline prune result was {behind:?}");
+        return Err(
+            io::Error::other(format!("behind baseline prune result was {behind:?}")).into(),
+        );
+    }
+    if read_frontier_with_retry(store, scope).await? != 2
+        || read_floor_with_retry(store, scope).await? != 0
+    {
+        eprintln!("fdb-ambiguity: behind baseline prune changed frontier or floor");
+        return Err(io::Error::other("behind baseline prune changed frontier or floor").into());
+    }
+
+    let artifact_two = build_snapshot_with_retry(store, scope, 2).await?;
+    if artifact_two.baseline.position() != 2
+        || artifact_two.documents.len() != 1
+        || artifact_two.documents[0].document != artifact_one.documents[0].document
+        || !artifact_two.documents[0].tombstone
+    {
+        eprintln!("fdb-ambiguity: second state-bearing artifact was incomplete");
+        return Err(io::Error::other("second state-bearing artifact was incomplete").into());
+    }
+    let mut deleted_state = Document::load(&artifact_two.documents[0].snapshot)?;
+    if !deleted_state.is_deleted()? {
+        eprintln!("fdb-ambiguity: second state-bearing artifact lost its tombstone");
+        return Err(io::Error::other("second state-bearing artifact lost its tombstone").into());
+    }
+    let artifact_two_request = OperationDigest::new([0x96; 32]);
+    let artifact_two_action =
+        seal_snapshot_action(scope, artifact_two_request, &artifact_two.baseline);
+    let artifact_two_grant = fixture_grant(scope, Effect::Sync, artifact_two_action, 2);
+    if seal_snapshot_with_retry(
+        store,
+        scope,
+        &artifact_two,
+        artifact_two_request,
+        &artifact_two_grant,
+    )
+    .await?
+        != (SealResult::Sealed { position: 2 })
+    {
+        eprintln!("fdb-ambiguity: second state-bearing baseline did not seal");
+        return Err(io::Error::other("second state-bearing baseline did not seal").into());
+    }
+
+    let prune_request = OperationDigest::new([0x97; 32]);
+    let prune_action_value = prune_action(scope, prune_request, 2, None);
+    let prune_grant = fixture_grant(scope, Effect::Sync, prune_action_value, 2);
+    let pruned = prune_with_retry(store, scope, prune_request, &prune_grant).await?;
+    if pruned
+        != PruneResult::Pruned(PruneReceipt {
+            pruned_through: 2,
+            floor: 2,
+        })
+    {
+        eprintln!("fdb-ambiguity: state-bearing prune result was {pruned:?}");
+        return Err(io::Error::other(format!("state-bearing prune result was {pruned:?}")).into());
+    }
+    let final_frontier = read_frontier_with_retry(store, scope).await?;
+    let final_floor = read_floor_with_retry(store, scope).await?;
+    if final_frontier != 2 || final_floor != 2 {
+        eprintln!(
+            "fdb-ambiguity: state-bearing prune ended at frontier={final_frontier} floor={final_floor}"
+        );
+        return Err(io::Error::other(format!(
+            "state-bearing prune ended at frontier={final_frontier} floor={final_floor}"
+        ))
+        .into());
+    }
+    let page = page_action(scope, replica, 0, 1, u32::try_from(MAX_PAGE_BYTES)?);
+    let page_grant = fixture_grant(scope, Effect::Sync, page.digest(), final_frontier);
+    if page_behind_floor_with_retry(store, page, &page_grant).await? != PageResult::BehindFloor {
+        eprintln!("fdb-ambiguity: pruned checkpoint was not behind the floor");
+        return Err(io::Error::other("pruned checkpoint was not behind the floor").into());
+    }
+    println!(
+        "PASS fdb-live-baseline-retention seeded=2 consumed=2 missing=refused corrupt=typed-baseline-corrupt baseline1=sealed baseline2=sealed prune=2 frontier={final_frontier} floor={final_floor} page_after=0=behind-floor scope=isolated"
+    );
+    Ok(())
+}
+
+async fn read_frontier_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+) -> Result<u64, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.frontier(scope).await {
+            Ok(frontier) => return Ok(frontier),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!("frontier retry budget exhausted: {last_error:?}")).into())
+}
+
+async fn read_consumed_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+) -> Result<u64, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.consumed_through(scope).await {
+            Ok(consumed) => return Ok(consumed),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "consumed-through retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn read_floor_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+) -> Result<u64, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.retention_floor(scope).await {
+            Ok(floor) => return Ok(floor),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "retention-floor retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn read_snapshot_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+) -> Result<Option<SnapshotRecord>, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.snapshot_baseline(scope).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "snapshot-baseline retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn build_snapshot_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+    through: u64,
+) -> Result<SnapshotArtifact, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.build_snapshot(scope, through).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "build-snapshot retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn page_behind_floor_with_retry(
+    store: &FdbServiceStore,
+    action: PageAction,
+    grant: &ForgedGrant,
+) -> Result<PageResult, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.page(action, grant).await {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "behind-floor page retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn accept_seed_with_retry(
+    store: &FdbServiceStore,
+    change: &ChangeEnvelope,
+    expected_frontier: u64,
+) -> Result<u64, Box<dyn Error>> {
+    let grant = fixture_grant(
+        change.scope,
+        Effect::Write,
+        write_action(change),
+        expected_frontier,
+    );
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.accept(change, &grant).await {
+            Ok(
+                AcceptResult::Accepted
+                | AcceptResult::Duplicate
+                | AcceptResult::RecoveredUnknownCommit,
+            ) => match store.frontier(change.scope).await {
+                Ok(frontier) if frontier == expected_frontier + 1 => return Ok(frontier),
+                Ok(frontier) if frontier > expected_frontier + 1 => {
+                    eprintln!(
+                        "fdb-ambiguity: seed frontier advanced past expected position: {frontier}"
+                    );
+                    return Err(io::Error::other(format!(
+                        "seed frontier advanced past expected position: {frontier}"
+                    ))
+                    .into());
+                }
+                Ok(_) | Err(_) => {}
+            },
+            Ok(other) => {
+                eprintln!("fdb-ambiguity: seed change returned unexpected outcome: {other:?}");
+                return Err(io::Error::other(format!(
+                    "seed change returned unexpected outcome: {other:?}"
+                ))
+                .into());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!("seed exact retry budget exhausted: {last_error:?}")).into())
+}
+
+async fn mark_consumed_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+    request: OperationDigest,
+    grant: &ForgedGrant,
+) -> Result<ConsumedResult, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.mark_consumed(scope, 2, request, grant).await {
+            Ok(ConsumedResult::Advanced { consumed_through }) if consumed_through == 2 => {
+                return Ok(ConsumedResult::Advanced { consumed_through });
+            }
+            Ok(ConsumedResult::Unchanged { consumed_through }) if consumed_through == 2 => {
+                return Ok(ConsumedResult::Unchanged { consumed_through });
+            }
+            Ok(ConsumedResult::StaleAuthority) => {
+                eprintln!("fdb-ambiguity: mark-consumed authority became stale");
+                return Err(io::Error::other("mark-consumed authority became stale").into());
+            }
+            Ok(other) => {
+                eprintln!("fdb-ambiguity: mark-consumed returned unexpected outcome: {other:?}");
+                return Err(io::Error::other(format!(
+                    "mark-consumed returned unexpected outcome: {other:?}"
+                ))
+                .into());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "mark-consumed retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn seal_snapshot_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+    artifact: &SnapshotArtifact,
+    request: OperationDigest,
+    grant: &ForgedGrant,
+) -> Result<SealResult, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.seal_snapshot(scope, artifact, request, grant).await {
+            Ok(SealResult::StaleAuthority) => {
+                eprintln!("fdb-ambiguity: seal snapshot authority became stale");
+                return Err(io::Error::other("seal snapshot authority became stale").into());
+            }
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!(
+        "seal snapshot retry budget exhausted: {last_error:?}"
+    ))
+    .into())
+}
+
+async fn prune_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+    request: OperationDigest,
+    grant: &ForgedGrant,
+) -> Result<PruneResult, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.prune(scope, 2, None, request, grant).await {
+            Ok(result @ (PruneResult::Refused(_) | PruneResult::Pruned(_))) => {
+                return Ok(result);
+            }
+            Ok(PruneResult::StaleAuthority) => {
+                eprintln!("fdb-ambiguity: prune authority became stale");
+                return Err(io::Error::other("prune authority became stale").into());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!("prune retry budget exhausted: {last_error:?}")).into())
 }
 
 async fn verify_http_action_binding(
@@ -278,20 +769,6 @@ async fn verify_http_action_binding(
     Ok(())
 }
 
-async fn read_frontier_with_retry(
-    store: &FdbServiceStore,
-    scope: Scope,
-) -> Result<u64, Box<dyn Error>> {
-    let mut last_error = None;
-    for _retry in 0..128 {
-        match store.frontier(scope).await {
-            Ok(frontier) => return Ok(frontier),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(io::Error::other(format!("frontier retry budget exhausted: {last_error:?}")).into())
-}
-
 async fn push_over_http(
     client: &reqwest::Client,
     endpoint: &str,
@@ -374,6 +851,33 @@ fn ambiguity_probe_change(
         replica,
         operation: OperationId::new(),
         request,
+        digest: encoded.digest,
+        bytes: encoded.bytes,
+    })
+}
+
+fn tombstone_probe_change(
+    scope: Scope,
+    replica: ReplicaId,
+    previous: &ChangeEnvelope,
+    attempt: u16,
+) -> Result<ChangeEnvelope, Box<dyn Error>> {
+    let mut document = Document::new();
+    document.apply(&[EncodedChange {
+        digest: previous.digest,
+        bytes: previous.bytes.clone(),
+    }])?;
+    let encoded = document
+        .delete()?
+        .pop()
+        .ok_or_else(|| io::Error::other("missing CRDT tombstone change"))?;
+    let request_byte = u8::try_from(attempt % 256).map_err(io::Error::other)?;
+    Ok(ChangeEnvelope {
+        scope,
+        document: previous.document,
+        replica,
+        operation: OperationId::new(),
+        request: OperationDigest::new([request_byte; 32]),
         digest: encoded.digest,
         bytes: encoded.bytes,
     })

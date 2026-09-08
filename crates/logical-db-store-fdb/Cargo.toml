@@ -16,6 +16,7 @@ foundationdb-tuple.workspace = true
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
+sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

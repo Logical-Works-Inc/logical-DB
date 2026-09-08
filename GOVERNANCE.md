@@ -21,6 +21,16 @@ and optional Cairn/episode vocabulary through the facade. Episode v1 snapshots
 have bounded decoding and identity over immutable scope and provenance fields.
 This is delivered functionality, not a declaration of production completion.
 
+The current recovery stack layer adds a bounded, content-addressed v2
+`SnapshotArtifact` for the server retention path. It preserves canonical
+document state and tombstone markers, while retaining readable v1 position-only
+records as migration data that cannot authorize pruning. FoundationDB rebuilds,
+rechecks, and atomically seals the artifact, and validates the descriptor and
+its stored manifests and chunks in the prune transaction. This establishes the
+server-side prune gate. It does not close issue #28: paged HTTP recovery and
+atomic client installation of recovered state and checkpoint are the next stack
+layer. No hosted full-recovery evidence is claimed here.
+
 ## Recorded product decision
 
 The Director already resolved the backend split in
@@ -62,7 +72,7 @@ implementation's correctness dependencies.
 | Priority | Work | Observed gap and completion evidence |
 |---|---|---|
 | Delivered in stack | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | The action-binding stack validates native CRDT bytes before authorization, computes a versioned canonical `ActionDigest`, and makes FDB recompute it. Unit HTTP tests and the hosted FDB journey hold a grant fixed across field mutations and preserve exact retry. Independent runtime Braid confirmation remains a separate release requirement |
-| P0 | [#28: recovery before pruning](https://github.com/srinji-kaggss/logical-DB/issues/28) | `SnapshotBaseline` contains only version and position. Prove a state-bearing baseline restores an unchanged document and tombstones after history has been pruned |
+| P0 | [#28: recovery before pruning](https://github.com/srinji-kaggss/logical-DB/issues/28) | This stack adds a bounded v2 content-addressed `SnapshotArtifact` (256 documents/4 MiB), keeps v1 position-only records readable but prune-ineligible, and makes FDB reconstruct/recheck/seal the artifact and validate it transactionally before pruning. The issue remains open until paged HTTP recovery and one atomic client install restore document state and the checkpoint after history is pruned |
 | P1 | [#29: projection semantics](https://github.com/srinji-kaggss/logical-DB/issues/29) | `projection_digest` includes schema version and index IDs, but no projection semantic identity. A changed projection under the same IDs must require migration and rebuild rows atomically |
 | P1 | [#25: checked access graph](https://github.com/srinji-kaggss/logical-DB/issues/25) | Audit migration, sync, and service transition coverage against the issue's graph contract after the action and recovery boundaries are settled |
 | Dependent | [#32: durable episode service](https://github.com/srinji-kaggss/logical-DB/issues/32) | The embedded episode snapshot journey is not a service-backed episode log. Requires resolved ownership, trusted admission, state-bearing recovery, and a real HTTP episode-to-LocalWorld journey |
@@ -70,8 +80,10 @@ implementation's correctness dependencies.
 | Release evidence | External LEM consumption and deployed-service behavior | The earlier facade/FDB consumer receipt is explicitly retired for an invalid confirmation model. Require current external consumption, verified confirmation, and the deployment journeys listed in `REWRITE_MANIFEST.md` |
 
 Embedded tombstones and export/restore are implemented and have retained tests.
-Their presence must not be confused with state-bearing server recovery or with
-completion of every process-interruption/deployment scenario.
+The server retention path now also carries tombstone state in the bounded v2
+artifact and gates pruning on that artifact. Neither path proves the missing
+paged HTTP recovery/client-install journey or completion of every
+process-interruption/deployment scenario.
 
 Canonical action encoding is owned by `logical-db-protocol`. It uses SHA-256
 over u64 big-endian length frames and a `logical-db-action-v1` domain. A golden

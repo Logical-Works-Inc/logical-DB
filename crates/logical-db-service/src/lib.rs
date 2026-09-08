@@ -6,13 +6,14 @@
 
 #![forbid(unsafe_code)]
 
-use std::{future::Future, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use hmac::{Hmac, KeyInit, Mac};
-use logical_db_crdt::{CrdtError, EncodedChange};
+use logical_db_crdt::{CrdtError, Document, EncodedChange};
 use logical_db_model::OperationId;
 use logical_db_model::{
-    ActionDigest, Effect, OperationDigest, Scope, SnapshotBaseline, is_behind_retention,
+    ActionDigest, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotRecord,
+    is_behind_retention,
 };
 use logical_db_protocol::{
     ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, PageAction, ProtocolError, PullPage, PullRequest,
@@ -25,6 +26,150 @@ use thiserror::Error;
 const CHECKPOINT_MAGIC: &[u8; 4] = b"LCP\x01";
 const CHECKPOINT_BODY_BYTES: usize = 52;
 const CHECKPOINT_BYTES: usize = CHECKPOINT_BODY_BYTES + 32;
+
+/// Compact, typed failures from state-bearing baseline materialization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum SnapshotMaterializationError {
+    /// The supplied base artifact or one of its tombstone markers is invalid.
+    #[error("snapshot base artifact is invalid at {context}")]
+    InvalidBase {
+        /// Materialization operation that rejected the base artifact.
+        context: &'static str,
+    },
+    /// The ordered change slice does not cover exactly the requested prefix.
+    #[error("snapshot changes do not exactly cover the requested prefix")]
+    Coverage,
+    /// A change belongs to another logical scope.
+    #[error("snapshot change belongs to another scope")]
+    ScopeMismatch,
+    /// A change failed protocol, native decode, digest, dependency, or apply validation.
+    #[error("snapshot change is invalid")]
+    InvalidChange,
+    /// The materialized artifact exceeded one of its bounded model limits.
+    #[error("snapshot materialization exceeds its bounded resource limits")]
+    ResourceLimit,
+}
+
+/// Materializes one deterministic, bounded state artifact from a validated log prefix.
+///
+/// `base` is an optional state-bearing artifact whose position precedes `changes`.
+/// The caller owns sequence verification; this function enforces the exact count,
+/// scope, native CRDT validation, tombstone consistency, and final model bounds.
+///
+/// # Errors
+///
+/// Returns [`SnapshotMaterializationError`] when the base, coverage, scope, native
+/// changes, or bounded artifact is invalid.
+pub fn materialize_snapshot(
+    scope: Scope,
+    through: u64,
+    base: Option<&SnapshotArtifact>,
+    changes: &[ChangeEnvelope],
+) -> Result<SnapshotArtifact, SnapshotMaterializationError> {
+    let base_position = match base {
+        Some(artifact) => {
+            artifact.validate(scope).map_err(|error| {
+                eprintln!("logical-db-service: materialize_snapshot base validation: {error}");
+                SnapshotMaterializationError::InvalidBase {
+                    context: "base validation",
+                }
+            })?;
+            artifact.baseline.position()
+        }
+        None => 0,
+    };
+    let expected = through
+        .checked_sub(base_position)
+        .ok_or(SnapshotMaterializationError::Coverage)?;
+    if expected != changes.len() as u64 {
+        eprintln!(
+            "logical-db-service: materialize_snapshot coverage: through={through} base={base_position} changes={}",
+            changes.len()
+        );
+        return Err(SnapshotMaterializationError::Coverage);
+    }
+
+    let mut documents = BTreeMap::<logical_db_model::DocumentId, Document>::new();
+    if let Some(artifact) = base {
+        for state in &artifact.documents {
+            let mut document = Document::load(&state.snapshot).map_err(|error| {
+                eprintln!("logical-db-service: materialize_snapshot document load: {error}");
+                SnapshotMaterializationError::InvalidBase {
+                    context: "document load",
+                }
+            })?;
+            let tombstone = document.is_deleted().map_err(|error| {
+                eprintln!("logical-db-service: materialize_snapshot tombstone read: {error}");
+                SnapshotMaterializationError::InvalidBase {
+                    context: "tombstone read",
+                }
+            })?;
+            if tombstone != state.tombstone {
+                eprintln!(
+                    "logical-db-service: materialize_snapshot tombstone mismatch: document={}",
+                    state.document
+                );
+                return Err(SnapshotMaterializationError::InvalidBase {
+                    context: "tombstone mismatch",
+                });
+            }
+            documents.insert(state.document, document);
+        }
+    }
+
+    for change in changes {
+        if change.scope != scope {
+            eprintln!(
+                "logical-db-service: materialize_snapshot scope mismatch: document={}",
+                change.document
+            );
+            return Err(SnapshotMaterializationError::ScopeMismatch);
+        }
+        change.validate().map_err(|error| {
+            eprintln!("logical-db-service: materialize_snapshot change validation: {error}");
+            SnapshotMaterializationError::InvalidChange
+        })?;
+        let encoded = EncodedChange {
+            digest: change.digest,
+            bytes: change.bytes.clone(),
+        };
+        encoded.validate().map_err(|error| {
+            eprintln!("logical-db-service: materialize_snapshot encoded validation: {error}");
+            SnapshotMaterializationError::InvalidChange
+        })?;
+        documents
+            .entry(change.document)
+            .or_default()
+            .apply(&[encoded])
+            .map_err(|error| {
+                eprintln!("logical-db-service: materialize_snapshot apply: {error}");
+                SnapshotMaterializationError::InvalidChange
+            })?;
+    }
+
+    let states = documents
+        .into_iter()
+        .map(|(document, mut state)| {
+            let tombstone = state.is_deleted().map_err(|error| {
+                eprintln!("logical-db-service: materialize_snapshot output tombstone: {error}");
+                SnapshotMaterializationError::InvalidChange
+            })?;
+            let snapshot = state.save().map_err(|error| {
+                eprintln!("logical-db-service: materialize_snapshot save: {error}");
+                SnapshotMaterializationError::ResourceLimit
+            })?;
+            Ok(logical_db_model::SnapshotDocument {
+                document,
+                snapshot,
+                tombstone,
+            })
+        })
+        .collect::<Result<Vec<_>, SnapshotMaterializationError>>()?;
+    SnapshotArtifact::new(scope, through, states).map_err(|error| {
+        eprintln!("logical-db-service: materialize_snapshot artifact: {error}");
+        SnapshotMaterializationError::ResourceLimit
+    })
+}
 
 /// Verifier-produced execution proof consumed by a storage transaction.
 pub trait ExecutionGrant: Send + Sync {
@@ -199,6 +344,13 @@ where
 /// Stable refusal reasons for one peer-aware prune decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PruneRefusal {
+    /// No state-bearing recovery artifact covers the requested prefix.
+    MissingBaseline,
+    /// The newest state-bearing recovery artifact stops before the requested prefix.
+    BaselineBehind {
+        /// Highest position covered by the recovery artifact.
+        position: u64,
+    },
     /// A live unexpired checkpoint still addresses the requested prefix.
     LiveCheckpoint {
         /// Minimum position across live checkpoints that blocks collection.
@@ -326,10 +478,20 @@ pub trait RetentionStore: ServiceStore {
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
     /// Reads the versioned snapshot baseline available for full recovery.
+    ///
+    /// Legacy position-only records remain observable for migration, but do
+    /// not authorize collection.
     fn snapshot_baseline(
         &self,
         scope: Scope,
-    ) -> impl Future<Output = Result<Option<SnapshotBaseline>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send;
+
+    /// Reconstructs a bounded state-bearing artifact through one position.
+    fn build_snapshot(
+        &self,
+        scope: Scope,
+        through: u64,
+    ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send;
 
     /// Durably records a versioned snapshot baseline for the scope.
     ///
@@ -339,7 +501,7 @@ pub trait RetentionStore: ServiceStore {
     fn seal_snapshot(
         &self,
         scope: Scope,
-        baseline: SnapshotBaseline,
+        artifact: &SnapshotArtifact,
         request: OperationDigest,
         grant: &impl ExecutionGrant,
     ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send;
@@ -389,18 +551,26 @@ where
     fn snapshot_baseline(
         &self,
         scope: Scope,
-    ) -> impl Future<Output = Result<Option<SnapshotBaseline>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
         (**self).snapshot_baseline(scope)
+    }
+
+    fn build_snapshot(
+        &self,
+        scope: Scope,
+        through: u64,
+    ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
+        (**self).build_snapshot(scope, through)
     }
 
     fn seal_snapshot(
         &self,
         scope: Scope,
-        baseline: SnapshotBaseline,
+        artifact: &SnapshotArtifact,
         request: OperationDigest,
         grant: &impl ExecutionGrant,
     ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
-        (**self).seal_snapshot(scope, baseline, request, grant)
+        (**self).seal_snapshot(scope, artifact, request, grant)
     }
 
     fn mark_consumed(
@@ -765,7 +935,7 @@ where
     pub async fn seal_snapshot(
         &self,
         scope: Scope,
-        baseline: SnapshotBaseline,
+        through: u64,
         request: OperationDigest,
         now_unix_ms: u64,
     ) -> Result<SealResult, ServiceError<Store::Error>> {
@@ -774,10 +944,18 @@ where
             .frontier(scope)
             .await
             .map_err(ServiceError::Store)?;
+        if through > frontier {
+            return Ok(SealResult::BeyondFrontier { frontier });
+        }
+        let artifact = self
+            .store
+            .build_snapshot(scope, through)
+            .await
+            .map_err(ServiceError::Store)?;
         let Some(grant) = self.policy.authorize(
             scope,
             Effect::Sync,
-            seal_snapshot_action(scope, request, baseline),
+            seal_snapshot_action(scope, request, &artifact.baseline),
             frontier,
             now_unix_ms,
         ) else {
@@ -785,7 +963,7 @@ where
             return Err(ServiceError::Forbidden);
         };
         self.store
-            .seal_snapshot(scope, baseline, request, &grant)
+            .seal_snapshot(scope, &artifact, request, &grant)
             .await
             .map_err(ServiceError::Store)
     }
@@ -934,9 +1112,7 @@ mod tests {
     use std::{collections::HashMap, convert::Infallible, sync::Mutex};
 
     use logical_db_crdt::{Document, Object, Scalar};
-    use logical_db_model::{
-        AccountId, ChangeDigest, DocumentId, OperationId, ReplicaId, SnapshotBaseline, SpaceId,
-    };
+    use logical_db_model::{AccountId, ChangeDigest, DocumentId, OperationId, ReplicaId, SpaceId};
 
     use super::*;
 
@@ -1007,11 +1183,11 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Default)]
     struct RetentionState {
         floor: u64,
         consumed: u64,
-        baseline: Option<SnapshotBaseline>,
+        baseline: Option<SnapshotArtifact>,
     }
 
     #[derive(Default)]
@@ -1029,7 +1205,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&scope)
-                .copied()
+                .cloned()
                 .unwrap_or_default();
             state.floor + Self::retained_count(&changes, scope)
         }
@@ -1046,7 +1222,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&scope)
-                .copied()
+                .cloned()
                 .unwrap_or_default()
         }
 
@@ -1105,18 +1281,25 @@ mod tests {
         fn snapshot_baseline(
             &self,
             scope: Scope,
-        ) -> impl Future<Output = Result<Option<SnapshotBaseline>, Self::Error>> + Send {
+        ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
             std::future::ready(Ok(self.snapshot_baseline_result(scope)))
+        }
+        fn build_snapshot(
+            &self,
+            scope: Scope,
+            through: u64,
+        ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
+            std::future::ready(Ok(self.build_snapshot_result(scope, through)))
         }
         fn seal_snapshot(
             &self,
             scope: Scope,
-            baseline: SnapshotBaseline,
+            artifact: &SnapshotArtifact,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
             std::future::ready(Ok(
-                self.seal_snapshot_result(scope, baseline, request, grant)
+                self.seal_snapshot_result(scope, artifact, request, grant)
             ))
         }
         fn mark_consumed(
@@ -1204,16 +1387,42 @@ mod tests {
         fn consumed_through_result(&self, scope: Scope) -> u64 {
             self.retention_state(scope).consumed
         }
-        fn snapshot_baseline_result(&self, scope: Scope) -> Option<SnapshotBaseline> {
-            self.retention_state(scope).baseline
+        fn snapshot_baseline_result(&self, scope: Scope) -> Option<SnapshotRecord> {
+            self.retention_state(scope)
+                .baseline
+                .map(|artifact| SnapshotRecord::State(artifact.baseline))
+        }
+        fn build_snapshot_result(&self, scope: Scope, through: u64) -> SnapshotArtifact {
+            let state = self.retention_state(scope);
+            let base = state
+                .baseline
+                .filter(|artifact| artifact.baseline.position() <= through);
+            let base_position = base
+                .as_ref()
+                .map_or(state.floor, |artifact| artifact.baseline.position());
+            let skip =
+                usize::try_from(base_position.saturating_sub(state.floor)).unwrap_or(usize::MAX);
+            let retained =
+                usize::try_from(through.saturating_sub(base_position)).unwrap_or(usize::MAX);
+            let changes = self.changes.lock().unwrap();
+            let changes = changes
+                .iter()
+                .filter(|change| change.scope == scope)
+                .skip(skip)
+                .take(retained)
+                .cloned()
+                .collect::<Vec<_>>();
+            materialize_snapshot(scope, through, base.as_ref(), &changes)
+                .expect("memory store must build a bounded test artifact")
         }
         fn seal_snapshot_result(
             &self,
             scope: Scope,
-            baseline: SnapshotBaseline,
+            artifact: &SnapshotArtifact,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> SealResult {
+            let baseline = &artifact.baseline;
             let Some(frontier) = self.check_retention_grant(
                 scope,
                 seal_snapshot_action(scope, request, baseline),
@@ -1229,7 +1438,7 @@ mod tests {
                 .unwrap()
                 .entry(scope)
                 .or_default()
-                .baseline = Some(baseline);
+                .baseline = Some(artifact.clone());
             SealResult::Sealed {
                 position: baseline.position(),
             }
@@ -1285,6 +1494,17 @@ mod tests {
                     Err(refusal) => return PruneResult::Refused(refusal),
                 };
             if through > state.floor {
+                let Some(artifact) = state.baseline else {
+                    return PruneResult::Refused(PruneRefusal::MissingBaseline);
+                };
+                if artifact.baseline.position() < through {
+                    return PruneResult::Refused(PruneRefusal::BaselineBehind {
+                        position: artifact.baseline.position(),
+                    });
+                }
+                artifact
+                    .validate(scope)
+                    .expect("memory store retains validated snapshot artifacts");
                 let floor = state.floor;
                 let mut position = floor;
                 self.changes.lock().unwrap().retain(|change| {
@@ -1671,7 +1891,7 @@ mod tests {
     {
         futures::executor::block_on(service.seal_snapshot(
             scope,
-            SnapshotBaseline::new(position),
+            position,
             OperationDigest::new([61; 32]),
             now,
         ))
@@ -1789,15 +2009,59 @@ mod tests {
         );
         assert_eq!(
             collect(&service, scope, 2, None, 13),
+            PruneResult::Refused(PruneRefusal::MissingBaseline)
+        );
+        assert_eq!(
+            seal_at(&service, scope, 2, 14),
+            SealResult::Sealed { position: 2 }
+        );
+        assert_eq!(
+            collect(&service, scope, 2, None, 15),
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 2,
                 floor: 2
             })
         );
         assert_eq!(
-            collect(&service, scope, 3, None, 14),
+            collect(&service, scope, 3, None, 16),
             PruneResult::Refused(PruneRefusal::PendingOperations {
                 consumed_through: 2
+            })
+        );
+    }
+
+    #[test]
+    fn prune_refuses_a_prefix_beyond_the_state_bearing_baseline() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([29; 32], 10_000).unwrap(),
+        );
+        let changes = (70u8..73)
+            .map(|request| envelope_with(scope, replica, OperationId::new(), request))
+            .collect::<Vec<_>>();
+        push_all(&service, replica, changes);
+        assert_eq!(
+            seal_at(&service, scope, 2, 11),
+            SealResult::Sealed { position: 2 }
+        );
+        assert_eq!(
+            consume_through(&service, scope, 3, 12),
+            ConsumedResult::Advanced {
+                consumed_through: 3
+            }
+        );
+        assert_eq!(
+            collect(&service, scope, 3, None, 13),
+            PruneResult::Refused(PruneRefusal::BaselineBehind { position: 2 })
+        );
+        assert_eq!(
+            collect(&service, scope, 2, None, 14),
+            PruneResult::Pruned(PruneReceipt {
+                pruned_through: 2,
+                floor: 2
             })
         );
     }
@@ -1869,13 +2133,17 @@ mod tests {
             .collect::<Vec<_>>();
         push_all(&service, replica, changes.clone());
         assert_eq!(
-            consume_through(&service, scope, 3, 11),
+            seal_at(&service, scope, 2, 11),
+            SealResult::Sealed { position: 2 }
+        );
+        assert_eq!(
+            consume_through(&service, scope, 3, 12),
             ConsumedResult::Advanced {
                 consumed_through: 3
             }
         );
         assert_eq!(
-            collect(&service, scope, 2, None, 12),
+            collect(&service, scope, 2, None, 13),
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 2,
                 floor: 2
@@ -1951,10 +2219,10 @@ mod tests {
             futures::executor::block_on(store.retention_floor(scope)).unwrap(),
             2
         );
-        assert_eq!(
+        assert!(matches!(
             futures::executor::block_on(store.snapshot_baseline(scope)).unwrap(),
-            Some(SnapshotBaseline::new(2))
-        );
+            Some(SnapshotRecord::State(ref baseline)) if baseline.position() == 2
+        ));
         assert_eq!(
             pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
             ServicePull::CheckpointExpired
@@ -1994,7 +2262,7 @@ mod tests {
         assert_eq!(
             futures::executor::block_on(stale.seal_snapshot(
                 scope,
-                SnapshotBaseline::new(0),
+                0,
                 OperationDigest::new([61; 32]),
                 10,
             ))

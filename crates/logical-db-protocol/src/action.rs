@@ -57,12 +57,12 @@ pub fn write_action(change: &ChangeEnvelope) -> ActionDigest {
     ActionDigest::new(digest.finalize().into())
 }
 
-/// Binds a seal operation to the exact versioned baseline representation.
+/// Binds a seal operation to the complete state-bearing artifact descriptor.
 #[must_use]
 pub fn seal_snapshot_action(
     scope: Scope,
     intent: OperationDigest,
-    baseline: SnapshotBaseline,
+    baseline: &SnapshotBaseline,
 ) -> ActionDigest {
     let mut digest = action_hash(b"seal-snapshot", scope, intent);
     frame(&mut digest, &baseline.encode());
@@ -208,6 +208,8 @@ mod tests {
 
     #[test]
     fn retention_actions_are_domain_separated_and_bind_bounds() {
+        use logical_db_model::BaselineDigest;
+
         let original = change();
         let (scope, intent) = (original.scope, original.request);
         let consumed = mark_consumed_action(scope, intent, 1);
@@ -217,9 +219,17 @@ mod tests {
             prune_action(scope, intent, 1, None),
             prune_action(scope, intent, 1, Some(0))
         );
-        assert_ne!(
-            seal_snapshot_action(scope, intent, SnapshotBaseline::new(1)),
-            seal_snapshot_action(scope, intent, SnapshotBaseline::new(2))
-        );
+        let baseline = SnapshotBaseline::new(1, BaselineDigest::new([1; 32]), 1, 10);
+        for rebound in [
+            SnapshotBaseline::new(2, baseline.digest(), 1, 10),
+            SnapshotBaseline::new(1, BaselineDigest::new([2; 32]), 1, 10),
+            SnapshotBaseline::new(1, baseline.digest(), 2, 10),
+            SnapshotBaseline::new(1, baseline.digest(), 1, 11),
+        ] {
+            assert_ne!(
+                seal_snapshot_action(scope, intent, &baseline),
+                seal_snapshot_action(scope, intent, &rebound)
+            );
+        }
     }
 }
