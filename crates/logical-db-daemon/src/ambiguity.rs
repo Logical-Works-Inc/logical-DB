@@ -303,9 +303,7 @@ async fn push_over_http(
         }
         if !response.status().is_success() {
             eprintln!("fdb-ambiguity: HTTP push status {}", response.status());
-            return Err(
-                io::Error::other(format!("HTTP push status {}", response.status())).into(),
-            );
+            return Err(io::Error::other(format!("HTTP push status {}", response.status())).into());
         }
         let bytes = response.bytes().await?;
         let decoded: PushResponse = ciborium::from_reader(bytes.as_ref())?;
