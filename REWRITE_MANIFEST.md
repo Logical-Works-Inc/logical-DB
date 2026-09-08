@@ -56,8 +56,9 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 
 ## Still blocking production release and LEM handoff
 
-- [ ] Resolve the competing product-scope contracts and estate ownership
-  decisions recorded in `GOVERNANCE.md`.
+- [ ] Complete the explicit backend capability profiles and matched-trace
+  evidence required by the recorded Director ruling in `GOVERNANCE.md`.
+- [ ] Resolve the remaining estate ownership decision before LEM handoff.
 - [ ] Bind authority to a service-computed canonical action digest distinct
   from caller intent/idempotency identity, including payload-field mutation
   and exact-retry proof through HTTP and FDB (issue #27).
