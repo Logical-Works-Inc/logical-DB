@@ -61,11 +61,15 @@ Remain in the old repos as read-only reference; not re-implemented here:
 - Frontier eval harness.
 - Lean specs.
 
-## Deprecation pointer
+## Source-repository ownership
 
-- `cairn` and `LOGICAL-EVENT-MEMORY` are frozen. No new work goes there.
-- New semantic-layer work goes in `crates/logical-db-cairn` and
-  `crates/logical-db-episode` in this workspace.
+The semantic ports in this workspace live in `crates/logical-db-cairn` and
+`crates/logical-db-episode`. The original source paths remain provenance
+references for those ports.
+
+Porting the types did not amend LEM's Director-controlled `SOT.okf.md` or prove
+that either source repository was retired. The cross-repository ownership
+decision remains open in issue #30 and is tracked in `GOVERNANCE.md`.
 
 ## Next steps
 

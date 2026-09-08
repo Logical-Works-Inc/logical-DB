@@ -109,8 +109,11 @@ also has deterministic state-machine tests, crash-resumable schema migration,
 kill/restart journeys, mutation campaigns, and official FDB unknown-commit
 injection. The former facade-to-daemon journey is explicitly retired because
 its confirmation model was unsound. `REWRITE_MANIFEST.md` remains
-authoritative. The implemented core is not being called production-complete
-while server-log retention/snapshot baselines, embedded export/restore,
-deletion/tombstone policy, multi-node FDB recovery, public TLS/issuer
-integration, runtime Braid confirmation, sustained load, and external LEM
-consumption remain unproven or unimplemented.
+authoritative. Embedded tombstones and export/restore are implemented and have
+retained tests. Production completion still requires trusted action-byte
+authorization, state-bearing server recovery, projection semantic identity,
+multi-node FDB recovery, public TLS/issuer integration, runtime Braid
+confirmation, sustained load, and external LEM consumption.
+
+See [GOVERNANCE.md](GOVERNANCE.md) for delivered evidence, open acceptance work,
+and the Director decisions needed to reconcile historical scope contracts.
