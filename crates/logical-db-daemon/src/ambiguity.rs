@@ -214,7 +214,7 @@ async fn verify_http_action_binding(
     let endpoint = format!("http://{address}/v1/changes:push");
     let client = reqwest::Client::new();
 
-    let before = observer.frontier(scope).await?;
+    let before = read_frontier_with_retry(observer, scope).await?;
     let first = push_over_http(&client, &endpoint, &original).await?;
     if !matches!(
         first,
@@ -223,7 +223,7 @@ async fn verify_http_action_binding(
         eprintln!("fdb-ambiguity: canonical HTTP write was {first:?}");
         return Err(io::Error::other(format!("canonical HTTP write was {first:?}")).into());
     }
-    let after_first = observer.frontier(scope).await?;
+    let after_first = read_frontier_with_retry(observer, scope).await?;
     if after_first != before + 1 {
         eprintln!("fdb-ambiguity: HTTP frontier moved from {before} to {after_first}");
         return Err(io::Error::other("canonical HTTP write did not advance once").into());
@@ -261,11 +261,13 @@ async fn verify_http_action_binding(
             return Err(io::Error::other(format!("mutated HTTP action was {outcome:?}")).into());
         }
     }
-    if observer.frontier(scope).await? != after_first {
+    if read_frontier_with_retry(observer, scope).await? != after_first {
         eprintln!("fdb-ambiguity: rejected HTTP action advanced canonical scope");
         return Err(io::Error::other("rejected HTTP action advanced the frontier").into());
     }
-    if observer.frontier(account_scope).await? != 0 || observer.frontier(space_scope).await? != 0 {
+    if read_frontier_with_retry(observer, account_scope).await? != 0
+        || read_frontier_with_retry(observer, space_scope).await? != 0
+    {
         eprintln!("fdb-ambiguity: rejected HTTP scope mutation created durable state");
         return Err(io::Error::other("rejected HTTP scope mutation created state").into());
     }
@@ -274,6 +276,20 @@ async fn verify_http_action_binding(
     );
     server.abort();
     Ok(())
+}
+
+async fn read_frontier_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+) -> Result<u64, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.frontier(scope).await {
+            Ok(frontier) => return Ok(frontier),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!("frontier retry budget exhausted: {last_error:?}")).into())
 }
 
 async fn push_over_http(
