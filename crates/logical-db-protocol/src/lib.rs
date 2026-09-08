@@ -6,6 +6,11 @@
 
 #![forbid(unsafe_code)]
 
+mod action;
+pub use action::{
+    PageAction, mark_consumed_action, prune_action, seal_snapshot_action, write_action,
+};
+
 pub use logical_db_model::ChangeDigest;
 use logical_db_model::{
     DocumentId, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, OperationDigest,

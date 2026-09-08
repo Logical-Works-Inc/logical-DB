@@ -1248,6 +1248,7 @@ name = "logical-db-daemon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ciborium",
  "foundationdb",
  "foundationdb-tuple",
  "hmac",
@@ -1258,6 +1259,7 @@ dependencies = [
  "logical-db-server",
  "logical-db-service",
  "logical-db-store-fdb",
+ "reqwest",
  "sha2",
  "tokio",
  "uuid",
@@ -1345,6 +1347,7 @@ dependencies = [
  "logical-db-model",
  "serde",
  "serde_bytes",
+ "sha2",
  "thiserror",
 ]
 

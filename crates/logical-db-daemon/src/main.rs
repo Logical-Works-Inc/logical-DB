@@ -256,9 +256,12 @@ mod tests {
     };
 
     use logical_db_crdt::{Document, Object, Scalar};
-    use logical_db_model::{DocumentId, Effect, OperationDigest, OperationId, ReplicaId};
+    use logical_db_model::{
+        ActionDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
+    };
     use logical_db_protocol::{
-        ChangeEnvelope, PROTOCOL_VERSION, PullRequest, PushOutcome, PushRequest, RejectionCode,
+        ChangeEnvelope, PROTOCOL_VERSION, PageAction, PullRequest, PushOutcome, PushRequest,
+        RejectionCode,
     };
     use logical_db_service::{
         AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ProtocolService,
@@ -276,8 +279,8 @@ mod tests {
         )
     }
 
-    fn request(seed: u8) -> OperationDigest {
-        OperationDigest::new([seed; 32])
+    fn action(seed: u8) -> ActionDigest {
+        ActionDigest::new([seed; 32])
     }
 
     /// Store double that must never be contacted: the default composition
@@ -303,11 +306,7 @@ mod tests {
 
         fn page(
             &self,
-            _scope: Scope,
-            _request: OperationDigest,
-            _after: u64,
-            _max_changes: u16,
-            _max_bytes: u32,
+            _action: PageAction,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
             std::future::poll_fn(|_| {
@@ -403,27 +402,27 @@ mod tests {
             .unwrap();
         assert!(
             policy
-                .authorize(expected_scope, Effect::Write, request(1), 0, 60_999)
+                .authorize(expected_scope, Effect::Write, action(1), 0, 60_999)
                 .is_none()
         );
         assert!(
             policy
-                .authorize(expected_scope, Effect::Sync, request(2), 0, 60_999)
+                .authorize(expected_scope, Effect::Sync, action(2), 0, 60_999)
                 .is_none()
         );
         assert!(
             policy
-                .authorize(scope(20), Effect::Write, request(3), 0, 60_999)
+                .authorize(scope(20), Effect::Write, action(3), 0, 60_999)
                 .is_none()
         );
         assert!(
             policy
-                .authorize(expected_scope, Effect::Read, request(4), 0, 60_999)
+                .authorize(expected_scope, Effect::Read, action(4), 0, 60_999)
                 .is_some()
         );
         assert!(
             policy
-                .authorize(expected_scope, Effect::Write, request(5), 0, 61_000)
+                .authorize(expected_scope, Effect::Write, action(5), 0, 61_000)
                 .is_none()
         );
         assert!(

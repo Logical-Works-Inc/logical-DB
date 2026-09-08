@@ -59,9 +59,10 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Complete the explicit backend capability profiles and matched-trace
   evidence required by the recorded Director ruling in `GOVERNANCE.md`.
 - [ ] Resolve the remaining estate ownership decision before LEM handoff.
-- [ ] Bind authority to a service-computed canonical action digest distinct
-  from caller intent/idempotency identity, including payload-field mutation
-  and exact-retry proof through HTTP and FDB (issue #27).
+- [x] Bind authority to a service-computed canonical action digest distinct
+  from caller intent/idempotency identity. The hosted FDB journey holds one
+  action grant fixed while mutating every write field, proves rejection without
+  frontier advance, and preserves exact-byte retry (issue #27).
 - [ ] Include explicit application-supplied projection semantic identity in
   the durable schema digest and migration proof (issue #29).
 - [x] Native Windows CI passed data placement, file locking, concurrent open,

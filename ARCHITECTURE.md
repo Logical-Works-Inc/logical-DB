@@ -72,10 +72,13 @@ allowed-dependency map must additionally declare the semantic edges
 | Standalone process | `logical-db-daemon` environment contract | FDB network guard, directory transaction, listener lifecycle |
 | Braid | `prepare_request`, `prepare_local_request`, `BraidGrant`, `BraidAuthority`, `LocalBraidAuthority` | grant construction fields and proof fabrication |
 
-An application mutation supplies both `OperationId` and a canonical
-`OperationDigest`. Exact retries return the original durable receipt without
-rerunning application code. Reusing an operation identity for different
-request/change bytes fails closed.
+An application mutation supplies `OperationId` and an intent
+`OperationDigest`. After native CRDT validation, trusted service code computes
+an `ActionDigest` over a versioned length-framed encoding of scope, document,
+operation, replica, intent, change digest, and exact change bytes. Braid and the
+store bind the computed action. Exact retries return the original durable
+receipt without rerunning application code. Reusing an operation identity for
+different intent/change bytes fails closed.
 
 ## Local transaction and subscription contract
 
@@ -113,17 +116,18 @@ Database outbox
   -> HttpTransport validates + CBOR POST /v1/changes:push
   -> whole-request concurrency admission + deadline
   -> server authenticates credential
+  -> validate native change bytes and compute canonical action identity
   -> read scoped FDB frontier
-  -> Braid admits capsule + proves exact snapshot predicate
+  -> Braid admits capsule + proves exact scope/action/frontier predicate
   -> RunnableInvocation becomes an opaque ExecutionGrant
-  -> FDB transaction rechecks frontier and atomically consumes invocation
+  -> FDB recomputes action, rechecks frontier, and consumes invocation
   -> exact operation returns accepted / duplicate / recovered-unknown / conflict
 
 durable peer checkpoint
   -> bounded PullRequest
   -> POST /v1/changes:pull
   -> HMAC-authenticated scoped checkpoint opens to ordered FDB position
-  -> FDB read transaction rechecks the Braid-bound scope/request/frontier
+  -> FDB read transaction rechecks normalized scope/action/frontier
   -> bounded PullPage
   -> CRDT verifies/merges all changes
   -> local snapshots + indexes + events + checkpoint commit atomically
@@ -183,7 +187,8 @@ writes are `Irreversible`, and synchronization is `Egress` with a vault ceiling.
 Write and sync capsules must carry Braid's dangerous-operation confirmation
 policy; a capability string alone is insufficient.
 The snapshot commits to account, space, exact DB effect (point read and scan are
-distinct), request digest, current durable frontier, and exclusive expiry.
+distinct), canonical action digest, current durable frontier, and exclusive
+expiry. The caller's intent digest remains a separate idempotency field.
 `BraidGrant` retains that verifier-owned runnable;
 the service passes it unchanged to FDB, which atomically consumes its combined
 capsule/registry/authority/snapshot/predicate identity with a new operation.

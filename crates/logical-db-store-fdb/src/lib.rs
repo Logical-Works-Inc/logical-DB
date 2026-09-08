@@ -412,7 +412,10 @@ mod runtime {
     };
     use foundationdb_tuple::Subspace;
     use logical_db_model::{Effect, OperationDigest, Scope, SnapshotBaseline};
-    use logical_db_protocol::ChangeEnvelope;
+    use logical_db_protocol::{
+        ChangeEnvelope, PageAction, mark_consumed_action, prune_action, seal_snapshot_action,
+        write_action,
+    };
     use logical_db_service::{
         AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneResult,
         RetentionStore, SealResult, ServiceStore, StoreFailureClass, StoredPage, prune_decision,
@@ -509,7 +512,7 @@ mod runtime {
             }
             if grant.scope() != change.scope
                 || grant.effect() != Effect::Write
-                || grant.request() != change.request
+                || grant.action() != write_action(change)
             {
                 return Ok(AcceptResult::StaleAuthority);
             }
@@ -598,25 +601,21 @@ mod runtime {
 
         async fn page(
             &self,
-            scope: Scope,
-            request: OperationDigest,
-            after: u64,
-            max_changes: u16,
-            max_bytes: u32,
+            action: PageAction,
             grant: &impl ExecutionGrant,
         ) -> Result<PageResult, Self::Error> {
-            if !valid_page_limits(max_changes, max_bytes) {
+            if !valid_page_limits(action.max_changes, action.max_bytes) {
                 eprintln!("logical-db-store-fdb: page limits are invalid");
                 return Err(FdbStoreError::InvalidPageLimits);
             }
-            if grant.scope() != scope
+            if grant.scope() != action.scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != action.digest()
             {
                 return Ok(PageResult::StaleAuthority);
             }
             let expected_frontier = grant.frontier();
-            let scope_space = self.scope_space(scope);
+            let scope_space = self.scope_space(action.scope);
             let spaces = PageSpaces {
                 sequence_key: scope_space.pack(&(KIND_SEQUENCE,)),
                 retention_key: scope_space.pack(&(KIND_RETENTION,)),
@@ -625,11 +624,11 @@ mod runtime {
                 scope: scope_space,
             };
             let query = PageQuery {
-                scope,
+                scope: action.scope,
                 frontier: expected_frontier,
-                after,
-                max_changes,
-                max_bytes,
+                after: action.after,
+                max_changes: action.max_changes,
+                max_bytes: action.max_bytes,
             };
             self.database
                 .run(move |transaction, _maybe_committed| {
@@ -701,7 +700,7 @@ mod runtime {
         ) -> Result<SealResult, Self::Error> {
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != seal_snapshot_action(scope, request, baseline)
             {
                 return Ok(SealResult::StaleAuthority);
             }
@@ -741,7 +740,7 @@ mod runtime {
         ) -> Result<ConsumedResult, Self::Error> {
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != mark_consumed_action(scope, request, through)
             {
                 return Ok(ConsumedResult::StaleAuthority);
             }
@@ -789,7 +788,7 @@ mod runtime {
         ) -> Result<PruneResult, Self::Error> {
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != prune_action(scope, request, up_to, min_live)
             {
                 return Ok(PruneResult::StaleAuthority);
             }

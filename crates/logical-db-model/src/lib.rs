@@ -165,6 +165,28 @@ impl ChangeDigest {
     }
 }
 
+/// Canonical identity of an action recomputed at a trusted admission boundary.
+///
+/// This is not an application retry label. Stores must recompute the action
+/// from its fields before accepting a grant carrying this identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ActionDigest([u8; 32]);
+
+impl ActionDigest {
+    /// Wraps the output of the versioned canonical action encoder.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the stable digest bytes.
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// Canonical identity of the caller's requested logical mutation.
 ///
 /// This is distinct from [`ChangeDigest`]: retries bind to what the caller

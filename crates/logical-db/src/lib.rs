@@ -20,8 +20,8 @@ use std::{
 pub use logical_db_crdt::{ConflictValue, Editor, Item, Object, ObjectKind, Reader, Scalar};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 pub use logical_db_model::{
-    AccountId, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue,
-    OperationDigest, OperationId, PeerId, ReplicaId, Scope, SpaceId,
+    AccountId, ActionDigest, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId,
+    IndexValue, OperationDigest, OperationId, PeerId, ReplicaId, Scope, SpaceId,
 };
 pub use logical_db_platform::PlatformError;
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};

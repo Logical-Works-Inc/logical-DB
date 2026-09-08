@@ -92,7 +92,9 @@ guard intact.
   host supplies externally prepared grants; it also refuses a non-loopback
   plaintext bind.
 - **Ecosystem host:** Logic OS or another host nests the same router and uses
-  `logical-db-braid` to admit exact account/space/request capabilities. The host
+  `logical-db-braid` to admit exact account/space/action capabilities computed
+  after native validation. Application request digests remain retry identities.
+  The host
   does not own embedded CRUD.
 
 The wire boundary is two versioned CBOR operations:
@@ -110,8 +112,10 @@ kill/restart journeys, mutation campaigns, and official FDB unknown-commit
 injection. The former facade-to-daemon journey is explicitly retired because
 its confirmation model was unsound. `REWRITE_MANIFEST.md` remains
 authoritative. Embedded tombstones and export/restore are implemented and have
-retained tests. Production completion still requires trusted action-byte
-authorization, state-bearing server recovery, projection semantic identity,
+retained tests. Canonical action-byte authorization is implemented and exercised
+through the HTTP/service/FDB seam. Production completion still requires
+independent runtime Braid confirmation, state-bearing server recovery,
+projection semantic identity,
 multi-node FDB recovery, public TLS/issuer integration, runtime Braid
 confirmation, sustained load, and external LEM consumption.
 

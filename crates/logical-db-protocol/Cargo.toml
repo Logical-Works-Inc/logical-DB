@@ -15,6 +15,7 @@ logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 serde.workspace = true
 serde_bytes.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true

@@ -29,11 +29,14 @@ mod tests {
         StoredPage,
     };
 
+    use logical_db_model::ActionDigest;
+    use logical_db_protocol::{PageAction, write_action};
+
     struct Allow;
     struct Grant {
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
     }
 
@@ -44,14 +47,14 @@ mod tests {
         fn effect(&self) -> Effect {
             self.effect
         }
-        fn request(&self) -> OperationDigest {
-            self.request
+        fn action(&self) -> ActionDigest {
+            self.action
         }
         fn frontier(&self) -> u64 {
             self.frontier
         }
         fn invocation_id(&self) -> [u8; 32] {
-            self.request.into_bytes()
+            self.action.into_bytes()
         }
     }
 
@@ -62,14 +65,14 @@ mod tests {
             &self,
             scope: Scope,
             effect: Effect,
-            request: OperationDigest,
+            action: ActionDigest,
             frontier: u64,
             _now_unix_ms: u64,
         ) -> Option<Self::Grant> {
             Some(Grant {
                 scope,
                 effect,
-                request,
+                action,
                 frontier,
             })
         }
@@ -113,8 +116,14 @@ mod tests {
         fn accept(
             &self,
             change: &ChangeEnvelope,
-            _grant: &impl ExecutionGrant,
+            grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            if grant.scope() != change.scope
+                || grant.effect() != Effect::Write
+                || grant.action() != write_action(change)
+            {
+                return ready(Ok(AcceptResult::StaleAuthority));
+            }
             let mut operations = self.operations.lock().unwrap();
             let outcome = match operations.get(&change.operation) {
                 Some(existing) if *existing == (change.request, change.digest) => {
@@ -143,13 +152,16 @@ mod tests {
 
         fn page(
             &self,
-            scope: Scope,
-            request: OperationDigest,
-            after: u64,
-            max_changes: u16,
-            max_bytes: u32,
+            action: PageAction,
             grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            let PageAction {
+                scope,
+                after,
+                max_changes,
+                max_bytes,
+                ..
+            } = action;
             let changes = self.changes.lock().unwrap();
             let scoped = changes
                 .iter()
@@ -157,7 +169,7 @@ mod tests {
                 .collect::<Vec<_>>();
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != action.digest()
                 || grant.frontier() != scoped.len() as u64
             {
                 return ready(Ok(PageResult::StaleAuthority));
