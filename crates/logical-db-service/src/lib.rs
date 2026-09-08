@@ -11,10 +11,13 @@ use std::{future::Future, sync::Arc};
 use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, EncodedChange};
 use logical_db_model::OperationId;
-use logical_db_model::{Effect, OperationDigest, Scope, SnapshotBaseline, is_behind_retention};
+use logical_db_model::{
+    ActionDigest, Effect, OperationDigest, Scope, SnapshotBaseline, is_behind_retention,
+};
 use logical_db_protocol::{
-    ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest,
-    PushOutcome, PushRequest, PushResponse, RejectionCode,
+    ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, PageAction, ProtocolError, PullPage, PullRequest,
+    PushOutcome, PushRequest, PushResponse, RejectionCode, mark_consumed_action, prune_action,
+    seal_snapshot_action, write_action,
 };
 use sha2::Sha256;
 use thiserror::Error;
@@ -29,8 +32,8 @@ pub trait ExecutionGrant: Send + Sync {
     fn scope(&self) -> Scope;
     /// Strongest database effect proven by the invocation.
     fn effect(&self) -> Effect;
-    /// Canonical request digest bound into the invocation snapshot.
-    fn request(&self) -> OperationDigest;
+    /// Canonical action digest bound into the invocation snapshot.
+    fn action(&self) -> ActionDigest;
     /// Exact durable scope frontier justified before transaction execution.
     fn frontier(&self) -> u64;
     /// Stable content identity atomically consumed with a new write.
@@ -47,7 +50,7 @@ pub trait Authority {
         &self,
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
         now_unix_ms: u64,
     ) -> Option<Self::Grant>;
@@ -150,11 +153,7 @@ pub trait ServiceStore: Send + Sync {
     /// Returns a typed backend read, decode, or corruption failure.
     fn page(
         &self,
-        scope: Scope,
-        request: OperationDigest,
-        after: u64,
-        max_changes: u16,
-        max_bytes: u32,
+        action: PageAction,
         grant: &impl ExecutionGrant,
     ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send;
 }
@@ -190,14 +189,10 @@ where
 
     fn page(
         &self,
-        scope: Scope,
-        request: OperationDigest,
-        after: u64,
-        max_changes: u16,
-        max_bytes: u32,
+        action: PageAction,
         grant: &impl ExecutionGrant,
     ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
-        (**self).page(scope, request, after, max_changes, max_bytes, grant)
+        (**self).page(action, grant)
     }
 }
 
@@ -596,24 +591,6 @@ where
         let mut outcomes = Vec::with_capacity(request.changes.len());
         for change in &request.changes {
             let operation = change.operation;
-            let frontier = self
-                .store
-                .frontier(change.scope)
-                .await
-                .map_err(ServiceError::Store)?;
-            let Some(grant) = self.policy.authorize(
-                change.scope,
-                Effect::Write,
-                change.request,
-                frontier,
-                now_unix_ms,
-            ) else {
-                outcomes.push(PushOutcome::Rejected {
-                    operation,
-                    code: RejectionCode::Forbidden,
-                });
-                continue;
-            };
             let validation = (EncodedChange {
                 digest: change.digest,
                 bytes: change.bytes.clone(),
@@ -630,6 +607,24 @@ where
                 });
                 continue;
             }
+            let frontier = self
+                .store
+                .frontier(change.scope)
+                .await
+                .map_err(ServiceError::Store)?;
+            let Some(grant) = self.policy.authorize(
+                change.scope,
+                Effect::Write,
+                write_action(change),
+                frontier,
+                now_unix_ms,
+            ) else {
+                outcomes.push(PushOutcome::Rejected {
+                    operation,
+                    code: RejectionCode::Forbidden,
+                });
+                continue;
+            };
             let accepted = self
                 .store
                 .accept(change, &grant)
@@ -661,26 +656,6 @@ where
         now_unix_ms: u64,
     ) -> Result<ServicePull, ServiceError<Store::Error>> {
         request.validate().map_err(ServiceError::Protocol)?;
-        let frontier = self
-            .store
-            .frontier(request.scope)
-            .await
-            .map_err(ServiceError::Store)?;
-        let floor = self
-            .store
-            .retention_floor(request.scope)
-            .await
-            .map_err(ServiceError::Store)?;
-        let Some(grant) = self.policy.authorize(
-            request.scope,
-            Effect::Sync,
-            request.request,
-            frontier,
-            now_unix_ms,
-        ) else {
-            eprintln!("logical-db-service: pull: Forbidden");
-            return Err(ServiceError::Forbidden);
-        };
         let checkpoint_position = match &request.after {
             Some(token) => match self.checkpoints.open(request.scope, token, now_unix_ms) {
                 Ok(position) => Some(position),
@@ -692,20 +667,41 @@ where
             },
             None => None,
         };
+        let frontier = self
+            .store
+            .frontier(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let floor = self
+            .store
+            .retention_floor(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
         if checkpoint_position.is_some_and(|position| is_behind_retention(position, floor)) {
             return Ok(ServicePull::CheckpointExpired);
         }
         let after = checkpoint_position.unwrap_or(0).max(floor);
+        let action = PageAction {
+            scope: request.scope,
+            replica: request.replica,
+            intent: request.request,
+            after,
+            max_changes: request.max_changes,
+            max_bytes: request.max_bytes,
+        };
+        let Some(grant) = self.policy.authorize(
+            request.scope,
+            Effect::Sync,
+            action.digest(),
+            frontier,
+            now_unix_ms,
+        ) else {
+            eprintln!("logical-db-service: pull: Forbidden");
+            return Err(ServiceError::Forbidden);
+        };
         let result = self
             .store
-            .page(
-                request.scope,
-                request.request,
-                after,
-                request.max_changes,
-                request.max_bytes,
-                &grant,
-            )
+            .page(action, &grant)
             .await
             .map_err(ServiceError::Store)?;
         let stored = match result {
@@ -778,10 +774,13 @@ where
             .frontier(scope)
             .await
             .map_err(ServiceError::Store)?;
-        let Some(grant) =
-            self.policy
-                .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
-        else {
+        let Some(grant) = self.policy.authorize(
+            scope,
+            Effect::Sync,
+            seal_snapshot_action(scope, request, baseline),
+            frontier,
+            now_unix_ms,
+        ) else {
             eprintln!("logical-db-service: seal_snapshot: Forbidden");
             return Err(ServiceError::Forbidden);
         };
@@ -809,10 +808,13 @@ where
             .frontier(scope)
             .await
             .map_err(ServiceError::Store)?;
-        let Some(grant) =
-            self.policy
-                .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
-        else {
+        let Some(grant) = self.policy.authorize(
+            scope,
+            Effect::Sync,
+            mark_consumed_action(scope, request, through),
+            frontier,
+            now_unix_ms,
+        ) else {
             eprintln!("logical-db-service: mark_consumed: Forbidden");
             return Err(ServiceError::Forbidden);
         };
@@ -844,10 +846,13 @@ where
             .frontier(scope)
             .await
             .map_err(ServiceError::Store)?;
-        let Some(grant) =
-            self.policy
-                .authorize(scope, Effect::Sync, request, frontier, now_unix_ms)
-        else {
+        let Some(grant) = self.policy.authorize(
+            scope,
+            Effect::Sync,
+            prune_action(scope, request, up_to, min_live),
+            frontier,
+            now_unix_ms,
+        ) else {
             eprintln!("logical-db-service: prune: Forbidden");
             return Err(ServiceError::Forbidden);
         };
@@ -940,7 +945,7 @@ mod tests {
     struct Grant {
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
     }
 
@@ -951,14 +956,14 @@ mod tests {
         fn effect(&self) -> Effect {
             self.effect
         }
-        fn request(&self) -> OperationDigest {
-            self.request
+        fn action(&self) -> ActionDigest {
+            self.action
         }
         fn frontier(&self) -> u64 {
             self.frontier
         }
         fn invocation_id(&self) -> [u8; 32] {
-            self.request.into_bytes()
+            self.action.into_bytes()
         }
     }
 
@@ -969,14 +974,14 @@ mod tests {
             &self,
             scope: Scope,
             effect: Effect,
-            request: OperationDigest,
+            action: ActionDigest,
             frontier: u64,
             _now: u64,
         ) -> Option<Self::Grant> {
             Some(Grant {
                 scope,
                 effect,
-                request,
+                action,
                 frontier,
             })
         }
@@ -989,14 +994,14 @@ mod tests {
             &self,
             scope: Scope,
             effect: Effect,
-            request: OperationDigest,
+            action: ActionDigest,
             frontier: u64,
             _now: u64,
         ) -> Option<Self::Grant> {
             Some(Grant {
                 scope,
                 effect,
-                request,
+                action,
                 frontier: frontier.checked_sub(1).unwrap_or(1),
             })
         }
@@ -1048,13 +1053,13 @@ mod tests {
         fn check_retention_grant(
             &self,
             scope: Scope,
-            request: OperationDigest,
+            action: ActionDigest,
             grant: &impl ExecutionGrant,
         ) -> Option<u64> {
             let frontier = self.scope_frontier(scope);
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != action
                 || grant.frontier() != frontier
             {
                 return None;
@@ -1083,21 +1088,10 @@ mod tests {
         }
         fn page(
             &self,
-            scope: Scope,
-            request: OperationDigest,
-            after: u64,
-            max_changes: u16,
-            max_bytes: u32,
+            action: PageAction,
             grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
-            std::future::ready(Ok(self.page_result(
-                scope,
-                request,
-                after,
-                max_changes,
-                max_bytes,
-                grant,
-            )))
+            std::future::ready(Ok(self.page_result(action, grant)))
         }
     }
 
@@ -1166,21 +1160,17 @@ mod tests {
         fn retention_floor_result(&self, scope: Scope) -> u64 {
             self.retention_state(scope).floor
         }
-        fn page_result(
-            &self,
-            scope: Scope,
-            request: OperationDigest,
-            after: u64,
-            max_changes: u16,
-            max_bytes: u32,
-            grant: &impl ExecutionGrant,
-        ) -> PageResult {
-            if grant.scope() != scope
+        fn page_result(&self, action: PageAction, grant: &impl ExecutionGrant) -> PageResult {
+            if grant.scope() != action.scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != action.digest()
             {
                 return PageResult::StaleAuthority;
             }
+            let scope = action.scope;
+            let after = action.after;
+            let max_changes = action.max_changes;
+            let max_bytes = action.max_bytes;
             let floor = self.retention_state(scope).floor;
             if after < floor {
                 return PageResult::BehindFloor;
@@ -1224,7 +1214,11 @@ mod tests {
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> SealResult {
-            let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
+            let Some(frontier) = self.check_retention_grant(
+                scope,
+                seal_snapshot_action(scope, request, baseline),
+                grant,
+            ) else {
                 return SealResult::StaleAuthority;
             };
             if baseline.position() > frontier {
@@ -1247,7 +1241,11 @@ mod tests {
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> ConsumedResult {
-            let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
+            let Some(frontier) = self.check_retention_grant(
+                scope,
+                mark_consumed_action(scope, request, through),
+                grant,
+            ) else {
                 return ConsumedResult::StaleAuthority;
             };
             if through > frontier {
@@ -1273,7 +1271,11 @@ mod tests {
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> PruneResult {
-            let Some(frontier) = self.check_retention_grant(scope, request, grant) else {
+            let Some(frontier) = self.check_retention_grant(
+                scope,
+                prune_action(scope, request, up_to, min_live),
+                grant,
+            ) else {
                 return PruneResult::StaleAuthority;
             };
             let state = self.retention_state(scope);
@@ -1571,7 +1573,7 @@ mod tests {
             &self,
             _scope: Scope,
             _effect: Effect,
-            _request: OperationDigest,
+            _action: ActionDigest,
             _frontier: u64,
             _now: u64,
         ) -> Option<Self::Grant> {

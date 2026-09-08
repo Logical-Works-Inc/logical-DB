@@ -18,7 +18,7 @@ use braid_ir::{
 use braid_run::{JustificationProof, RunnableInvocation};
 use braid_sdk::Builder;
 use braid_verify::{Verdict, admit};
-use logical_db_model::{Effect, OperationDigest, Scope};
+use logical_db_model::{ActionDigest, Effect, Scope};
 use logical_db_service::{Authority, ExecutionGrant};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,55 +34,55 @@ pub const SYNC_CAPABILITY: &str = "logical_db.sync";
 
 const SCOPE_FACT: &str = "logical_db.scope";
 const EFFECT_FACT: &str = "logical_db.effect";
-const REQUEST_FACT: &str = "logical_db.request";
+const ACTION_FACT: &str = "logical_db.action.v1";
 const FRONTIER_FACT: &str = "logical_db.frontier";
 const EXPIRY_FACT: &str = "logical_db.expires_at_unix_ms";
 
 /// Exact logical facts and expiry supplied to Braid preparation as one value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RequestBinding {
+pub struct ActionBinding {
     scope: Scope,
     effect: Effect,
-    request: OperationDigest,
+    action: ActionDigest,
     frontier: u64,
     expires_at_unix_ms: u64,
 }
 
-impl RequestBinding {
-    /// Binds one request to its observed durable frontier and exclusive expiry.
+impl ActionBinding {
+    /// Binds one action to its observed durable frontier and exclusive expiry.
     #[must_use]
     pub const fn new(
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
         expires_at_unix_ms: u64,
     ) -> Self {
         Self {
             scope,
             effect,
-            request,
+            action,
             frontier,
             expires_at_unix_ms,
         }
     }
 }
 
-/// Constructs the exact Braid capability for one DB request.
+/// Constructs the exact Braid capability for one DB action.
 #[must_use]
-pub fn capability_for(scope: Scope, effect: Effect, request: OperationDigest) -> Capability {
+pub fn capability_for(scope: Scope, effect: Effect, action: ActionDigest) -> Capability {
     let prefix = match effect {
         Effect::Read => READ_CAPABILITY,
         Effect::Scan => SCAN_CAPABILITY,
         Effect::Write => WRITE_CAPABILITY,
         Effect::Sync => SYNC_CAPABILITY,
     };
-    let mut request_hex = String::with_capacity(64);
-    for byte in request.into_bytes() {
-        write!(&mut request_hex, "{byte:02x}").expect("writing to String is infallible");
+    let mut action_hex = String::with_capacity(64);
+    for byte in action.into_bytes() {
+        write!(&mut action_hex, "{byte:02x}").expect("writing to String is infallible");
     }
     Capability::new(format!(
-        "{prefix}.{}.{}.{request_hex}",
+        "{prefix}.{}.{}.{action_hex}",
         scope.account(),
         scope.space()
     ))
@@ -94,7 +94,7 @@ pub struct BraidGrant {
     runnable: RunnableInvocation,
     scope: Scope,
     effect: Effect,
-    request: OperationDigest,
+    action: ActionDigest,
     frontier: u64,
     expires_at_unix_ms: u64,
     invocation_id: [u8; 32],
@@ -111,13 +111,13 @@ impl BraidGrant {
         &self,
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
         now_unix_ms: u64,
     ) -> bool {
         self.scope == scope
             && self.effect == effect
-            && self.request == request
+            && self.action == action
             && self.frontier == frontier
             && now_unix_ms < self.expires_at_unix_ms
     }
@@ -130,8 +130,8 @@ impl ExecutionGrant for BraidGrant {
     fn effect(&self) -> Effect {
         self.effect
     }
-    fn request(&self) -> OperationDigest {
-        self.request
+    fn action(&self) -> ActionDigest {
+        self.action
     }
     fn frontier(&self) -> u64 {
         self.frontier
@@ -143,7 +143,7 @@ impl ExecutionGrant for BraidGrant {
 
 /// Turns independently supplied canonical Braid material into an exact runnable grant.
 ///
-/// The proof snapshot binds scope, strongest effect, request digest, and the durable
+/// The proof snapshot binds scope, strongest effect, action digest, and the durable
 /// tuple-space frontier. Any change to those facts changes the invocation identity.
 ///
 /// # Errors
@@ -154,18 +154,18 @@ pub fn prepare_request(
     capsule_bytes: &[u8],
     registry: &TermRegistry,
     ambient: &[Capability],
-    binding: RequestBinding,
+    binding: ActionBinding,
 ) -> Result<BraidGrant, BraidAdapterError> {
-    let RequestBinding {
+    let ActionBinding {
         scope,
         effect,
-        request,
+        action,
         frontier,
         expires_at_unix_ms,
     } = binding;
     let admission = admit(capsule_bytes, registry, ambient).map_err(BraidAdapterError::Rejected)?;
     let capsule = Capsule::from_bytes(capsule_bytes).map_err(BraidAdapterError::Capsule)?;
-    let required = capability_for(scope, effect, request);
+    let required = capability_for(scope, effect, action);
     if !capsule.grants.iter().any(|grant| grant == &required) {
         eprintln!("logical-db-braid: prepare_request: MissingExactGrant");
         return Err(BraidAdapterError::MissingExactGrant);
@@ -179,9 +179,9 @@ pub fn prepare_request(
         eprintln!("logical-db-braid: BraidAdapterError::Expiry: {error}");
         BraidAdapterError::Expiry(expires_at_unix_ms)
     })?;
-    let facts = request_facts(scope, effect, request, frontier_value, expiry_value);
+    let facts = action_facts(scope, effect, action, frontier_value, expiry_value);
     let snapshot = FlowSnapshot::new(facts.clone());
-    let predicate = request_predicate(&facts)?;
+    let predicate = action_predicate(&facts)?;
     let justification =
         JustificationProof::prove(&capsule, &predicate, &snapshot, &CompletionMap::new())
             .map_err(BraidAdapterError::Execution)?;
@@ -199,7 +199,7 @@ pub fn prepare_request(
         runnable,
         scope,
         effect,
-        request,
+        action,
         frontier,
         expires_at_unix_ms,
         invocation_id,
@@ -258,10 +258,10 @@ fn validate_operation_policy(
     }
 }
 
-fn request_facts(
+fn action_facts(
     scope: Scope,
     effect: Effect,
-    request: OperationDigest,
+    action: ActionDigest,
     frontier: i64,
     expires_at_unix_ms: i64,
 ) -> BTreeMap<String, Value> {
@@ -272,15 +272,15 @@ fn request_facts(
         (SCOPE_FACT.into(), Value::Bytes(scope_bytes)),
         (EFFECT_FACT.into(), Value::Text(effect_name(effect).into())),
         (
-            REQUEST_FACT.into(),
-            Value::Bytes(request.into_bytes().to_vec()),
+            ACTION_FACT.into(),
+            Value::Bytes(action.into_bytes().to_vec()),
         ),
         (FRONTIER_FACT.into(), Value::Int(frontier)),
         (EXPIRY_FACT.into(), Value::Int(expires_at_unix_ms)),
     ])
 }
 
-fn request_predicate(facts: &BTreeMap<String, Value>) -> Result<Predicate, BraidAdapterError> {
+fn action_predicate(facts: &BTreeMap<String, Value>) -> Result<Predicate, BraidAdapterError> {
     let mut clauses = Vec::with_capacity(facts.len());
     for (name, value) in facts {
         let fact = FactRef::new(name).map_err(BraidAdapterError::Fact)?;
@@ -325,11 +325,11 @@ fn effect_name(effect: Effect) -> &'static str {
 pub fn prepare_local_request(
     scope: Scope,
     effect: Effect,
-    request: OperationDigest,
+    action: ActionDigest,
     frontier: u64,
     expires_at_unix_ms: u64,
 ) -> Result<BraidGrant, BraidAdapterError> {
-    let capability = capability_for(scope, effect, request);
+    let capability = capability_for(scope, effect, action);
     let mut registry = TermRegistry::new(1);
     registry
         .insert(TermSpec {
@@ -356,7 +356,7 @@ pub fn prepare_local_request(
             cost: 1,
         })
         .map_err(BraidAdapterError::Registry)?;
-    let mut builder = Builder::new(&registry, "execute exact Logical-DB request");
+    let mut builder = Builder::new(&registry, "execute exact Logical-DB action");
     let bound_request = builder
         .strand("logical_db.bound_request", &[])
         .map_err(BraidAdapterError::Build)?;
@@ -370,7 +370,7 @@ pub fn prepare_local_request(
         &bytes,
         &registry,
         &[capability],
-        RequestBinding::new(scope, effect, request, frontier, expires_at_unix_ms),
+        ActionBinding::new(scope, effect, action, frontier, expires_at_unix_ms),
     )
 }
 
@@ -411,7 +411,7 @@ impl Authority for LocalBraidAuthority {
         &self,
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
         now_unix_ms: u64,
     ) -> Option<Self::Grant> {
@@ -421,7 +421,7 @@ impl Authority for LocalBraidAuthority {
         {
             return None;
         }
-        prepare_local_request(scope, effect, request, frontier, self.expires_at_unix_ms).ok()
+        prepare_local_request(scope, effect, action, frontier, self.expires_at_unix_ms).ok()
     }
 }
 
@@ -452,13 +452,13 @@ impl Authority for BraidAuthority {
         &self,
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
         now_unix_ms: u64,
     ) -> Option<Self::Grant> {
         self.grants
             .iter()
-            .find(|grant| grant.permits(scope, effect, request, frontier, now_unix_ms))
+            .find(|grant| grant.permits(scope, effect, action, frontier, now_unix_ms))
             .cloned()
     }
 }
@@ -472,8 +472,8 @@ pub enum BraidAdapterError {
     /// Canonical capsule bytes did not decode.
     #[error("Braid capsule decoding failed: {0}")]
     Capsule(braid_ir::capsule::CapsuleError),
-    /// Capsule grant set omitted the exact scope/effect/request capability.
-    #[error("Braid capsule lacks the exact scoped request capability")]
+    /// Capsule grant set omitted the exact scope/effect/action capability.
+    #[error("Braid capsule lacks the exact scoped action capability")]
     MissingExactGrant,
     /// Exact capability was not attached to a vault-tainted term with the
     /// required effect, ceiling, and dangerous-operation confirmation policy.
@@ -509,47 +509,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_runnable_is_bound_to_scope_effect_request_frontier_and_expiry() {
+    fn real_runnable_is_bound_to_scope_effect_action_frontier_and_expiry() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([9; 32]);
-        let grant = prepare_local_request(scope, Effect::Read, request, 7, 100).unwrap();
+        let action = ActionDigest::new([9; 32]);
+        let grant = prepare_local_request(scope, Effect::Read, action, 7, 100).unwrap();
         assert_eq!(ExecutionGrant::scope(&grant), scope);
         assert_eq!(ExecutionGrant::effect(&grant), Effect::Read);
-        assert_eq!(ExecutionGrant::request(&grant), request);
+        assert_eq!(ExecutionGrant::action(&grant), action);
         assert_eq!(ExecutionGrant::frontier(&grant), 7);
-        assert!(grant.permits(scope, Effect::Read, request, 7, 99));
-        assert!(!grant.permits(scope, Effect::Read, request, 8, 99));
-        assert!(!grant.permits(scope, Effect::Sync, request, 7, 99));
-        assert!(!grant.permits(scope, Effect::Read, OperationDigest::new([8; 32]), 7, 99));
-        assert!(!grant.permits(scope, Effect::Read, request, 7, 100));
+        assert!(grant.permits(scope, Effect::Read, action, 7, 99));
+        assert!(!grant.permits(scope, Effect::Read, action, 8, 99));
+        assert!(!grant.permits(scope, Effect::Sync, action, 7, 99));
+        assert!(!grant.permits(scope, Effect::Read, ActionDigest::new([8; 32]), 7, 99));
+        assert!(!grant.permits(scope, Effect::Read, action, 7, 100));
     }
 
     #[test]
-    fn invocation_identity_changes_with_frontier_request_and_expiry() {
+    fn invocation_identity_changes_with_frontier_action_and_expiry() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let first = prepare_local_request(scope, Effect::Read, OperationDigest::new([1; 32]), 1, 9)
-            .unwrap();
+        let first =
+            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 1, 9).unwrap();
         let frontier =
-            prepare_local_request(scope, Effect::Read, OperationDigest::new([1; 32]), 2, 9)
-                .unwrap();
-        let request =
-            prepare_local_request(scope, Effect::Read, OperationDigest::new([2; 32]), 1, 9)
-                .unwrap();
+            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 2, 9).unwrap();
+        let action =
+            prepare_local_request(scope, Effect::Read, ActionDigest::new([2; 32]), 1, 9).unwrap();
         let expiry =
-            prepare_local_request(scope, Effect::Read, OperationDigest::new([1; 32]), 1, 10)
-                .unwrap();
+            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 1, 10).unwrap();
         assert_ne!(first.invocation_id(), frontier.invocation_id());
-        assert_ne!(first.invocation_id(), request.invocation_id());
+        assert_ne!(first.invocation_id(), action.invocation_id());
         assert_ne!(first.invocation_id(), expiry.invocation_id());
     }
 
     #[test]
     fn scan_and_point_read_require_distinct_capabilities() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([3; 32]);
+        let action = ActionDigest::new([3; 32]);
         assert_ne!(
-            capability_for(scope, Effect::Read, request),
-            capability_for(scope, Effect::Scan, request)
+            capability_for(scope, Effect::Read, action),
+            capability_for(scope, Effect::Scan, action)
         );
     }
 
@@ -570,12 +567,12 @@ mod tests {
     #[test]
     fn external_capsule_cannot_attach_write_capability_to_a_weaker_effect() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([5; 32]);
-        let capability = capability_for(scope, Effect::Write, request);
+        let action = ActionDigest::new([5; 32]);
+        let capability = capability_for(scope, Effect::Write, action);
         let mut registry = TermRegistry::new(1);
         registry
             .insert(TermSpec {
-                id: "request".into(),
+                id: "action".into(),
                 inputs: vec![],
                 output: TypeTag::Bool,
                 capability: None,
@@ -598,7 +595,7 @@ mod tests {
             })
             .unwrap();
         let mut builder = Builder::new(&registry, "attempt write downgrade");
-        let source = builder.strand("request", &[]).unwrap();
+        let source = builder.strand("action", &[]).unwrap();
         let sink = builder.strand("downgraded_write", &[source]).unwrap();
         builder
             .output(sink)
@@ -610,7 +607,7 @@ mod tests {
                 &capsule.to_bytes(),
                 &registry,
                 &[capability],
-                RequestBinding::new(scope, Effect::Write, request, 0, 1),
+                ActionBinding::new(scope, Effect::Write, action, 0, 1),
             ),
             Err(BraidAdapterError::EffectPolicyMismatch)
         ));
@@ -619,12 +616,12 @@ mod tests {
     #[test]
     fn externally_confirmed_exact_write_capsule_is_accepted() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([6; 32]);
-        let capability = capability_for(scope, Effect::Write, request);
+        let action = ActionDigest::new([6; 32]);
+        let capability = capability_for(scope, Effect::Write, action);
         let mut registry = TermRegistry::new(1);
         registry
             .insert(TermSpec {
-                id: "request".into(),
+                id: "action".into(),
                 inputs: vec![],
                 output: TypeTag::Bool,
                 capability: None,
@@ -647,7 +644,7 @@ mod tests {
             })
             .unwrap();
         let mut builder = Builder::new(&registry, "externally confirmed write");
-        let source = builder.strand("request", &[]).unwrap();
+        let source = builder.strand("action", &[]).unwrap();
         let sink = builder.strand("write", &[source]).unwrap();
         builder
             .output(sink)
@@ -658,7 +655,7 @@ mod tests {
             &capsule.to_bytes(),
             &registry,
             &[capability],
-            RequestBinding::new(scope, Effect::Write, request, 0, 1),
+            ActionBinding::new(scope, Effect::Write, action, 0, 1),
         )
         .unwrap();
         assert_eq!(grant.effect(), Effect::Write);
@@ -667,12 +664,12 @@ mod tests {
     #[test]
     fn external_read_capsule_cannot_change_the_required_ceiling_shape() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([7; 32]);
-        let capability = capability_for(scope, Effect::Read, request);
+        let action = ActionDigest::new([7; 32]);
+        let capability = capability_for(scope, Effect::Read, action);
         let mut registry = TermRegistry::new(1);
         registry
             .insert(TermSpec {
-                id: "request".into(),
+                id: "action".into(),
                 inputs: vec![],
                 output: TypeTag::Bool,
                 capability: None,
@@ -695,7 +692,7 @@ mod tests {
             })
             .unwrap();
         let mut builder = Builder::new(&registry, "attempt read policy drift");
-        let source = builder.strand("request", &[]).unwrap();
+        let source = builder.strand("action", &[]).unwrap();
         let sink = builder.strand("read", &[source]).unwrap();
         builder.output(sink).budget_tight();
         let capsule = builder.build().unwrap();
@@ -704,7 +701,7 @@ mod tests {
                 &capsule.to_bytes(),
                 &registry,
                 &[capability],
-                RequestBinding::new(scope, Effect::Read, request, 0, 1),
+                ActionBinding::new(scope, Effect::Read, action, 0, 1),
             ),
             Err(BraidAdapterError::EffectPolicyMismatch)
         ));
@@ -713,8 +710,8 @@ mod tests {
     #[test]
     fn external_sync_capsule_must_route_vault_tainted_request_material() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([8; 32]);
-        let capability = capability_for(scope, Effect::Sync, request);
+        let action = ActionDigest::new([8; 32]);
+        let capability = capability_for(scope, Effect::Sync, action);
         let mut registry = TermRegistry::new(1);
         registry
             .insert(TermSpec {
@@ -753,7 +750,7 @@ mod tests {
                 &capsule.to_bytes(),
                 &registry,
                 &[capability],
-                RequestBinding::new(scope, Effect::Sync, request, 0, 1),
+                ActionBinding::new(scope, Effect::Sync, action, 0, 1),
             ),
             Err(BraidAdapterError::EffectPolicyMismatch)
         ));
@@ -763,24 +760,24 @@ mod tests {
     fn local_policy_generates_only_exact_authenticated_runnable_grants() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let policy = LocalBraidAuthority::new(scope, 20);
-        let request = OperationDigest::new([4; 32]);
+        let action = ActionDigest::new([4; 32]);
         assert!(
             policy
-                .authorize(scope, Effect::Read, request, 3, 19)
+                .authorize(scope, Effect::Read, action, 3, 19)
                 .is_some()
         );
         assert!(
             policy
-                .authorize(scope, Effect::Write, request, 3, 19)
+                .authorize(scope, Effect::Write, action, 3, 19)
                 .is_none()
         );
         assert!(
             policy
-                .authorize(scope, Effect::Read, request, 3, 20)
+                .authorize(scope, Effect::Read, action, 3, 20)
                 .is_none()
         );
         assert!(matches!(
-            prepare_local_request(scope, Effect::Write, request, 3, 20),
+            prepare_local_request(scope, Effect::Write, action, 3, 20),
             Err(BraidAdapterError::Build(
                 braid_sdk::BuildError::ConfirmRequired { .. }
             ))
@@ -795,20 +792,20 @@ mod tests {
         assert_eq!(effect_name(Effect::Sync), "sync");
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([6; 32]);
-        let grant = prepare_local_request(scope, Effect::Read, request, 11, 30).unwrap();
+        let action = ActionDigest::new([6; 32]);
+        let grant = prepare_local_request(scope, Effect::Read, action, 11, 30).unwrap();
         let expected_id = grant.invocation_id();
         let authority = BraidAuthority::new(vec![grant]).unwrap();
         assert_eq!(
             authority
-                .authorize(scope, Effect::Read, request, 11, 29)
+                .authorize(scope, Effect::Read, action, 11, 29)
                 .unwrap()
                 .invocation_id(),
             expected_id
         );
         assert!(
             authority
-                .authorize(scope, Effect::Read, request, 12, 29)
+                .authorize(scope, Effect::Read, action, 12, 29)
                 .is_none()
         );
     }
@@ -816,14 +813,14 @@ mod tests {
     fn confirmed_dangerous_material(
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
     ) -> (Vec<u8>, TermRegistry, Capability) {
         let (operation_effect, _) = operation_policy(effect);
-        let capability = capability_for(scope, effect, request);
+        let capability = capability_for(scope, effect, action);
         let mut registry = TermRegistry::new(1);
         registry
             .insert(TermSpec {
-                id: "request".into(),
+                id: "action".into(),
                 inputs: vec![],
                 output: TypeTag::Bool,
                 capability: None,
@@ -845,8 +842,8 @@ mod tests {
                 cost: 1,
             })
             .unwrap();
-        let mut builder = Builder::new(&registry, "externally confirmed request");
-        let source = builder.strand("request", &[]).unwrap();
+        let mut builder = Builder::new(&registry, "externally confirmed action");
+        let source = builder.strand("action", &[]).unwrap();
         let sink = builder.strand("invoke", &[source]).unwrap();
         builder
             .output(sink)
@@ -859,16 +856,16 @@ mod tests {
     #[test]
     fn fabricated_confirmation_is_rejected_for_write_evidence() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([11; 32]);
+        let action = ActionDigest::new([11; 32]);
         let (bytes, registry, capability) =
-            confirmed_dangerous_material(scope, Effect::Write, request);
+            confirmed_dangerous_material(scope, Effect::Write, action);
         let mut tampered = Capsule::from_bytes(&bytes).unwrap();
         tampered.confirm = ConfirmPolicy::None;
         let result = prepare_request(
             &tampered.to_bytes(),
             &registry,
             &[capability],
-            RequestBinding::new(scope, Effect::Write, request, 0, 1),
+            ActionBinding::new(scope, Effect::Write, action, 0, 1),
         );
         assert!(
             matches!(result, Err(BraidAdapterError::Rejected(_))),
@@ -879,9 +876,9 @@ mod tests {
     #[test]
     fn local_fabrication_cannot_mint_sync_evidence() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([12; 32]);
+        let action = ActionDigest::new([12; 32]);
         assert!(matches!(
-            prepare_local_request(scope, Effect::Sync, request, 3, 20),
+            prepare_local_request(scope, Effect::Sync, action, 3, 20),
             Err(BraidAdapterError::Build(
                 braid_sdk::BuildError::ConfirmRequired { .. }
             ))
@@ -889,7 +886,7 @@ mod tests {
         let policy = LocalBraidAuthority::new(scope, 20);
         assert!(
             policy
-                .authorize(scope, Effect::Sync, request, 3, 19)
+                .authorize(scope, Effect::Sync, action, 3, 19)
                 .is_none()
         );
     }
@@ -897,28 +894,28 @@ mod tests {
     #[test]
     fn external_write_grant_lookup_is_exact_across_scope_effect_and_expiry() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([13; 32]);
+        let action = ActionDigest::new([13; 32]);
         let (bytes, registry, capability) =
-            confirmed_dangerous_material(scope, Effect::Write, request);
+            confirmed_dangerous_material(scope, Effect::Write, action);
         let grant = prepare_request(
             &bytes,
             &registry,
             &[capability],
-            RequestBinding::new(scope, Effect::Write, request, 5, 100),
+            ActionBinding::new(scope, Effect::Write, action, 5, 100),
         )
         .unwrap();
         let expected_id = grant.invocation_id();
         let authority = BraidAuthority::new(vec![grant]).unwrap();
         assert_eq!(
             authority
-                .authorize(scope, Effect::Write, request, 5, 99)
+                .authorize(scope, Effect::Write, action, 5, 99)
                 .unwrap()
                 .invocation_id(),
             expected_id
         );
         assert!(
             authority
-                .authorize(scope, Effect::Write, request, 5, 100)
+                .authorize(scope, Effect::Write, action, 5, 100)
                 .is_none()
         );
         assert!(
@@ -926,7 +923,7 @@ mod tests {
                 .authorize(
                     Scope::new(AccountId::new(), SpaceId::new()),
                     Effect::Write,
-                    request,
+                    action,
                     5,
                     99
                 )
@@ -934,17 +931,17 @@ mod tests {
         );
         assert!(
             authority
-                .authorize(scope, Effect::Sync, request, 5, 99)
+                .authorize(scope, Effect::Sync, action, 5, 99)
                 .is_none()
         );
         assert!(
             authority
-                .authorize(scope, Effect::Write, OperationDigest::new([14; 32]), 5, 99)
+                .authorize(scope, Effect::Write, ActionDigest::new([14; 32]), 5, 99)
                 .is_none()
         );
         assert!(
             authority
-                .authorize(scope, Effect::Write, request, 6, 99)
+                .authorize(scope, Effect::Write, action, 6, 99)
                 .is_none()
         );
     }
@@ -952,30 +949,30 @@ mod tests {
     #[test]
     fn external_sync_grant_authorizes_exact_sync_evidence() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let request = OperationDigest::new([15; 32]);
+        let action = ActionDigest::new([15; 32]);
         let (bytes, registry, capability) =
-            confirmed_dangerous_material(scope, Effect::Sync, request);
+            confirmed_dangerous_material(scope, Effect::Sync, action);
         let grant = prepare_request(
             &bytes,
             &registry,
             &[capability],
-            RequestBinding::new(scope, Effect::Sync, request, 5, 100),
+            ActionBinding::new(scope, Effect::Sync, action, 5, 100),
         )
         .unwrap();
         let authority = BraidAuthority::new(vec![grant]).unwrap();
         assert!(
             authority
-                .authorize(scope, Effect::Sync, request, 5, 99)
+                .authorize(scope, Effect::Sync, action, 5, 99)
                 .is_some()
         );
         assert!(
             authority
-                .authorize(scope, Effect::Sync, request, 5, 100)
+                .authorize(scope, Effect::Sync, action, 5, 100)
                 .is_none()
         );
         assert!(
             authority
-                .authorize(scope, Effect::Write, request, 5, 99)
+                .authorize(scope, Effect::Write, action, 5, 99)
                 .is_none()
         );
     }

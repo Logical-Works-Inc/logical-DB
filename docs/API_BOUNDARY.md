@@ -79,12 +79,13 @@ Database::synchronize
       `-- POST versioned bounded CBOR
            `-- server request admission (body + concurrency + deadline)
                 `-- Authenticator
-                     `-- Authority::authorize(scope,effect,request,frontier,time)
+                     `-- validate native bytes + compute ActionDigest
+                     `-- Authority::authorize(scope,effect,action,frontier,time)
                           `-- Braid RunnableInvocation / ExecutionGrant
                 `-- ServiceStore
                      |-- frontier(scope)
                      |-- accept(change, grant)
-                     `-- page(scope, request, position, count, bytes, grant)
+                     `-- page(PageAction, grant)
                           `-- FoundationDB transaction
 ```
 
@@ -125,9 +126,13 @@ application state above those backend-private encodings.
 - The transport owns TLS, credentials, representation, status, body, and
   checkpoint-expiry errors; retryable statuses preserve only numeric
   `Retry-After` delays no greater than one hour.
-- The service owns protocol correlation, authorization, and cross-scope checks.
+- The service owns protocol correlation, native validation before authorization,
+  canonical action construction, and cross-scope checks. `OperationDigest` is
+  application intent/idempotency identity; `ActionDigest` is trusted authority
+  identity and is never accepted directly from the wire.
 - The FDB adapter owns unknown commit, cancellation, version skew, retry
-  exhaustion, native failure, binding failure, and durable corruption. Only its
+  exhaustion, action recomputation, native failure, binding failure, and durable
+  corruption. Only its
   explicit transient categories cross HTTP as retryable 503; permanent and
   corrupt/configuration failures are 500 without retry advice.
 - The host owns account authentication, TLS termination, FDB boot/configuration,

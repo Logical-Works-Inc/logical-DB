@@ -61,7 +61,7 @@ implementation's correctness dependencies.
 
 | Priority | Work | Observed gap and completion evidence |
 |---|---|---|
-| P0 | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | `ProtocolService::push` authorizes `change.request` before native CRDT validation; FDB checks the same caller-supplied identity. Separate intent from trusted canonical action identity and exercise field mutation plus exact retry through HTTP, authority, and FDB |
+| Delivered in stack | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | The action-binding stack validates native CRDT bytes before authorization, computes a versioned canonical `ActionDigest`, and makes FDB recompute it. Unit HTTP tests and the hosted FDB journey hold a grant fixed across field mutations and preserve exact retry. Independent runtime Braid confirmation remains a separate release requirement |
 | P0 | [#28: recovery before pruning](https://github.com/srinji-kaggss/logical-DB/issues/28) | `SnapshotBaseline` contains only version and position. Prove a state-bearing baseline restores an unchanged document and tombstones after history has been pruned |
 | P1 | [#29: projection semantics](https://github.com/srinji-kaggss/logical-DB/issues/29) | `projection_digest` includes schema version and index IDs, but no projection semantic identity. A changed projection under the same IDs must require migration and rebuild rows atomically |
 | P1 | [#25: checked access graph](https://github.com/srinji-kaggss/logical-DB/issues/25) | Audit migration, sync, and service transition coverage against the issue's graph contract after the action and recovery boundaries are settled |
@@ -72,6 +72,11 @@ implementation's correctness dependencies.
 Embedded tombstones and export/restore are implemented and have retained tests.
 Their presence must not be confused with state-bearing server recovery or with
 completion of every process-interruption/deployment scenario.
+
+Canonical action encoding is owned by `logical-db-protocol`. It uses SHA-256
+over u64 big-endian length frames and a `logical-db-action-v1` domain. A golden
+vector is independently reproducible outside Rust. `OperationDigest` remains
+caller intent; it is included in, but never substituted for, `ActionDigest`.
 
 ## Delivery and release gates
 

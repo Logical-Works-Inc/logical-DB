@@ -10,11 +10,17 @@ use foundationdb::{Database, api::FdbApiBuilder, options::NetworkOption};
 use foundationdb_tuple::Subspace;
 use logical_db_crdt::{Document, Object, Scalar};
 use logical_db_model::{
-    AccountId, DocumentId, Effect, MAX_PAGE_BYTES, OperationDigest, OperationId, ReplicaId, Scope,
-    SpaceId,
+    AccountId, ActionDigest, DocumentId, Effect, MAX_PAGE_BYTES, OperationDigest, OperationId,
+    ReplicaId, Scope, SpaceId,
 };
-use logical_db_protocol::ChangeEnvelope;
-use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, ServiceStore, StoredPage};
+use logical_db_protocol::{ChangeEnvelope, PageAction, write_action};
+use logical_db_protocol::{
+    PROTOCOL_VERSION, PushOutcome, PushRequest, PushResponse, RejectionCode,
+};
+use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
+use logical_db_service::{
+    AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ServiceStore, StoredPage,
+};
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
 use sha2::{Digest, Sha256};
 
@@ -24,9 +30,50 @@ const FULL_FDB_CHUNK_PROBE_BYTES: usize = 65_536;
 struct ForgedGrant {
     scope: Scope,
     effect: Effect,
-    request: OperationDigest,
+    action: ActionDigest,
     frontier: u64,
     invocation: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct FixedActionAuthority {
+    scope: Scope,
+    action: ActionDigest,
+}
+
+impl Authority for FixedActionAuthority {
+    type Grant = ForgedGrant;
+
+    fn authorize(
+        &self,
+        scope: Scope,
+        effect: Effect,
+        action: ActionDigest,
+        frontier: u64,
+        _now_unix_ms: u64,
+    ) -> Option<Self::Grant> {
+        (scope == self.scope && effect == Effect::Write && action == self.action)
+            .then(|| fixture_grant(scope, effect, action, frontier))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FixedActionAuthenticator(FixedActionAuthority);
+
+impl Authenticator for FixedActionAuthenticator {
+    type Policy = FixedActionAuthority;
+
+    fn authenticate(
+        &self,
+        authorization: &axum::http::HeaderValue,
+        _now_unix_ms: u64,
+    ) -> Result<Self::Policy, AuthenticationError> {
+        if authorization.as_bytes() == b"Bearer action-fixture" {
+            Ok(self.0)
+        } else {
+            Err(AuthenticationError::Unauthorized)
+        }
+    }
 }
 
 impl ExecutionGrant for ForgedGrant {
@@ -38,8 +85,8 @@ impl ExecutionGrant for ForgedGrant {
         self.effect
     }
 
-    fn request(&self) -> OperationDigest {
-        self.request
+    fn action(&self) -> ActionDigest {
+        self.action
     }
 
     fn frontier(&self) -> u64 {
@@ -51,12 +98,7 @@ impl ExecutionGrant for ForgedGrant {
     }
 }
 
-fn fixture_grant(
-    scope: Scope,
-    effect: Effect,
-    request: OperationDigest,
-    frontier: u64,
-) -> ForgedGrant {
+fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u64) -> ForgedGrant {
     let mut digest = Sha256::new();
     digest.update(b"logical-db/fdb-ambiguity-fixture/v1\0");
     digest.update(scope.account().as_uuid().as_bytes());
@@ -67,12 +109,12 @@ fn fixture_grant(
         Effect::Write => 3,
         Effect::Sync => 4,
     }]);
-    digest.update(request.into_bytes());
+    digest.update(action.into_bytes());
     digest.update(frontier.to_be_bytes());
     ForgedGrant {
         scope,
         effect,
-        request,
+        action,
         frontier,
         invocation: digest.finalize().into(),
     }
@@ -105,8 +147,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         )
         .into_bytes(),
     );
-    let store = FdbServiceStore::new(database, root)?;
+    let audit_database = Database::new_compat(Some(&cluster_file)).await?;
+    let http_database = Database::new_compat(Some(&cluster_file)).await?;
+    let audit_store = FdbServiceStore::new(audit_database, root.clone())?;
+    let http_store = FdbServiceStore::new(http_database, root.clone())?;
     let replica = ReplicaId::new();
+    verify_http_action_binding(http_store, &audit_store, scope, replica).await?;
+    let store = FdbServiceStore::new(database, root)?;
 
     for attempt in 0_u16..512 {
         let change = match ambiguity_probe_change(scope, replica, attempt) {
@@ -116,11 +163,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 return Err(error);
             }
         };
-        let request = change.request;
+        let action = write_action(&change);
         let Ok(frontier) = store.frontier(scope).await else {
             continue;
         };
-        let grant = fixture_grant(scope, Effect::Write, request, frontier);
+        let grant = fixture_grant(scope, Effect::Write, action, frontier);
         match store.accept(&change, &grant).await {
             Ok(AcceptResult::RecoveredUnknownCommit) => {
                 let observed =
@@ -144,12 +191,153 @@ async fn run() -> Result<(), Box<dyn Error>> {
     Err(io::Error::other("FDB buggify did not exercise a post-commit unknown result").into())
 }
 
+async fn verify_http_action_binding(
+    store: FdbServiceStore,
+    observer: &FdbServiceStore,
+    scope: Scope,
+    replica: ReplicaId,
+) -> Result<(), Box<dyn Error>> {
+    let original = ambiguity_probe_change(scope, replica, 600)?;
+    let authority = FixedActionAuthority {
+        scope,
+        action: write_action(&original),
+    };
+    let application = router(
+        store,
+        FixedActionAuthenticator(authority),
+        CheckpointCodec::new([0x27; 32], 60_000)?,
+        SystemClock,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, application).await });
+    let endpoint = format!("http://{address}/v1/changes:push");
+    let client = reqwest::Client::new();
+
+    let before = read_frontier_with_retry(observer, scope).await?;
+    let first = push_over_http(&client, &endpoint, &original).await?;
+    if !matches!(
+        first,
+        PushOutcome::Accepted { .. } | PushOutcome::Duplicate { .. }
+    ) {
+        eprintln!("fdb-ambiguity: canonical HTTP write was {first:?}");
+        return Err(io::Error::other(format!("canonical HTTP write was {first:?}")).into());
+    }
+    let after_first = read_frontier_with_retry(observer, scope).await?;
+    if after_first != before + 1 {
+        eprintln!("fdb-ambiguity: HTTP frontier moved from {before} to {after_first}");
+        return Err(io::Error::other("canonical HTTP write did not advance once").into());
+    }
+    let replay = push_over_http(&client, &endpoint, &original).await?;
+    if !matches!(replay, PushOutcome::Duplicate { .. }) {
+        eprintln!("fdb-ambiguity: exact HTTP replay was {replay:?}");
+        return Err(io::Error::other(format!("exact HTTP replay was {replay:?}")).into());
+    }
+
+    let replacement = ambiguity_probe_change(scope, replica, 601)?;
+    // This fixture proves the HTTP/service/store action seam. It is deliberately
+    // not presented as runtime human confirmation or independent Braid admission.
+    let account_scope = Scope::new(AccountId::new(), scope.space());
+    let space_scope = Scope::new(scope.account(), SpaceId::new());
+    let mut variants = vec![original.clone(); 8];
+    variants[0].scope = account_scope;
+    variants[1].scope = space_scope;
+    variants[2].document = DocumentId::new();
+    variants[3].operation = OperationId::new();
+    variants[4].replica = ReplicaId::new();
+    variants[5].request = OperationDigest::new([0x51; 32]);
+    variants[6].digest = replacement.digest;
+    variants[7].digest = replacement.digest;
+    variants[7].bytes = replacement.bytes;
+    for (index, variant) in variants.into_iter().enumerate() {
+        let outcome = push_over_http(&client, &endpoint, &variant).await?;
+        let expected = if index == 6 {
+            RejectionCode::DigestMismatch
+        } else {
+            RejectionCode::Forbidden
+        };
+        if !matches!(outcome, PushOutcome::Rejected { code, .. } if code == expected) {
+            eprintln!("fdb-ambiguity: mutated HTTP action was {outcome:?}");
+            return Err(io::Error::other(format!("mutated HTTP action was {outcome:?}")).into());
+        }
+    }
+    if read_frontier_with_retry(observer, scope).await? != after_first {
+        eprintln!("fdb-ambiguity: rejected HTTP action advanced canonical scope");
+        return Err(io::Error::other("rejected HTTP action advanced the frontier").into());
+    }
+    if read_frontier_with_retry(observer, account_scope).await? != 0
+        || read_frontier_with_retry(observer, space_scope).await? != 0
+    {
+        eprintln!("fdb-ambiguity: rejected HTTP scope mutation created durable state");
+        return Err(io::Error::other("rejected HTTP scope mutation created state").into());
+    }
+    println!(
+        "PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated"
+    );
+    server.abort();
+    Ok(())
+}
+
+async fn read_frontier_with_retry(
+    store: &FdbServiceStore,
+    scope: Scope,
+) -> Result<u64, Box<dyn Error>> {
+    let mut last_error = None;
+    for _retry in 0..128 {
+        match store.frontier(scope).await {
+            Ok(frontier) => return Ok(frontier),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(io::Error::other(format!("frontier retry budget exhausted: {last_error:?}")).into())
+}
+
+async fn push_over_http(
+    client: &reqwest::Client,
+    endpoint: &str,
+    change: &ChangeEnvelope,
+) -> Result<PushOutcome, Box<dyn Error>> {
+    let request = PushRequest {
+        protocol: PROTOCOL_VERSION,
+        replica: change.replica,
+        changes: vec![change.clone()],
+    };
+    let mut body = Vec::new();
+    ciborium::into_writer(&request, &mut body)?;
+    for _attempt in 0..32 {
+        let response = client
+            .post(endpoint)
+            .header("authorization", "Bearer action-fixture")
+            .header("content-type", "application/vnd.logical-db.v1+cbor")
+            .header("accept", "application/vnd.logical-db.v1+cbor")
+            .body(body.clone())
+            .send()
+            .await?;
+        if response.status().is_server_error() {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if !response.status().is_success() {
+            eprintln!("fdb-ambiguity: HTTP push status {}", response.status());
+            return Err(io::Error::other(format!("HTTP push status {}", response.status())).into());
+        }
+        let bytes = response.bytes().await?;
+        let decoded: PushResponse = ciborium::from_reader(bytes.as_ref())?;
+        return decoded
+            .outcomes
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::other("HTTP push returned no outcome").into());
+    }
+    Err(io::Error::other("HTTP push exhausted bounded exact retries").into())
+}
+
 async fn complete_recovery_path(
     store: &FdbServiceStore,
     scope: Scope,
     frontier: u64,
     change: &ChangeEnvelope,
-    grant: &impl ExecutionGrant,
+    grant: &ForgedGrant,
 ) -> Result<u64, Box<dyn Error>> {
     let (observed, rebound) = verify_recovered_write(store, scope, frontier, change, grant).await?;
     let (observed, continuation) = append_continuation_record(store, scope, observed).await?;
@@ -225,7 +413,7 @@ async fn append_continuation_record(
             digest: encoded.digest,
             bytes: encoded.bytes,
         };
-        let grant = fixture_grant(scope, Effect::Write, request, frontier);
+        let grant = fixture_grant(scope, Effect::Write, write_action(&change), frontier);
         if matches!(
             store.accept(&change, &grant).await,
             Ok(AcceptResult::Accepted | AcceptResult::RecoveredUnknownCommit)
@@ -254,7 +442,7 @@ async fn verify_recovered_write(
     scope: Scope,
     frontier: u64,
     change: &ChangeEnvelope,
-    grant: &impl ExecutionGrant,
+    grant: &ForgedGrant,
 ) -> Result<(u64, ChangeEnvelope), Box<dyn Error>> {
     let mut observed = None;
     for _retry in 0..128 {
@@ -291,7 +479,7 @@ async fn verify_recovered_write(
         .first_mut()
         .ok_or_else(|| io::Error::other("change unexpectedly empty"))?;
     *first ^= 0xff;
-    let collision_grant = fixture_grant(scope, Effect::Write, collision.request, observed);
+    let collision_grant = fixture_grant(scope, Effect::Write, write_action(&collision), observed);
     let mut collision_result = None;
     for _retry in 0..128 {
         if let Ok(value) = store.accept(&collision, &collision_grant).await {
@@ -305,9 +493,13 @@ async fn verify_recovered_write(
     }
     let mut rebound = change.clone();
     rebound.operation = OperationId::new();
+    let rebound_grant = ForgedGrant {
+        action: write_action(&rebound),
+        ..*grant
+    };
     let mut reused = None;
     for _retry in 0..128 {
-        if let Ok(value) = store.accept(&rebound, grant).await {
+        if let Ok(value) = store.accept(&rebound, &rebound_grant).await {
             reused = Some(value);
             break;
         }
@@ -340,9 +532,9 @@ async fn verify_page(
     let mut continuation_change_count = 0_usize;
     let mut operations = HashSet::new();
     loop {
-        let request = page_fixture_request(scope, after, count, bytes);
-        let grant = fixture_grant(scope, Effect::Sync, request, observed);
-        let page = read_page_with_retry(store, scope, request, after, count, bytes, &grant).await?;
+        let action = page_action(scope, change.replica, after, count, bytes);
+        let grant = fixture_grant(scope, Effect::Sync, action.digest(), observed);
+        let page = read_page_with_retry(store, action, &grant).await?;
         if page.position <= after
             || page.position > observed
             || page.changes.is_empty()
@@ -394,13 +586,10 @@ async fn verify_page(
         return Err(io::Error::other("ordered FDB pages lost their frontier").into());
     }
     let mut byte_ceiling_proven = false;
-    let byte_request = page_fixture_request(scope, 0, count, 1);
-    let byte_grant = fixture_grant(scope, Effect::Sync, byte_request, observed);
+    let byte_action = page_action(scope, change.replica, 0, count, 1);
+    let byte_grant = fixture_grant(scope, Effect::Sync, byte_action.digest(), observed);
     for _retry in 0..128 {
-        match store
-            .page(scope, byte_request, 0, count, 1, &byte_grant)
-            .await
-        {
+        match store.page(byte_action, &byte_grant).await {
             Err(FdbStoreError::Corruption(FdbDataError::ChangeExceedsPage)) => {
                 byte_ceiling_proven = true;
                 break;
@@ -413,39 +602,39 @@ async fn verify_page(
         eprintln!("fdb-ambiguity: one-byte page accepted an oversized change");
         return Err(io::Error::other("page byte ceiling was not enforced").into());
     }
-    let rebound_request = page_fixture_request(scope, 0, 1, bytes);
-    verify_rebound_grants(store, scope, observed, rebound_request, rebound).await
+    let rebound_action = page_action(scope, change.replica, 0, 1, bytes);
+    verify_rebound_grants(store, observed, rebound_action, rebound).await
 }
 
 async fn read_page_with_retry(
     store: &FdbServiceStore,
-    scope: Scope,
-    request: OperationDigest,
-    after: u64,
-    max_changes: u16,
-    max_bytes: u32,
+    action: PageAction,
     grant: &impl ExecutionGrant,
 ) -> Result<StoredPage, Box<dyn Error>> {
     let mut last_error = None;
     for _retry in 0..128 {
-        match store
-            .page(scope, request, after, max_changes, max_bytes, grant)
-            .await
-        {
+        match store.page(action, grant).await {
             Ok(PageResult::Page(page)) => return Ok(page),
             Ok(PageResult::StaleAuthority) => {
-                let durable = store.frontier(scope).await;
-                eprintln!("fdb-ambiguity: stale page authority after={after} durable={durable:?}");
+                let durable = store.frontier(action.scope).await;
+                eprintln!(
+                    "fdb-ambiguity: stale page authority after={} durable={durable:?}",
+                    action.after
+                );
                 return Err(io::Error::other(format!(
-                    "page authority became stale after={after} expected_frontier={} durable_frontier={durable:?}",
+                    "page authority became stale after={} expected_frontier={} durable_frontier={durable:?}", action.after,
                     grant.frontier()
                 ))
                 .into());
             }
             Ok(PageResult::BehindFloor) => {
-                eprintln!("fdb-ambiguity: page checkpoint expired after={after}");
+                eprintln!(
+                    "fdb-ambiguity: page checkpoint expired after={}",
+                    action.after
+                );
                 return Err(io::Error::other(format!(
-                    "page checkpoint expired after={after} expected_frontier={}",
+                    "page checkpoint expired after={} expected_frontier={}",
+                    action.after,
                     grant.frontier()
                 ))
                 .into());
@@ -454,39 +643,40 @@ async fn read_page_with_retry(
         }
     }
     Err(io::Error::other(format!(
-        "page retry budget exhausted after={after} expected_frontier={} last_error={last_error:?}",
+        "page retry budget exhausted after={} expected_frontier={} last_error={last_error:?}",
+        action.after,
         grant.frontier()
     ))
     .into())
 }
 
-fn page_fixture_request(
+fn page_action(
     scope: Scope,
+    replica: ReplicaId,
     after: u64,
     max_changes: u16,
     max_bytes: u32,
-) -> OperationDigest {
-    let mut digest = Sha256::new();
-    digest.update(b"logical-db/fdb-page-fixture/v1\0");
-    digest.update(scope.account().as_uuid().as_bytes());
-    digest.update(scope.space().as_uuid().as_bytes());
-    digest.update(after.to_be_bytes());
-    digest.update(max_changes.to_be_bytes());
-    digest.update(max_bytes.to_be_bytes());
-    OperationDigest::new(digest.finalize().into())
+) -> PageAction {
+    PageAction {
+        scope,
+        replica,
+        intent: OperationDigest::new([0x70; 32]),
+        after,
+        max_changes,
+        max_bytes,
+    }
 }
 
 async fn verify_rebound_grants(
     store: &FdbServiceStore,
-    scope: Scope,
     observed: u64,
-    request: OperationDigest,
+    action: PageAction,
     rebound: &ChangeEnvelope,
 ) -> Result<(), Box<dyn Error>> {
     let forged = ForgedGrant {
-        scope,
+        scope: action.scope,
         effect: Effect::Write,
-        request: rebound.request,
+        action: write_action(rebound),
         frontier: observed,
         invocation: [0x44; 32],
     };
@@ -498,11 +688,11 @@ async fn verify_rebound_grants(
         effect: Effect::Sync,
         ..forged
     };
-    let wrong_request = ForgedGrant {
-        request: OperationDigest::new([0x55; 32]),
+    let wrong_action = ForgedGrant {
+        action: ActionDigest::new([0x55; 32]),
         ..forged
     };
-    for invalid in [wrong_scope, wrong_effect, wrong_request] {
+    for invalid in [wrong_scope, wrong_effect, wrong_action] {
         if store.accept(rebound, &invalid).await? != AcceptResult::StaleAuthority {
             eprintln!("fdb-ambiguity: accept admitted an invalid rebound grant");
             return Err(io::Error::other("accept admitted a rebound grant").into());
@@ -520,18 +710,15 @@ async fn verify_rebound_grants(
         return Err(io::Error::other("scope tuple axis leaked a frontier").into());
     }
     let stale = ForgedGrant {
-        scope,
+        scope: action.scope,
         effect: Effect::Sync,
-        request,
+        action: action.digest(),
         frontier: observed.saturating_sub(1),
         invocation: [0x66; 32],
     };
     let mut stale_result = None;
     for _retry in 0..128 {
-        if let Ok(value) = store
-            .page(scope, request, 0, 1, u32::try_from(MAX_PAGE_BYTES)?, &stale)
-            .await
-        {
+        if let Ok(value) = store.page(action, &stale).await {
             stale_result = Some(value);
             break;
         }
@@ -547,18 +734,30 @@ async fn verify_rebound_grants(
 mod tests {
     use logical_db_model::{AccountId, Scope, SpaceId};
 
-    use super::{page_fixture_request, run};
+    use super::{page_action, run};
 
     #[test]
     fn page_fixture_identity_binds_scope_position_and_limits() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let baseline = page_fixture_request(scope, 0, 1, 1024);
-        assert_ne!(baseline, page_fixture_request(scope, 1, 1, 1024));
-        assert_ne!(baseline, page_fixture_request(scope, 0, 2, 1024));
-        assert_ne!(baseline, page_fixture_request(scope, 0, 1, 1025));
+        let replica = logical_db_model::ReplicaId::new();
+        let baseline = page_action(scope, replica, 0, 1, 1024).digest();
         assert_ne!(
             baseline,
-            page_fixture_request(Scope::new(AccountId::new(), SpaceId::new()), 0, 1, 1024)
+            page_action(scope, logical_db_model::ReplicaId::new(), 0, 1, 1024).digest()
+        );
+        assert_ne!(baseline, page_action(scope, replica, 1, 1, 1024).digest());
+        assert_ne!(baseline, page_action(scope, replica, 0, 2, 1024).digest());
+        assert_ne!(baseline, page_action(scope, replica, 0, 1, 1025).digest());
+        assert_ne!(
+            baseline,
+            page_action(
+                Scope::new(AccountId::new(), SpaceId::new()),
+                replica,
+                0,
+                1,
+                1024,
+            )
+            .digest()
         );
     }
 
