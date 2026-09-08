@@ -6,6 +6,13 @@
 
 #![forbid(unsafe_code)]
 
+mod baseline;
+pub use baseline::{
+    BaselineDigest, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, SNAPSHOT_BASELINE_BYTES,
+    SNAPSHOT_BASELINE_LEGACY_BYTES, SNAPSHOT_BASELINE_LEGACY_VERSION, SNAPSHOT_BASELINE_VERSION,
+    SnapshotArtifact, SnapshotBaseline, SnapshotDocument, SnapshotRecord,
+};
+
 use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
@@ -206,86 +213,6 @@ impl OperationDigest {
     #[must_use]
     pub const fn into_bytes(self) -> [u8; 32] {
         self.0
-    }
-}
-
-/// Version of the service snapshot-baseline record.
-pub const SNAPSHOT_BASELINE_VERSION: u16 = 1;
-/// Encoded bytes of one versioned snapshot baseline: version plus position.
-pub const SNAPSHOT_BASELINE_BYTES: usize = 10;
-
-/// Versioned service snapshot baseline: durable position through which history
-/// is captured outside the prunable log prefix.
-///
-/// The version fails closed on decode so a future baseline layout can never be
-/// mistaken for the current position encoding.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct SnapshotBaseline {
-    version: u16,
-    position: u64,
-}
-
-impl SnapshotBaseline {
-    /// Records a baseline at the current layout version.
-    #[must_use]
-    pub const fn new(position: u64) -> Self {
-        Self {
-            version: SNAPSHOT_BASELINE_VERSION,
-            position,
-        }
-    }
-
-    /// Returns the baseline layout version.
-    #[must_use]
-    pub const fn version(self) -> u16 {
-        self.version
-    }
-
-    /// Returns the durable log position captured by the baseline.
-    #[must_use]
-    pub const fn position(self) -> u64 {
-        self.position
-    }
-
-    /// Encodes the baseline as fixed version-plus-position bytes.
-    #[must_use]
-    pub const fn encode(self) -> [u8; SNAPSHOT_BASELINE_BYTES] {
-        let version = self.version.to_be_bytes();
-        let position = self.position.to_be_bytes();
-        [
-            version[0],
-            version[1],
-            position[0],
-            position[1],
-            position[2],
-            position[3],
-            position[4],
-            position[5],
-            position[6],
-            position[7],
-        ]
-    }
-
-    /// Decodes fixed baseline bytes, refusing bad lengths and versions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ModelError::InvalidSnapshotEncoding`] for a bad length and
-    /// [`ModelError::UnsupportedSnapshotVersion`] for a foreign version.
-    pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
-        if bytes.len() != SNAPSHOT_BASELINE_BYTES {
-            eprintln!("logical-db-model: decode: InvalidSnapshotEncoding");
-            return Err(ModelError::InvalidSnapshotEncoding);
-        }
-        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
-        if version != SNAPSHOT_BASELINE_VERSION {
-            eprintln!("logical-db-model: decode: UnsupportedSnapshotVersion");
-            return Err(ModelError::UnsupportedSnapshotVersion { actual: version });
-        }
-        let position = u64::from_be_bytes([
-            bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
-        ]);
-        Ok(Self { version, position })
     }
 }
 
@@ -877,6 +804,21 @@ pub enum ModelError {
         /// Observed baseline layout version.
         actual: u16,
     },
+    /// The artifact exceeded the document count bound.
+    #[error("snapshot contains too many documents")]
+    SnapshotTooManyDocuments,
+    /// Document identifiers were not strictly ascending and unique.
+    #[error("snapshot document ordering or uniqueness is invalid")]
+    SnapshotDocumentsUnordered,
+    /// A document snapshot violated its per-document bound.
+    #[error("snapshot document is empty or exceeds its bound")]
+    SnapshotDocumentInvalid,
+    /// The aggregate snapshot payload exceeded its byte bound.
+    #[error("snapshot exceeds its aggregate byte bound")]
+    SnapshotTooLarge,
+    /// Descriptor metadata or digest did not match the artifact documents.
+    #[error("snapshot descriptor does not match its documents")]
+    SnapshotDescriptorMismatch,
     /// A namespace checkpoint record violated its versioned encoding.
     #[error("namespace checkpoint encoding is malformed")]
     InvalidNamespaceCheckpointEncoding,
@@ -937,28 +879,49 @@ mod tests {
 
     #[test]
     fn snapshot_baseline_codec_is_versioned_and_fail_closed() {
-        let baseline = SnapshotBaseline::new(41);
+        let account = AccountId::new();
+        let space = SpaceId::new();
+        let scope = Scope::new(account, space);
+        let artifact = SnapshotArtifact::new(
+            scope,
+            41,
+            vec![SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1, 2],
+                tombstone: false,
+            }],
+        )
+        .unwrap();
+        let baseline = artifact.baseline.clone();
         assert_eq!(baseline.version(), SNAPSHOT_BASELINE_VERSION);
         assert_eq!(baseline.position(), 41);
-        let encoded = baseline.encode();
-        assert_eq!(encoded.len(), SNAPSHOT_BASELINE_BYTES);
-        assert_eq!(SnapshotBaseline::decode(&encoded), Ok(baseline));
         assert_eq!(
-            SnapshotBaseline::decode(&encoded[..SNAPSHOT_BASELINE_BYTES - 1]),
-            Err(ModelError::InvalidSnapshotEncoding)
+            SnapshotBaseline::decode(&baseline.encode()),
+            Ok(SnapshotRecord::State(baseline))
+        );
+        assert_eq!(
+            SnapshotBaseline::decode(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 41]),
+            Ok(SnapshotRecord::LegacyPosition(41))
         );
         assert_eq!(
             SnapshotBaseline::decode(&[0; SNAPSHOT_BASELINE_BYTES]),
             Err(ModelError::UnsupportedSnapshotVersion { actual: 0 })
         );
-        let mut unknown = encoded;
-        unknown[..2].copy_from_slice(&(SNAPSHOT_BASELINE_VERSION + 1).to_be_bytes());
+        let mut too_many = artifact.baseline.encode();
+        too_many[42..46]
+            .copy_from_slice(&(u32::try_from(MAX_BASELINE_DOCUMENTS).unwrap() + 1).to_be_bytes());
         assert_eq!(
-            SnapshotBaseline::decode(&unknown),
-            Err(ModelError::UnsupportedSnapshotVersion {
-                actual: SNAPSHOT_BASELINE_VERSION + 1
-            })
+            SnapshotBaseline::decode(&too_many),
+            Err(ModelError::SnapshotTooManyDocuments)
         );
+        let mut too_large = artifact.baseline.encode();
+        too_large[46..50]
+            .copy_from_slice(&(u32::try_from(MAX_BASELINE_BYTES).unwrap() + 1).to_be_bytes());
+        assert_eq!(
+            SnapshotBaseline::decode(&too_large),
+            Err(ModelError::SnapshotTooLarge)
+        );
+        assert!(artifact.validate(scope).is_ok());
     }
 
     #[test]

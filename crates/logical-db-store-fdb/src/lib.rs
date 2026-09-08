@@ -8,10 +8,13 @@
 
 #[cfg(test)]
 use foundationdb_tuple::Subspace;
+#[cfg(test)]
+use logical_db_model::SnapshotArtifact;
 #[cfg(any(feature = "fdb", test))]
 use logical_db_model::{
-    ChangeDigest, DocumentId, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES,
-    OperationDigest, OperationId, ReplicaId, Scope, SnapshotBaseline,
+    ChangeDigest, DocumentId, MAX_BASELINE_BYTES, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE,
+    MAX_PAGE_BYTES, OperationDigest, OperationId, ReplicaId, Scope, SnapshotBaseline,
+    SnapshotDocument, SnapshotRecord,
 };
 #[cfg(any(feature = "fdb", test))]
 use logical_db_protocol::ChangeEnvelope;
@@ -22,6 +25,12 @@ use thiserror::Error;
 fn malformed_data<E: std::fmt::Debug>(cause: E) -> FdbDataError {
     eprintln!("logical-db-store-fdb: malformed durable value; cause={cause:?}");
     FdbDataError::InvalidManifest { at: "manifest" }
+}
+
+#[cfg(test)]
+fn malformed_baseline<E: std::fmt::Debug>(cause: E) -> FdbDataError {
+    eprintln!("logical-db-store-fdb: malformed baseline; cause={cause:?}");
+    FdbDataError::BaselineCorrupt
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -38,6 +47,63 @@ const OPERATION_BYTES: usize = 158;
 const RETENTION_VERSION: u16 = 1;
 #[cfg(any(feature = "fdb", test))]
 const RETENTION_BYTES: usize = 18;
+#[cfg(feature = "fdb")]
+const MAX_BASELINE_CHANGES: usize = 4_096;
+#[cfg(any(feature = "fdb", test))]
+const BASELINE_DOCUMENT_VERSION: u16 = 1;
+#[cfg(any(feature = "fdb", test))]
+const BASELINE_DOCUMENT_MANIFEST_BYTES: usize = 41;
+
+#[cfg(any(feature = "fdb", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BaselineDocumentManifest {
+    tombstone: bool,
+    byte_len: usize,
+    chunks: u16,
+    digest: [u8; 32],
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn encode_baseline_document(document: &SnapshotDocument) -> Result<[u8; 41], FdbDataError> {
+    use sha2::{Digest, Sha256};
+
+    if document.snapshot.len() > MAX_BASELINE_BYTES {
+        eprintln!("logical-db-store-fdb: baseline document exceeds byte budget");
+        return Err(FdbDataError::BaselineResourceLimit);
+    }
+    let byte_len = u32::try_from(document.snapshot.len()).map_err(malformed_data)?;
+    let chunks = chunk_count(document.snapshot.len());
+    let mut bytes = [0; BASELINE_DOCUMENT_MANIFEST_BYTES];
+    bytes[..2].copy_from_slice(&BASELINE_DOCUMENT_VERSION.to_be_bytes());
+    bytes[2] = u8::from(document.tombstone);
+    bytes[3..7].copy_from_slice(&byte_len.to_be_bytes());
+    bytes[7..9].copy_from_slice(&chunks.to_be_bytes());
+    bytes[9..].copy_from_slice(&Sha256::digest(&document.snapshot));
+    Ok(bytes)
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn decode_baseline_document(bytes: &[u8]) -> Result<BaselineDocumentManifest, FdbDataError> {
+    if bytes.len() != BASELINE_DOCUMENT_MANIFEST_BYTES
+        || decode_u16(&bytes[..2])? != BASELINE_DOCUMENT_VERSION
+        || bytes[2] > 1
+    {
+        eprintln!("logical-db-store-fdb: baseline document manifest is malformed");
+        return Err(FdbDataError::BaselineCorrupt);
+    }
+    let byte_len = usize::try_from(decode_u32(&bytes[3..7])?).map_err(malformed_data)?;
+    let chunks = decode_u16(&bytes[7..9])?;
+    if byte_len > MAX_BASELINE_BYTES || chunks != chunk_count(byte_len) {
+        eprintln!("logical-db-store-fdb: baseline document manifest bounds disagree");
+        return Err(FdbDataError::BaselineCorrupt);
+    }
+    Ok(BaselineDocumentManifest {
+        tombstone: bytes[2] == 1,
+        byte_len,
+        chunks,
+        digest: bytes[9..].try_into().map_err(malformed_data)?,
+    })
+}
 
 #[cfg(any(feature = "fdb", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,7 +266,7 @@ fn decode_retention(bytes: &[u8]) -> Result<(u64, u64), DataError> {
 }
 
 #[cfg(any(feature = "fdb", test))]
-fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotBaseline, DataError> {
+fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotRecord, DataError> {
     SnapshotBaseline::decode(bytes).map_err(malformed_data)
 }
 
@@ -215,6 +281,60 @@ struct CollectionView<'a> {
     operations: &'a BTreeMap<OperationId, Vec<u8>>,
     /// Invocation identity to invocation binding bytes.
     invocations: &'a BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+#[cfg(test)]
+struct BaselineAtlas {
+    manifests: BTreeMap<([u8; 32], DocumentId), Vec<u8>>,
+    chunks: BTreeMap<([u8; 32], DocumentId, u16), Vec<u8>>,
+}
+
+#[cfg(test)]
+fn validate_baseline_atlas(
+    scope: Scope,
+    baseline: &SnapshotBaseline,
+    atlas: &BaselineAtlas,
+) -> Result<SnapshotArtifact, DataError> {
+    use sha2::{Digest, Sha256};
+
+    let digest = baseline.digest().into_bytes();
+    let mut documents = Vec::new();
+    for ((artifact, document), bytes) in &atlas.manifests {
+        if artifact != &digest {
+            continue;
+        }
+        let manifest = decode_baseline_document(bytes)?;
+        let mut snapshot = Vec::with_capacity(manifest.byte_len);
+        for index in 0..manifest.chunks {
+            let chunk = atlas
+                .chunks
+                .get(&(digest, *document, index))
+                .ok_or(DataError::BaselineCorrupt)?;
+            if chunk.is_empty() || chunk.len() > CHUNK_BYTES {
+                eprintln!("logical-db-store-fdb: atlas chunk length is invalid");
+                return Err(DataError::BaselineCorrupt);
+            }
+            snapshot.extend_from_slice(chunk);
+        }
+        if snapshot.len() != manifest.byte_len
+            || Sha256::digest(&snapshot).as_slice() != manifest.digest
+        {
+            eprintln!("logical-db-store-fdb: atlas snapshot digest is invalid");
+            return Err(DataError::BaselineCorrupt);
+        }
+        documents.push(SnapshotDocument {
+            document: *document,
+            snapshot,
+            tombstone: manifest.tombstone,
+        });
+    }
+    let artifact =
+        SnapshotArtifact::new(scope, baseline.position(), documents).map_err(malformed_baseline)?;
+    if &artifact.baseline != baseline {
+        eprintln!("logical-db-store-fdb: atlas baseline descriptor is invalid");
+        return Err(DataError::BaselineCorrupt);
+    }
+    Ok(artifact)
 }
 
 #[cfg(test)]
@@ -368,6 +488,18 @@ fn decode_u16(bytes: &[u8]) -> Result<u16, DataError> {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 /// Stable Logical-DB corruption and resource failures decoded inside an FDB transaction.
 pub enum FdbDataError {
+    /// Snapshot construction exceeded the bounded change, document, or byte budget.
+    #[error("FoundationDB snapshot baseline exceeds its resource budget")]
+    BaselineResourceLimit,
+    /// Snapshot documents do not exactly cover the immutable log prefix.
+    #[error("FoundationDB snapshot baseline does not cover the requested log prefix")]
+    BaselineCoverage,
+    /// Snapshot pointer, document manifest, chunks, or aggregate digest is corrupt.
+    #[error("FoundationDB snapshot baseline artifact is corrupt")]
+    BaselineCorrupt,
+    /// A state-bearing baseline does not reach the requested prune position.
+    #[error("FoundationDB snapshot baseline is missing or behind the prune position")]
+    BaselineBehind,
     /// Operation or log manifest violated its fixed binary format.
     #[error("FoundationDB service manifest is malformed")]
     InvalidManifest {
@@ -402,23 +534,28 @@ type DataError = FdbDataError;
 #[cfg(feature = "fdb")]
 mod runtime {
     use super::{
-        CHUNK_BYTES, DataError, FORMAT_VERSION, KIND_LOG, MANIFEST_BYTES, Record, decode_manifest,
-        decode_operation, decode_retention, decode_u64, encode_manifest, encode_retention,
-        invocation_binding, invocation_binding_record, logical_page_more, page_read_plan,
-        valid_page_limits,
+        BaselineDocumentManifest, CHUNK_BYTES, DataError, FORMAT_VERSION, KIND_LOG, MANIFEST_BYTES,
+        MAX_BASELINE_CHANGES, Record, decode_baseline_document, decode_manifest, decode_operation,
+        decode_retention, decode_snapshot, decode_u64, encode_baseline_document, encode_manifest,
+        encode_retention, invocation_binding, invocation_binding_record, logical_page_more,
+        page_read_plan, valid_page_limits,
     };
     use foundationdb::{
         Database, FdbBindingError, KeySelector, RangeOption, options::TransactionOption,
     };
     use foundationdb_tuple::Subspace;
-    use logical_db_model::{Effect, OperationDigest, Scope, SnapshotBaseline};
+    use logical_db_model::{
+        DocumentId, Effect, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, OperationDigest, Scope,
+        SnapshotArtifact, SnapshotDocument, SnapshotRecord,
+    };
     use logical_db_protocol::{
         ChangeEnvelope, PageAction, mark_consumed_action, prune_action, seal_snapshot_action,
         write_action,
     };
     use logical_db_service::{
-        AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneResult,
-        RetentionStore, SealResult, ServiceStore, StoreFailureClass, StoredPage, prune_decision,
+        AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneRefusal,
+        PruneResult, RetentionStore, SealResult, ServiceStore, SnapshotMaterializationError,
+        StoreFailureClass, StoredPage, materialize_snapshot, prune_decision,
     };
     use thiserror::Error;
 
@@ -428,6 +565,8 @@ mod runtime {
     const KIND_INVOCATION: i64 = 5;
     const KIND_RETENTION: i64 = 6;
     const KIND_SNAPSHOT: i64 = 7;
+    const KIND_SNAPSHOT_DOCUMENT: i64 = 8;
+    const KIND_SNAPSHOT_CHUNK: i64 = 9;
     const TRANSACTION_TIMEOUT_MS: i32 = 4_000;
     const TRANSACTION_RETRY_LIMIT: i32 = 8;
 
@@ -447,6 +586,16 @@ mod runtime {
         after: u64,
         max_changes: u16,
         max_bytes: u32,
+    }
+
+    #[derive(Clone)]
+    struct BaselineSpaces {
+        scope: Subspace,
+        pointer_key: Vec<u8>,
+        log: Subspace,
+        change_chunk: Subspace,
+        document: Subspace,
+        snapshot_chunk: Subspace,
     }
 
     /// Async multi-tenant service store over a host-booted `FoundationDB` client.
@@ -671,9 +820,7 @@ mod runtime {
         async fn snapshot_baseline(
             &self,
             scope: Scope,
-        ) -> Result<Option<SnapshotBaseline>, Self::Error> {
-            use super::decode_snapshot;
-
+        ) -> Result<Option<SnapshotRecord>, Self::Error> {
             let snapshot_key = self.scope_space(scope).pack(&(KIND_SNAPSHOT,));
             self.database
                 .run(move |transaction, _maybe_committed| {
@@ -691,40 +838,72 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        async fn build_snapshot(
+            &self,
+            scope: Scope,
+            through: u64,
+        ) -> Result<SnapshotArtifact, Self::Error> {
+            let scope_space = self.scope_space(scope);
+            let spaces = baseline_spaces(&scope_space);
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let spaces = spaces.clone();
+                    let scope_space = scope_space.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        let frontier =
+                            read_frontier(&transaction, &scope_space.pack(&(KIND_SEQUENCE,)))
+                                .await?;
+                        if through > frontier {
+                            eprintln!("logical-db-store-fdb: baseline position exceeds frontier");
+                            return Err(binding(DataError::BaselineCoverage));
+                        }
+                        reconstruct_artifact(&transaction, scope, through, &spaces).await
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
         async fn seal_snapshot(
             &self,
             scope: Scope,
-            baseline: SnapshotBaseline,
+            artifact: &SnapshotArtifact,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> Result<SealResult, Self::Error> {
+            artifact.validate(scope).map_err(|error| {
+                eprintln!("logical-db-store-fdb: supplied baseline is invalid: {error}");
+                FdbStoreError::Corruption(DataError::BaselineCorrupt)
+            })?;
+            let baseline = artifact.baseline.clone();
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.action() != seal_snapshot_action(scope, request, baseline)
+                || grant.action() != seal_snapshot_action(scope, request, &baseline)
             {
                 return Ok(SealResult::StaleAuthority);
             }
             let expected_frontier = grant.frontier();
             let position = baseline.position();
-            let encoded = baseline.encode();
+            let artifact = artifact.clone();
             let scope_space = self.scope_space(scope);
             let sequence_key = scope_space.pack(&(KIND_SEQUENCE,));
-            let snapshot_key = scope_space.pack(&(KIND_SNAPSHOT,));
+            let spaces = baseline_spaces(&scope_space);
             self.database
                 .run(move |transaction, _maybe_committed| {
                     let sequence_key = sequence_key.clone();
-                    let snapshot_key = snapshot_key.clone();
+                    let spaces = spaces.clone();
+                    let artifact = artifact.clone();
                     async move {
-                        configure_transaction(&transaction)?;
-                        let frontier = read_frontier(&transaction, &sequence_key).await?;
-                        if frontier != expected_frontier {
-                            return Ok(SealResult::StaleAuthority);
-                        }
-                        if position > frontier {
-                            return Ok(SealResult::BeyondFrontier { frontier });
-                        }
-                        transaction.set(&snapshot_key, &encoded);
-                        Ok(SealResult::Sealed { position })
+                        let operation = SealOperation {
+                            scope,
+                            expected_frontier,
+                            position,
+                            sequence_key,
+                            spaces,
+                            artifact,
+                        };
+                        seal_transaction(&transaction, operation).await
                     }
                 })
                 .await
@@ -798,14 +977,17 @@ mod runtime {
             let retention_key = scope_space.pack(&(KIND_RETENTION,));
             let log_space = scope_space.subspace(&(KIND_LOG,));
             let chunk_space = scope_space.subspace(&(KIND_CHUNK,));
+            let baseline = baseline_spaces(&scope_space);
             self.database
                 .run(move |transaction, _maybe_committed| {
                     let sequence_key = sequence_key.clone();
                     let retention_key = retention_key.clone();
                     let log_space = log_space.clone();
                     let chunk_space = chunk_space.clone();
+                    let baseline = baseline.clone();
                     async move {
                         let operation = PruneOperation {
+                            scope,
                             expected_frontier,
                             up_to,
                             min_live,
@@ -813,6 +995,7 @@ mod runtime {
                             retention_key,
                             log_space,
                             chunk_space,
+                            baseline,
                         };
                         prune_transaction(&transaction, operation).await
                     }
@@ -897,6 +1080,7 @@ mod runtime {
     }
 
     struct PruneOperation {
+        scope: Scope,
         expected_frontier: u64,
         up_to: u64,
         min_live: Option<u64>,
@@ -904,6 +1088,338 @@ mod runtime {
         retention_key: Vec<u8>,
         log_space: Subspace,
         chunk_space: Subspace,
+        baseline: BaselineSpaces,
+    }
+
+    struct SealOperation {
+        scope: Scope,
+        expected_frontier: u64,
+        position: u64,
+        sequence_key: Vec<u8>,
+        spaces: BaselineSpaces,
+        artifact: SnapshotArtifact,
+    }
+
+    async fn seal_transaction(
+        transaction: &foundationdb::RetryableTransaction,
+        operation: SealOperation,
+    ) -> Result<SealResult, FdbBindingError> {
+        configure_transaction(transaction)?;
+        let frontier = read_frontier(transaction, &operation.sequence_key).await?;
+        if frontier != operation.expected_frontier {
+            return Ok(SealResult::StaleAuthority);
+        }
+        if operation.position > frontier {
+            return Ok(SealResult::BeyondFrontier { frontier });
+        }
+        let existing = read_snapshot_record(transaction, &operation.spaces.pointer_key).await?;
+        let existing_position = match &existing {
+            Some(SnapshotRecord::LegacyPosition(position)) => *position,
+            Some(SnapshotRecord::State(state)) => state.position(),
+            None => 0,
+        };
+        if existing_position > operation.position {
+            eprintln!("logical-db-store-fdb: baseline position would regress");
+            return Err(binding(DataError::BaselineCoverage));
+        }
+        let rebuilt = reconstruct_artifact(
+            transaction,
+            operation.scope,
+            operation.position,
+            &operation.spaces,
+        )
+        .await?;
+        if rebuilt != operation.artifact {
+            eprintln!("logical-db-store-fdb: supplied baseline lacks exact coverage");
+            return Err(binding(DataError::BaselineCoverage));
+        }
+        if let Some(SnapshotRecord::State(previous)) = existing
+            && previous.digest() != operation.artifact.baseline.digest()
+        {
+            clear_artifact(transaction, previous.digest(), &operation.spaces);
+        }
+        write_artifact(transaction, &operation.artifact, &operation.spaces)?;
+        Ok(SealResult::Sealed {
+            position: operation.position,
+        })
+    }
+
+    fn baseline_spaces(scope: &Subspace) -> BaselineSpaces {
+        BaselineSpaces {
+            scope: scope.clone(),
+            pointer_key: scope.pack(&(KIND_SNAPSHOT,)),
+            log: scope.subspace(&(KIND_LOG,)),
+            change_chunk: scope.subspace(&(KIND_CHUNK,)),
+            document: scope.subspace(&(KIND_SNAPSHOT_DOCUMENT,)),
+            snapshot_chunk: scope.subspace(&(KIND_SNAPSHOT_CHUNK,)),
+        }
+    }
+
+    fn write_artifact(
+        transaction: &foundationdb::RetryableTransaction,
+        artifact: &SnapshotArtifact,
+        spaces: &BaselineSpaces,
+    ) -> Result<(), FdbBindingError> {
+        let digest = artifact.baseline.digest().into_bytes();
+        for document in &artifact.documents {
+            let manifest = encode_baseline_document(document).map_err(binding)?;
+            let key = spaces
+                .document
+                .pack(&(digest.as_slice(), document.document.as_uuid()));
+            transaction.set(&key, &manifest);
+            for (index, chunk) in document.snapshot.chunks(CHUNK_BYTES).enumerate() {
+                let index = u16::try_from(index).map_err(binding_invalid)?;
+                let key = spaces.snapshot_chunk.pack(&(
+                    digest.as_slice(),
+                    document.document.as_uuid(),
+                    index,
+                ));
+                transaction.set(&key, chunk);
+            }
+        }
+        transaction.set(&spaces.pointer_key, &artifact.baseline.encode());
+        Ok(())
+    }
+
+    fn clear_artifact(
+        transaction: &foundationdb::RetryableTransaction,
+        digest: logical_db_model::BaselineDigest,
+        spaces: &BaselineSpaces,
+    ) {
+        let digest = digest.into_bytes();
+        for space in [&spaces.document, &spaces.snapshot_chunk] {
+            let artifact = space.subspace(&(digest.as_slice(),));
+            let (begin, end) = artifact.range();
+            transaction.clear_range(&begin, &end);
+        }
+    }
+
+    async fn reconstruct_artifact(
+        transaction: &foundationdb::RetryableTransaction,
+        scope: Scope,
+        through: u64,
+        spaces: &BaselineSpaces,
+    ) -> Result<SnapshotArtifact, FdbBindingError> {
+        let mut position = 0_u64;
+        let mut replayed_bytes = 0_usize;
+        let mut base = None;
+        if let Some(record) = read_snapshot_record(transaction, &spaces.pointer_key).await?
+            && let SnapshotRecord::State(baseline) = record
+            && baseline.position() <= through
+        {
+            let artifact = load_artifact(transaction, scope, &baseline, spaces).await?;
+            position = baseline.position();
+            base = Some(artifact);
+        }
+        let begin = spaces.log.pack(&(position.saturating_add(1),));
+        let end = through
+            .checked_add(1)
+            .map_or_else(|| spaces.log.range().1, |next| spaces.log.pack(&(next,)));
+        let mut options = RangeOption::from((begin.as_slice(), end.as_slice()));
+        options.limit = Some(MAX_BASELINE_CHANGES + 1);
+        options.target_bytes = MAX_BASELINE_BYTES;
+        let values = transaction.get_range(&options, 1, false).await?;
+        if values.len() > MAX_BASELINE_CHANGES || values.more() {
+            eprintln!("logical-db-store-fdb: baseline replay exceeds change budget");
+            return Err(binding(DataError::BaselineResourceLimit));
+        }
+        let manifests = values
+            .iter()
+            .map(|value| (value.key().to_vec(), value.value().to_vec()))
+            .collect::<Vec<_>>();
+        drop(values);
+        let mut changes = Vec::with_capacity(manifests.len());
+        for (key, value) in manifests {
+            let (sequence, change, next_bytes) = load_baseline_change(
+                transaction,
+                spaces,
+                scope,
+                position,
+                replayed_bytes,
+                &key,
+                &value,
+            )
+            .await?;
+            changes.push(change);
+            position = sequence;
+            replayed_bytes = next_bytes;
+        }
+        if position != through {
+            eprintln!("logical-db-store-fdb: baseline replay coverage is incomplete");
+            return Err(binding(DataError::BaselineCoverage));
+        }
+        materialize_snapshot(scope, through, base.as_ref(), &changes).map_err(|error| {
+            let data = match error {
+                SnapshotMaterializationError::Coverage => DataError::BaselineCoverage,
+                SnapshotMaterializationError::ResourceLimit => DataError::BaselineResourceLimit,
+                SnapshotMaterializationError::InvalidBase { context: _ }
+                | SnapshotMaterializationError::ScopeMismatch
+                | SnapshotMaterializationError::InvalidChange => DataError::BaselineCorrupt,
+            };
+            binding(data)
+        })
+    }
+
+    async fn load_baseline_change(
+        transaction: &foundationdb::RetryableTransaction,
+        spaces: &BaselineSpaces,
+        scope: Scope,
+        previous: u64,
+        replayed_bytes: usize,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(u64, ChangeEnvelope, usize), FdbBindingError> {
+        let (sequence,) = spaces.log.unpack::<(u64,)>(key).map_err(binding_invalid)?;
+        if previous.checked_add(1) != Some(sequence) {
+            eprintln!("logical-db-store-fdb: baseline replay log is not contiguous");
+            return Err(binding(DataError::BaselineCoverage));
+        }
+        let record = decode_manifest(value, sequence).map_err(binding)?;
+        let next_bytes = replayed_bytes
+            .checked_add(record.byte_len)
+            .filter(|total| *total <= MAX_BASELINE_BYTES)
+            .ok_or_else(|| binding(DataError::BaselineResourceLimit))?;
+        verify_operation(transaction, &spaces.scope, &record).await?;
+        let bytes = load_change_bytes(transaction, &spaces.change_chunk, sequence, &record).await?;
+        Ok((sequence, record.envelope(scope, bytes), next_bytes))
+    }
+
+    async fn read_snapshot_record(
+        transaction: &foundationdb::RetryableTransaction,
+        pointer_key: &[u8],
+    ) -> Result<Option<SnapshotRecord>, FdbBindingError> {
+        transaction
+            .get(pointer_key, false)
+            .await?
+            .map(|bytes| decode_snapshot(bytes.as_ref()).map_err(binding))
+            .transpose()
+    }
+
+    async fn load_artifact(
+        transaction: &foundationdb::RetryableTransaction,
+        scope: Scope,
+        baseline: &logical_db_model::SnapshotBaseline,
+        spaces: &BaselineSpaces,
+    ) -> Result<SnapshotArtifact, FdbBindingError> {
+        let digest = baseline.digest().into_bytes();
+        let document_space = spaces.document.subspace(&(digest.as_slice(),));
+        let (begin, end) = document_space.range();
+        let mut options = RangeOption::from((begin.as_slice(), end.as_slice()));
+        options.limit = Some(MAX_BASELINE_DOCUMENTS + 1);
+        options.target_bytes = MAX_BASELINE_BYTES;
+        let values = transaction.get_range(&options, 1, false).await?;
+        if values.len() != baseline.document_count() as usize || values.more() {
+            eprintln!("logical-db-store-fdb: baseline manifest count is inconsistent");
+            return Err(binding(DataError::BaselineCorrupt));
+        }
+        let manifests = values
+            .iter()
+            .map(|value| (value.key().to_vec(), value.value().to_vec()))
+            .collect::<Vec<_>>();
+        drop(values);
+        let mut documents = Vec::with_capacity(manifests.len());
+        let mut aggregate_bytes = 0_usize;
+        let expected_bytes = usize::try_from(baseline.byte_len()).map_err(binding_invalid)?;
+        for (key, value) in manifests {
+            let manifest = decode_baseline_document(&value).map_err(binding)?;
+            let Some(next_total) = aggregate_bytes
+                .checked_add(manifest.byte_len)
+                .filter(|total| *total <= MAX_BASELINE_BYTES && *total <= expected_bytes)
+            else {
+                eprintln!("logical-db-store-fdb: baseline byte total exceeds its descriptor");
+                return Err(binding(DataError::BaselineCorrupt));
+            };
+            let document = load_artifact_document(
+                transaction,
+                &document_space,
+                spaces,
+                digest,
+                &key,
+                manifest,
+            )
+            .await?;
+            aggregate_bytes = next_total;
+            documents.push(document);
+        }
+        if aggregate_bytes != expected_bytes {
+            eprintln!("logical-db-store-fdb: baseline byte total is inconsistent");
+            return Err(binding(DataError::BaselineCorrupt));
+        }
+        let artifact = SnapshotArtifact::new(scope, baseline.position(), documents)
+            .map_err(binding_baseline)?;
+        if &artifact.baseline != baseline {
+            eprintln!("logical-db-store-fdb: aggregate baseline digest mismatch");
+            return Err(binding(DataError::BaselineCorrupt));
+        }
+        let native = materialize_snapshot(scope, baseline.position(), Some(&artifact), &[])
+            .map_err(|error| {
+                eprintln!("logical-db-store-fdb: baseline native state is invalid: {error}");
+                binding(DataError::BaselineCorrupt)
+            })?;
+        if native != artifact {
+            eprintln!("logical-db-store-fdb: baseline native state is not canonical");
+            return Err(binding(DataError::BaselineCorrupt));
+        }
+        Ok(artifact)
+    }
+
+    async fn load_artifact_document(
+        transaction: &foundationdb::RetryableTransaction,
+        document_space: &Subspace,
+        spaces: &BaselineSpaces,
+        digest: [u8; 32],
+        key: &[u8],
+        manifest: BaselineDocumentManifest,
+    ) -> Result<SnapshotDocument, FdbBindingError> {
+        use sha2::{Digest, Sha256};
+
+        let (document_id,) = document_space
+            .unpack::<(uuid::Uuid,)>(key)
+            .map_err(binding_invalid)?;
+        let snapshot = load_snapshot_bytes(
+            transaction,
+            &spaces.snapshot_chunk,
+            digest,
+            document_id,
+            manifest,
+        )
+        .await?;
+        if Sha256::digest(&snapshot).as_slice() != manifest.digest {
+            eprintln!("logical-db-store-fdb: baseline document digest mismatch");
+            return Err(binding(DataError::BaselineCorrupt));
+        }
+        Ok(SnapshotDocument {
+            document: DocumentId::from_uuid(document_id),
+            snapshot,
+            tombstone: manifest.tombstone,
+        })
+    }
+
+    async fn load_snapshot_bytes(
+        transaction: &foundationdb::RetryableTransaction,
+        chunk_space: &Subspace,
+        artifact: [u8; 32],
+        document: uuid::Uuid,
+        manifest: BaselineDocumentManifest,
+    ) -> Result<Vec<u8>, FdbBindingError> {
+        let mut bytes = Vec::with_capacity(manifest.byte_len);
+        for index in 0..manifest.chunks {
+            let key = chunk_space.pack(&(artifact.as_slice(), document, index));
+            let chunk = transaction
+                .get(&key, false)
+                .await?
+                .ok_or_else(|| binding(DataError::BaselineCorrupt))?;
+            if chunk.is_empty() || chunk.len() > CHUNK_BYTES {
+                eprintln!("logical-db-store-fdb: baseline chunk length is invalid");
+                return Err(binding(DataError::BaselineCorrupt));
+            }
+            bytes.extend_from_slice(chunk.as_ref());
+        }
+        if bytes.len() != manifest.byte_len {
+            eprintln!("logical-db-store-fdb: baseline chunks do not match manifest length");
+            return Err(binding(DataError::BaselineCorrupt));
+        }
+        Ok(bytes)
     }
 
     async fn prune_transaction(
@@ -911,6 +1427,7 @@ mod runtime {
         operation: PruneOperation,
     ) -> Result<PruneResult, FdbBindingError> {
         let PruneOperation {
+            scope,
             expected_frontier,
             up_to,
             min_live,
@@ -918,6 +1435,7 @@ mod runtime {
             retention_key,
             log_space,
             chunk_space,
+            baseline,
         } = operation;
         configure_transaction(transaction)?;
         let frontier = read_frontier(transaction, &sequence_key).await?;
@@ -929,6 +1447,25 @@ mod runtime {
             Ok(value) => value,
             Err(refusal) => return Ok(PruneResult::Refused(refusal)),
         };
+        if through <= floor {
+            return Ok(PruneResult::Pruned(PruneReceipt {
+                pruned_through: floor,
+                floor,
+            }));
+        }
+        let baseline_record = read_snapshot_record(transaction, &baseline.pointer_key).await?;
+        let state = match baseline_record {
+            Some(SnapshotRecord::State(state)) if state.position() >= through => state,
+            Some(SnapshotRecord::State(state)) => {
+                return Ok(PruneResult::Refused(PruneRefusal::BaselineBehind {
+                    position: state.position(),
+                }));
+            }
+            Some(SnapshotRecord::LegacyPosition(_)) | None => {
+                return Ok(PruneResult::Refused(PruneRefusal::MissingBaseline));
+            }
+        };
+        load_artifact(transaction, scope, &state, &baseline).await?;
         if through > floor {
             let log_begin = log_space.pack(&(floor.saturating_add(1),));
             let log_end = through
@@ -1242,6 +1779,11 @@ mod runtime {
     fn binding_invalid<E: std::fmt::Debug>(cause: E) -> FdbBindingError {
         eprintln!("logical-db-store-fdb: invalid transaction value; cause={cause:?}");
         binding(DataError::InvalidManifest { at: "manifest" })
+    }
+
+    fn binding_baseline<E: std::fmt::Debug>(cause: E) -> FdbBindingError {
+        eprintln!("logical-db-store-fdb: baseline operation failed; cause={cause:?}");
+        binding(DataError::BaselineCorrupt)
     }
 
     fn classify_transaction(error: FdbBindingError) -> FdbStoreError {
@@ -1628,9 +2170,13 @@ mod tests {
     fn snapshot_record_round_trips_through_the_versioned_model_codec() {
         use logical_db_model::SnapshotBaseline;
 
-        let baseline = SnapshotBaseline::new(41);
+        let baseline =
+            SnapshotBaseline::new(41, logical_db_model::BaselineDigest::new([7; 32]), 0, 0);
         let encoded = baseline.encode();
-        assert_eq!(decode_snapshot(&encoded), Ok(baseline));
+        assert_eq!(
+            decode_snapshot(&encoded),
+            Ok(SnapshotRecord::State(baseline))
+        );
         assert_eq!(
             decode_snapshot(&encoded[..encoded.len() - 1]),
             Err(DataError::InvalidManifest { at: "manifest" })
@@ -1640,6 +2186,50 @@ mod tests {
         assert_eq!(
             decode_snapshot(&foreign),
             Err(DataError::InvalidManifest { at: "manifest" })
+        );
+    }
+
+    #[test]
+    fn state_baseline_atlas_rejects_missing_or_corrupt_chunks() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = SnapshotDocument {
+            document: DocumentId::new(),
+            snapshot: b"bounded snapshot".to_vec(),
+            tombstone: false,
+        };
+        let artifact = SnapshotArtifact::new(scope, 7, vec![document.clone()]).unwrap();
+        let digest = artifact.baseline.digest().into_bytes();
+        let manifest = encode_baseline_document(&document).unwrap();
+        assert_eq!(manifest.len(), BASELINE_DOCUMENT_MANIFEST_BYTES);
+        assert_eq!(
+            decode_baseline_document(&manifest[..manifest.len() - 1]),
+            Err(DataError::BaselineCorrupt)
+        );
+        let mut atlas = BaselineAtlas {
+            manifests: BTreeMap::from([((digest, document.document), manifest.to_vec())]),
+            chunks: BTreeMap::from([((digest, document.document, 0), document.snapshot.clone())]),
+        };
+        assert_eq!(
+            validate_baseline_atlas(scope, &artifact.baseline, &atlas),
+            Ok(artifact.clone())
+        );
+        let chunk = atlas
+            .chunks
+            .remove(&(digest, document.document, 0))
+            .unwrap();
+        assert_eq!(
+            validate_baseline_atlas(scope, &artifact.baseline, &atlas),
+            Err(DataError::BaselineCorrupt)
+        );
+        atlas.chunks.insert((digest, document.document, 0), chunk);
+        atlas
+            .chunks
+            .get_mut(&(digest, document.document, 0))
+            .unwrap()
+            .push(0xff);
+        assert_eq!(
+            validate_baseline_atlas(scope, &artifact.baseline, &atlas),
+            Err(DataError::BaselineCorrupt)
         );
     }
 

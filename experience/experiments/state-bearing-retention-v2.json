@@ -1,0 +1,29 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "state-bearing-retention-v2",
+  "actor": "Logical-DB service host",
+  "job": "retain a complete bounded recovery artifact before collecting immutable log history",
+  "artifact": "SnapshotArtifact v2 through RetentionStore and FdbServiceStore",
+  "initial_state": "isolated FDB scope with two accepted document changes and no baseline",
+  "expectation": "the floor advances only after a verified artifact covers every collected position",
+  "perturbation": "attempt collection with no baseline, a corrupt descriptor, and a baseline behind the requested prefix",
+  "observations": [
+    "missing baseline refuses collection without moving the frontier or floor",
+    "corrupt descriptor returns typed corruption and publishes no pointer",
+    "baseline through one cannot authorize pruning through two",
+    "baseline through two seals atomically and permits pruning through two",
+    "a page starting before the new floor returns BehindFloor"
+  ],
+  "invariant": "pruning through N requires a validated immutable state-bearing artifact covering every document and tombstone through N",
+  "verdict": "pending-hosted-execution",
+  "limitations": [
+    "this layer establishes the server prune gate but does not provide paged HTTP artifact recovery",
+    "atomic client installation of the recovered artifact and checkpoint remains the next stack layer"
+  ],
+  "evidence": [
+    "crates/logical-db-model/src/baseline.rs",
+    "crates/logical-db-service/src/lib.rs materialize_snapshot",
+    "crates/logical-db-store-fdb/src/lib.rs reconstruct_artifact and prune_transaction",
+    "crates/logical-db-daemon/src/ambiguity.rs verify_live_baseline_retention"
+  ]
+}
