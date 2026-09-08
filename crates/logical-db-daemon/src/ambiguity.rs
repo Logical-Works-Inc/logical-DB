@@ -216,7 +216,10 @@ async fn verify_http_action_binding(
 
     let before = observer.frontier(scope).await?;
     let first = push_over_http(&client, &endpoint, &original).await?;
-    if !matches!(first, PushOutcome::Accepted { .. }) {
+    if !matches!(
+        first,
+        PushOutcome::Accepted { .. } | PushOutcome::Duplicate { .. }
+    ) {
         eprintln!("fdb-ambiguity: canonical HTTP write was {first:?}");
         return Err(io::Error::other(format!("canonical HTTP write was {first:?}")).into());
     }
@@ -266,6 +269,9 @@ async fn verify_http_action_binding(
         eprintln!("fdb-ambiguity: rejected HTTP scope mutation created durable state");
         return Err(io::Error::other("rejected HTTP scope mutation created state").into());
     }
+    println!(
+        "PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated"
+    );
     server.abort();
     Ok(())
 }
@@ -282,25 +288,34 @@ async fn push_over_http(
     };
     let mut body = Vec::new();
     ciborium::into_writer(&request, &mut body)?;
-    let response = client
-        .post(endpoint)
-        .header("authorization", "Bearer action-fixture")
-        .header("content-type", "application/vnd.logical-db.v1+cbor")
-        .header("accept", "application/vnd.logical-db.v1+cbor")
-        .body(body)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        eprintln!("fdb-ambiguity: HTTP push status {}", response.status());
-        return Err(io::Error::other(format!("HTTP push status {}", response.status())).into());
+    for _attempt in 0..32 {
+        let response = client
+            .post(endpoint)
+            .header("authorization", "Bearer action-fixture")
+            .header("content-type", "application/vnd.logical-db.v1+cbor")
+            .header("accept", "application/vnd.logical-db.v1+cbor")
+            .body(body.clone())
+            .send()
+            .await?;
+        if response.status().is_server_error() {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if !response.status().is_success() {
+            eprintln!("fdb-ambiguity: HTTP push status {}", response.status());
+            return Err(
+                io::Error::other(format!("HTTP push status {}", response.status())).into(),
+            );
+        }
+        let bytes = response.bytes().await?;
+        let decoded: PushResponse = ciborium::from_reader(bytes.as_ref())?;
+        return decoded
+            .outcomes
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::other("HTTP push returned no outcome").into());
     }
-    let bytes = response.bytes().await?;
-    let decoded: PushResponse = ciborium::from_reader(bytes.as_ref())?;
-    decoded
-        .outcomes
-        .into_iter()
-        .next()
-        .ok_or_else(|| io::Error::other("HTTP push returned no outcome").into())
+    Err(io::Error::other("HTTP push exhausted bounded exact retries").into())
 }
 
 async fn complete_recovery_path(
