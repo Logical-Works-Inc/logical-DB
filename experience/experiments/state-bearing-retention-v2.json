@@ -15,7 +15,7 @@
     "a page starting before the new floor returns BehindFloor"
   ],
   "invariant": "pruning through N requires a validated immutable state-bearing artifact covering every document and tombstone through N",
-  "verdict": "pending-hosted-execution",
+  "verdict": "pass",
   "limitations": [
     "this layer establishes the server prune gate but does not provide paged HTTP artifact recovery",
     "atomic client installation of the recovered artifact and checkpoint remains the next stack layer"
@@ -24,6 +24,7 @@
     "crates/logical-db-model/src/baseline.rs",
     "crates/logical-db-service/src/lib.rs materialize_snapshot",
     "crates/logical-db-store-fdb/src/lib.rs reconstruct_artifact and prune_transaction",
-    "crates/logical-db-daemon/src/ambiguity.rs verify_live_baseline_retention"
+    "crates/logical-db-daemon/src/ambiguity.rs verify_live_baseline_retention",
+    "GitHub Actions run 34176936171 job 101908093195: PASS fdb-live-baseline-retention, PASS fdb-action-binding, and PASS fdb-commit-unknown-recovered"
   ]
 }
