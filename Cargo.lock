@@ -1298,6 +1298,7 @@ dependencies = [
  "foundationdb-tuple",
  "hmac",
  "lgwks_bot",
+ "logical-db",
  "logical-db-braid",
  "logical-db-crdt",
  "logical-db-model",

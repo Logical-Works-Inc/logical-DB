@@ -20,9 +20,19 @@ name = "fdb-ambiguity-journey"
 path = "src/ambiguity.rs"
 required-features = ["fdb"]
 
+[[bin]]
+name = "fdb-recovery-composition"
+path = "src/recovery_composition.rs"
+required-features = ["fdb"]
+
 [features]
 default = []
-fdb = ["dep:foundationdb", "dep:foundationdb-tuple", "dep:logical-db-store-fdb"]
+fdb = [
+  "dep:foundationdb",
+  "dep:foundationdb-tuple",
+  "dep:logical-db",
+  "dep:logical-db-store-fdb",
+]
 
 [dependencies]
 axum.workspace = true
@@ -30,6 +40,7 @@ ciborium.workspace = true
 foundationdb = { workspace = true, optional = true }
 foundationdb-tuple = { workspace = true, optional = true }
 hmac.workspace = true
+logical-db = { version = "0.1.0", path = "../logical-db", features = ["http"], optional = true }
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-braid = { version = "0.1.0", path = "../logical-db-braid" }
 logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
