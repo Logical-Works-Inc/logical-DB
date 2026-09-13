@@ -13,7 +13,7 @@ mod tests {
         convert::Infallible,
         fs,
         future::{Future, ready},
-        sync::Mutex,
+        sync::{Arc, Mutex},
     };
 
     use logical_db::{
@@ -27,11 +27,14 @@ mod tests {
     use logical_db_server::{AuthenticationError, Authenticator, Clock, router};
     use logical_db_service::{
         AcceptResult, Authority, CheckpointCodec, ConsumedResult, ExecutionGrant, PageResult,
-        PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore, StoredPage,
+        PruneReceipt, PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore,
+        StoredPage, materialize_snapshot, prune_decision,
     };
 
     use logical_db_model::ActionDigest;
-    use logical_db_protocol::{PageAction, write_action};
+    use logical_db_protocol::{
+        PageAction, mark_consumed_action, prune_action, seal_snapshot_action, write_action,
+    };
 
     struct Allow;
     struct Grant {
@@ -105,10 +108,58 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RetentionState {
+        floor: u64,
+        consumed: u64,
+        baseline: Option<SnapshotArtifact>,
+    }
+
     #[derive(Default)]
     struct MemoryServiceStore {
         changes: Mutex<Vec<ChangeEnvelope>>,
         operations: Mutex<HashMap<OperationId, (OperationDigest, ChangeDigest)>>,
+        retention: Mutex<HashMap<Scope, RetentionState>>,
+    }
+
+    impl MemoryServiceStore {
+        fn scope_frontier(&self, scope: Scope) -> u64 {
+            let changes = self.changes.lock().unwrap();
+            self.retention_state(scope).floor + Self::retained_count(&changes, scope)
+        }
+
+        fn retained_count(changes: &[ChangeEnvelope], scope: Scope) -> u64 {
+            changes
+                .iter()
+                .filter(|change| change.scope == scope)
+                .count() as u64
+        }
+
+        fn retention_state(&self, scope: Scope) -> RetentionState {
+            self.retention
+                .lock()
+                .unwrap()
+                .get(&scope)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn check_retention_grant(
+            &self,
+            scope: Scope,
+            action: ActionDigest,
+            grant: &impl ExecutionGrant,
+        ) -> Option<u64> {
+            let frontier = self.scope_frontier(scope);
+            if grant.scope() != scope
+                || grant.effect() != Effect::Sync
+                || grant.action() != action
+                || grant.frontier() != frontier
+            {
+                return None;
+            }
+            Some(frontier)
+        }
     }
 
     impl ServiceStore for MemoryServiceStore {
@@ -141,14 +192,14 @@ mod tests {
         }
 
         fn frontier(&self, scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-            let frontier = self
-                .changes
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|change| change.scope == scope)
-                .count() as u64;
-            ready(Ok(frontier))
+            ready(Ok(self.scope_frontier(scope)))
+        }
+
+        fn retention_floor(
+            &self,
+            scope: Scope,
+        ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Ok(self.retention_state(scope).floor))
         }
 
         fn page(
@@ -163,6 +214,10 @@ mod tests {
                 max_bytes,
                 ..
             } = action;
+            let floor = self.retention_state(scope).floor;
+            if after < floor {
+                return ready(Ok(PageResult::BehindFloor));
+            }
             let changes = self.changes.lock().unwrap();
             let scoped = changes
                 .iter()
@@ -171,14 +226,14 @@ mod tests {
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
                 || grant.action() != action.digest()
-                || grant.frontier() != scoped.len() as u64
+                || grant.frontier() != floor + scoped.len() as u64
             {
                 return ready(Ok(PageResult::StaleAuthority));
             }
             let mut bytes = 0usize;
             let page = scoped
                 .iter()
-                .skip(usize::try_from(after).unwrap_or(usize::MAX))
+                .skip(usize::try_from(after - floor).unwrap_or(usize::MAX))
                 .take(usize::from(max_changes))
                 .take_while(|change| {
                     bytes = bytes.saturating_add(change.bytes.len());
@@ -190,62 +245,167 @@ mod tests {
             ready(Ok(PageResult::Page(StoredPage {
                 changes: page,
                 position,
-                more: usize::try_from(position).is_ok_and(|position| position < scoped.len()),
+                more: floor + scoped.len() as u64 > position,
             })))
         }
     }
 
-    /// Inert retention for journeys whose scope never collects a log prefix.
     impl RetentionStore for MemoryServiceStore {
         fn consumed_through(
             &self,
-            _scope: Scope,
+            scope: Scope,
         ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-            ready(Ok(0))
+            ready(Ok(self.retention_state(scope).consumed))
         }
+
         fn snapshot_baseline(
             &self,
-            _scope: Scope,
+            scope: Scope,
         ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
-            ready(Ok(None))
+            ready(Ok(self
+                .retention_state(scope)
+                .baseline
+                .map(|artifact| SnapshotRecord::State(artifact.baseline))))
         }
+
         fn build_snapshot(
             &self,
             scope: Scope,
             through: u64,
         ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
-            ready(Ok(SnapshotArtifact::new(scope, through, Vec::new())
-                .expect("an empty bounded artifact is valid")))
+            let state = self.retention_state(scope);
+            let base = state
+                .baseline
+                .filter(|artifact| artifact.baseline.position() <= through);
+            let base_position = base
+                .as_ref()
+                .map_or(state.floor, |artifact| artifact.baseline.position());
+            let skip =
+                usize::try_from(base_position.saturating_sub(state.floor)).unwrap_or(usize::MAX);
+            let retained =
+                usize::try_from(through.saturating_sub(base_position)).unwrap_or(usize::MAX);
+            let changes = self.changes.lock().unwrap();
+            let retained_changes = changes
+                .iter()
+                .filter(|change| change.scope == scope)
+                .skip(skip)
+                .take(retained)
+                .cloned()
+                .collect::<Vec<_>>();
+            let artifact = materialize_snapshot(scope, through, base.as_ref(), &retained_changes)
+                .expect("the journey store materializes bounded validated artifacts");
+            ready(Ok(artifact))
         }
+
         fn seal_snapshot(
             &self,
-            _scope: Scope,
-            _artifact: &SnapshotArtifact,
-            _request: OperationDigest,
-            _grant: &impl ExecutionGrant,
+            scope: Scope,
+            artifact: &SnapshotArtifact,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
-            ready(Ok(SealResult::BeyondFrontier { frontier: 0 }))
-        }
-        fn mark_consumed(
-            &self,
-            _scope: Scope,
-            _through: u64,
-            _request: OperationDigest,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
-            ready(Ok(ConsumedResult::Unchanged {
-                consumed_through: 0,
+            let baseline = &artifact.baseline;
+            let Some(frontier) = self.check_retention_grant(
+                scope,
+                seal_snapshot_action(scope, request, baseline),
+                grant,
+            ) else {
+                return ready(Ok(SealResult::StaleAuthority));
+            };
+            if baseline.position() > frontier {
+                return ready(Ok(SealResult::BeyondFrontier { frontier }));
+            }
+            self.retention
+                .lock()
+                .unwrap()
+                .entry(scope)
+                .or_default()
+                .baseline = Some(artifact.clone());
+            ready(Ok(SealResult::Sealed {
+                position: baseline.position(),
             }))
         }
+
+        fn mark_consumed(
+            &self,
+            scope: Scope,
+            through: u64,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+            let Some(frontier) = self.check_retention_grant(
+                scope,
+                mark_consumed_action(scope, request, through),
+                grant,
+            ) else {
+                return ready(Ok(ConsumedResult::StaleAuthority));
+            };
+            if through > frontier {
+                return ready(Ok(ConsumedResult::BeyondFrontier { frontier }));
+            }
+            let mut retention = self.retention.lock().unwrap();
+            let state = retention.entry(scope).or_default();
+            if through <= state.consumed {
+                return ready(Ok(ConsumedResult::Unchanged {
+                    consumed_through: state.consumed,
+                }));
+            }
+            state.consumed = through;
+            ready(Ok(ConsumedResult::Advanced {
+                consumed_through: through,
+            }))
+        }
+
         fn prune(
             &self,
-            _scope: Scope,
-            _up_to: u64,
-            _min_live: Option<u64>,
-            _request: OperationDigest,
-            _grant: &impl ExecutionGrant,
+            scope: Scope,
+            up_to: u64,
+            min_live: Option<u64>,
+            request: OperationDigest,
+            grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
-            ready(Ok(PruneResult::Refused(PruneRefusal::MissingBaseline)))
+            let Some(frontier) = self.check_retention_grant(
+                scope,
+                prune_action(scope, request, up_to, min_live),
+                grant,
+            ) else {
+                return ready(Ok(PruneResult::StaleAuthority));
+            };
+            let state = self.retention_state(scope);
+            let through =
+                match prune_decision(frontier, state.floor, up_to, min_live, state.consumed) {
+                    Ok(through) => through,
+                    Err(refusal) => return ready(Ok(PruneResult::Refused(refusal))),
+                };
+            if through > state.floor {
+                let Some(artifact) = state.baseline.as_ref() else {
+                    return ready(Ok(PruneResult::Refused(PruneRefusal::MissingBaseline)));
+                };
+                if artifact.baseline.position() < through {
+                    return ready(Ok(PruneResult::Refused(PruneRefusal::BaselineBehind {
+                        position: artifact.baseline.position(),
+                    })));
+                }
+                let floor = state.floor;
+                let mut position = floor;
+                self.changes.lock().unwrap().retain(|change| {
+                    if change.scope != scope {
+                        return true;
+                    }
+                    position += 1;
+                    position > through
+                });
+                self.retention
+                    .lock()
+                    .unwrap()
+                    .entry(scope)
+                    .or_default()
+                    .floor = through;
+            }
+            ready(Ok(PruneResult::Pruned(PruneReceipt {
+                pruned_through: through,
+                floor: through.max(state.floor),
+            })))
         }
     }
 
@@ -463,5 +623,140 @@ mod tests {
         fs::set_permissions(&path, original_permissions).unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    async fn seal_consume_and_prune(store: &MemoryServiceStore, scope: Scope) {
+        let artifact = store.build_snapshot(scope, 1).await.unwrap();
+        let frontier = store.frontier(scope).await.unwrap();
+        let seal_request = OperationDigest::new([0x52; 32]);
+        assert!(matches!(
+            store
+                .seal_snapshot(
+                    scope,
+                    &artifact,
+                    seal_request,
+                    &Grant {
+                        scope,
+                        effect: Effect::Sync,
+                        action: seal_snapshot_action(scope, seal_request, &artifact.baseline),
+                        frontier,
+                    },
+                )
+                .await
+                .unwrap(),
+            SealResult::Sealed { position: 1 }
+        ));
+        let consumed_request = OperationDigest::new([0x53; 32]);
+        assert!(matches!(
+            store
+                .mark_consumed(
+                    scope,
+                    1,
+                    consumed_request,
+                    &Grant {
+                        scope,
+                        effect: Effect::Sync,
+                        action: mark_consumed_action(scope, consumed_request, 1),
+                        frontier,
+                    },
+                )
+                .await
+                .unwrap(),
+            ConsumedResult::Advanced {
+                consumed_through: 1
+            }
+        ));
+        let prune_request = OperationDigest::new([0x54; 32]);
+        assert!(matches!(
+            store
+                .prune(
+                    scope,
+                    1,
+                    None,
+                    prune_request,
+                    &Grant {
+                        scope,
+                        effect: Effect::Sync,
+                        action: prune_action(scope, prune_request, 1, None),
+                        frontier,
+                    },
+                )
+                .await
+                .unwrap(),
+            PruneResult::Pruned(PruneReceipt {
+                pruned_through: 1,
+                floor: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn fresh_replica_recovers_a_pruned_document_through_real_http() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(fresh_replica_recovers_a_pruned_document_body());
+    }
+
+    async fn fresh_replica_recovers_a_pruned_document_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([23; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let first_path = path("recovery-first");
+        let second_path = path("recovery-second");
+
+        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        first
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([0x51; 32]),
+                |editor| editor.put(&Object::root(), "state", Scalar::String("sealed".into())),
+            )
+            .unwrap();
+        first
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        assert_eq!(store.frontier(scope).await.unwrap(), 1);
+
+        seal_consume_and_prune(&store, scope).await;
+
+        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let report = second
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        assert!(report.recovered);
+        assert_eq!(
+            second
+                .read(document, |reader| reader.get(&Object::root(), "state"))
+                .unwrap(),
+            Some(Some(Item::Scalar(Scalar::String("sealed".into()))))
+        );
+
+        drop((first, second));
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+        server.abort();
     }
 }
