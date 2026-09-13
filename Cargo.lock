@@ -1316,6 +1316,8 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "ciborium",
+ "foundationdb",
+ "foundationdb-tuple",
  "lgwks_bot",
  "lgwks_deps",
  "logical-db",
@@ -1326,6 +1328,7 @@ dependencies = [
  "logical-db-protocol",
  "logical-db-server",
  "logical-db-service",
+ "logical-db-store-fdb",
  "uuid",
 ]
 
