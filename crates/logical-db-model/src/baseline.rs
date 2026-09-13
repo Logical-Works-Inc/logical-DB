@@ -195,17 +195,25 @@ impl SnapshotArtifact {
         position: u64,
         documents: Vec<SnapshotDocument>,
     ) -> Result<Self, ModelError> {
-        validate_documents(&documents)?;
-        let byte_len = documents.iter().try_fold(0usize, |total, doc| {
-            total
-                .checked_add(doc.snapshot.len())
-                .ok_or(ModelError::SnapshotTooLarge)
-        })?;
-        let digest = BaselineDigest(compute_digest(scope, position, &documents));
+        if documents.len() > MAX_BASELINE_DOCUMENTS {
+            let error = ModelError::SnapshotTooManyDocuments;
+            eprintln!("logical-db-model: SnapshotArtifact::new count: {error}");
+            return Err(error);
+        }
         let document_count = u32::try_from(documents.len()).map_err(|error| {
             eprintln!("logical-db-model: SnapshotArtifact::new document count: {error}");
             ModelError::SnapshotTooLarge
         })?;
+        let mut builder = SnapshotDigestBuilder::new(scope, position, u64::from(document_count));
+        for document in &documents {
+            builder.push(document)?;
+        }
+        let (digest, byte_len) = builder.finish()?;
+        if byte_len > MAX_BASELINE_BYTES {
+            let error = ModelError::SnapshotTooLarge;
+            eprintln!("logical-db-model: SnapshotArtifact::new aggregate bytes: {error}");
+            return Err(error);
+        }
         let byte_len = u32::try_from(byte_len).map_err(|error| {
             eprintln!("logical-db-model: SnapshotArtifact::new byte length: {error}");
             ModelError::SnapshotTooLarge
@@ -222,7 +230,6 @@ impl SnapshotArtifact {
     ///
     /// Returns a model error when the artifact is malformed or its descriptor mismatches.
     pub fn validate(&self, scope: Scope) -> Result<(), ModelError> {
-        validate_documents(&self.documents)?;
         let expected = Self::new(scope, self.baseline.position, self.documents.clone())?;
         if expected.baseline != self.baseline {
             let error = ModelError::SnapshotDescriptorMismatch;
@@ -233,51 +240,86 @@ impl SnapshotArtifact {
     }
 }
 
-fn validate_documents(documents: &[SnapshotDocument]) -> Result<(), ModelError> {
-    if documents.len() > MAX_BASELINE_DOCUMENTS {
-        let error = ModelError::SnapshotTooManyDocuments;
-        eprintln!("logical-db-model: validate_documents count: {error}");
-        return Err(error);
-    }
-    let mut total = 0usize;
-    let mut previous = None;
-    for document in documents {
-        if previous.is_some_and(|id| id >= document.document) {
-            let error = ModelError::SnapshotDocumentsUnordered;
-            eprintln!("logical-db-model: validate_documents ordering: {error}");
-            return Err(error);
-        }
-        previous = Some(document.document);
-        if document.snapshot.is_empty() || document.snapshot.len() > MAX_BASELINE_BYTES {
-            let error = ModelError::SnapshotDocumentInvalid;
-            eprintln!("logical-db-model: validate_documents payload: {error}");
-            return Err(error);
-        }
-        total = total
-            .checked_add(document.snapshot.len())
-            .ok_or(ModelError::SnapshotTooLarge)?;
-    }
-    if total > MAX_BASELINE_BYTES {
-        let error = ModelError::SnapshotTooLarge;
-        eprintln!("logical-db-model: validate_documents aggregate bytes: {error}");
-        return Err(error);
-    }
-    Ok(())
+/// Incremental canonical digest over one ordered snapshot document sequence.
+///
+/// [`SnapshotArtifact::new`] and a paged recovery client fold the same sequence
+/// through this builder, so a streamed artifact reproduces the exact digest of
+/// the same sequence assembled in memory. The builder owns ordering,
+/// per-document bounds, the running byte total, and the declared document count;
+/// a sequence that ends short, long, or out of order cannot finalize.
+#[derive(Debug)]
+pub struct SnapshotDigestBuilder {
+    digest: Sha256,
+    expected_count: u64,
+    count: u64,
+    byte_len: usize,
+    previous: Option<DocumentId>,
 }
 
-fn compute_digest(scope: Scope, position: u64, documents: &[SnapshotDocument]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    frame(&mut digest, b"logical-db-baseline-v2");
-    frame(&mut digest, scope.account().as_uuid().as_bytes());
-    frame(&mut digest, scope.space().as_uuid().as_bytes());
-    frame(&mut digest, &position.to_be_bytes());
-    frame(&mut digest, &(documents.len() as u64).to_be_bytes());
-    for document in documents {
-        frame(&mut digest, document.document.as_uuid().as_bytes());
-        frame(&mut digest, &[u8::from(document.tombstone)]);
-        frame(&mut digest, &document.snapshot);
+impl SnapshotDigestBuilder {
+    /// Starts a builder for exactly `document_count` documents at `position`.
+    #[must_use]
+    pub fn new(scope: Scope, position: u64, document_count: u64) -> Self {
+        let mut digest = Sha256::new();
+        frame(&mut digest, b"logical-db-baseline-v2");
+        frame(&mut digest, scope.account().as_uuid().as_bytes());
+        frame(&mut digest, scope.space().as_uuid().as_bytes());
+        frame(&mut digest, &position.to_be_bytes());
+        frame(&mut digest, &document_count.to_be_bytes());
+        Self {
+            digest,
+            expected_count: document_count,
+            count: 0,
+            byte_len: 0,
+            previous: None,
+        }
     }
-    digest.finalize().into()
+
+    /// Folds the next document into the running digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed model error when the document is empty, oversized, or not
+    /// strictly ascending after the previously folded document.
+    pub fn push(&mut self, document: &SnapshotDocument) -> Result<(), ModelError> {
+        if self
+            .previous
+            .is_some_and(|previous| previous >= document.document)
+        {
+            let error = ModelError::SnapshotDocumentsUnordered;
+            eprintln!("logical-db-model: SnapshotDigestBuilder ordering: {error}");
+            return Err(error);
+        }
+        if document.snapshot.is_empty() || document.snapshot.len() > MAX_BASELINE_BYTES {
+            let error = ModelError::SnapshotDocumentInvalid;
+            eprintln!("logical-db-model: SnapshotDigestBuilder payload: {error}");
+            return Err(error);
+        }
+        self.byte_len = self
+            .byte_len
+            .checked_add(document.snapshot.len())
+            .ok_or(ModelError::SnapshotTooLarge)?;
+        self.count = self.count.saturating_add(1);
+        self.previous = Some(document.document);
+        frame(&mut self.digest, document.document.as_uuid().as_bytes());
+        frame(&mut self.digest, &[u8::from(document.tombstone)]);
+        frame(&mut self.digest, &document.snapshot);
+        Ok(())
+    }
+
+    /// Consumes the builder and returns the descriptor digest and aggregate bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed model error when the folded count differs from the declared count.
+    pub fn finish(self) -> Result<(BaselineDigest, usize), ModelError> {
+        if self.count != self.expected_count {
+            let error = ModelError::SnapshotDescriptorMismatch;
+            eprintln!("logical-db-model: SnapshotDigestBuilder count: {error}");
+            return Err(error);
+        }
+        Ok((BaselineDigest(self.digest.finalize().into()), self.byte_len))
+    }
 }
 
 fn frame(digest: &mut Sha256, bytes: &[u8]) {
@@ -389,6 +431,59 @@ mod tests {
                 }],
             ),
             Err(ModelError::SnapshotDocumentInvalid)
+        );
+    }
+
+    #[test]
+    fn streamed_documents_reproduce_the_in_memory_digest() {
+        let scope = scope();
+        let documents = (0..200_u128)
+            .map(|index| SnapshotDocument {
+                document: DocumentId::from_uuid(uuid::Uuid::from_u128(index)),
+                snapshot: vec![1, 2, 3],
+                tombstone: index % 2 == 0,
+            })
+            .collect::<Vec<_>>();
+        let artifact = SnapshotArtifact::new(scope, 9, documents.clone()).unwrap();
+        let mut builder = SnapshotDigestBuilder::new(scope, 9, documents.len() as u64);
+        for document in &documents {
+            builder.push(document).unwrap();
+        }
+        let (digest, byte_len) = builder.finish().unwrap();
+        assert_eq!(digest, artifact.baseline.digest());
+        assert_eq!(byte_len, 200 * 3);
+    }
+
+    #[test]
+    fn streamed_digest_folds_past_the_single_artifact_cap() {
+        let scope = scope();
+        let declared = u64::try_from(MAX_BASELINE_DOCUMENTS + 1).unwrap();
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, declared);
+        for index in 0..=MAX_BASELINE_DOCUMENTS {
+            builder
+                .push(&SnapshotDocument {
+                    document: DocumentId::from_uuid(uuid::Uuid::from_u128(index as u128)),
+                    snapshot: vec![7],
+                    tombstone: false,
+                })
+                .unwrap();
+        }
+        let (_, byte_len) = builder.finish().unwrap();
+        assert_eq!(byte_len, MAX_BASELINE_DOCUMENTS + 1);
+    }
+
+    #[test]
+    fn streamed_digest_refuses_short_streams_and_disorder() {
+        let scope = scope();
+        let first = doc();
+        let mut short = SnapshotDigestBuilder::new(scope, 0, 2);
+        short.push(&first).unwrap();
+        assert_eq!(short.finish(), Err(ModelError::SnapshotDescriptorMismatch));
+        let mut disordered = SnapshotDigestBuilder::new(scope, 0, 2);
+        disordered.push(&first).unwrap();
+        assert_eq!(
+            disordered.push(&first),
+            Err(ModelError::SnapshotDocumentsUnordered)
         );
     }
 }
