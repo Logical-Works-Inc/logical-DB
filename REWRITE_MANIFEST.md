@@ -95,8 +95,12 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [x] Implement embedded document tombstones and versioned export/restore with
   retained facade/store tests for reopen, propagation, corrupt input, and
   resuming a restore prefix.
-- [ ] Complete direct process-kill-during-restore and external-consumer recovery
-  evidence; an in-process partial replay test is not a process-kill receipt.
+- [x] Complete direct process-kill-during-restore and external-consumer recovery
+  evidence. `fdb_process_kill_restore` spawns the external `recovery_consumer`
+  process, `SIGKILL`s it after a continued baseline page, proves the durable
+  replica committed no checkpoint, local change, or document, then reruns the
+  same process to a complete atomic install. An in-process partial replay test
+  is not a process-kill receipt.
 - [ ] Exercise multi-node FDB failover and point-in-time restore, public
   TLS/issuer/rotation, sustained load/backpressure, disk exhaustion, sleep/wake,
   and mobile sandbox lifecycle.
