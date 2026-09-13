@@ -60,6 +60,7 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-protocol",
         "logical-db-server",
         "logical-db-service",
+        "logical-db-store-fdb",
     },
     "logical-db-daemon": {
         "logical-db-braid",
