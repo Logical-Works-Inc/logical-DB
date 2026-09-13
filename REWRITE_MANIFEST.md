@@ -20,6 +20,12 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   explicit full resync have typed tests.
 - [x] The service has bounded HTTP ingress and an async FDB adapter with private
   tuple subspaces, chunked values, and transaction ceilings.
+- [x] The server retention layer has a bounded v2 content-addressed
+  `SnapshotArtifact` (256 documents/4 MiB), preserves tombstone state, keeps v1
+  position-only baselines readable but prune-ineligible, and makes FDB
+  reconstruct/recheck/seal the artifact and validate it in the prune
+  transaction. This establishes the prune gate; it is not hosted
+  full-recovery evidence.
 - [x] Externally prepared Braid material produces a real pinned
   `RunnableInvocation` bound to exact scoped request facts and the durable
   frontier; FDB consumes it atomically.
@@ -59,9 +65,10 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Complete the explicit backend capability profiles and matched-trace
   evidence required by the recorded Director ruling in `GOVERNANCE.md`.
 - [ ] Resolve the remaining estate ownership decision before LEM handoff.
-- [ ] Bind authority to a service-computed canonical action digest distinct
-  from caller intent/idempotency identity, including payload-field mutation
-  and exact-retry proof through HTTP and FDB (issue #27).
+- [x] Bind authority to a service-computed canonical action digest distinct
+  from caller intent/idempotency identity. The hosted FDB journey holds one
+  action grant fixed while mutating every write field, proves rejection without
+  frontier advance, and preserves exact-byte retry (issue #27).
 - [ ] Include explicit application-supplied projection semantic identity in
   the durable schema digest and migration proof (issue #29).
 - [x] Native Windows CI passed data placement, file locking, concurrent open,
@@ -73,8 +80,11 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Integrate independently verifiable, exact-request Braid confirmation
   evidence before enabling daemon write or synchronization authority. Pinned
   Braid's capsule flag alone is not treated as runtime evidence.
-- [ ] Add a versioned server snapshot baseline, retention floor, client recovery
-  transition, and peer-aware garbage collection before pruning the append-only log.
+- [ ] Close server recovery before pruning: expose paged HTTP baseline recovery
+  and install the recovered document state plus checkpoint atomically in the
+  client. The v2 server baseline, retention floor, and transactional prune gate
+  are established by the current stack layer, but issue #28 remains open until
+  this client journey is proven.
 - [x] Implement embedded document tombstones and versioned export/restore with
   retained facade/store tests for reopen, propagation, corrupt input, and
   resuming a restore prefix.

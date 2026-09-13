@@ -1,0 +1,29 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "action-binding-v1",
+  "actor": "Logical-DB service host",
+  "job": "authorize the exact decoded database action rather than a caller label",
+  "artifact": "HTTP push through ProtocolService and FdbServiceStore",
+  "initial_state": "isolated empty FDB Directory Layer root and one fixed canonical action grant",
+  "expectation": "only the exact validated write advances the frontier; exact replay is duplicate",
+  "perturbation": "hold the grant fixed while changing account, space, document, operation, replica, intent, digest, and valid payload bytes",
+  "observations": [
+    "canonical action accepted and advanced the scoped frontier once",
+    "exact-byte replay returned Duplicate",
+    "digest mismatch was rejected before authority",
+    "every other field mutation returned Forbidden",
+    "canonical and foreign-scope frontiers did not advance after rejected mutations"
+  ],
+  "invariant": "trusted code computes a versioned canonical action identity after native validation and the durable adapter recomputes it",
+  "verdict": "pass",
+  "limitations": [
+    "fixture authority proves the HTTP/service/store seam, not independent runtime Braid confirmation",
+    "the official FoundationDB 7.3.77 process runs in the protected hosted job"
+  ],
+  "evidence": [
+    "crates/logical-db-protocol/src/action.rs",
+    "crates/logical-db-server/src/lib.rs fixed_action_rejects_wire_mutations_and_accepts_exact_retry",
+    "crates/logical-db-daemon/src/ambiguity.rs verify_http_action_binding",
+    "GitHub Actions run 34175071967 job 101902785828: PASS fdb-action-binding and PASS fdb-commit-unknown-recovered"
+  ]
+}

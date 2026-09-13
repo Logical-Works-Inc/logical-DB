@@ -75,14 +75,17 @@ allowed-dependency map must additionally declare the semantic edges
 | Projection schema | `Projection`, `IndexId`, `IndexValue`, nonzero schema version | reverse rows, ordered value encoding, rebuild mechanics |
 | Thin client | `HttpTransport`, async `CredentialProvider`, `SyncLimits`, `SyncReport` | reqwest client, CBOR buffers, retry cursors |
 | HTTP service | `logical_db_server::router`, `Authenticator`, `Clock` | listener/TLS/process lifecycle, authorization headers |
-| Durable service | `ServiceStore::{frontier,accept,page}`, `ExecutionGrant` | FDB database and transaction handles |
+| Durable service | `ServiceStore::{frontier,accept,page}`, `RetentionStore::{build_snapshot,seal_snapshot,prune}`, `ExecutionGrant` | FDB database and transaction handles |
 | Standalone process | `logical-db-daemon` environment contract | FDB network guard, directory transaction, listener lifecycle |
 | Braid | `prepare_request`, `prepare_local_request`, `BraidGrant`, `BraidAuthority`, `LocalBraidAuthority` | grant construction fields and proof fabrication |
 
-An application mutation supplies both `OperationId` and a canonical
-`OperationDigest`. Exact retries return the original durable receipt without
-rerunning application code. Reusing an operation identity for different
-request/change bytes fails closed.
+An application mutation supplies `OperationId` and an intent
+`OperationDigest`. After native CRDT validation, trusted service code computes
+an `ActionDigest` over a versioned length-framed encoding of scope, document,
+operation, replica, intent, change digest, and exact change bytes. Braid and the
+store bind the computed action. Exact retries return the original durable
+receipt without rerunning application code. Reusing an operation identity for
+different intent/change bytes fails closed.
 
 ## Local transaction and subscription contract
 
@@ -120,17 +123,18 @@ Database outbox
   -> HttpTransport validates + CBOR POST /v1/changes:push
   -> whole-request concurrency admission + deadline
   -> server authenticates credential
+  -> validate native change bytes and compute canonical action identity
   -> read scoped FDB frontier
-  -> Braid admits capsule + proves exact snapshot predicate
+  -> Braid admits capsule + proves exact scope/action/frontier predicate
   -> RunnableInvocation becomes an opaque ExecutionGrant
-  -> FDB transaction rechecks frontier and atomically consumes invocation
+  -> FDB recomputes action, rechecks frontier, and consumes invocation
   -> exact operation returns accepted / duplicate / recovered-unknown / conflict
 
 durable peer checkpoint
   -> bounded PullRequest
   -> POST /v1/changes:pull
   -> HMAC-authenticated scoped checkpoint opens to ordered FDB position
-  -> FDB read transaction rechecks the Braid-bound scope/request/frontier
+  -> FDB read transaction rechecks normalized scope/action/frontier
   -> bounded PullPage
   -> CRDT verifies/merges all changes
   -> local snapshots + indexes + events + checkpoint commit atomically
@@ -144,6 +148,30 @@ an empty page that claims more work is rejected as non-progress. A valid expired
 checkpoint produces HTTP 410 and an explicit full-resync transition; forged or
 cross-scope checkpoints fail rather than guessing continuity. Notifications,
 when added by a host, are only pull hints.
+
+## Server baselines and retention
+
+This stack layer adds a state-bearing server recovery artifact and makes it a
+prune precondition. `SnapshotArtifact` v2 is content addressed with the
+`logical-db-baseline-v2` SHA-256 domain. Its digest covers the immutable scope,
+log position, ordered document IDs, canonical native document snapshots, and
+each document's tombstone bit. The artifact is bounded to 256 documents and
+4 MiB of aggregate snapshot bytes; its fixed descriptor records the version,
+position, digest, document count, and byte length.
+
+Position-only v1 `SnapshotRecord`s remain readable for migration and inspection,
+but are prune-ineligible. A v2 artifact is required before the retention floor
+can advance. FoundationDB reconstructs the artifact from the immutable log,
+rechecks the supplied descriptor and document states against the same frontier,
+and atomically seals the pointer, document manifests, and snapshot chunks in a
+single transaction. The prune transaction revalidates the v2 descriptor and
+every manifest and chunk before clearing the collected log prefix, while also
+checking the frontier, live checkpoints, and peer-consumption watermark.
+
+This establishes the server-side prune gate; it does not close issue #28. The
+next stack layer must provide paged HTTP recovery and one atomic client install
+of the recovered document state and checkpoint after expiry. No hosted
+full-recovery journey is claimed by this layer.
 
 ## Internal axes
 
@@ -169,6 +197,11 @@ root / (3, account UUID, space UUID) /
   (3, sequence)                       ordered change manifest
   (4, sequence, chunk)                64 KiB canonical-change chunks
   (5, invocation digest)              single-use Braid execution marker
+  (6)                                 retention floor and peer-consumption watermark
+  (7)                                 v2 snapshot baseline descriptor
+  (8, baseline digest, document UUID) state document manifest
+  (9, baseline digest, document UUID, chunk)
+                                      canonical state snapshot chunks
 ```
 
 Chunking stays below FDB’s 100 kB value limit. Every adapter transaction applies
@@ -190,7 +223,8 @@ writes are `Irreversible`, and synchronization is `Egress` with a vault ceiling.
 Write and sync capsules must carry Braid's dangerous-operation confirmation
 policy; a capability string alone is insufficient.
 The snapshot commits to account, space, exact DB effect (point read and scan are
-distinct), request digest, current durable frontier, and exclusive expiry.
+distinct), canonical action digest, current durable frontier, and exclusive
+expiry. The caller's intent digest remains a separate idempotency field.
 `BraidGrant` retains that verifier-owned runnable;
 the service passes it unchanged to FDB, which atomically consumes its combined
 capsule/registry/authority/snapshot/predicate identity with a new operation.
@@ -234,11 +268,17 @@ Windows app embeds redb and uses the rustls HTTP client when cloud sync is enabl
 
 ## Deliberate release blockers
 
-The v1 log is append-only. It has no server snapshot baseline/retention floor,
-no peer-aware garbage collection, and no first-class document tombstone. The
-embedded store also lacks a supported portable export/restore contract. Deleting
-history before those pieces exist could strand an expired client, so this
-implementation intentionally does not disguise unsafe pruning as compaction.
+The service log retains immutable ordered entries until collection, and this stack supplies a bounded,
+content-addressed v2 server baseline with a transactional retention floor and
+peer-aware prune gate. The artifact carries native document state and explicit
+tombstone markers. A readable v1 position-only record cannot authorize pruning,
+and the FDB transaction validates the v2 artifact before deleting history.
+Deleting history is still not a complete client recovery contract: paged HTTP
+baseline recovery and atomic client installation remain in the next stack layer,
+so issue #28 remains open. The embedded store has a versioned portable
+export/restore contract; its direct process-kill-during-restore receipt remains
+outstanding. This implementation does not treat the server prune gate as proof
+of end-to-end recovery.
 The standalone service is additionally blocked on externally verifiable,
 request-bound Braid confirmation evidence for irreversible and egress effects.
 Multi-node FDB failover/restore, public ingress, mobile sandboxing, and sustained

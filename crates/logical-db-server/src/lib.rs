@@ -448,11 +448,58 @@ mod tests {
 
     use super::*;
 
+    use logical_db_model::ActionDigest;
+    use logical_db_protocol::{PageAction, write_action};
+
     struct Allow;
+    #[derive(Clone, Copy)]
+    struct ExactAction {
+        scope: Scope,
+        action: ActionDigest,
+    }
+
+    impl Authority for ExactAction {
+        type Grant = Grant;
+
+        fn authorize(
+            &self,
+            scope: Scope,
+            effect: Effect,
+            action: ActionDigest,
+            frontier: u64,
+            _now: u64,
+        ) -> Option<Grant> {
+            if scope != self.scope || effect != Effect::Write || action != self.action {
+                return None;
+            }
+            Some(Grant {
+                scope,
+                effect,
+                action,
+                frontier,
+            })
+        }
+    }
+
+    impl Authenticator for ExactAction {
+        type Policy = Self;
+
+        fn authenticate(
+            &self,
+            authorization: &HeaderValue,
+            _now: u64,
+        ) -> Result<Self, AuthenticationError> {
+            if authorization.as_bytes() == b"Bearer integration-test" {
+                Ok(*self)
+            } else {
+                Err(AuthenticationError::Unauthorized)
+            }
+        }
+    }
     struct Grant {
         scope: Scope,
         effect: Effect,
-        request: OperationDigest,
+        action: ActionDigest,
         frontier: u64,
     }
 
@@ -463,14 +510,14 @@ mod tests {
         fn effect(&self) -> Effect {
             self.effect
         }
-        fn request(&self) -> OperationDigest {
-            self.request
+        fn action(&self) -> ActionDigest {
+            self.action
         }
         fn frontier(&self) -> u64 {
             self.frontier
         }
         fn invocation_id(&self) -> [u8; 32] {
-            self.request.into_bytes()
+            self.action.into_bytes()
         }
     }
 
@@ -481,14 +528,14 @@ mod tests {
             &self,
             scope: Scope,
             effect: Effect,
-            request: OperationDigest,
+            action: ActionDigest,
             frontier: u64,
             _now_unix_ms: u64,
         ) -> Option<Self::Grant> {
             Some(Grant {
                 scope,
                 effect,
-                request,
+                action,
                 frontier,
             })
         }
@@ -531,7 +578,7 @@ mod tests {
             &self,
             scope: Scope,
             effect: Effect,
-            request: OperationDigest,
+            action: ActionDigest,
             frontier: u64,
             now_unix_ms: u64,
         ) -> Option<Self::Grant> {
@@ -544,7 +591,7 @@ mod tests {
             Some(Grant {
                 scope,
                 effect,
-                request,
+                action,
                 frontier,
             })
         }
@@ -597,11 +644,7 @@ mod tests {
 
         fn page(
             &self,
-            _scope: Scope,
-            _request: OperationDigest,
-            _after: u64,
-            _max_changes: u16,
-            _max_bytes: u32,
+            _action: PageAction,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
             ready(Ok(PageResult::StaleAuthority))
@@ -644,11 +687,7 @@ mod tests {
 
         fn page(
             &self,
-            _scope: Scope,
-            _request: OperationDigest,
-            _after: u64,
-            _max_changes: u16,
-            _max_bytes: u32,
+            _action: PageAction,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
             ready(Err(ClassifiedStoreError::InvalidData))
@@ -684,8 +723,14 @@ mod tests {
         fn accept(
             &self,
             change: &ChangeEnvelope,
-            _grant: &impl ExecutionGrant,
+            grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
+            if grant.scope() != change.scope
+                || grant.effect() != Effect::Write
+                || grant.action() != write_action(change)
+            {
+                return ready(Ok(AcceptResult::StaleAuthority));
+            }
             let mut operations = self.operations.lock().unwrap();
             let outcome = if let Some(existing) = operations.get(&change.operation) {
                 if *existing == (change.request, change.digest) {
@@ -714,17 +759,21 @@ mod tests {
 
         fn page(
             &self,
-            scope: Scope,
-            request: OperationDigest,
-            after: u64,
-            max_changes: u16,
-            _max_bytes: u32,
+            action: PageAction,
             grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            let PageAction {
+                scope,
+                after,
+                max_changes,
+                max_bytes: _max_bytes,
+                ..
+            } = action;
+
             let changes = self.changes.lock().unwrap();
             if grant.scope() != scope
                 || grant.effect() != Effect::Sync
-                || grant.request() != request
+                || grant.action() != action.digest()
                 || grant.frontier()
                     != changes
                         .iter()
@@ -775,11 +824,7 @@ mod tests {
 
         fn page(
             &self,
-            _scope: Scope,
-            _request: OperationDigest,
-            _after: u64,
-            _max_changes: u16,
-            _max_bytes: u32,
+            _action: PageAction,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
             ready(Ok(PageResult::Page(StoredPage {
@@ -824,6 +869,66 @@ mod tests {
             digest: encoded.digest,
             bytes: encoded.bytes,
         }
+    }
+
+    async fn push_one(app: Router, change: ChangeEnvelope) -> PushOutcome {
+        let push = PushRequest {
+            protocol: PROTOCOL_VERSION,
+            replica: change.replica,
+            changes: vec![change],
+        };
+        let response = app
+            .oneshot(request("/v1/changes:push", encode(&push)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+            .await
+            .unwrap();
+        let mut decoded: PushResponse = ciborium::from_reader(body.as_ref()).unwrap();
+        assert_eq!(decoded.outcomes.len(), 1);
+        decoded.outcomes.remove(0)
+    }
+
+    #[tokio::test]
+    async fn fixed_action_rejects_wire_mutations_and_accepts_exact_retry() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let original = change(scope, ReplicaId::new());
+        let action = ExactAction {
+            scope,
+            action: write_action(&original),
+        };
+        let app = router(
+            Memory::default(),
+            action,
+            CheckpointCodec::new([9; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let mut mutations = vec![original.clone(); 8];
+        mutations[0].scope = Scope::new(AccountId::new(), scope.space());
+        mutations[1].scope = Scope::new(scope.account(), SpaceId::new());
+        mutations[2].document = DocumentId::new();
+        mutations[3].operation = OperationId::new();
+        mutations[4].replica = ReplicaId::new();
+        mutations[5].request = OperationDigest::new([99; 32]);
+        mutations[6].digest = ChangeDigest::new([99; 32]);
+        let replacement = change(scope, original.replica);
+        mutations[7].bytes = replacement.bytes;
+        mutations[7].digest = replacement.digest;
+        for mutation in mutations {
+            assert!(matches!(
+                push_one(app.clone(), mutation).await,
+                PushOutcome::Rejected { .. }
+            ));
+        }
+        assert!(matches!(
+            push_one(app.clone(), original.clone()).await,
+            PushOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            push_one(app, original).await,
+            PushOutcome::Duplicate { .. }
+        ));
     }
 
     #[test]

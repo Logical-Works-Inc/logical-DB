@@ -95,7 +95,9 @@ round-trips through a document with its evidence-subset guard intact. See
   host supplies externally prepared grants; it also refuses a non-loopback
   plaintext bind.
 - **Ecosystem host:** Logic OS or another host nests the same router and uses
-  `logical-db-braid` to admit exact account/space/request capabilities. The host
+  `logical-db-braid` to admit exact account/space/action capabilities computed
+  after native validation. Application request digests remain retry identities.
+  The host
   does not own embedded CRUD.
 
 The wire boundary is two versioned CBOR operations:
@@ -112,8 +114,14 @@ also has deterministic state-machine tests, crash-resumable schema migration,
 kill/restart journeys, mutation campaigns, and official FDB unknown-commit
 injection. The former facade-to-daemon journey is explicitly retired because
 its confirmation model was unsound. `REWRITE_MANIFEST.md` remains
-authoritative. The implemented core is not being called production-complete
-while server-log retention/snapshot baselines, embedded export/restore,
-deletion/tombstone policy, multi-node FDB recovery, public TLS/issuer
-integration, runtime Braid confirmation, sustained load, and external LEM
-consumption remain unproven or unimplemented.
+authoritative. Embedded tombstones and export/restore are implemented and have
+retained tests. Canonical action-byte authorization is implemented and exercised
+through the HTTP/service/FDB seam. The v2 state-bearing server baseline,
+retention floor, and transactional prune gate are established, but production
+completion still requires paged HTTP baseline recovery and atomic client
+installation, independent runtime Braid confirmation, projection semantic
+identity, multi-node FDB recovery, public TLS/issuer integration, sustained
+load, external LEM consumption, and direct process-kill restore evidence.
+
+See [GOVERNANCE.md](GOVERNANCE.md) for delivered evidence, open acceptance work,
+and the Director decisions needed to reconcile historical scope contracts.
