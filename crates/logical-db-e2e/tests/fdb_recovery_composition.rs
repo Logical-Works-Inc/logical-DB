@@ -16,11 +16,11 @@
 use std::{error::Error, fs, io};
 
 use logical_db::{
-    AccountId, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId, ReplicaId,
-    Scalar, Scope, SpaceId, SyncLimits,
+    AccountId, BatchEdit, Database, DocumentId, Object, OperationDigest, OperationId, PeerId,
+    ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     http::{HttpTransport, StaticBearer, Url},
 };
-use logical_db_model::{ActionDigest, Effect};
+use logical_db_model::{ActionDigest, Effect, MAX_BASELINE_PAGE_DOCUMENTS};
 use logical_db_protocol::{mark_consumed_action, prune_action, seal_snapshot_action};
 use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
 use logical_db_service::{
@@ -145,30 +145,47 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let mut transport = HttpTransport::new(endpoint, StaticBearer::new("recovery-fixture")?)?;
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
-    let document = DocumentId::new();
     let peer = PeerId::new();
     let run = uuid::Uuid::now_v7();
     let first_path = std::env::temp_dir().join(format!("logical-db-fdb-recovery-first-{run}.redb"));
     let second_path =
         std::env::temp_dir().join(format!("logical-db-fdb-recovery-second-{run}.redb"));
+    let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
+    let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
 
     let first = Database::open(&first_path, scope, ReplicaId::new())?;
-    first.edit(
-        document,
-        OperationId::new(),
-        OperationDigest::new([0x51; 32]),
-        |editor| editor.put(&Object::root(), "state", Scalar::String("sealed".into())),
-    )?;
-    first
-        .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-        .await?;
+    for (batch, chunk) in documents.chunks(150).enumerate() {
+        let edits = chunk
+            .iter()
+            .enumerate()
+            .map(|(offset, document)| {
+                let index = batch * 150 + offset;
+                let value = i64::try_from(index % 1_000)?;
+                Ok(BatchEdit::new(
+                    *document,
+                    OperationId::new(),
+                    OperationDigest::new([u8::try_from(index % 256)?; 32]),
+                    move |editor| editor.put(&Object::root(), "state", Scalar::Integer(value)),
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        first.edit_many(edits)?;
+    }
+    for _round in 0..8 {
+        first
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await?;
+        if read_frontier(&prune_store, scope).await? == u64::try_from(total)? {
+            break;
+        }
+    }
     let seeded = read_frontier(&prune_store, scope).await?;
-    if seeded != 1 {
+    if seeded != u64::try_from(total)? {
         eprintln!("fdb-recovery-composition: first replica seeded frontier={seeded}");
-        return Err(io::Error::other("first replica did not seed exactly one change").into());
+        return Err(io::Error::other("first replica did not seed every document").into());
     }
 
-    seal_consume_and_prune(&prune_store, scope).await?;
+    seal_consume_and_prune(&prune_store, scope, u64::try_from(total)?).await?;
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
@@ -178,20 +195,24 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         eprintln!("fdb-recovery-composition: fresh replica did not install a baseline");
         return Err(io::Error::other("fresh replica did not require recovery").into());
     }
-    let observed = second.read(document, |reader| reader.get(&Object::root(), "state"))?;
-    if observed != Some(Some(Item::Scalar(Scalar::String("sealed".into())))) {
-        eprintln!("fdb-recovery-composition: replica state diverged after recovery: {observed:?}");
-        return Err(io::Error::other("recovered replica lost its document state").into());
+    for document in &documents {
+        if second
+            .read(*document, |reader| reader.get(&Object::root(), "state"))?
+            .is_none()
+        {
+            eprintln!("fdb-recovery-composition: replica state diverged after recovery");
+            return Err(io::Error::other("recovered replica lost a document").into());
+        }
     }
     let frontier = read_frontier(&prune_store, scope).await?;
     let floor = read_floor(&prune_store, scope).await?;
-    if frontier != 1 || floor != 1 {
+    if frontier != u64::try_from(total)? || floor != u64::try_from(total)? {
         eprintln!("fdb-recovery-composition: durable retention frontier={frontier} floor={floor}");
         return Err(io::Error::other("prune did not retain the sealed baseline").into());
     }
 
     println!(
-        "PASS fdb-http-recovery route=/v1/recovery:baseline recovered=true documents=1 frontier={frontier} floor={floor} store=real-fdb scope=isolated"
+        "PASS fdb-http-recovery route=/v1/recovery:baseline recovered=true documents={total} frontier={frontier} floor={floor} store=real-fdb scope=isolated"
     );
 
     drop((first, second));
@@ -205,8 +226,9 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 async fn seal_consume_and_prune(
     store: &FdbServiceStore,
     scope: Scope,
+    through: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let artifact = store.build_snapshot(scope, 1).await?;
+    let artifact = store.build_snapshot(scope, through).await?;
     let frontier = store.frontier(scope).await?;
     let seal_request = OperationDigest::new([0x52; 32]);
     if store
@@ -222,7 +244,7 @@ async fn seal_consume_and_prune(
             ),
         )
         .await?
-        != (SealResult::Sealed { position: 1 })
+        != (SealResult::Sealed { position: through })
     {
         eprintln!("fdb-recovery-composition: baseline did not seal");
         return Err(io::Error::other("baseline did not seal").into());
@@ -231,18 +253,18 @@ async fn seal_consume_and_prune(
     if store
         .mark_consumed(
             scope,
-            1,
+            through,
             consumed_request,
             &grant(
                 scope,
                 Effect::Sync,
-                mark_consumed_action(scope, consumed_request, 1),
+                mark_consumed_action(scope, consumed_request, through),
                 frontier,
             ),
         )
         .await?
         != (ConsumedResult::Advanced {
-            consumed_through: 1,
+            consumed_through: through,
         })
     {
         eprintln!("fdb-recovery-composition: consumption did not advance");
@@ -252,20 +274,20 @@ async fn seal_consume_and_prune(
     if store
         .prune(
             scope,
-            1,
+            through,
             None,
             prune_request,
             &grant(
                 scope,
                 Effect::Sync,
-                prune_action(scope, prune_request, 1, None),
+                prune_action(scope, prune_request, through, None),
                 frontier,
             ),
         )
         .await?
         != (PruneResult::Pruned(PruneReceipt {
-            pruned_through: 1,
-            floor: 1,
+            pruned_through: through,
+            floor: through,
         }))
     {
         eprintln!("fdb-recovery-composition: prune did not collect the log prefix");

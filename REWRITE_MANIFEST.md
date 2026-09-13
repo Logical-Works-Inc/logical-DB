@@ -86,11 +86,12 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Integrate independently verifiable, exact-request Braid confirmation
   evidence before enabling daemon write or synchronization authority. Pinned
   Braid's capsule flag alone is not treated as runtime evidence.
-- [ ] Close server recovery before pruning: expose paged HTTP baseline recovery
+- [x] Close server recovery before pruning: expose paged HTTP baseline recovery
   and install the recovered document state plus checkpoint atomically in the
   client. The v2 server baseline, retention floor, and transactional prune gate
-  are established by the current stack layer, but issue #28 remains open until
-  this client journey is proven.
+  are established, and the paged client journey is proven by
+  `a_baseline_larger_than_one_page_recovers_through_real_http` and the live
+  `fdb_recovery_composition` journey at 300 documents.
 - [x] Implement embedded document tombstones and versioned export/restore with
   retained facade/store tests for reopen, propagation, corrupt input, and
   resuming a restore prefix.

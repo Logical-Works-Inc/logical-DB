@@ -545,9 +545,8 @@ mod runtime {
     };
     use foundationdb_tuple::Subspace;
     use logical_db_model::{
-        DocumentId, Effect, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS,
-        MAX_BASELINE_PAGE_DOCUMENTS, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
-        SnapshotDocument, SnapshotRecord,
+        DocumentId, Effect, MAX_BASELINE_BYTES, MAX_BASELINE_PAGE_DOCUMENTS, OperationDigest,
+        Scope, SnapshotArtifact, SnapshotBaseline, SnapshotDocument, SnapshotRecord,
     };
     use logical_db_protocol::{
         ChangeEnvelope, PageAction, RecoveryAction, mark_consumed_action, prune_action,
@@ -1250,23 +1249,47 @@ mod runtime {
             position = baseline.position();
             base = Some(artifact);
         }
-        let begin = spaces.log.pack(&(position.saturating_add(1),));
         let end = through
             .checked_add(1)
             .map_or_else(|| spaces.log.range().1, |next| spaces.log.pack(&(next,)));
-        let mut options = RangeOption::from((begin.as_slice(), end.as_slice()));
-        options.limit = Some(MAX_BASELINE_CHANGES + 1);
-        options.target_bytes = MAX_BASELINE_BYTES;
-        let values = transaction.get_range(&options, 1, false).await?;
-        if values.len() > MAX_BASELINE_CHANGES || values.more() {
-            eprintln!("logical-db-store-fdb: baseline replay exceeds change budget");
-            return Err(binding(DataError::BaselineResourceLimit));
+        // A single range read may be truncated by the client before either the
+        // row or byte budget is reached, so continue from the last sequence
+        // until the range is exhausted or the change budget is exceeded.
+        let mut manifests = Vec::new();
+        let mut next_sequence = position.saturating_add(1);
+        loop {
+            let begin = spaces.log.pack(&(next_sequence,));
+            let remaining = MAX_BASELINE_CHANGES
+                .saturating_add(1)
+                .saturating_sub(manifests.len());
+            let options = RangeOption {
+                begin: KeySelector::first_greater_or_equal(begin.as_slice()),
+                end: KeySelector::first_greater_or_equal(end.as_slice()),
+                limit: Some(remaining.max(1)),
+                target_bytes: MAX_BASELINE_BYTES,
+                ..RangeOption::default()
+            };
+            let values = transaction.get_range(&options, 1, false).await?;
+            let more = values.more();
+            manifests.extend(
+                values
+                    .iter()
+                    .map(|value| (value.key().to_vec(), value.value().to_vec())),
+            );
+            if manifests.len() > MAX_BASELINE_CHANGES {
+                eprintln!("logical-db-store-fdb: baseline replay exceeds change budget");
+                return Err(binding(DataError::BaselineResourceLimit));
+            }
+            if !more {
+                break;
+            }
+            let Some((last, _)) = manifests.last() else {
+                eprintln!("logical-db-store-fdb: baseline replay reported more without progress");
+                return Err(binding(DataError::BaselineResourceLimit));
+            };
+            let (sequence,) = spaces.log.unpack::<(u64,)>(last).map_err(binding_invalid)?;
+            next_sequence = sequence.saturating_add(1);
         }
-        let manifests = values
-            .iter()
-            .map(|value| (value.key().to_vec(), value.value().to_vec()))
-            .collect::<Vec<_>>();
-        drop(values);
         let mut changes = Vec::with_capacity(manifests.len());
         for (key, value) in manifests {
             let (sequence, change, next_bytes) = load_baseline_change(
@@ -1342,20 +1365,58 @@ mod runtime {
     ) -> Result<SnapshotArtifact, FdbBindingError> {
         let digest = baseline.digest().into_bytes();
         let document_space = spaces.document.subspace(&(digest.as_slice(),));
-        let (begin, end) = document_space.range();
-        let mut options = RangeOption::from((begin.as_slice(), end.as_slice()));
-        options.limit = Some(MAX_BASELINE_DOCUMENTS + 1);
-        options.target_bytes = MAX_BASELINE_BYTES;
-        let values = transaction.get_range(&options, 1, false).await?;
-        if values.len() != baseline.document_count() as usize || values.more() {
+        let (space_begin, space_end) = document_space.range();
+        // The client may truncate a range read before the row budget is reached,
+        // so continue from the last document until the range is exhausted. The
+        // descriptor still bounds the total count and aggregate bytes.
+        let expected_count = baseline.document_count() as usize;
+        let mut manifests = Vec::new();
+        let mut cursor = space_begin;
+        let mut exclusive = false;
+        loop {
+            let remaining = expected_count
+                .saturating_add(1)
+                .saturating_sub(manifests.len());
+            let begin = if exclusive {
+                KeySelector::first_greater_than(cursor.as_slice())
+            } else {
+                KeySelector::first_greater_or_equal(cursor.as_slice())
+            };
+            let options = RangeOption {
+                begin,
+                end: KeySelector::first_greater_or_equal(space_end.as_slice()),
+                limit: Some(remaining.max(1)),
+                target_bytes: MAX_BASELINE_BYTES,
+                ..RangeOption::default()
+            };
+            let values = transaction.get_range(&options, 1, false).await?;
+            let more = values.more();
+            let last = values.iter().last().map(|value| value.key().to_vec());
+            manifests.extend(
+                values
+                    .iter()
+                    .map(|value| (value.key().to_vec(), value.value().to_vec())),
+            );
+            if manifests.len() > expected_count {
+                eprintln!("logical-db-store-fdb: baseline manifest count is inconsistent");
+                return Err(binding(DataError::BaselineCorrupt));
+            }
+            if !more {
+                break;
+            }
+            let Some(last) = last else {
+                eprintln!(
+                    "logical-db-store-fdb: baseline manifest read reported more without progress"
+                );
+                return Err(binding(DataError::BaselineCorrupt));
+            };
+            cursor = last;
+            exclusive = true;
+        }
+        if manifests.len() != expected_count {
             eprintln!("logical-db-store-fdb: baseline manifest count is inconsistent");
             return Err(binding(DataError::BaselineCorrupt));
         }
-        let manifests = values
-            .iter()
-            .map(|value| (value.key().to_vec(), value.value().to_vec()))
-            .collect::<Vec<_>>();
-        drop(values);
         let mut documents = Vec::with_capacity(manifests.len());
         let mut aggregate_bytes = 0_usize;
         let expected_bytes = usize::try_from(baseline.byte_len()).map_err(binding_invalid)?;
@@ -1413,9 +1474,7 @@ mod runtime {
         let (space_begin, space_end) = document_space.range();
         let begin = after.map_or_else(
             || KeySelector::first_greater_or_equal(space_begin),
-            |cursor| {
-                KeySelector::first_greater_than(document_space.pack(&(digest.as_slice(), cursor)))
-            },
+            |cursor| KeySelector::first_greater_than(document_space.pack(&(cursor,))),
         );
         let options = RangeOption {
             begin,

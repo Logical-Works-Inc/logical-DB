@@ -17,8 +17,8 @@ mod tests {
     };
 
     use logical_db::{
-        AccountId, ChangeEvent, Database, DatabaseError, DatabaseErrorKind, DocumentId, IndexId,
-        IndexValue, Item, Object, OperationDigest, OperationId, PeerId, Projection,
+        AccountId, BatchEdit, ChangeEvent, Database, DatabaseError, DatabaseErrorKind, DocumentId,
+        IndexId, IndexValue, Item, Object, OperationDigest, OperationId, PeerId, Projection,
         ProjectionSemantics, RemoteChange, ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     };
     use logical_db_http::{HttpTransport, StaticBearer};
@@ -806,6 +806,97 @@ mod tests {
                 .unwrap(),
             Some(Some(Item::Scalar(Scalar::String("sealed".into()))))
         );
+
+        drop((first, second));
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn a_baseline_larger_than_one_page_recovers_through_real_http() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(a_baseline_larger_than_one_page_recovers_body());
+    }
+
+    async fn a_baseline_larger_than_one_page_recovers_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([25; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let first_path = path("paged-recovery-first");
+        let second_path = path("paged-recovery-second");
+        let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
+
+        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        for (batch, chunk) in documents.chunks(150).enumerate() {
+            let edits = chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, document)| {
+                    let index = batch * 150 + offset;
+                    let value = i64::try_from(index % 1_000).unwrap();
+                    BatchEdit::new(
+                        *document,
+                        OperationId::new(),
+                        OperationDigest::new([u8::try_from(index % 256).unwrap(); 32]),
+                        move |editor| editor.put(&Object::root(), "page", Scalar::Integer(value)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            first.edit_many(edits).unwrap();
+        }
+        for _round in 0..8 {
+            first
+                .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+                .await
+                .unwrap();
+            if store.frontier(scope).await.unwrap() == u64::try_from(total).unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            store.frontier(scope).await.unwrap(),
+            u64::try_from(total).unwrap()
+        );
+
+        seal_consume_and_prune_through(&store, scope, u64::try_from(total).unwrap()).await;
+
+        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let report = second
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        assert!(report.recovered, "a >256-document baseline must recover");
+        for document in &documents {
+            assert!(
+                second
+                    .read(*document, |reader| reader.get(&Object::root(), "page"))
+                    .unwrap()
+                    .is_some(),
+                "every document in the paged baseline is installed"
+            );
+        }
 
         drop((first, second));
         fs::remove_file(first_path).unwrap();

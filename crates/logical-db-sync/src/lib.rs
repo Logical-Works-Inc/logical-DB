@@ -14,8 +14,9 @@ use logical_db_model::{
     ReplicaId, Scope, SnapshotArtifact, is_namespace_checkpoint_expired, validate_namespace,
 };
 use logical_db_protocol::{
-    BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError,
-    PullPage, PullRequest, PushOutcome, PushRequest, PushResponse, RejectionCode,
+    BaselineAccumulator, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint,
+    PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
+    RejectionCode,
 };
 use sha2::{Digest, Sha256};
 
@@ -496,10 +497,13 @@ where
 
 /// Installs the state-bearing baseline after the service collected the prefix.
 ///
-/// Returns whether a baseline was installed. `false` reports that no baseline is
-/// sealed for the scope, so the durable log still covers every position and the
-/// caller restarts from the floor. A second recovery request in one cycle is a
-/// loud protocol failure, never a silent loop.
+/// Fetches one bounded page at a time, folds them into the descriptor identity,
+/// and installs the assembled document state plus its checkpoint in one durable
+/// replica transition. A page that repeats or skips a cursor, changes the
+/// descriptor, or reports no baseline mid-sequence is a loud protocol failure,
+/// never a partial install. `false` reports that no baseline is sealed for the
+/// scope, so the durable log still covers every position and the caller restarts
+/// from the floor.
 async fn install_recovery<R, T>(
     replica: &R,
     peer: PeerId,
@@ -516,34 +520,65 @@ where
         return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
     }
     *restarted = true;
+    let BaselineResult::Artifact(page) =
+        request_baseline_page(transport, replica, after.as_ref(), None).await?
+    else {
+        *after = None;
+        return Ok(false);
+    };
+    let descriptor = page
+        .validate_page(replica.scope())
+        .map_err(SyncError::Protocol)?;
+    let mut accumulator = BaselineAccumulator::new(replica.scope(), descriptor);
+    let mut checkpoint = page.checkpoint.clone();
+    let mut complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
+    let mut cursor = page.next_document;
+    while !complete {
+        let Some(next) = cursor else {
+            eprintln!("logical-db-sync: a continued recovery carried no cursor");
+            return Err(SyncError::Protocol(ProtocolError::NonProgressPage));
+        };
+        let BaselineResult::Artifact(page) =
+            request_baseline_page(transport, replica, after.as_ref(), Some(next)).await?
+        else {
+            eprintln!("logical-db-sync: a continued recovery reported no baseline");
+            return Err(SyncError::Protocol(ProtocolError::BaselineMismatch));
+        };
+        checkpoint = page.checkpoint.clone();
+        complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
+        cursor = page.next_document;
+    }
+    let artifact = accumulator.finish().map_err(SyncError::Protocol)?;
+    replica
+        .install_baseline(peer, &artifact, checkpoint.as_wire())
+        .map_err(SyncError::Replica)?;
+    *after = Some(checkpoint);
+    Ok(true)
+}
+
+/// Requests exactly one bounded baseline page at one exclusive cursor.
+async fn request_baseline_page<R, T>(
+    transport: &mut T,
+    replica: &R,
+    after: Option<&Checkpoint>,
+    cursor: Option<DocumentId>,
+) -> Result<BaselineResult, SyncError<R::Error, T::Error>>
+where
+    R: ReplicaPort,
+    T: Transport,
+{
     let request = BaselineRequest {
         protocol: PROTOCOL_VERSION,
         scope: replica.scope(),
         replica: replica.replica(),
-        request: baseline_request_digest(replica.scope(), replica.replica(), after.as_ref()),
-        after: after.clone(),
-        after_document: None,
+        request: baseline_request_digest(replica.scope(), replica.replica(), after, cursor),
+        after: after.cloned(),
+        after_document: cursor,
     };
     request.validate().map_err(SyncError::Protocol)?;
-    match fetch_baseline(transport, request)
+    fetch_baseline(transport, request)
         .await
-        .map_err(SyncError::Transport)?
-    {
-        BaselineResult::Artifact(page) => {
-            let artifact = page
-                .validate(replica.scope())
-                .map_err(SyncError::Protocol)?;
-            replica
-                .install_baseline(peer, &artifact, page.checkpoint.as_wire())
-                .map_err(SyncError::Replica)?;
-            *after = Some(page.checkpoint);
-            Ok(true)
-        }
-        BaselineResult::Unavailable => {
-            *after = None;
-            Ok(false)
-        }
-    }
+        .map_err(SyncError::Transport)
 }
 
 async fn fetch_baseline<T: Transport>(
@@ -557,6 +592,7 @@ fn baseline_request_digest(
     scope: Scope,
     replica: ReplicaId,
     after: Option<&Checkpoint>,
+    after_document: Option<DocumentId>,
 ) -> OperationDigest {
     let mut digest = Sha256::new();
     digest.update(b"logical-db/baseline/v1");
@@ -567,6 +603,13 @@ fn baseline_request_digest(
         Some(checkpoint) => {
             digest.update([1]);
             digest.update(checkpoint.as_wire());
+        }
+        None => digest.update([0]),
+    }
+    match after_document {
+        Some(cursor) => {
+            digest.update([1]);
+            digest.update(cursor.as_uuid().as_bytes());
         }
         None => digest.update([0]),
     }
@@ -2172,6 +2215,32 @@ mod tests {
         }
     }
 
+    fn page_for(
+        artifact: &SnapshotArtifact,
+        slice: &[logical_db_model::SnapshotDocument],
+        more: bool,
+    ) -> BaselinePage {
+        BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: artifact.baseline.encode().to_vec(),
+            documents: slice
+                .iter()
+                .map(|document| logical_db_protocol::BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
+            more,
+            next_document: if more {
+                slice.last().map(|document| document.document)
+            } else {
+                None
+            },
+        }
+    }
+
     #[test]
     fn baseline_required_installs_state_before_the_suffix_commit() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
@@ -2215,6 +2284,37 @@ mod tests {
             *replica.checkpoint.borrow(),
             Some(suffix_checkpoint.as_wire().to_vec())
         );
+    }
+
+    #[test]
+    fn a_broken_paged_recovery_installs_nothing() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let mut documents = (0..=logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS)
+            .map(|index| logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![u8::try_from(index % 251).unwrap() + 1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        let artifact = SnapshotArtifact::new(scope, 3, documents.clone()).unwrap();
+        let (first, _rest) = documents.split_at(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
+        let mut wire = RecoveryWire {
+            pulls: [PullResult::BaselineRequired].into(),
+            baseline: Some(page_for(&artifact, first, true)),
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || false,
+        ));
+        assert!(result.is_err());
+        assert!(replica.baselines.borrow().is_empty());
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
     }
 
     #[test]

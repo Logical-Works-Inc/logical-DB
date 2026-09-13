@@ -248,7 +248,8 @@ where
             return Ok(BaselineResult::Unavailable);
         }
         let page = decode_response::<BaselinePage>(response).await?;
-        page.validate(request.scope).map_err(HttpError::Protocol)?;
+        page.validate_page(request.scope)
+            .map_err(HttpError::Protocol)?;
         Ok(BaselineResult::Artifact(page))
     }
 }
