@@ -68,13 +68,16 @@ CredentialProvider, StaticBearer}` without coupling an app to internal crates.
 Custom transports implement the facade-exported `logical_db::transport::Transport`
 using its versioned push/pull types.
 
-Hosts that persist semantic observations enable the facade's `semantics`
-feature to reuse the `logical-db-cairn` observation vocabulary and the
-`logical-db-episode` content-hashed log through the same `Database` API. The
-feature stays off by default so embedded replicas keep their minimal
-footprint, and `logical-db-e2e` carries a network-free journey proving an
-episode snapshot round-trips through a document with its evidence-subset
-guard intact.
+Hosts that model semantic observations may enable the facade's `semantics`
+feature to reuse the bounded, non-authoritative `logical-db-cairn` vocabulary
+and `logical-db-episode` local model through the same `Database` API. This is
+not the canonical CAIRN ingestion path or the durable ORIGIN episode database,
+and its v1 SHA-256 snapshot is not the locked LEM v0 BLAKE3 wire. A reviewed
+versioned adapter is required for external LEM consumption. The feature stays
+off by default so embedded replicas keep their minimal footprint, and
+`logical-db-e2e` carries a network-free journey proving an episode snapshot
+round-trips through a document with its evidence-subset guard intact. See
+`docs/adr/0001-semantic-plane-boundary.md`.
 
 ## Deployment shapes
 

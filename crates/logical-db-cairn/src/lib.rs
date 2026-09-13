@@ -1,4 +1,4 @@
-//! Cairn semantic observations ported into Logical-DB.
+//! Non-authoritative Cairn semantic observations ported into Logical-DB.
 //!
 //! Evidence: S11 S12 S13 establish local-first, causal, and authenticated
 //! semantic records; S17 S22 bound hostile values and corruption handling;
@@ -16,7 +16,8 @@
 //! authority-weight and content-hash concepts from
 //! `cairn/crates/wm-core`, and deny-first steering with trust-graded
 //! memory claims from the Cairn steering/memory broker (smb).
-//! Bounds fail closed with rejection diagnostics; no storage or network access.
+//! Bounds fail closed with rejection diagnostics; no storage, network,
+//! ingestion, or canonicity authority is present here.
 
 #![forbid(unsafe_code)]
 

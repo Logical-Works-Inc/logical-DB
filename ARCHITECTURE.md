@@ -24,10 +24,17 @@ application / LEM
         |     `-- logical-db-protocol    versioned transport-neutral messages
         `-- logical-db-platform          Windows/macOS/Linux data placement
 
-semantic layer (above model, below applications / LEM)
+semantic ports (above model, below applications / LEM; non-authoritative)
   |-- logical-db-episode               content-hashed episode log + operators
   |     `-- logical-db-cairn           typed world-token observation vocabulary
   `-- consumed optionally by logical-db (semantics feature) and logical-db-e2e
+
+The semantic ports are bounded local models. They do not own CAIRN ingestion,
+canonical ORIGIN persistence, or FORGE receipts. The LEM SOT remains the
+authority for those planes; the locked LEM v0 BLAKE3 wire is not interchangeable
+with the workspace v1 SHA-256 semantic snapshot. A future adapter must make
+that translation and its durable handoff explicit. See
+`docs/adr/0001-semantic-plane-boundary.md`.
 
 thin client
   `-- logical-db-http                    pooled async TLS/CBOR transport

@@ -4,10 +4,11 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 //!
-//! The optional `semantics` feature re-exports the `logical-db-cairn` and
-//! `logical-db-episode` vocabularies for hosts that persist semantic
-//! observations. It stays off by default to preserve the minimal embedded
-//! footprint.
+//! The optional `semantics` feature re-exports the bounded, non-authoritative
+//! `logical-db-cairn` and `logical-db-episode` ports for hosts that model
+//! semantic observations. It does not provide canonical LEM ORIGIN storage or
+//! LEM v0 wire compatibility. The feature stays off by default to preserve the
+//! minimal embedded footprint.
 
 #![forbid(unsafe_code)]
 
@@ -17,8 +18,10 @@ use std::{
     sync::Arc,
 };
 
-pub use logical_db_crdt::{ConflictValue, Editor, Item, Object, ObjectKind, Reader, Scalar};
-use logical_db_crdt::{CrdtError, Document, EncodedChange};
+pub use logical_db_crdt::{
+    ConflictValue, CrdtError, Editor, Item, Object, ObjectKind, Reader, Scalar,
+};
+use logical_db_crdt::{Document, EncodedChange};
 pub use logical_db_model::{
     AccountId, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue,
     OperationDigest, OperationId, PeerId, ReplicaId, Scope, SpaceId,
@@ -37,6 +40,8 @@ use logical_db_sync::{
 pub use logical_db_sync::{SyncLimits, SyncReport, Transport};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+const MAX_EDIT_BATCH: usize = 256;
 
 /// Opt-in production thin-client transport exposed by the same app facade.
 #[cfg(feature = "http")]
@@ -77,9 +82,24 @@ type MaterializedRemoteDocument = (
     bool,
 );
 
+struct PreparedBatchEdit {
+    index: usize,
+    document: DocumentId,
+    operation: OperationId,
+    request: OperationDigest,
+    digest: ChangeDigest,
+    bytes: Vec<u8>,
+    expected_revision: Option<DocumentRevision>,
+    snapshot: Vec<u8>,
+    indexes: Vec<IndexEntry>,
+    heads: Vec<ChangeDigest>,
+}
+
 type ProjectionFunction = dyn for<'document> Fn(&mut Reader<'document>) -> Result<Option<IndexValue>, CrdtError>
     + Send
     + Sync;
+type BatchEditFunction =
+    dyn for<'document> FnOnce(&mut Editor<'document>) -> Result<(), CrdtError> + Send;
 
 /// One application-owned materialized secondary-index projection.
 #[derive(Clone)]
@@ -112,6 +132,66 @@ impl Projection {
     #[must_use]
     pub const fn index(&self) -> IndexId {
         self.index
+    }
+}
+
+/// One caller-owned document edit prepared for an atomic local batch.
+pub struct BatchEdit {
+    /// Document receiving the edit.
+    pub document: DocumentId,
+    /// Retryable logical operation identity.
+    pub operation: OperationId,
+    /// Canonical caller request identity.
+    pub request: OperationDigest,
+    /// Structured edit applied to the document snapshot before commit.
+    edit: Box<BatchEditFunction>,
+}
+
+impl BatchEdit {
+    /// Creates one atomic local batch member.
+    #[must_use]
+    pub fn new(
+        document: DocumentId,
+        operation: OperationId,
+        request: OperationDigest,
+        edit: impl for<'document> FnOnce(&mut Editor<'document>) -> Result<(), CrdtError>
+        + Send
+        + 'static,
+    ) -> Self {
+        Self {
+            document,
+            operation,
+            request,
+            edit: Box::new(edit),
+        }
+    }
+}
+
+impl Database {
+    fn existing_batch_operation(
+        &self,
+        edit: &BatchEdit,
+    ) -> Result<Option<DuplicateReceipt>, DatabaseError> {
+        let Some(existing) = self.store.operation(self.scope, edit.operation)? else {
+            return Ok(None);
+        };
+        if existing.document != edit.document || existing.request != edit.request {
+            eprintln!("logical-db: batch edit operation conflicts with an existing request");
+            return Err(StoreError::OperationConflict.into());
+        }
+        let bytes = self
+            .store
+            .load_change(self.scope, edit.document, existing.digest)?
+            .ok_or(DatabaseError::MissingChange(existing.digest))?;
+        EncodedChange {
+            digest: existing.digest,
+            bytes,
+        }
+        .validate()?;
+        Ok(Some(DuplicateReceipt {
+            sequence: existing.sequence,
+            digest: existing.digest,
+        }))
     }
 }
 
@@ -290,6 +370,36 @@ impl Database {
         request: OperationDigest,
         edit: impl FnOnce(&mut Editor<'_>) -> Result<T, CrdtError>,
     ) -> Result<EditOutcome<T>, DatabaseError> {
+        self.edit_with_revision(document, None, operation, request, edit)
+    }
+
+    /// Applies one structured edit only if the document still has the supplied
+    /// revision. Exact operation retries retain the normal duplicate result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::Store`] containing
+    /// [`StoreError::StaleDocument`] when the observed revision changed before
+    /// the edit could commit.
+    pub fn edit_if_revision<T>(
+        &self,
+        document: DocumentId,
+        expected_revision: DocumentRevision,
+        operation: OperationId,
+        request: OperationDigest,
+        edit: impl FnOnce(&mut Editor<'_>) -> Result<T, CrdtError>,
+    ) -> Result<EditOutcome<T>, DatabaseError> {
+        self.edit_with_revision(document, Some(expected_revision), operation, request, edit)
+    }
+
+    fn edit_with_revision<T>(
+        &self,
+        document: DocumentId,
+        required_revision: Option<DocumentRevision>,
+        operation: OperationId,
+        request: OperationDigest,
+        edit: impl FnOnce(&mut Editor<'_>) -> Result<T, CrdtError>,
+    ) -> Result<EditOutcome<T>, DatabaseError> {
         let existing_operation = self.store.operation(self.scope, operation)?;
         if let Some(existing) = existing_operation {
             if existing.document == document && existing.request == request {
@@ -311,7 +421,10 @@ impl Database {
             return Err(StoreError::OperationConflict.into());
         }
         let stored = self.store.load_snapshot(self.scope, document)?;
-        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let actual_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        if required_revision.is_some_and(|expected| actual_revision != Some(expected)) {
+            return Err(StoreError::StaleDocument.into());
+        }
         let mut state = match stored {
             Some(snapshot) => Document::load(&snapshot.bytes)?,
             None => Document::new(),
@@ -341,7 +454,7 @@ impl Database {
         )?;
         let outcome = self.store.commit_local(LocalCommit {
             change: local_change,
-            expected_revision,
+            expected_revision: actual_revision,
             snapshot: &snapshot,
             indexes: &indexes,
             tombstone: false,
@@ -358,6 +471,137 @@ impl Database {
                 digest: change.digest,
             })),
         }
+    }
+
+    fn prepare_batch_edit(
+        &self,
+        index: usize,
+        edit: BatchEdit,
+    ) -> Result<PreparedBatchEdit, DatabaseError> {
+        let stored = self.store.load_snapshot(self.scope, edit.document)?;
+        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let mut state = match stored {
+            Some(snapshot) => Document::load(&snapshot.bytes)?,
+            None => Document::new(),
+        };
+        if state.is_deleted()? {
+            return Err(DatabaseError::DocumentDeleted);
+        }
+        let ((), mut changes) = state.edit(edit.edit)?;
+        if changes.len() != 1 {
+            eprintln!(
+                "logical-db: batch edit produced {} changes, expected one",
+                changes.len()
+            );
+            return Err(DatabaseError::ChangeCardinality(changes.len()));
+        }
+        let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
+        let indexes = self.project(&mut state)?;
+        let snapshot = state.save()?;
+        Ok(PreparedBatchEdit {
+            index,
+            document: edit.document,
+            operation: edit.operation,
+            request: edit.request,
+            digest: change.digest,
+            bytes: change.bytes,
+            expected_revision,
+            snapshot,
+            indexes,
+            heads: state.heads(),
+        })
+    }
+
+    /// Applies several structured edits and atomically saves all resulting
+    /// snapshots, immutable changes, operation receipts, indexes, and outbox
+    /// entries in one durable transaction.
+    ///
+    /// Every edit is materialized and checked before the first durable write.
+    /// A stale document, malformed edit, or storage failure leaves the whole
+    /// batch absent. Duplicate document identities are rejected before any
+    /// edit closure runs. The input is bounded before materialization or
+    /// transaction setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed CRDT, duplicate-document, stale-read, operation, or
+    /// storage failure.
+    pub fn edit_many(&self, edits: Vec<BatchEdit>) -> Result<Vec<EditOutcome<()>>, DatabaseError> {
+        if edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        if edits.len() > MAX_EDIT_BATCH {
+            eprintln!("logical-db: invalid edit batch size {}", edits.len());
+            return Err(DatabaseError::InvalidEditBatchSize(edits.len()));
+        }
+        let mut documents = BTreeSet::new();
+        for edit in &edits {
+            if !documents.insert(edit.document) {
+                return Err(DatabaseError::DuplicateBatchDocument(edit.document));
+            }
+        }
+
+        let mut duplicates = Vec::with_capacity(edits.len());
+        for edit in &edits {
+            duplicates.push(self.existing_batch_operation(edit)?);
+        }
+        let mut prepared = Vec::with_capacity(edits.len());
+        for (index, edit) in edits.into_iter().enumerate() {
+            if duplicates[index].is_some() {
+                continue;
+            }
+            prepared.push(self.prepare_batch_edit(index, edit)?);
+        }
+        let mut results: Vec<Option<EditOutcome<()>>> =
+            (0..duplicates.len()).map(|_| None).collect();
+        for (index, duplicate) in duplicates.into_iter().enumerate() {
+            if let Some(duplicate) = duplicate {
+                results[index] = Some(EditOutcome::Duplicate(duplicate));
+            }
+        }
+        if prepared.is_empty() {
+            return results
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(DatabaseError::ChangeCardinality(0));
+        }
+        let mut commits = Vec::with_capacity(prepared.len());
+        for edit in &prepared {
+            let change = LocalChange::new(
+                self.scope,
+                edit.document,
+                edit.operation,
+                edit.request,
+                edit.digest,
+                &edit.bytes,
+            )?;
+            commits.push(LocalCommit {
+                change,
+                expected_revision: edit.expected_revision,
+                snapshot: &edit.snapshot,
+                indexes: &edit.indexes,
+                tombstone: false,
+            });
+        }
+        let outcomes = self.store.commit_local_batch(&commits)?;
+        for (outcome, edit) in outcomes.into_iter().zip(prepared) {
+            results[edit.index] = Some(match outcome {
+                CommitOutcome::Applied { sequence } => EditOutcome::Applied(EditReceipt {
+                    value: (),
+                    sequence,
+                    digest: edit.digest,
+                    heads: edit.heads,
+                }),
+                CommitOutcome::Duplicate { sequence } => EditOutcome::Duplicate(DuplicateReceipt {
+                    sequence,
+                    digest: edit.digest,
+                }),
+            });
+        }
+        results
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(DatabaseError::ChangeCardinality(0))
     }
 
     /// Commits a first-class tombstone that converges to absent on every
@@ -464,6 +708,25 @@ impl Database {
         document: DocumentId,
         project: impl FnOnce(&mut Reader<'_>) -> Result<T, CrdtError>,
     ) -> Result<Option<T>, DatabaseError> {
+        Ok(self
+            .read_with_revision(document, project)?
+            .map(|(_, value)| value))
+    }
+
+    /// Reads a materialized document and returns its durable document revision.
+    ///
+    /// The revision can be supplied to [`Database::edit_if_revision`] to make
+    /// a read-modify-clear operation refuse a concurrent replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed store or CRDT error. A missing or deleted document
+    /// returns `None`.
+    pub fn read_with_revision<T>(
+        &self,
+        document: DocumentId,
+        project: impl FnOnce(&mut Reader<'_>) -> Result<T, CrdtError>,
+    ) -> Result<Option<(DocumentRevision, T)>, DatabaseError> {
         match self.store.load_snapshot(self.scope, document)? {
             None => Ok(None),
             Some(snapshot) => {
@@ -472,7 +735,7 @@ impl Database {
                     Ok(None)
                 } else {
                     project(&mut state.reader())
-                        .map(Some)
+                        .map(|value| Some((snapshot.revision, value)))
                         .map_err(DatabaseError::from)
                 }
             }
@@ -1250,12 +1513,18 @@ pub enum DatabaseError {
     /// Two projection functions claimed the same stable index identity.
     #[error("projection set contains a duplicate index identity")]
     DuplicateProjection,
+    /// An atomic edit batch attempted to update one document more than once.
+    #[error("atomic edit batch contains duplicate document {0}")]
+    DuplicateBatchDocument(DocumentId),
     /// Schema version zero is reserved.
     #[error("application schema version must be nonzero")]
     InvalidSchemaVersion,
     /// Migration pages are bounded to keep transactions and memory predictable.
     #[error("migration batch size {0} is outside 1..=256")]
     InvalidMigrationBatchSize(usize),
+    /// Atomic edit batches are bounded before materialization and transaction setup.
+    #[error("edit batch size {0} exceeds the maximum of 256")]
+    InvalidEditBatchSize(usize),
     /// One atomic install would retain too much aggregate materialized state.
     #[error("materialized page exceeds the bounded in-memory installation budget")]
     MaterializationBudgetExceeded,
@@ -1606,6 +1875,110 @@ mod tests {
             ));
             assert_eq!(error.kind(), DatabaseErrorKind::OperationConflict);
         }
+        drop(database);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn atomic_batch_retries_duplicates_without_rerunning_and_preserves_order() {
+        let path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let database = Database::open(&path, scope, ReplicaId::new()).unwrap();
+        let first_document = DocumentId::new();
+        let second_document = DocumentId::new();
+        let third_document = DocumentId::new();
+        let first_operation = OperationId::new();
+        let second_operation = OperationId::new();
+        let third_operation = OperationId::new();
+        let first_request = OperationDigest::new([5; 32]);
+        let second_request = OperationDigest::new([6; 32]);
+        let third_request = OperationDigest::new([7; 32]);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_calls = std::sync::Arc::clone(&calls);
+        let second_calls = std::sync::Arc::clone(&calls);
+        let applied = database
+            .edit_many(vec![
+                BatchEdit::new(
+                    first_document,
+                    first_operation,
+                    first_request,
+                    move |editor| {
+                        first_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        editor.put(&Object::root(), "value", Scalar::Integer(1))
+                    },
+                ),
+                BatchEdit::new(
+                    second_document,
+                    second_operation,
+                    second_request,
+                    move |editor| {
+                        second_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        editor.put(&Object::root(), "value", Scalar::Integer(2))
+                    },
+                ),
+            ])
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(matches!(applied[0], EditOutcome::Applied(_)));
+        assert!(matches!(applied[1], EditOutcome::Applied(_)));
+
+        let duplicate_calls = std::sync::Arc::clone(&calls);
+        let third_calls = std::sync::Arc::clone(&calls);
+        let retried = database
+            .edit_many(vec![
+                BatchEdit::new(
+                    first_document,
+                    first_operation,
+                    first_request,
+                    move |_editor| {
+                        duplicate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    },
+                ),
+                BatchEdit::new(
+                    third_document,
+                    third_operation,
+                    third_request,
+                    move |editor| {
+                        third_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        editor.put(&Object::root(), "value", Scalar::Integer(3))
+                    },
+                ),
+            ])
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(matches!(retried[0], EditOutcome::Duplicate(_)));
+        assert!(matches!(retried[1], EditOutcome::Applied(_)));
+        drop(database);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn atomic_batch_bound_rejects_before_materialization() {
+        let path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let database = Database::open(&path, scope, ReplicaId::new()).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let edits = (0..=MAX_EDIT_BATCH)
+            .map(|_| {
+                let calls = std::sync::Arc::clone(&calls);
+                BatchEdit::new(
+                    DocumentId::new(),
+                    OperationId::new(),
+                    OperationDigest::new([8; 32]),
+                    move |_editor| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            })
+            .collect();
+        assert!(matches!(
+            database.edit_many(edits),
+            Err(DatabaseError::InvalidEditBatchSize(actual))
+                if actual == MAX_EDIT_BATCH + 1
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(database);
         fs::remove_file(path).unwrap();
     }

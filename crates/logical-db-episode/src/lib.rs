@@ -1,6 +1,8 @@
-//! Episode log ported from LOGICAL-EVENT-MEMORY (`src/lib.rs`, operators).
-//! V1 identity covers scope, clocks, references, and payload; snapshots fail
-//! closed on unknown versions and rebuild derived indexes during decoding.
+//! Bounded local episode model ported from LOGICAL-EVENT-MEMORY (`src/lib.rs`,
+//! operators). It is not canonical ORIGIN persistence and does not implement
+//! the locked LEM v0 wire. V1 identity covers scope, clocks, references, and
+//! payload; snapshots fail closed on unknown versions and rebuild derived
+//! indexes during decoding.
 //!
 //! Evidence: S02 S03 S04 S05 define opaque progress, ordered changes, and
 //! explicit conflict provenance; S09 S10 S11 S12 S13 cover resumable logs,
@@ -634,7 +636,8 @@ impl LocalWorldRecord {
     }
 }
 
-/// In-memory append-only ORIGIN log with the eight-operator surface.
+/// In-memory append-only episode-log model with the eight-operator surface.
+/// This is not the canonical ORIGIN database.
 #[derive(Clone, Debug, Default)]
 pub struct OriginLog {
     episodes: Vec<Episode>,
