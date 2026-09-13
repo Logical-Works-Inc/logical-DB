@@ -16,9 +16,10 @@ use logical_db_model::{
     is_behind_retention,
 };
 use logical_db_protocol::{
-    ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, PageAction, ProtocolError, PullPage, PullRequest,
-    PushOutcome, PushRequest, PushResponse, RejectionCode, mark_consumed_action, prune_action,
-    seal_snapshot_action, write_action,
+    BaselineDocument, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION,
+    PageAction, ProtocolError, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
+    RejectionCode, mark_consumed_action, prune_action, recover_action, seal_snapshot_action,
+    write_action,
 };
 use sha2::Sha256;
 use thiserror::Error;
@@ -722,6 +723,25 @@ pub enum ServicePull {
     Page(PullPage),
     /// Valid authenticated checkpoint reached its expiry.
     CheckpointExpired,
+    /// The client cannot resume from the log prefix alone.
+    ///
+    /// The retained prefix below `floor` was collected into a state-bearing
+    /// baseline, so a fresh or expired replica must install that artifact
+    /// before any suffix pull. A position is not a recoverable snapshot.
+    BaselineRequired {
+        /// Durable retention floor the client must recover through.
+        floor: u64,
+    },
+}
+
+/// Response to one recovery request: the sealed artifact or its absence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceBaseline {
+    /// A sealed state-bearing artifact covers the retained prefix.
+    Artifact(Box<BaselinePage>),
+    /// No state-bearing baseline exists, so the durable log still covers every
+    /// position and a full pull from the floor is complete.
+    Unavailable,
 }
 
 /// Stateless service orchestration over a durable storage adapter.
@@ -811,30 +831,49 @@ where
 
     /// Reads one authorized page after an authenticated opaque checkpoint.
     ///
-    /// A checkpoint behind the durable retention floor takes the explicit
-    /// full-recovery transition instead of a partial prefix. A request without
-    /// a checkpoint resumes from the floor, which is the full-recovery read
-    /// path after collection.
+    /// A checkpoint behind the durable retention floor, an expired checkpoint
+    /// once collection has advanced the floor, and a fresh replica facing a
+    /// nonzero floor all take the explicit [`ServicePull::BaselineRequired`]
+    /// transition: the collected prefix exists only as a state-bearing
+    /// baseline, so no partial log prefix may be applied.
     ///
     /// # Errors
     ///
     /// Returns protocol, authority, checkpoint-authentication, backend, or
-    /// cross-scope corruption failures. Expiry is a typed non-error response.
+    /// cross-scope corruption failures. Expiry and required recovery are typed
+    /// non-error responses.
     pub async fn pull(
         &self,
         request: &PullRequest,
         now_unix_ms: u64,
     ) -> Result<ServicePull, ServiceError<Store::Error>> {
         request.validate().map_err(ServiceError::Protocol)?;
+        let floor = self
+            .store
+            .retention_floor(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
         let checkpoint_position = match &request.after {
             Some(token) => match self.checkpoints.open(request.scope, token, now_unix_ms) {
+                Ok(position) if is_behind_retention(position, floor) => {
+                    eprintln!("logical-db-service: pull: BaselineRequired");
+                    return Ok(ServicePull::BaselineRequired { floor });
+                }
                 Ok(position) => Some(position),
+                Err(CheckpointError::Expired) if floor > 0 => {
+                    eprintln!("logical-db-service: pull: BaselineRequired");
+                    return Ok(ServicePull::BaselineRequired { floor });
+                }
                 Err(CheckpointError::Expired) => return Ok(ServicePull::CheckpointExpired),
                 Err(error) => {
                     eprintln!("logical-db-service: pull checkpoint: {error}");
                     return Err(ServiceError::Checkpoint(error));
                 }
             },
+            None if floor > 0 => {
+                eprintln!("logical-db-service: pull: BaselineRequired");
+                return Ok(ServicePull::BaselineRequired { floor });
+            }
             None => None,
         };
         let frontier = self
@@ -842,15 +881,18 @@ where
             .frontier(request.scope)
             .await
             .map_err(ServiceError::Store)?;
-        let floor = self
-            .store
-            .retention_floor(request.scope)
-            .await
-            .map_err(ServiceError::Store)?;
-        if checkpoint_position.is_some_and(|position| is_behind_retention(position, floor)) {
-            return Ok(ServicePull::CheckpointExpired);
-        }
         let after = checkpoint_position.unwrap_or(0).max(floor);
+        self.page_after(request, after, frontier, now_unix_ms).await
+    }
+
+    /// Serves one authorized page and issues the replacement checkpoint.
+    async fn page_after(
+        &self,
+        request: &PullRequest,
+        after: u64,
+        frontier: u64,
+        now_unix_ms: u64,
+    ) -> Result<ServicePull, ServiceError<Store::Error>> {
         let action = PageAction {
             scope: request.scope,
             replica: request.replica,
@@ -966,6 +1008,87 @@ where
             .seal_snapshot(scope, &artifact, request, &grant)
             .await
             .map_err(ServiceError::Store)
+    }
+
+    /// Returns the sealed state-bearing baseline a recovering client must install.
+    ///
+    /// The artifact is rebuilt from durable state and the versioned descriptor
+    /// is recomputed, so a client refuses any page whose documents do not
+    /// reproduce the sealed digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns protocol, authority, backend, or cross-scope corruption
+    /// failures. A scope with no sealed state-bearing baseline reports
+    /// [`ServiceBaseline::Unavailable`] instead of an empty artifact.
+    pub async fn recover(
+        &self,
+        request: &BaselineRequest,
+        now_unix_ms: u64,
+    ) -> Result<ServiceBaseline, ServiceError<Store::Error>> {
+        request.validate().map_err(ServiceError::Protocol)?;
+        let frontier = self
+            .store
+            .frontier(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        if self
+            .policy
+            .authorize(
+                request.scope,
+                Effect::Sync,
+                recover_action(
+                    request.scope,
+                    request.replica,
+                    request.request,
+                    request.after.as_ref(),
+                ),
+                frontier,
+                now_unix_ms,
+            )
+            .is_none()
+        {
+            eprintln!("logical-db-service: recover: Forbidden");
+            return Err(ServiceError::Forbidden);
+        }
+        let sealed = self
+            .store
+            .snapshot_baseline(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let Some(SnapshotRecord::State(descriptor)) = sealed else {
+            return Ok(ServiceBaseline::Unavailable);
+        };
+        let artifact = self
+            .store
+            .build_snapshot(request.scope, descriptor.position())
+            .await
+            .map_err(ServiceError::Store)?;
+        if artifact.baseline != descriptor {
+            eprintln!("logical-db-service: recover: CorruptStoreData");
+            return Err(ServiceError::CorruptStoreData);
+        }
+        let checkpoint = self
+            .checkpoints
+            .issue(request.scope, descriptor.position(), now_unix_ms)
+            .map_err(ServiceError::Checkpoint)?;
+        let page = BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: descriptor.encode().to_vec(),
+            documents: artifact
+                .documents
+                .iter()
+                .map(|document| BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint,
+        };
+        page.validate(request.scope)
+            .map_err(ServiceError::Protocol)?;
+        Ok(ServiceBaseline::Artifact(Box::new(page)))
     }
 
     /// Advances the peer-consumption watermark guarding collection.
@@ -1878,6 +2001,28 @@ mod tests {
         lgwks_std::task::block_on(service.pull(&request, now)).unwrap()
     }
 
+    fn recover_at<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        replica: ReplicaId,
+        after: Option<Checkpoint>,
+        now: u64,
+    ) -> ServiceBaseline
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        let request = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([92; 32]),
+            after,
+        };
+        lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+    }
+
     fn seal_at<Store, Policy>(
         service: &ProtocolService<Store, Policy>,
         scope: Scope,
@@ -2067,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn behind_floor_checkpoint_expires_then_full_recovery_completes() {
+    fn behind_floor_checkpoint_requires_baseline_then_suffix_completes() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
@@ -2105,11 +2250,29 @@ mod tests {
             })
         );
         assert_eq!(
-            pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
-            ServicePull::CheckpointExpired
+            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15),
+            ServicePull::BaselineRequired { floor: 2 }
         );
-        let ServicePull::Page(recovered) = pull_after(&service, scope, replica, None, 16) else {
-            panic!("recovery page expected")
+        assert_eq!(
+            pull_after(&service, scope, replica, None, 15),
+            ServicePull::BaselineRequired { floor: 2 }
+        );
+        let ServiceBaseline::Artifact(baseline) =
+            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)
+        else {
+            panic!("state-bearing baseline expected")
+        };
+        let artifact = baseline.validate(scope).unwrap();
+        assert_eq!(artifact.baseline.position(), 2);
+        assert_eq!(artifact.documents.len(), 2);
+        let ServicePull::Page(recovered) = pull_after(
+            &service,
+            scope,
+            replica,
+            Some(baseline.checkpoint.clone()),
+            17,
+        ) else {
+            panic!("recovery suffix page expected")
         };
         assert_eq!(recovered.changes.len(), 2);
         assert_eq!(recovered.changes[0].bytes, tombstone_bytes);
@@ -2164,7 +2327,17 @@ mod tests {
                 ..
             }
         ));
-        let ServicePull::Page(page) = pull_after(&service, scope, replica, None, 13) else {
+        let ServiceBaseline::Artifact(baseline) = recover_at(&service, scope, replica, None, 13)
+        else {
+            panic!("state-bearing baseline expected")
+        };
+        let ServicePull::Page(page) = pull_after(
+            &service,
+            scope,
+            replica,
+            Some(baseline.checkpoint.clone()),
+            13,
+        ) else {
             panic!("page expected")
         };
         assert_eq!(page.changes.len(), 1);
@@ -2224,9 +2397,17 @@ mod tests {
             Some(SnapshotRecord::State(ref baseline)) if baseline.position() == 2
         ));
         assert_eq!(
-            pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
-            ServicePull::CheckpointExpired
+            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15),
+            ServicePull::BaselineRequired { floor: 2 }
         );
+        let ServiceBaseline::Artifact(baseline) =
+            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)
+        else {
+            panic!("state-bearing baseline must survive restart")
+        };
+        let artifact = baseline.validate(scope).unwrap();
+        assert_eq!(artifact.baseline.position(), 2);
+        assert_eq!(artifact.documents.len(), 2);
     }
 
     #[test]

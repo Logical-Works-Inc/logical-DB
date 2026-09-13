@@ -11,11 +11,11 @@ use std::{error::Error, fmt, time::Duration};
 use logical_db_model::{
     ChangeDigest, DocumentId, ModelError, NAMESPACE_CHECKPOINT_TTL_MS, NamespaceCheckpoint,
     NamespaceCheckpoints, NamespacePolicy, NetworkCondition, OperationDigest, OperationId, PeerId,
-    ReplicaId, Scope, is_namespace_checkpoint_expired, validate_namespace,
+    ReplicaId, Scope, SnapshotArtifact, is_namespace_checkpoint_expired, validate_namespace,
 };
 use logical_db_protocol::{
-    ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest,
-    PushOutcome, PushRequest, PushResponse, RejectionCode,
+    BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError,
+    PullPage, PullRequest, PushOutcome, PushRequest, PushResponse, RejectionCode,
 };
 use sha2::{Digest, Sha256};
 
@@ -94,6 +94,21 @@ pub trait ReplicaPort {
         changes: &[InboundChange],
         checkpoint: &[u8],
     ) -> Result<(), Self::Error>;
+    /// Atomically installs a verified state-bearing baseline and its checkpoint.
+    ///
+    /// The artifact has already reproduced its sealed descriptor digest. A
+    /// replica must commit the document states and the replacement checkpoint
+    /// in one durable transition, leaving both unchanged on any failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the replica's validation, merge, or durable commit failure.
+    fn install_baseline(
+        &self,
+        peer: PeerId,
+        artifact: &SnapshotArtifact,
+        checkpoint: &[u8],
+    ) -> Result<(), Self::Error>;
 }
 
 /// Result of requesting one pull page.
@@ -103,6 +118,17 @@ pub enum PullResult {
     Page(PullPage),
     /// The service no longer recognizes the supplied checkpoint.
     CheckpointExpired,
+    /// The retained prefix was collected; the replica must install a baseline.
+    BaselineRequired,
+}
+
+/// Result of requesting the state-bearing recovery baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaselineResult {
+    /// A bounded state-bearing artifact and its replacement checkpoint.
+    Artifact(BaselinePage),
+    /// No baseline is sealed, so the durable log still covers every position.
+    Unavailable,
 }
 
 /// Network or in-process protocol transport.
@@ -123,6 +149,12 @@ pub trait Transport {
     ///
     /// Returns a transport-specific request or response failure.
     async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error>;
+    /// Downloads the state-bearing baseline a recovering replica must install.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-specific request or response failure.
+    async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error>;
 }
 
 /// Resource ceilings for one synchronization cycle.
@@ -180,6 +212,8 @@ pub struct SyncReport {
     pub pages: usize,
     /// Whether an expired checkpoint forced a full pull.
     pub full_resync: bool,
+    /// Whether a state-bearing baseline was installed during this cycle.
+    pub recovered: bool,
     /// Whether unsent local changes or remote pages remain after this bounded cycle.
     pub more: bool,
 }
@@ -275,17 +309,21 @@ where
         .map_err(SyncError::Protocol)?;
     let mut restarted_after_expiry = false;
     while report.pages < usize::from(limits.pages_per_cycle) {
-        let Some(page) = pull_and_install(
-            replica,
-            peer,
-            transport,
-            limits,
-            &mut after,
-            &mut restarted_after_expiry,
-        )
-        .await?
+        let Some(page) = pull_and_install(replica, peer, transport, limits, &mut after).await?
         else {
-            report.full_resync = true;
+            if install_recovery(
+                replica,
+                peer,
+                transport,
+                &mut after,
+                &mut restarted_after_expiry,
+            )
+            .await?
+            {
+                report.recovered = true;
+            } else {
+                report.full_resync = true;
+            }
             continue;
         };
         let inbound = page.changes.len();
@@ -413,7 +451,6 @@ async fn pull_and_install<R, T>(
     transport: &mut T,
     limits: SyncLimits,
     after: &mut Option<Checkpoint>,
-    restarted: &mut bool,
 ) -> Result<Option<PullPage>, SyncError<R::Error, T::Error>>
 where
     R: ReplicaPort,
@@ -434,15 +471,11 @@ where
         .map_err(SyncError::Transport)?;
     let page = match pulled {
         PullResult::Page(page) => page,
-        PullResult::CheckpointExpired if after.is_some() && !*restarted => {
-            *after = None;
-            *restarted = true;
-            return Ok(None);
-        }
-        PullResult::CheckpointExpired => {
-            eprintln!("logical-db-sync: checkpoint expired during synchronization");
+        PullResult::CheckpointExpired if after.is_none() => {
+            eprintln!("logical-db-sync: checkpoint expired without a durable checkpoint");
             return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
         }
+        PullResult::CheckpointExpired | PullResult::BaselineRequired => return Ok(None),
     };
     page.validate(replica.scope())
         .map_err(SyncError::Protocol)?;
@@ -461,6 +494,84 @@ where
     Ok(Some(page))
 }
 
+/// Installs the state-bearing baseline after the service collected the prefix.
+///
+/// Returns whether a baseline was installed. `false` reports that no baseline is
+/// sealed for the scope, so the durable log still covers every position and the
+/// caller restarts from the floor. A second recovery request in one cycle is a
+/// loud protocol failure, never a silent loop.
+async fn install_recovery<R, T>(
+    replica: &R,
+    peer: PeerId,
+    transport: &mut T,
+    after: &mut Option<Checkpoint>,
+    restarted: &mut bool,
+) -> Result<bool, SyncError<R::Error, T::Error>>
+where
+    R: ReplicaPort,
+    T: Transport,
+{
+    if *restarted {
+        eprintln!("logical-db-sync: recovery requested twice in one cycle");
+        return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
+    }
+    *restarted = true;
+    let request = BaselineRequest {
+        protocol: PROTOCOL_VERSION,
+        scope: replica.scope(),
+        replica: replica.replica(),
+        request: baseline_request_digest(replica.scope(), replica.replica(), after.as_ref()),
+        after: after.clone(),
+    };
+    request.validate().map_err(SyncError::Protocol)?;
+    match fetch_baseline(transport, request)
+        .await
+        .map_err(SyncError::Transport)?
+    {
+        BaselineResult::Artifact(page) => {
+            let artifact = page
+                .validate(replica.scope())
+                .map_err(SyncError::Protocol)?;
+            replica
+                .install_baseline(peer, &artifact, page.checkpoint.as_wire())
+                .map_err(SyncError::Replica)?;
+            *after = Some(page.checkpoint);
+            Ok(true)
+        }
+        BaselineResult::Unavailable => {
+            *after = None;
+            Ok(false)
+        }
+    }
+}
+
+async fn fetch_baseline<T: Transport>(
+    transport: &mut T,
+    request: BaselineRequest,
+) -> Result<BaselineResult, T::Error> {
+    transport.baseline(request).await
+}
+
+fn baseline_request_digest(
+    scope: Scope,
+    replica: ReplicaId,
+    after: Option<&Checkpoint>,
+) -> OperationDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"logical-db/baseline/v1");
+    digest.update(scope.account().as_uuid().as_bytes());
+    digest.update(scope.space().as_uuid().as_bytes());
+    digest.update(replica.as_uuid().as_bytes());
+    match after {
+        Some(checkpoint) => {
+            digest.update([1]);
+            digest.update(checkpoint.as_wire());
+        }
+        None => digest.update([0]),
+    }
+    OperationDigest::new(digest.finalize().into())
+}
+
 struct NamespacePullContext<'a, F> {
     namespace: &'a str,
     is_mine: &'a F,
@@ -468,7 +579,6 @@ struct NamespacePullContext<'a, F> {
     now_unix_ms: u64,
     policy: NamespacePolicy,
     after: &'a mut Option<Checkpoint>,
-    restarted: &'a mut bool,
 }
 
 async fn pull_namespace_page<R, T, F>(
@@ -503,13 +613,8 @@ where
         .map_err(NamespaceSyncError::Transport)?;
     let page = match pulled {
         PullResult::Page(page) => page,
-        PullResult::CheckpointExpired if context.after.is_some() && !*context.restarted => {
-            *context.after = None;
-            *context.restarted = true;
-            return Ok(None);
-        }
-        PullResult::CheckpointExpired => {
-            eprintln!("logical-db-sync: namespace checkpoint expired during pull");
+        PullResult::CheckpointExpired | PullResult::BaselineRequired => {
+            eprintln!("logical-db-sync: namespace checkpoint requires baseline recovery");
             return Err(NamespaceSyncError::Protocol(
                 ProtocolError::InvalidCheckpoint,
             ));
@@ -726,7 +831,6 @@ where
     let start = namespace_start(replica, peer, namespace, now_unix_ms)?;
     let mut checkpoints = start.checkpoints;
     let mut after = start.after;
-    let mut restarted_after_expiry = start.restarted_after_expiry;
     if start.recovered {
         report.full_resync = true;
     }
@@ -738,7 +842,6 @@ where
             now_unix_ms,
             policy,
             after: &mut after,
-            restarted: &mut restarted_after_expiry,
         };
         let Some(page) = pull_namespace_page(replica, peer, transport, &mut context).await? else {
             report.full_resync = true;
@@ -873,7 +976,6 @@ where
 struct NamespaceStart {
     checkpoints: NamespaceCheckpoints,
     after: Option<Checkpoint>,
-    restarted_after_expiry: bool,
     recovered: bool,
 }
 
@@ -894,12 +996,10 @@ where
         Some(bytes) => NamespaceCheckpoints::decode(&bytes).map_err(NamespaceSyncError::Model)?,
     };
     let mut after = None;
-    let mut restarted_after_expiry = false;
     let mut recovered = false;
     if let Some(stored) = checkpoints.get(namespace) {
         if is_namespace_checkpoint_expired(stored, now_unix_ms) {
             recovered = true;
-            restarted_after_expiry = true;
         } else {
             after = Some(
                 Checkpoint::from_wire(stored.cursor().to_vec())
@@ -910,7 +1010,6 @@ where
     Ok(NamespaceStart {
         checkpoints,
         after,
-        restarted_after_expiry,
         recovered,
     })
 }
@@ -1648,6 +1747,7 @@ mod tests {
         checkpoint: std::cell::RefCell<Option<Vec<u8>>>,
         acknowledged: std::cell::Cell<u64>,
         installed: std::cell::RefCell<Vec<InboundChange>>,
+        baselines: std::cell::RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
     }
 
     impl ReplicaPort for Replica {
@@ -1687,6 +1787,18 @@ mod tests {
             *self.checkpoint.borrow_mut() = Some(checkpoint.to_vec());
             Ok(())
         }
+        fn install_baseline(
+            &self,
+            _peer: PeerId,
+            artifact: &SnapshotArtifact,
+            checkpoint: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.baselines
+                .borrow_mut()
+                .push((artifact.baseline.encode().to_vec(), checkpoint.to_vec()));
+            *self.checkpoint.borrow_mut() = Some(checkpoint.to_vec());
+            Ok(())
+        }
     }
 
     struct Wire {
@@ -1707,6 +1819,12 @@ mod tests {
             _request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             std::future::ready(Ok(self.pulls.pop_front().unwrap()))
+        }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
         }
     }
 
@@ -1729,6 +1847,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(Some(vec![9])),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let new_checkpoint = Checkpoint::from_wire(vec![10]).unwrap();
         let mut wire = Wire {
@@ -1765,6 +1884,7 @@ mod tests {
                 pulled: 0,
                 pages: 1,
                 full_resync: true,
+                recovered: false,
                 more: false
             }
         );
@@ -1790,6 +1910,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
             push: Some(PushResponse {
@@ -1829,6 +1950,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
             push: Some(PushResponse {
@@ -1867,6 +1989,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
             push: Some(PushResponse {
@@ -1905,6 +2028,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1965,6 +2089,112 @@ mod tests {
             Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint))
         ));
         assert!(replica.checkpoint.borrow().is_none());
+    }
+
+    struct RecoveryWire {
+        pulls: std::collections::VecDeque<PullResult>,
+        baseline: Option<BaselinePage>,
+    }
+
+    impl Transport for RecoveryWire {
+        type Error = Infallible;
+        fn push(
+            &mut self,
+            _request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
+            std::future::ready(Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: Vec::new(),
+            }))
+        }
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
+            std::future::ready(Ok(self.pulls.pop_front().unwrap()))
+        }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            let result = match self.baseline.take() {
+                Some(page) => BaselineResult::Artifact(page),
+                None => BaselineResult::Unavailable,
+            };
+            std::future::ready(Ok(result))
+        }
+    }
+
+    fn recovery_page(scope: Scope, position: u64) -> BaselinePage {
+        let artifact = SnapshotArtifact::new(
+            scope,
+            position,
+            vec![logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1, 2, 3],
+                tombstone: false,
+            }],
+        )
+        .unwrap();
+        BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: artifact.baseline.encode().to_vec(),
+            documents: artifact
+                .documents
+                .iter()
+                .map(|document| logical_db_protocol::BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
+        }
+    }
+
+    #[test]
+    fn baseline_required_installs_state_before_the_suffix_commit() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let baseline = recovery_page(scope, 2);
+        let baseline_checkpoint = baseline.checkpoint.as_wire().to_vec();
+        let suffix_checkpoint = Checkpoint::from_wire(vec![10]).unwrap();
+        let mut wire = RecoveryWire {
+            pulls: [
+                PullResult::BaselineRequired,
+                PullResult::Page(PullPage {
+                    protocol: PROTOCOL_VERSION,
+                    changes: Vec::new(),
+                    checkpoint: suffix_checkpoint.clone(),
+                    more: false,
+                }),
+            ]
+            .into(),
+            baseline: Some(baseline),
+        };
+        let report = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || false,
+        ))
+        .unwrap();
+        assert!(report.recovered);
+        assert!(!report.full_resync);
+        assert_eq!(report.pages, 1);
+        let baselines = replica.baselines.borrow();
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0].1, baseline_checkpoint);
+        assert!(matches!(
+            logical_db_model::SnapshotBaseline::decode(&baselines[0].0),
+            Ok(logical_db_model::SnapshotRecord::State(baseline)) if baseline.position() == 2
+        ));
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(suffix_checkpoint.as_wire().to_vec())
+        );
     }
 
     #[test]
@@ -2152,6 +2382,14 @@ mod tests {
             *self.slot.borrow_mut() = Some(checkpoint.to_vec());
             Ok(())
         }
+        fn install_baseline(
+            &self,
+            _peer: PeerId,
+            _artifact: &SnapshotArtifact,
+            _checkpoint: &[u8],
+        ) -> Result<(), Self::Error> {
+            unreachable!("namespace synchronization fails closed before baseline installation")
+        }
     }
 
     struct LogChange {
@@ -2262,6 +2500,12 @@ mod tests {
                 checkpoint: Checkpoint::from_wire(Self::position_bytes(next as u64)).unwrap(),
                 more,
             })))
+        }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
         }
     }
 
@@ -2657,6 +2901,12 @@ mod tests {
                 .pop_front()
                 .expect("orchestrator pulled past the scripted pages")))
         }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
+        }
     }
 
     fn scripted_page(
@@ -2709,6 +2959,7 @@ mod tests {
                 checkpoint: RefCell::new(None),
                 acknowledged: Cell::new(0),
                 installed: RefCell::new(Vec::new()),
+                baselines: RefCell::new(Vec::new()),
             },
             operations,
         )
@@ -2784,6 +3035,12 @@ mod tests {
                 more: false,
             })))
         }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
+        }
     }
 
     struct ServiceLog {
@@ -2856,6 +3113,12 @@ mod tests {
                     .unwrap(),
                 more,
             })))
+        }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
         }
     }
 
@@ -2987,6 +3250,7 @@ mod tests {
             checkpoint: RefCell::new(Some(vec![9])),
             acknowledged: Cell::new(0),
             installed: RefCell::new(Vec::new()),
+            baselines: RefCell::new(Vec::new()),
         };
         let mut wire =
             ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
@@ -3250,6 +3514,7 @@ mod tests {
             checkpoint: RefCell::new(None),
             acknowledged: Cell::new(0),
             installed: RefCell::new(Vec::new()),
+            baselines: RefCell::new(Vec::new()),
         };
         let receiver = empty_replica(scope);
         let mut log = ServiceLog {

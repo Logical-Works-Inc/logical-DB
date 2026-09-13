@@ -7,7 +7,7 @@
 use logical_db_model::{ActionDigest, OperationDigest, ReplicaId, Scope, SnapshotBaseline};
 use sha2::{Digest, Sha256};
 
-use crate::{ChangeEnvelope, PROTOCOL_VERSION};
+use crate::{ChangeEnvelope, Checkpoint, PROTOCOL_VERSION};
 
 /// Server-normalized page parameters after authenticated checkpoint decoding.
 ///
@@ -66,6 +66,26 @@ pub fn seal_snapshot_action(
 ) -> ActionDigest {
     let mut digest = action_hash(b"seal-snapshot", scope, intent);
     frame(&mut digest, &baseline.encode());
+    ActionDigest::new(digest.finalize().into())
+}
+
+/// Binds a recovery fetch to the scope, replica, intent, and triggering checkpoint.
+#[must_use]
+pub fn recover_action(
+    scope: Scope,
+    replica: ReplicaId,
+    intent: OperationDigest,
+    after: Option<&Checkpoint>,
+) -> ActionDigest {
+    let mut digest = action_hash(b"recover-baseline", scope, intent);
+    frame(&mut digest, replica.as_uuid().as_bytes());
+    match after {
+        Some(checkpoint) => {
+            frame(&mut digest, &[1]);
+            frame(&mut digest, checkpoint.as_wire());
+        }
+        None => frame(&mut digest, &[0]),
+    }
     ActionDigest::new(digest.finalize().into())
 }
 

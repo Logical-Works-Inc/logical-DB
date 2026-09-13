@@ -25,7 +25,7 @@ pub use logical_db_crdt::{
 use logical_db_crdt::{Document, EncodedChange};
 pub use logical_db_model::{
     AccountId, ActionDigest, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId,
-    IndexValue, OperationDigest, OperationId, PeerId, ReplicaId, Scope, SpaceId,
+    IndexValue, OperationDigest, OperationId, PeerId, ReplicaId, Scope, SnapshotArtifact, SpaceId,
 };
 pub use logical_db_platform::PlatformError;
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
@@ -62,9 +62,10 @@ pub use logical_db_episode;
 /// Types required only by hosts implementing a custom synchronization transport.
 pub mod transport {
     pub use logical_db_protocol::{
-        Checkpoint, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
+        BaselinePage, BaselineRequest, Checkpoint, PullPage, PullRequest, PushOutcome, PushRequest,
+        PushResponse,
     };
-    pub use logical_db_sync::{PullResult, Transport};
+    pub use logical_db_sync::{BaselineResult, PullResult, Transport};
 }
 
 /// Application-owned embedded replica handle.
@@ -1019,6 +1020,63 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically installs a verified state-bearing baseline and its checkpoint.
+    ///
+    /// The artifact's content identity is verified before any durable mutation,
+    /// then each document is re-projected locally and the whole set commits with
+    /// the replacement checkpoint in one transaction. Local changes are never
+    /// lost: every local change is either covered by the baseline or re-delivered
+    /// by the log suffix the client resumes from, so recovery converges.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure when the artifact is malformed, a document does
+    /// not load, or the durable transaction fails. Both state and checkpoint
+    /// stay unchanged on every failure path.
+    pub fn install_baseline(
+        &self,
+        peer: PeerId,
+        artifact: &SnapshotArtifact,
+        checkpoint: &[u8],
+    ) -> Result<(), DatabaseError> {
+        artifact.validate(self.scope).map_err(|error| {
+            eprintln!("logical-db: install_baseline artifact: {error}");
+            DatabaseError::InvalidBaseline
+        })?;
+        let mut materialized = Vec::with_capacity(artifact.documents.len());
+        for document in &artifact.documents {
+            let expected_revision = self
+                .store
+                .load_snapshot(self.scope, document.document)?
+                .map(|snapshot| snapshot.revision);
+            let mut state = Document::load(&document.snapshot)?;
+            let tombstoned = state.is_deleted()?;
+            if tombstoned != document.tombstone {
+                eprintln!("logical-db: install_baseline tombstone flag mismatch");
+                return Err(DatabaseError::InvalidBaseline);
+            }
+            let indexes = if tombstoned {
+                Vec::new()
+            } else {
+                self.project(&mut state)?
+            };
+            materialized.push((document, expected_revision, indexes));
+        }
+        let durable_documents = materialized
+            .iter()
+            .map(|(document, expected_revision, indexes)| RemoteDocument {
+                document: document.document,
+                expected_revision: *expected_revision,
+                snapshot: &document.snapshot,
+                indexes,
+                tombstone: document.tombstone,
+            })
+            .collect::<Vec<_>>();
+        self.store
+            .install_remote_page(self.scope, peer, &durable_documents, &[], checkpoint)?;
+        Ok(())
+    }
+
     /// Exports one versioned logical backup of this scope.
     ///
     /// The payload is a versioned logical dump — ordered commit history plus
@@ -1451,6 +1509,15 @@ impl ReplicaPort for Database {
             .collect::<Vec<_>>();
         Database::install_remote_page(self, peer, &changes, checkpoint)
     }
+
+    fn install_baseline(
+        &self,
+        peer: PeerId,
+        artifact: &SnapshotArtifact,
+        checkpoint: &[u8],
+    ) -> Result<(), Self::Error> {
+        Database::install_baseline(self, peer, artifact, checkpoint)
+    }
 }
 
 /// One untrusted immutable remote change entering the embedded replica.
@@ -1618,6 +1685,13 @@ pub enum DatabaseError {
     /// [`DatabaseErrorKind::Other`].
     #[error("logical export scope does not match this replica scope")]
     ExportScopeMismatch,
+    /// A recovery baseline violated its versioned content identity.
+    ///
+    /// The artifact is refused before any durable mutation, so a truncated,
+    /// reordered, or substituted baseline leaves state and checkpoint
+    /// unchanged. Classified as [`DatabaseErrorKind::Other`].
+    #[error("recovery baseline artifact is malformed or mismatched")]
+    InvalidBaseline,
 }
 
 impl DatabaseError {
@@ -1864,6 +1938,14 @@ mod tests {
                 more: false,
             })))
         }
+
+        fn baseline(
+            &mut self,
+            _request: transport::BaselineRequest,
+        ) -> impl std::future::Future<Output = Result<transport::BaselineResult, Self::Error>>
+        {
+            std::future::ready(Ok(transport::BaselineResult::Unavailable))
+        }
     }
 
     #[test]
@@ -2099,6 +2181,7 @@ mod tests {
                 pulled: 0,
                 pages: 1,
                 full_resync: false,
+                recovered: false,
                 more: false,
             }
         );

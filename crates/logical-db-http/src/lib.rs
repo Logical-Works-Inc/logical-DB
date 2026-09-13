@@ -15,8 +15,10 @@ use std::{
 };
 
 use lgwks_std::json::serde::{Serialize, de::DeserializeOwned};
-use logical_db_protocol::{ProtocolError, PullPage, PullRequest, PushRequest, PushResponse};
-use logical_db_sync::{PullResult, Transport};
+use logical_db_protocol::{
+    BaselinePage, BaselineRequest, ProtocolError, PullPage, PullRequest, PushRequest, PushResponse,
+};
+use logical_db_sync::{BaselineResult, PullResult, Transport};
 pub use reqwest::Url;
 use reqwest::{
     Client, Response, StatusCode,
@@ -220,9 +222,34 @@ where
         if response.status() == StatusCode::GONE {
             return Ok(PullResult::CheckpointExpired);
         }
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(PullResult::BaselineRequired);
+        }
         let page = decode_response::<PullPage>(response).await?;
         page.validate(request.scope).map_err(HttpError::Protocol)?;
         Ok(PullResult::Page(page))
+    }
+
+    async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error> {
+        request.validate().map_err(HttpError::Protocol)?;
+        let body = encode(&request)?;
+        let authorization = self.credentials.authorization().await?;
+        let response = self
+            .client
+            .post(self.route("v1/recovery:baseline")?)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_TYPE, MEDIA_TYPE)
+            .header(ACCEPT, MEDIA_TYPE)
+            .body(body)
+            .send()
+            .await
+            .map_err(HttpError::Network)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(BaselineResult::Unavailable);
+        }
+        let page = decode_response::<BaselinePage>(response).await?;
+        page.validate(request.scope).map_err(HttpError::Protocol)?;
+        Ok(BaselineResult::Artifact(page))
     }
 }
 

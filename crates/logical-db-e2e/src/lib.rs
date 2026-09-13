@@ -22,12 +22,12 @@ mod tests {
         SyncLimits,
     };
     use logical_db_http::{HttpTransport, StaticBearer};
-    use logical_db_model::{ChangeDigest, Effect};
+    use logical_db_model::{ChangeDigest, Effect, SnapshotArtifact, SnapshotRecord};
     use logical_db_protocol::ChangeEnvelope;
     use logical_db_server::{AuthenticationError, Authenticator, Clock, router};
     use logical_db_service::{
-        AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ServiceStore,
-        StoredPage,
+        AcceptResult, Authority, CheckpointCodec, ConsumedResult, ExecutionGrant, PageResult,
+        PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore, StoredPage,
     };
 
     use logical_db_model::ActionDigest;
@@ -192,6 +192,60 @@ mod tests {
                 position,
                 more: usize::try_from(position).is_ok_and(|position| position < scoped.len()),
             })))
+        }
+    }
+
+    /// Inert retention for journeys whose scope never collects a log prefix.
+    impl RetentionStore for MemoryServiceStore {
+        fn consumed_through(
+            &self,
+            _scope: Scope,
+        ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            ready(Ok(0))
+        }
+        fn snapshot_baseline(
+            &self,
+            _scope: Scope,
+        ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
+            ready(Ok(None))
+        }
+        fn build_snapshot(
+            &self,
+            scope: Scope,
+            through: u64,
+        ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
+            ready(Ok(SnapshotArtifact::new(scope, through, Vec::new())
+                .expect("an empty bounded artifact is valid")))
+        }
+        fn seal_snapshot(
+            &self,
+            _scope: Scope,
+            _artifact: &SnapshotArtifact,
+            _request: OperationDigest,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
+            ready(Ok(SealResult::BeyondFrontier { frontier: 0 }))
+        }
+        fn mark_consumed(
+            &self,
+            _scope: Scope,
+            _through: u64,
+            _request: OperationDigest,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+            ready(Ok(ConsumedResult::Unchanged {
+                consumed_through: 0,
+            }))
+        }
+        fn prune(
+            &self,
+            _scope: Scope,
+            _up_to: u64,
+            _min_live: Option<u64>,
+            _request: OperationDigest,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
+            ready(Ok(PruneResult::Refused(PruneRefusal::MissingBaseline)))
         }
     }
 

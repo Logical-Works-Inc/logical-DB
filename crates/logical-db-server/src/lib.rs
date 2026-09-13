@@ -28,10 +28,10 @@ use axum::{
 };
 use lgwks_bot::rt::{sync::Semaphore, time::timeout};
 use lgwks_std::json::serde;
-use logical_db_protocol::{PullRequest, PushRequest};
+use logical_db_protocol::{BaselineRequest, PullRequest, PushRequest};
 use logical_db_service::{
-    Authority, CheckpointCodec, ProtocolService, ServiceError, ServicePull, ServiceStore,
-    StoreFailureClass,
+    Authority, CheckpointCodec, ProtocolService, RetentionStore, ServiceBaseline, ServiceError,
+    ServicePull, ServiceStore, StoreFailureClass,
 };
 
 /// Versioned representation accepted and emitted by the synchronization API.
@@ -134,7 +134,7 @@ pub fn router<Store, Authentication, Time>(
     clock: Time,
 ) -> Router
 where
-    Store: ServiceStore + 'static,
+    Store: RetentionStore + 'static,
     Store::Error: Send + 'static,
     Authentication: Authenticator + 'static,
     Time: Clock + 'static,
@@ -158,7 +158,7 @@ fn router_with_limits<Store, Authentication, Time>(
     deadline: Duration,
 ) -> Router
 where
-    Store: ServiceStore + 'static,
+    Store: RetentionStore + 'static,
     Store::Error: Send + 'static,
     Authentication: Authenticator + 'static,
     Time: Clock + 'static,
@@ -181,6 +181,10 @@ where
         .route(
             "/v1/changes:pull",
             post(pull::<Store, Authentication, Time>),
+        )
+        .route(
+            "/v1/recovery:baseline",
+            post(recover::<Store, Authentication, Time>),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(admission, admit_request))
@@ -254,6 +258,37 @@ where
         {
             ServicePull::Page(page) => encode_response(StatusCode::OK, &page),
             ServicePull::CheckpointExpired => Err(ApiError::CheckpointExpired),
+            ServicePull::BaselineRequired { .. } => Err(ApiError::BaselineRequired),
+        }
+    }
+    .await;
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn recover<Store, Authentication, Time>(
+    State(state): State<ApiState<Store, Authentication, Time>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    Store: RetentionStore + 'static,
+    Store::Error: Send + 'static,
+    Authentication: Authenticator + 'static,
+    Time: Clock + 'static,
+{
+    let result = async {
+        validate_representation(&headers)?;
+        let now = state.clock.now_unix_ms().ok_or(ApiError::Clock)?;
+        let policy = authenticate(&state, &headers, now)?;
+        let request: BaselineRequest = decode(&body)?;
+        let service = ProtocolService::new(state.store, policy, state.checkpoints);
+        match service
+            .recover(&request, now)
+            .await
+            .map_err(|error| map_service_error::<Store>(&error))?
+        {
+            ServiceBaseline::Artifact(page) => encode_response(StatusCode::OK, &page),
+            ServiceBaseline::Unavailable => Err(ApiError::BaselineUnavailable),
         }
     }
     .await;
@@ -381,6 +416,8 @@ enum ApiError {
     NotAcceptable,
     Malformed { context: &'static str },
     CheckpointExpired,
+    BaselineRequired,
+    BaselineUnavailable,
     Busy,
     Deadline,
     Unavailable,
@@ -400,6 +437,8 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::CheckpointExpired => StatusCode::GONE,
+            Self::BaselineRequired => StatusCode::CONFLICT,
+            Self::BaselineUnavailable => StatusCode::NOT_FOUND,
             Self::Busy | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Deadline => StatusCode::GATEWAY_TIMEOUT,
             Self::Clock | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -439,12 +478,15 @@ mod tests {
     use logical_db_crdt::{Document, Object, Scalar};
     use logical_db_model::{
         AccountId, ChangeDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
-        Scope, SpaceId,
+        Scope, SnapshotArtifact, SnapshotRecord, SpaceId,
     };
     use logical_db_protocol::{
         ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
-    use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, StoredPage};
+    use logical_db_service::{
+        AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneRefusal, PruneResult,
+        SealResult, StoredPage,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -798,6 +840,68 @@ mod tests {
             })))
         }
     }
+
+    /// Inert retention for doubles whose tests never reach recovery or pruning.
+    macro_rules! inert_retention {
+        ($store:ty) => {
+            impl RetentionStore for $store {
+                fn consumed_through(
+                    &self,
+                    _scope: Scope,
+                ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+                    ready(Ok(0))
+                }
+                fn snapshot_baseline(
+                    &self,
+                    _scope: Scope,
+                ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
+                    ready(Ok(None))
+                }
+                fn build_snapshot(
+                    &self,
+                    scope: Scope,
+                    through: u64,
+                ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
+                    ready(Ok(SnapshotArtifact::new(scope, through, Vec::new())
+                        .expect("an empty bounded artifact is valid")))
+                }
+                fn seal_snapshot(
+                    &self,
+                    _scope: Scope,
+                    _artifact: &SnapshotArtifact,
+                    _request: OperationDigest,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
+                    ready(Ok(SealResult::BeyondFrontier { frontier: 0 }))
+                }
+                fn mark_consumed(
+                    &self,
+                    _scope: Scope,
+                    _through: u64,
+                    _request: OperationDigest,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+                    ready(Ok(ConsumedResult::Unchanged {
+                        consumed_through: 0,
+                    }))
+                }
+                fn prune(
+                    &self,
+                    _scope: Scope,
+                    _up_to: u64,
+                    _min_live: Option<u64>,
+                    _request: OperationDigest,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
+                    ready(Ok(PruneResult::Refused(PruneRefusal::MissingBaseline)))
+                }
+            }
+        };
+    }
+
+    inert_retention!(Memory);
+    inert_retention!(Stalled);
+    inert_retention!(ConsumedInvocations);
 
     struct Stalled {
         entered: Arc<Notify>,
