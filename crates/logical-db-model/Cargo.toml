@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-serde.workspace = true
+lgwks_std.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

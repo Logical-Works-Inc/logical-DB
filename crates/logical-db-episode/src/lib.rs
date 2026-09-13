@@ -17,11 +17,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use logical_db_cairn::{EpisodeRef, TokenKind, digest_frame};
-use serde::{
+use lgwks_std::json::serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as _, SeqAccess, Visitor},
 };
+use logical_db_cairn::{EpisodeRef, TokenKind, digest_frame};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -46,6 +46,7 @@ pub const MAX_EPISODES_PER_SNAPSHOT: usize = 256;
 
 /// Content-derived episode identity; the zero digest is rejected.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct EpisodeId([u8; 32]);
 
@@ -109,6 +110,7 @@ impl fmt::Display for EpisodeId {
 
 /// One of the seven episode clocks; time is first-class and multi-clock.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub enum ClockKind {
     /// When ORIGIN encountered the episode.
     Observed,
@@ -128,6 +130,7 @@ pub enum ClockKind {
 
 /// Seven-clock episode timestamp in milliseconds since the epoch.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct EpisodeTime {
     /// When ORIGIN encountered the episode.
     pub observed: i64,
@@ -147,6 +150,7 @@ pub struct EpisodeTime {
 
 /// How an episode is known.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub enum Epistemic {
     /// Directly observed evidence.
     Explicit,
@@ -160,6 +164,7 @@ pub enum Epistemic {
 
 /// One evidence link: the episode plus the role it played.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct Evidence {
     /// Upstream episode this link rests on.
     pub episode: EpisodeId,
@@ -476,6 +481,7 @@ impl Episode {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(deny_unknown_fields)]
 struct EpisodeWire {
     version: u16,
@@ -550,6 +556,7 @@ impl<'de> Deserialize<'de> for Episode {
 /// `trajectories` and `contradictions` must be covered by `evidence`, so
 /// rendered state cannot invent lineage. Guards mirror LEM `lib.rs:115-200`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct LocalWorldRecord {
     /// Local replay checkpoint, not cross-instance identity.
     pub source_sequence: u64,
@@ -645,6 +652,7 @@ pub struct OriginLog {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(deny_unknown_fields)]
 struct OriginLogWire {
     version: u16,

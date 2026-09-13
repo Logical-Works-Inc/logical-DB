@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use lgwks_std::json::serde::{Serialize, de::DeserializeOwned};
 use logical_db_protocol::{ProtocolError, PullPage, PullRequest, PushRequest, PushResponse};
 use logical_db_sync::{PullResult, Transport};
 pub use reqwest::Url;
@@ -22,7 +23,6 @@ use reqwest::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
-use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";

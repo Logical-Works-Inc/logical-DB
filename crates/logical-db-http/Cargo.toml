@@ -12,10 +12,10 @@ repository.workspace = true
 
 [dependencies]
 ciborium.workspace = true
+lgwks_std.workspace = true
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-sync = { version = "0.1.0", path = "../logical-db-sync" }
 reqwest.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

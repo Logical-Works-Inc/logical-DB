@@ -15,7 +15,7 @@ pub use baseline::{
 
 use std::{collections::BTreeMap, fmt};
 
-use serde::{Deserialize, Serialize};
+use lgwks_std::json::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod namespace_wire;
@@ -39,6 +39,7 @@ macro_rules! entity_id {
         #[derive(
             Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
         )]
+        #[serde(crate = "lgwks_std::json::serde")]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -96,6 +97,7 @@ entity_id!(PeerId, "Identifies one synchronization service or peer.");
 /// ordering and conflict semantics must be made explicit by an application
 /// projection before they enter a durable query key.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum IndexValue {
     /// Boolean ordering is `false`, then `true`.
@@ -114,6 +116,7 @@ pub enum IndexValue {
 
 /// One materialized secondary-index value for a document.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct IndexEntry {
     /// Stable schema identity of the projection.
     pub index: IndexId,
@@ -127,6 +130,7 @@ pub struct IndexEntry {
 /// incorporate several concurrent changes and therefore has multiple causal
 /// heads rather than one privileged last change.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct DocumentRevision(u64);
 
@@ -155,6 +159,7 @@ impl DocumentRevision {
 
 /// Content identity of immutable CRDT change bytes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct ChangeDigest([u8; 32]);
 
@@ -177,6 +182,7 @@ impl ChangeDigest {
 /// This is not an application retry label. Stores must recompute the action
 /// from its fields before accepting a grant carrying this identity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct ActionDigest([u8; 32]);
 
@@ -199,6 +205,7 @@ impl ActionDigest {
 /// This is distinct from [`ChangeDigest`]: retries bind to what the caller
 /// requested, while the change digest identifies the CRDT result.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct OperationDigest([u8; 32]);
 
@@ -270,6 +277,7 @@ const NAMESPACE_MAP_MAGIC: [u8; 6] = *b"LDBNS1";
 /// metered link still makes progress; [`NetworkCondition::Online`] runs the
 /// full policy budget.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkCondition {
     /// Run the full page budget every cycle.
@@ -287,6 +295,7 @@ pub enum NetworkCondition {
 /// the quiet namespace's pages: the driver runs every domain with its own
 /// limits against its own checkpoint.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct NamespacePolicy {
     changes_per_page: u16,
     bytes_per_page: u32,
@@ -386,6 +395,7 @@ pub fn validate_namespace(namespace: &str) -> Result<(), ModelError> {
 /// explicit full-recovery transition as an expired global checkpoint instead
 /// of a partial page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct NamespaceCheckpoint {
     version: u16,
     expires_at_unix_ms: u64,
@@ -516,6 +526,7 @@ pub const fn is_namespace_checkpoint_expired(
 /// and bounded to the slot limit, so it installs through the same atomic
 /// page path as any other checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct NamespaceCheckpoints {
     entries: BTreeMap<String, NamespaceCheckpoint>,
 }
@@ -651,6 +662,7 @@ impl NamespaceCheckpoints {
 
 /// Logical ownership scope independent from physical backend keys.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct Scope {
     account: AccountId,
     space: SpaceId,
@@ -678,6 +690,7 @@ impl Scope {
 
 /// Effects understood by the core authorization boundary.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
     /// Read materialized document state.
@@ -695,6 +708,7 @@ pub enum Effect {
 /// A Braid adapter may produce this value, but Braid runtime types never cross
 /// the model or storage boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct AuthorityDecision {
     scope: Scope,
     effect: Effect,

@@ -1855,36 +1855,11 @@ fn content_digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::with_capacity(64);
-    for byte in digest {
-        name.push(char::from(HEX[usize::from(byte >> 4)]));
-        name.push(char::from(HEX[usize::from(byte & 0x0F)]));
-    }
-    name
+    lgwks_std::hex::encode(digest)
 }
 
 fn hex_to_digest(name: &str) -> Option<[u8; 32]> {
-    if name.len() != 64 {
-        return None;
-    }
-    let bytes = name.as_bytes();
-    let mut digest = [0_u8; 32];
-    for (index, slot) in digest.iter_mut().enumerate() {
-        let hi = hex_val(bytes[2 * index])?;
-        let lo = hex_val(bytes[2 * index + 1])?;
-        *slot = hi << 4 | lo;
-    }
-    Some(digest)
-}
-
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    lgwks_std::hex::decode(name).ok()?.try_into().ok()
 }
 
 fn is_blob_name(name: &str) -> bool {

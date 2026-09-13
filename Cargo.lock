@@ -1273,7 +1273,7 @@ dependencies = [
 name = "logical-db-cairn"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "lgwks_std 0.6.1",
  "sha2",
  "thiserror",
  "uuid",
@@ -1334,8 +1334,8 @@ name = "logical-db-episode"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "lgwks_std 0.6.1",
  "logical-db-cairn",
- "serde",
  "sha2",
  "thiserror",
  "uuid",
@@ -1348,11 +1348,11 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
+ "lgwks_std 0.6.1",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-sync",
  "reqwest",
- "serde",
  "serde_bytes",
  "thiserror",
 ]
@@ -1361,6 +1361,7 @@ dependencies = [
 name = "logical-db-kv"
 version = "0.1.0"
 dependencies = [
+ "lgwks_std 0.6.1",
  "logical-db",
  "logical-db-model",
  "sha2",
@@ -1372,7 +1373,7 @@ dependencies = [
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "lgwks_std 0.6.1",
  "sha2",
  "thiserror",
  "uuid",
@@ -1390,8 +1391,8 @@ name = "logical-db-protocol"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "lgwks_std 0.6.1",
  "logical-db-model",
- "serde",
  "serde_bytes",
  "sha2",
  "thiserror",
@@ -1404,11 +1405,11 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
+ "lgwks_std 0.6.1",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-service",
- "serde",
  "serde_bytes",
  "tower",
 ]

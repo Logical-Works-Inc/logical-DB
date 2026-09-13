@@ -11,14 +11,14 @@ pub use action::{
     PageAction, mark_consumed_action, prune_action, seal_snapshot_action, write_action,
 };
 
+use lgwks_std::json::serde::{
+    self, Deserialize, Deserializer, Serialize,
+    de::{Error as _, SeqAccess, Visitor},
+};
 pub use logical_db_model::ChangeDigest;
 use logical_db_model::{
     DocumentId, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, OperationDigest,
     OperationId, ReplicaId, Scope,
-};
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{Error as _, SeqAccess, Visitor},
 };
 use thiserror::Error;
 
@@ -28,6 +28,7 @@ const MAX_CHECKPOINT_BYTES: usize = 4_096;
 
 /// Opaque server-issued progress position for exactly one account and space.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct Checkpoint(
     #[serde(
@@ -61,6 +62,7 @@ impl Checkpoint {
 
 /// One immutable, retryable document change.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct ChangeEnvelope {
     /// Logical ownership scope.
     pub scope: Scope,
@@ -100,6 +102,7 @@ impl ChangeEnvelope {
 
 /// Bounded client-to-service change upload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct PushRequest {
     /// Exact protocol version encoded by the client.
     pub protocol: u16,
@@ -134,6 +137,7 @@ impl PushRequest {
 
 /// Per-change upload result so one invalid change cannot hide other outcomes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PushOutcome {
     /// The service durably accepted the change.
@@ -157,6 +161,7 @@ pub enum PushOutcome {
 
 /// Stable rejection categories carried inside successful batch responses.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(rename_all = "snake_case")]
 pub enum RejectionCode {
     /// Change bytes did not match the supplied digest.
@@ -175,6 +180,7 @@ pub enum RejectionCode {
 
 /// Service response to one bounded push page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct PushResponse {
     /// Exact protocol version encoded by the service.
     pub protocol: u16,
@@ -213,6 +219,7 @@ impl PushResponse {
 
 /// Request for changes after an opaque durable checkpoint.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct PullRequest {
     /// Exact protocol version encoded by the client.
     pub protocol: u16,
@@ -253,6 +260,7 @@ impl PullRequest {
 
 /// One bounded service-to-client page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct PullPage {
     /// Exact protocol version encoded by the service.
     pub protocol: u16,
@@ -676,7 +684,7 @@ mod tests {
 
     #[test]
     fn hostile_sequence_hint_cannot_preallocate_past_change_limit() {
-        use serde::de::value::{Error as ValueError, SeqDeserializer};
+        use lgwks_std::json::serde::de::value::{Error as ValueError, SeqDeserializer};
 
         let oversized = std::iter::repeat_n(0u8, MAX_CHANGE_BYTES + 1);
         let deserializer = SeqDeserializer::<_, ValueError>::new(oversized);
@@ -685,7 +693,7 @@ mod tests {
 
     #[test]
     fn checkpoint_deserialization_cannot_bypass_constructor_bounds() {
-        use serde::de::value::{Error as ValueError, SeqDeserializer};
+        use lgwks_std::json::serde::de::value::{Error as ValueError, SeqDeserializer};
 
         let empty = SeqDeserializer::<_, ValueError>::new(std::iter::empty::<u8>());
         assert!(Checkpoint::deserialize(empty).is_err());
@@ -799,7 +807,9 @@ mod tests {
 
     #[test]
     fn bounded_deserializers_preserve_values_and_reject_the_first_excess_item() {
-        use serde::de::value::{BorrowedBytesDeserializer, Error as ValueError, SeqDeserializer};
+        use lgwks_std::json::serde::de::value::{
+            BorrowedBytesDeserializer, Error as ValueError, SeqDeserializer,
+        };
 
         let source = [1_u8, 2, 3];
         let bytes = deserialize_bounded_bytes(

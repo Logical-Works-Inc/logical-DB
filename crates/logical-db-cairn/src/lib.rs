@@ -21,7 +21,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::{Deserialize, Deserializer, Serialize};
+use lgwks_std::json::serde::{self, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -36,6 +36,7 @@ macro_rules! string_vocab {
     ($doc:literal, $name:ident, $err:ident, $($vdoc:literal $variant:ident => $str:literal),* $(,)?) => {
         #[doc = $doc]
         #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
             $(
@@ -121,6 +122,7 @@ pub fn digest_frame(parts: &[&[u8]]) -> [u8; 32] {
 
 /// Content-derived observation identity; the zero digest is rejected.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 #[serde(transparent)]
 pub struct EpisodeRef([u8; 32]);
 
@@ -168,6 +170,7 @@ impl std::fmt::Display for EpisodeRef {
 
 /// Directed, confidence-weighted edge between two observations.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct TokenLink {
     /// Relation this edge asserts.
     pub relation: LinkRelation,
@@ -201,6 +204,7 @@ impl TokenLink {
 
 /// One validated semantic observation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct Observation {
     /// Observation identifier; must be non-zero.
     pub id: EpisodeRef,
@@ -310,6 +314,7 @@ pub const fn authority_weight(tier: u8) -> f64 {
 
 /// Trust-graded claim held in memory.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct MemoryClaim {
     /// Claim text; non-empty UTF-8 bounded to [`MAX_CLAIM_BYTES`].
     pub claim: String,
@@ -353,6 +358,7 @@ impl MemoryClaim {
 
 /// Steering verdict for a proposed action.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(crate = "lgwks_std::json::serde")]
 pub struct SteeringDecision {
     /// Whether the action may proceed.
     pub allow: bool,

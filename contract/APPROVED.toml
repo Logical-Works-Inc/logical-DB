@@ -214,24 +214,10 @@ approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
 # ── Serialization and wire encoding ─────────────────────────────────────────
-# `serde` is the estate's owned serialization stack (re-exported by
-# `lgwks_std::json`); it is registered here because logical-db declares the
-# crate directly for derive paths. CBOR and byte-string framing are the
-# versioned wire format and have no estate or std module yet.
-
-[[approved]]
-crate = "serde"
-tier = "boundary"
-version = "=1.0.229"
-owner = "logical-db-model"
-capability = "encoding.derive"
-source = "registry"
-allowed_consumers = "logical-db-model,logical-db-protocol,logical-db-episode,logical-db-cairn,logical-db-server,logical-db-http"
-allowed_kinds = "normal"
-reason = "Derive-based serialization needs compiler introspection the standard library does not expose."
-approved_by = "Director"
-approved_on = "2026-09-13"
-review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+# Derives route through `lgwks_std::json::{Serialize, Deserialize}`, the
+# estate's re-export of the serde crate, so no logical-db crate declares
+# `serde` directly. CBOR and byte-string framing are the versioned wire
+# format and have no estate or std module yet.
 
 [[approved]]
 crate = "serde_bytes"

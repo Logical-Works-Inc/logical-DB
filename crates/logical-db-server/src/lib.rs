@@ -27,6 +27,7 @@ use axum::{
     routing::post,
 };
 use lgwks_bot::rt::{sync::Semaphore, time::timeout};
+use lgwks_std::json::serde;
 use logical_db_protocol::{PullRequest, PushRequest};
 use logical_db_service::{
     Authority, CheckpointCodec, ProtocolService, ServiceError, ServicePull, ServiceStore,
