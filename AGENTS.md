@@ -30,3 +30,9 @@ rewrite whose evidence verifier is red.
 
 The locked architecture is `ARCHITECTURE.md`; the mechanical acceptance list is
 `REWRITE_MANIFEST.md`; source definitions are in `evidence/SOURCES.md`.
+
+`GOVERNANCE.md` tracks current completion evidence and unresolved Director
+decisions. Pause work that depends on a required human decision, ask for that
+decision, and continue independent authorized work. Do not silently resolve
+conflicting historical scope contracts or close issues whose acceptance is
+still unproven.

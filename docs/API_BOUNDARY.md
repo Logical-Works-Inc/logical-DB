@@ -28,6 +28,10 @@ Database::query_index(index, value, after_document, limit)
 Database::changes_since(after_sequence, limit)
 Database::migrate_schema(version, projections, batch_size)
 Database::synchronize(peer, transport, limits, cancelled)
+Database::delete(document, operation, request_digest)
+Database::export()
+Database::restore(payload)
+Database::restore_cursor()
 ```
 
 `edit_fn` receives only the typed CRDT `Editor`; `read_fn` and projection
@@ -133,7 +137,12 @@ That separation is the standalone/embedded invariant: deployment may replace
 ports, but it cannot fork the data semantics or leak physical backend APIs into
 applications.
 
-The v1 boundary does not promise multi-upstream fan-out, server history
-retention, snapshot-baseline recovery, database export/restore, document
-tombstones, or range/composite queries. Those require new durable protocol and
-schema contracts; they are not hidden behind the existing facade.
+The embedded facade implements document tombstones and bounded export/restore,
+including a durable restore cursor. Retained tests cover tombstone propagation,
+reopen, corrupt export refusal, and resuming a restore prefix.
+
+The service has retention operations, but its current baseline is a position
+marker rather than recoverable document state. State-bearing baseline recovery
+remains blocked by issue #28. Multi-upstream fan-out and range/composite queries
+are not implied by the existing API. `GOVERNANCE.md` distinguishes these open
+contracts from implemented embedded functionality.

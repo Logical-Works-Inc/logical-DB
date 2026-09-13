@@ -56,6 +56,14 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 
 ## Still blocking production release and LEM handoff
 
+- [ ] Complete the explicit backend capability profiles and matched-trace
+  evidence required by the recorded Director ruling in `GOVERNANCE.md`.
+- [ ] Resolve the remaining estate ownership decision before LEM handoff.
+- [ ] Bind authority to a service-computed canonical action digest distinct
+  from caller intent/idempotency identity, including payload-field mutation
+  and exact-retry proof through HTTP and FDB (issue #27).
+- [ ] Include explicit application-supplied projection semantic identity in
+  the durable schema digest and migration proof (issue #29).
 - [x] Native Windows CI passed data placement, file locking, concurrent open,
   Unicode, read-only paths, process termination, loopback HTTP, and all default
   workspace tests. Public TLS remains a deployment-host boundary, not an
@@ -67,8 +75,11 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   Braid's capsule flag alone is not treated as runtime evidence.
 - [ ] Add a versioned server snapshot baseline, retention floor, client recovery
   transition, and peer-aware garbage collection before pruning the append-only log.
-- [ ] Add first-class document tombstones plus a supported embedded export and
-  restore contract, including interrupted-restore and corrupt-backup journeys.
+- [x] Implement embedded document tombstones and versioned export/restore with
+  retained facade/store tests for reopen, propagation, corrupt input, and
+  resuming a restore prefix.
+- [ ] Complete direct process-kill-during-restore and external-consumer recovery
+  evidence; an in-process partial replay test is not a process-kill receipt.
 - [ ] Exercise multi-node FDB failover and point-in-time restore, public
   TLS/issuer/rotation, sustained load/backpressure, disk exhaustion, sleep/wake,
   and mobile sandbox lifecycle.
@@ -80,3 +91,7 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   prove local/main/origin tips match under protected-main policy.
 
 No green subset, churn percentage, or document may override an unchecked gate.
+
+The current issue/decision ledger is `GOVERNANCE.md`. PR #36's merge is recorded
+there without implying that the remaining release gates or conflicting scope
+decisions have been resolved.
