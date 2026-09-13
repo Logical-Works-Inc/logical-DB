@@ -13,16 +13,15 @@ repository.workspace = true
 [dependencies]
 axum.workspace = true
 ciborium.workspace = true
+lgwks_bot.workspace = true
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 serde.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
 serde_bytes.workspace = true
-tokio.workspace = true
 tower.workspace = true
 
 [lints]

@@ -244,17 +244,27 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn two_embedded_replicas_converge_through_real_http_and_keep_indexes_current() {
+    #[test]
+    fn two_embedded_replicas_converge_through_real_http_and_keep_indexes_current() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(two_embedded_replicas_body());
+    }
+
+    async fn two_embedded_replicas_body() {
         let app = router(
             MemoryServiceStore::default(),
             TestAuthentication,
             CheckpointCodec::new([21; 32], 60_000).unwrap(),
             FixedClock,
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let server = lgwks_bot::rt::task::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         let endpoint = format!("http://{address}/").parse().unwrap();

@@ -1587,13 +1587,13 @@ mod tests {
             changes: vec![change(scope, replica, operation)],
         };
         assert!(matches!(
-            futures::executor::block_on(service.push(&request, 10))
+            lgwks_std::task::block_on(service.push(&request, 10))
                 .unwrap()
                 .outcomes[0],
             PushOutcome::Accepted { .. }
         ));
         assert!(matches!(
-            futures::executor::block_on(service.push(&request, 10))
+            lgwks_std::task::block_on(service.push(&request, 10))
                 .unwrap()
                 .outcomes[0],
             PushOutcome::Duplicate { .. }
@@ -1607,7 +1607,7 @@ mod tests {
             max_changes: 10,
             max_bytes: 1024,
         };
-        let ServicePull::Page(page) = futures::executor::block_on(service.pull(&pull, 10)).unwrap()
+        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10)).unwrap()
         else {
             panic!("page expected")
         };
@@ -1618,7 +1618,7 @@ mod tests {
             ..pull
         };
         assert!(matches!(
-            futures::executor::block_on(service.pull(&forged, 11)),
+            lgwks_std::task::block_on(service.pull(&forged, 11)),
             Err(ServiceError::Checkpoint(CheckpointError::InvalidMac))
         ));
     }
@@ -1641,7 +1641,7 @@ mod tests {
             max_changes: 10,
             max_bytes: 1024,
         };
-        let ServicePull::Page(page) = futures::executor::block_on(service.pull(&pull, 10)).unwrap()
+        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10)).unwrap()
         else {
             panic!("page expected")
         };
@@ -1650,7 +1650,7 @@ mod tests {
             ..pull
         };
         assert_eq!(
-            futures::executor::block_on(service.pull(&expired, 15)).unwrap(),
+            lgwks_std::task::block_on(service.pull(&expired, 15)).unwrap(),
             ServicePull::CheckpointExpired
         );
     }
@@ -1668,7 +1668,7 @@ mod tests {
         malformed.bytes = vec![1];
         let mut mismatched = change(scope, replica, OperationId::new());
         mismatched.digest = ChangeDigest::new([0; 32]);
-        let response = futures::executor::block_on(service.push(
+        let response = lgwks_std::task::block_on(service.push(
             &PushRequest {
                 protocol: PROTOCOL_VERSION,
                 replica,
@@ -1712,7 +1712,7 @@ mod tests {
             max_bytes: 1024,
         };
         assert!(matches!(
-            futures::executor::block_on(service.pull(&pull, 10)),
+            lgwks_std::task::block_on(service.pull(&pull, 10)),
             Err(ServiceError::StaleAuthority)
         ));
     }
@@ -1851,7 +1851,7 @@ mod tests {
             replica,
             changes,
         };
-        futures::executor::block_on(service.push(&request, 10)).unwrap()
+        lgwks_std::task::block_on(service.push(&request, 10)).unwrap()
     }
 
     fn pull_after<Store, Policy>(
@@ -1875,7 +1875,7 @@ mod tests {
             max_changes: 10,
             max_bytes: 1_048_576,
         };
-        futures::executor::block_on(service.pull(&request, now)).unwrap()
+        lgwks_std::task::block_on(service.pull(&request, now)).unwrap()
     }
 
     fn seal_at<Store, Policy>(
@@ -1889,7 +1889,7 @@ mod tests {
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        futures::executor::block_on(service.seal_snapshot(
+        lgwks_std::task::block_on(service.seal_snapshot(
             scope,
             position,
             OperationDigest::new([61; 32]),
@@ -1909,7 +1909,7 @@ mod tests {
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        futures::executor::block_on(service.mark_consumed(
+        lgwks_std::task::block_on(service.mark_consumed(
             scope,
             through,
             OperationDigest::new([62; 32]),
@@ -1930,7 +1930,7 @@ mod tests {
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        futures::executor::block_on(service.prune(
+        lgwks_std::task::block_on(service.prune(
             scope,
             up_to,
             min_live,
@@ -2216,11 +2216,11 @@ mod tests {
             CheckpointCodec::new([25; 32], 10_000).unwrap(),
         );
         assert_eq!(
-            futures::executor::block_on(store.retention_floor(scope)).unwrap(),
+            lgwks_std::task::block_on(store.retention_floor(scope)).unwrap(),
             2
         );
         assert!(matches!(
-            futures::executor::block_on(store.snapshot_baseline(scope)).unwrap(),
+            lgwks_std::task::block_on(store.snapshot_baseline(scope)).unwrap(),
             Some(SnapshotRecord::State(ref baseline)) if baseline.position() == 2
         ));
         assert_eq!(
@@ -2260,7 +2260,7 @@ mod tests {
             CheckpointCodec::new([26; 32], 10_000).unwrap(),
         );
         assert_eq!(
-            futures::executor::block_on(stale.seal_snapshot(
+            lgwks_std::task::block_on(stale.seal_snapshot(
                 scope,
                 0,
                 OperationDigest::new([61; 32]),
@@ -2270,7 +2270,7 @@ mod tests {
             SealResult::StaleAuthority
         );
         assert_eq!(
-            futures::executor::block_on(stale.mark_consumed(
+            lgwks_std::task::block_on(stale.mark_consumed(
                 scope,
                 0,
                 OperationDigest::new([62; 32]),
@@ -2280,7 +2280,7 @@ mod tests {
             ConsumedResult::StaleAuthority
         );
         assert_eq!(
-            futures::executor::block_on(stale.prune(
+            lgwks_std::task::block_on(stale.prune(
                 scope,
                 0,
                 None,
@@ -2296,7 +2296,7 @@ mod tests {
             CheckpointCodec::new([27; 32], 10_000).unwrap(),
         );
         assert!(matches!(
-            futures::executor::block_on(denied.prune(
+            lgwks_std::task::block_on(denied.prune(
                 scope,
                 0,
                 None,

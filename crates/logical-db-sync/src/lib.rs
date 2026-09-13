@@ -1747,7 +1747,7 @@ mod tests {
             ]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -1802,7 +1802,7 @@ mod tests {
             pulls: std::collections::VecDeque::default(),
         };
         assert!(
-            matches!(futures::executor::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation)
+            matches!(lgwks_std::task::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation)
         );
         assert_eq!(replica.acknowledged.get(), 0);
     }
@@ -1838,7 +1838,7 @@ mod tests {
             pulls: std::collections::VecDeque::new(),
         };
         assert_eq!(
-            futures::executor::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))
+            lgwks_std::task::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))
                 .unwrap(),
             (1, true)
         );
@@ -1881,7 +1881,7 @@ mod tests {
             })]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -1955,7 +1955,7 @@ mod tests {
             pulls: [PullResult::CheckpointExpired].into(),
         };
         assert!(matches!(
-            futures::executor::block_on(synchronize(
+            lgwks_std::task::block_on(synchronize(
                 &replica,
                 PeerId::new(),
                 &mut wire,
@@ -1991,7 +1991,7 @@ mod tests {
             })]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -2028,7 +2028,7 @@ mod tests {
             })]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -2334,7 +2334,7 @@ mod tests {
             .iter()
             .find_map(|(document, namespace)| (*namespace == "quiet").then_some(*document))
             .unwrap();
-        let report = futures::executor::block_on(synchronize_namespace(
+        let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2362,7 +2362,7 @@ mod tests {
             PositionalLog::position_bytes(2)
         );
         assert!(map.get("chatty").is_none());
-        let rerun = futures::executor::block_on(synchronize_namespace(
+        let rerun = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2381,7 +2381,7 @@ mod tests {
         let (mut log, ownership) = log_with(scope, &["quiet"]);
         log.grow_per_pull = 20;
         let replica = NsReplica::fresh(scope, Vec::new());
-        let report = futures::executor::block_on(synchronize_namespace(
+        let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
@@ -2405,7 +2405,7 @@ mod tests {
         pending.push(quiet_change);
         let sender = NsReplica::fresh(scope, pending);
         let mut uplink = log_with(scope, &[]).0;
-        let send = futures::executor::block_on(send_namespace_now(
+        let send = lgwks_std::task::block_on(send_namespace_now(
             &sender,
             PeerId::new(),
             &mut uplink,
@@ -2435,7 +2435,7 @@ mod tests {
             .unwrap();
         replica.seed_map(&stale);
         let peer = PeerId::new();
-        let report = futures::executor::block_on(synchronize_namespace(
+        let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2456,7 +2456,7 @@ mod tests {
         expired_service.floor = u64::MAX;
         let fresh = NsReplica::fresh(scope, Vec::new());
         assert!(matches!(
-            futures::executor::block_on(synchronize_namespace(
+            lgwks_std::task::block_on(synchronize_namespace(
                 &fresh,
                 PeerId::new(),
                 &mut expired_service,
@@ -2477,7 +2477,7 @@ mod tests {
         let (mut log, ownership) = log_with(scope, &["quiet"; 6]);
         let replica = NsReplica::fresh(scope, Vec::new());
         let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
-        let deferred = futures::executor::block_on(synchronize_namespace(
+        let deferred = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
@@ -2494,7 +2494,7 @@ mod tests {
 
         let constrained =
             NamespacePolicy::new(2, 1_048_576, 8, NetworkCondition::Constrained).unwrap();
-        let partial = futures::executor::block_on(synchronize_namespace(
+        let partial = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
@@ -2516,7 +2516,7 @@ mod tests {
         let replica = NsReplica::fresh(scope, Vec::new());
         *replica.slot.borrow_mut() = Some(b"legacy-global-cursor".to_vec());
         assert!(matches!(
-            futures::executor::block_on(synchronize_namespace(
+            lgwks_std::task::block_on(synchronize_namespace(
                 &replica,
                 PeerId::new(),
                 &mut log,
@@ -2539,7 +2539,7 @@ mod tests {
         let (mut log, ownership) = log_with(scope, &["alpha", "beta", "alpha", "beta"]);
         let replica = NsReplica::fresh(scope, Vec::new());
         let peer = PeerId::new();
-        let alpha_report = futures::executor::block_on(synchronize_namespace(
+        let alpha_report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2552,7 +2552,7 @@ mod tests {
         assert_eq!(alpha_report.pages, 4);
         assert!(!alpha_report.more);
         assert!(replica.stored_map().get("beta").is_none());
-        let beta_report = futures::executor::block_on(synchronize_namespace(
+        let beta_report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2572,7 +2572,7 @@ mod tests {
             map.get("beta").unwrap().cursor(),
             PositionalLog::position_bytes(4)
         );
-        let quiet_rerun = futures::executor::block_on(synchronize_namespace(
+        let quiet_rerun = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2595,7 +2595,7 @@ mod tests {
         let mut uplink = log_with(scope, &[]).0;
         uplink.reject_push = true;
         assert!(matches!(
-            futures::executor::block_on(send_namespace_now(
+            lgwks_std::task::block_on(send_namespace_now(
                 &replica,
                 PeerId::new(),
                 &mut uplink,
@@ -2909,7 +2909,7 @@ mod tests {
         let mut wire = ScriptWire::with_pulls(vec![scripted_empty_page(1), scripted_empty_page(2)]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.send_now(
+        let report = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits {
@@ -2950,7 +2950,7 @@ mod tests {
         ]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.fetch_now(
+        let report = lgwks_std::task::block_on(engine.fetch_now(
             &replica,
             &mut wire,
             SyncLimits {
@@ -2992,7 +2992,7 @@ mod tests {
             ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.fetch_now(
+        let report = lgwks_std::task::block_on(engine.fetch_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3015,7 +3015,7 @@ mod tests {
         *fresh.checkpoint.borrow_mut() = Some(vec![9]);
         let mut retrying = orchestrator();
         assert!(matches!(
-            futures::executor::block_on(retrying.fetch_now(
+            lgwks_std::task::block_on(retrying.fetch_now(
                 &fresh,
                 &mut expired,
                 SyncLimits::default(),
@@ -3046,7 +3046,7 @@ mod tests {
             retry_after: &retry_after,
         };
         let mut engine = orchestrator();
-        let deferred = futures::executor::block_on(engine.send_now(
+        let deferred = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3062,7 +3062,7 @@ mod tests {
         assert_eq!(engine.state().not_ready_until_ms(), 50);
         assert!(wire.pushes.borrow().is_empty());
 
-        let gated = futures::executor::block_on(engine.send_now(
+        let gated = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3076,7 +3076,7 @@ mod tests {
         assert!(wire.pushes.borrow().is_empty());
         assert_eq!(wire.pulls_seen.get(), 0);
 
-        let recovered = futures::executor::block_on(engine.send_now(
+        let recovered = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3101,7 +3101,7 @@ mod tests {
         };
         let mut failing = orchestrator();
         assert!(matches!(
-            futures::executor::block_on(failing.send_now(
+            lgwks_std::task::block_on(failing.send_now(
                 &stuck,
                 &mut fatal,
                 SyncLimits::default(),
@@ -3133,7 +3133,7 @@ mod tests {
             changes_per_page: 1,
             ..SyncLimits::default()
         };
-        let partial = futures::executor::block_on(engine.send_now(
+        let partial = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             limits,
@@ -3148,7 +3148,7 @@ mod tests {
         let blob = engine.export_state();
         assert_eq!(OrchestratorState::decode(&blob).unwrap(), engine.state());
         let mut revived = SyncOrchestrator::restore(peer, policy, &blob).unwrap();
-        let resumed = futures::executor::block_on(revived.send_now(
+        let resumed = lgwks_std::task::block_on(revived.send_now(
             &replica,
             &mut wire,
             limits,
@@ -3159,7 +3159,7 @@ mod tests {
         .unwrap();
         assert_eq!(resumed.pushed, 1);
         assert!(resumed.more);
-        let finished = futures::executor::block_on(revived.send_now(
+        let finished = lgwks_std::task::block_on(revived.send_now(
             &replica,
             &mut wire,
             limits,
@@ -3191,7 +3191,7 @@ mod tests {
         let is_mine = |candidate| ownership.get(&candidate) == Some(&"quiet");
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.run_namespace(
+        let report = lgwks_std::task::block_on(engine.run_namespace(
             &replica,
             &mut log,
             &domain("quiet", online_policy(16, 8), 1_000),
@@ -3218,7 +3218,7 @@ mod tests {
 
         let pulls_before = log.pulls.get();
         let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
-        let parked = futures::executor::block_on(engine.run_namespace(
+        let parked = lgwks_std::task::block_on(engine.run_namespace(
             &replica,
             &mut log,
             &domain("quiet", offline, 2_000),
@@ -3262,7 +3262,7 @@ mod tests {
             ..SyncLimits::default()
         };
         let mut uplink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
-        let sent = futures::executor::block_on(uplink.send_now(
+        let sent = lgwks_std::task::block_on(uplink.send_now(
             &sender,
             &mut log,
             limits,
@@ -3275,7 +3275,7 @@ mod tests {
         assert!(!sent.more);
 
         let mut downlink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
-        let fetched = futures::executor::block_on(downlink.fetch_now(
+        let fetched = lgwks_std::task::block_on(downlink.fetch_now(
             &receiver,
             &mut log,
             limits,
@@ -3296,7 +3296,7 @@ mod tests {
         assert_eq!(installed_docs, vec![first_document, second_document]);
         assert_eq!(*log.pushes.borrow(), operations);
 
-        let quiet = futures::executor::block_on(downlink.send_now(
+        let quiet = lgwks_std::task::block_on(downlink.send_now(
             &receiver,
             &mut log,
             limits,
@@ -3308,7 +3308,7 @@ mod tests {
         assert_eq!(quiet.pushed, 0);
         assert_eq!(quiet.pulled, 0);
         assert!(!quiet.more);
-        let settled = futures::executor::block_on(uplink.fetch_now(
+        let settled = lgwks_std::task::block_on(uplink.fetch_now(
             &sender,
             &mut log,
             limits,

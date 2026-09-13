@@ -164,17 +164,17 @@ fn parse_non_nil_uuid(value: &str, name: &'static str) -> Result<Uuid, io::Error
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        if let Ok(mut terminate) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
+        if let Ok(mut terminate) = lgwks_bot::rt::signal::unix::signal(
+            lgwks_bot::rt::signal::unix::SignalKind::terminate(),
+        ) {
+            lgwks_bot::select! {
+                _ = lgwks_bot::rt::signal::ctrl_c() => {}
                 _ = terminate.recv() => {}
             }
             return;
         }
     }
-    if let Err(error) = tokio::signal::ctrl_c().await {
+    if let Err(error) = lgwks_bot::rt::signal::ctrl_c().await {
         eprintln!("logical-db-daemon: ctrl-c signal listener failed: {error}");
     }
 }
@@ -190,8 +190,11 @@ fn ensure_loopback(address: &SocketAddr) -> Result<(), io::Error> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
+    lgwks_bot::Runtime::new()?.block_on(service_main())
+}
+
+async fn service_main() -> Result<(), Box<dyn Error>> {
     let bind = std::env::var("LOGICAL_DB_BIND").unwrap_or_else(|error| {
         eprintln!("logical-db-daemon: LOGICAL_DB_BIND defaulted: {error}");
         "127.0.0.1:8080".into()
@@ -240,7 +243,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let authentication = BearerAuthenticator::new(key, bearer.as_bytes(), scope)?;
     let checkpoints = CheckpointCodec::new(key, 86_400_000)?;
     let application = router(store, authentication, checkpoints, SystemClock);
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = lgwks_bot::rt::net::TcpListener::bind(address).await?;
     axum::serve(listener, application)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -338,8 +341,19 @@ mod tests {
         (request, operation)
     }
 
-    #[tokio::test]
-    async fn default_composition_refuses_writes_and_sync_end_to_end() {
+    fn test_runtime() -> lgwks_bot::Runtime {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn default_composition_refuses_writes_and_sync_end_to_end() {
+        test_runtime().block_on(default_composition_body());
+    }
+
+    async fn default_composition_body() {
         let expected_scope = scope(41);
         let authentication =
             BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", expected_scope)

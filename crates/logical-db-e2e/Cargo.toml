@@ -12,8 +12,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lgwks_bot.workspace = true
 logical-db = { version = "0.1.0", path = "../logical-db", features = ["http", "semantics"] }
-tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

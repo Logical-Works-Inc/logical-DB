@@ -24,8 +24,11 @@ fn required(name: &'static str) -> Result<String, io::Error> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
+    lgwks_bot::Runtime::new()?.block_on(journey())
+}
+
+async fn journey() -> Result<(), Box<dyn Error>> {
     let endpoint: Url = required("LOGICAL_DB_JOURNEY_ENDPOINT")?.parse()?;
     let bearer_token = required("LOGICAL_DB_BEARER_TOKEN")?;
     let bearer = StaticBearer::new(&bearer_token)?;

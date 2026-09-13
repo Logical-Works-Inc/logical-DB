@@ -16,7 +16,7 @@ logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 sha2.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
+lgwks_std.workspace = true
 
 [lints]
 workspace = true

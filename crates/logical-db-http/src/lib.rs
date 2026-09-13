@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use futures::TryStreamExt;
 use logical_db_protocol::{ProtocolError, PullPage, PullRequest, PushRequest, PushResponse};
 use logical_db_sync::{PullResult, Transport};
 pub use reqwest::Url;
@@ -239,6 +238,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, HttpError> {
 }
 
 async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, HttpError> {
+    let mut response = response;
     let status = response.status();
     if !status.is_success() {
         let retry_after = response
@@ -271,9 +271,8 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
         eprintln!("logical-db-http: decode_response: BodyTooLarge");
         return Err(HttpError::BodyTooLarge);
     }
-    let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = stream.try_next().await.map_err(HttpError::Network)? {
+    while let Some(chunk) = response.chunk().await.map_err(HttpError::Network)? {
         if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
             eprintln!("logical-db-http: decode_response: BodyTooLarge");
             return Err(HttpError::BodyTooLarge);
@@ -476,10 +475,19 @@ mod tests {
                 "/gone/v1/changes:pull",
                 post(|| async { (AxumStatus::GONE, Body::empty()) }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        lgwks_bot::rt::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{address}/").parse().unwrap()
+    }
+
+    fn test_runtime() -> lgwks_bot::Runtime {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
     }
 
     #[test]
@@ -546,8 +554,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn response_decoder_enforces_status_media_and_exact_stream_bounds() {
+    #[test]
+    fn response_decoder_enforces_status_media_and_exact_stream_bounds() {
+        test_runtime().block_on(response_decoder_body());
+    }
+
+    async fn response_decoder_body() {
         let endpoint = endpoint().await;
         let client = Client::new();
         let response = client
@@ -621,8 +633,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn pull_maps_only_http_gone_to_checkpoint_expiry() {
+    #[test]
+    fn pull_maps_only_http_gone_to_checkpoint_expiry() {
+        test_runtime().block_on(pull_gone_body());
+    }
+
+    async fn pull_gone_body() {
         use logical_db_model::{AccountId, OperationDigest, ReplicaId, Scope, SpaceId};
 
         let mut transport =

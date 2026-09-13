@@ -2085,7 +2085,7 @@ mod tests {
         assert_eq!(ReplicaPort::replica(&database), replica);
         assert_eq!(ReplicaPort::pending(&database, 10).unwrap().len(), 1);
         assert_eq!(ReplicaPort::checkpoint(&database, peer).unwrap(), None);
-        let report = futures::executor::block_on(database.synchronize(
+        let report = lgwks_std::task::block_on(database.synchronize(
             peer,
             &mut AcceptingTransport,
             SyncLimits::default(),
@@ -2109,7 +2109,7 @@ mod tests {
         );
         let second_peer = PeerId::new();
         assert!(matches!(
-            futures::executor::block_on(database.synchronize(
+            lgwks_std::task::block_on(database.synchronize(
                 second_peer,
                 &mut AcceptingTransport,
                 SyncLimits::default(),
@@ -3389,7 +3389,7 @@ mod tests {
         database
             .delete(document, OperationId::new(), OperationDigest::new([2; 32]))
             .unwrap();
-        let report = futures::executor::block_on(database.synchronize(
+        let report = lgwks_std::task::block_on(database.synchronize(
             peer,
             &mut AcceptingTransport,
             SyncLimits::default(),

@@ -26,12 +26,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use lgwks_bot::rt::{sync::Semaphore, time::timeout};
 use logical_db_protocol::{PullRequest, PushRequest};
 use logical_db_service::{
     Authority, CheckpointCodec, ProtocolService, ServiceError, ServicePull, ServiceStore,
     StoreFailureClass,
 };
-use tokio::{sync::Semaphore, time::timeout};
 
 /// Versioned representation accepted and emitted by the synchronization API.
 pub const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";
@@ -434,6 +434,7 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
+    use lgwks_bot::rt::sync::Notify;
     use logical_db_crdt::{Document, Object, Scalar};
     use logical_db_model::{
         AccountId, ChangeDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
@@ -443,7 +444,6 @@ mod tests {
         ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
     use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, StoredPage};
-    use tokio::sync::Notify;
     use tower::ServiceExt;
 
     use super::*;
@@ -890,8 +890,19 @@ mod tests {
         decoded.outcomes.remove(0)
     }
 
-    #[tokio::test]
-    async fn fixed_action_rejects_wire_mutations_and_accepts_exact_retry() {
+    fn test_runtime() -> lgwks_bot::Runtime {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn fixed_action_rejects_wire_mutations_and_accepts_exact_retry() {
+        test_runtime().block_on(fixed_action_body());
+    }
+
+    async fn fixed_action_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let original = change(scope, ReplicaId::new());
         let action = ExactAction {
@@ -960,8 +971,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn router_pushes_then_pulls_versioned_cbor_without_leaking_credentials() {
+    #[test]
+    fn router_pushes_then_pulls_versioned_cbor_without_leaking_credentials() {
+        test_runtime().block_on(router_pushes_then_pulls_body());
+    }
+
+    async fn router_pushes_then_pulls_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let change = change(scope, replica);
@@ -1012,8 +1027,12 @@ mod tests {
         assert_eq!(page.changes, vec![change]);
     }
 
-    #[tokio::test]
-    async fn ingress_rejects_ambiguous_auth_and_wrong_representations() {
+    #[test]
+    fn ingress_rejects_ambiguous_auth_and_wrong_representations() {
+        test_runtime().block_on(ingress_rejects_body());
+    }
+
+    async fn ingress_rejects_body() {
         let app = router(
             Memory::default(),
             Bearer,
@@ -1066,8 +1085,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn admission_bounds_complete_requests_and_enforces_deadline() {
+    #[test]
+    fn admission_bounds_complete_requests_and_enforces_deadline() {
+        test_runtime().block_on(admission_bounds_body());
+    }
+
+    async fn admission_bounds_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let push = PushRequest {
@@ -1086,7 +1109,7 @@ mod tests {
             1,
             Duration::from_millis(50),
         );
-        let first = tokio::spawn(
+        let first = lgwks_bot::rt::task::spawn(
             app.clone()
                 .oneshot(request("/v1/changes:push", encode(&push))),
         );
@@ -1103,8 +1126,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn default_composition_refuses_writes_and_sync_over_http() {
+    #[test]
+    fn default_composition_refuses_writes_and_sync_over_http() {
+        test_runtime().block_on(default_composition_body());
+    }
+
+    async fn default_composition_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let app = router(
@@ -1159,8 +1186,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
-    async fn consumed_invocation_surfaces_as_typed_rejection_over_http() {
+    #[test]
+    fn consumed_invocation_surfaces_as_typed_rejection_over_http() {
+        test_runtime().block_on(consumed_invocation_body());
+    }
+
+    async fn consumed_invocation_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let app = router(

@@ -46,4 +46,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/srinji-kaggss/Braid"]
+allow-git = [
+    "https://github.com/srinji-kaggss/Braid",
+    "https://github.com/srinji-kaggss/logicalworks-crates",
+]
