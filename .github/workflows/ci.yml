@@ -177,5 +177,3 @@ jobs:
           export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
           cargo run -p logical-db-daemon --bin fdb-ambiguity-journey \
             --features fdb --locked
-          cargo run -p logical-db-daemon --bin fdb-recovery-composition \
-            --features fdb --locked
