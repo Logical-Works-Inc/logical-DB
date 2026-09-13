@@ -478,14 +478,14 @@ mod tests {
     use logical_db_crdt::{Document, Object, Scalar};
     use logical_db_model::{
         AccountId, ChangeDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
-        Scope, SnapshotArtifact, SnapshotRecord, SpaceId,
+        Scope, SnapshotArtifact, SnapshotBaseline, SnapshotRecord, SpaceId,
     };
     use logical_db_protocol::{
         ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
     use logical_db_service::{
-        AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneRefusal, PruneResult,
-        SealResult, StoredPage,
+        AcceptResult, BaselinePageSlice, ConsumedResult, ExecutionGrant, PageResult, PruneRefusal,
+        PruneResult, SealResult, StoredPage,
     };
     use tower::ServiceExt;
 
@@ -864,6 +864,17 @@ mod tests {
                 ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
                     ready(Ok(SnapshotArtifact::new(scope, through, Vec::new())
                         .expect("an empty bounded artifact is valid")))
+                }
+                fn read_baseline_page(
+                    &self,
+                    _scope: Scope,
+                    _descriptor: &SnapshotBaseline,
+                    _after: Option<DocumentId>,
+                ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
+                    ready(Ok(BaselinePageSlice {
+                        documents: Vec::new(),
+                        more: false,
+                    }))
                 }
                 fn seal_snapshot(
                     &self,

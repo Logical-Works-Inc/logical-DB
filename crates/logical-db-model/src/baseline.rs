@@ -17,8 +17,14 @@ pub const SNAPSHOT_BASELINE_LEGACY_VERSION: u16 = 1;
 pub const SNAPSHOT_BASELINE_BYTES: usize = 50;
 /// Encoded byte length of a legacy v1 position descriptor.
 pub const SNAPSHOT_BASELINE_LEGACY_BYTES: usize = 10;
-/// Maximum number of documents in one snapshot artifact.
-pub const MAX_BASELINE_DOCUMENTS: usize = 256;
+/// Maximum documents in one baseline page or single-page artifact transfer.
+pub const MAX_BASELINE_PAGE_DOCUMENTS: usize = 256;
+/// Maximum documents in one complete sealed snapshot artifact.
+///
+/// Aggregate payload is independently bounded by [`MAX_BASELINE_BYTES`]; this
+/// count bound keeps per-document identity and buffer overhead proportional to
+/// the payload bound instead of leaving it unbounded for tiny documents.
+pub const MAX_BASELINE_DOCUMENTS: usize = 65_536;
 /// Maximum aggregate snapshot payload bytes.
 pub const MAX_BASELINE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -697,6 +703,23 @@ mod tests {
         assert_eq!(
             disordered.push(&first),
             Err(ModelError::SnapshotDocumentsUnordered)
+        );
+    }
+
+    #[test]
+    fn artifact_accepts_a_baseline_larger_than_one_page() {
+        let scope = scope();
+        let documents = (0..=MAX_BASELINE_PAGE_DOCUMENTS)
+            .map(|index| SnapshotDocument {
+                document: DocumentId::from_uuid(uuid::Uuid::from_u128(index as u128)),
+                snapshot: vec![7],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        let artifact = SnapshotArtifact::new(scope, 3, documents).unwrap();
+        assert_eq!(
+            artifact.baseline.document_count() as usize,
+            MAX_BASELINE_PAGE_DOCUMENTS + 1
         );
     }
 }

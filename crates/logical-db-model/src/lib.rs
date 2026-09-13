@@ -8,9 +8,10 @@
 
 mod baseline;
 pub use baseline::{
-    BaselineDigest, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, SNAPSHOT_BASELINE_BYTES,
-    SNAPSHOT_BASELINE_LEGACY_BYTES, SNAPSHOT_BASELINE_LEGACY_VERSION, SNAPSHOT_BASELINE_VERSION,
-    SnapshotArtifact, SnapshotBaseline, SnapshotDigestBuilder, SnapshotDocument, SnapshotRecord,
+    BaselineDigest, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, MAX_BASELINE_PAGE_DOCUMENTS,
+    SNAPSHOT_BASELINE_BYTES, SNAPSHOT_BASELINE_LEGACY_BYTES, SNAPSHOT_BASELINE_LEGACY_VERSION,
+    SNAPSHOT_BASELINE_VERSION, SnapshotArtifact, SnapshotBaseline, SnapshotDigestBuilder,
+    SnapshotDocument, SnapshotRecord,
 };
 
 use std::{collections::BTreeMap, fmt};

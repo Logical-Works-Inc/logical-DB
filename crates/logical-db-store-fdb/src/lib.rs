@@ -545,17 +545,19 @@ mod runtime {
     };
     use foundationdb_tuple::Subspace;
     use logical_db_model::{
-        DocumentId, Effect, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, OperationDigest, Scope,
-        SnapshotArtifact, SnapshotDocument, SnapshotRecord,
+        DocumentId, Effect, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS,
+        MAX_BASELINE_PAGE_DOCUMENTS, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
+        SnapshotDocument, SnapshotRecord,
     };
     use logical_db_protocol::{
         ChangeEnvelope, PageAction, mark_consumed_action, prune_action, seal_snapshot_action,
         write_action,
     };
     use logical_db_service::{
-        AcceptResult, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneRefusal,
-        PruneResult, RetentionStore, SealResult, ServiceStore, SnapshotMaterializationError,
-        StoreFailureClass, StoredPage, materialize_snapshot, prune_decision,
+        AcceptResult, BaselinePageSlice, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt,
+        PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore,
+        SnapshotMaterializationError, StoreFailureClass, StoredPage, materialize_snapshot,
+        prune_decision,
     };
     use thiserror::Error;
 
@@ -859,6 +861,30 @@ mod runtime {
                             return Err(binding(DataError::BaselineCoverage));
                         }
                         reconstruct_artifact(&transaction, scope, through, &spaces).await
+                    }
+                })
+                .await
+                .map_err(classify_transaction)
+        }
+
+        async fn read_baseline_page(
+            &self,
+            scope: Scope,
+            descriptor: &SnapshotBaseline,
+            after: Option<DocumentId>,
+        ) -> Result<BaselinePageSlice, Self::Error> {
+            let scope_space = self.scope_space(scope);
+            let spaces = baseline_spaces(&scope_space);
+            let descriptor = descriptor.clone();
+            let after = after.map(|document| document.as_uuid());
+            self.database
+                .run(move |transaction, _maybe_committed| {
+                    let spaces = spaces.clone();
+                    let descriptor = descriptor.clone();
+                    async move {
+                        configure_transaction(&transaction)?;
+                        read_baseline_page_transaction(&transaction, &spaces, &descriptor, after)
+                            .await
                     }
                 })
                 .await
@@ -1361,6 +1387,59 @@ mod runtime {
             return Err(binding(DataError::BaselineCorrupt));
         }
         Ok(artifact)
+    }
+
+    async fn read_baseline_page_transaction(
+        transaction: &foundationdb::RetryableTransaction,
+        spaces: &BaselineSpaces,
+        baseline: &SnapshotBaseline,
+        after: Option<uuid::Uuid>,
+    ) -> Result<BaselinePageSlice, FdbBindingError> {
+        let digest = baseline.digest().into_bytes();
+        let document_space = spaces.document.subspace(&(digest.as_slice(),));
+        let (space_begin, space_end) = document_space.range();
+        let begin = after.map_or_else(
+            || KeySelector::first_greater_or_equal(space_begin),
+            |cursor| {
+                KeySelector::first_greater_than(document_space.pack(&(digest.as_slice(), cursor)))
+            },
+        );
+        let options = RangeOption {
+            begin,
+            end: KeySelector::first_greater_or_equal(space_end),
+            limit: Some(MAX_BASELINE_PAGE_DOCUMENTS + 1),
+            target_bytes: MAX_BASELINE_BYTES,
+            ..RangeOption::default()
+        };
+        let values = transaction.get_range(&options, 1, false).await?;
+        let more = values.len() > MAX_BASELINE_PAGE_DOCUMENTS || values.more();
+        let manifests = values
+            .iter()
+            .take(MAX_BASELINE_PAGE_DOCUMENTS)
+            .map(|value| (value.key().to_vec(), value.value().to_vec()))
+            .collect::<Vec<_>>();
+        drop(values);
+        let mut documents = Vec::with_capacity(manifests.len());
+        let mut aggregate_bytes = 0_usize;
+        for (key, value) in manifests {
+            let manifest = decode_baseline_document(&value).map_err(binding)?;
+            aggregate_bytes = aggregate_bytes
+                .checked_add(manifest.byte_len)
+                .filter(|total| *total <= MAX_BASELINE_BYTES)
+                .ok_or_else(|| binding(DataError::BaselineCorrupt))?;
+            documents.push(
+                load_artifact_document(
+                    transaction,
+                    &document_space,
+                    spaces,
+                    digest,
+                    &key,
+                    manifest,
+                )
+                .await?,
+            );
+        }
+        Ok(BaselinePageSlice { documents, more })
     }
 
     async fn load_artifact_document(

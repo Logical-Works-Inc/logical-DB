@@ -22,13 +22,16 @@ mod tests {
         ProjectionSemantics, RemoteChange, ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     };
     use logical_db_http::{HttpTransport, StaticBearer};
-    use logical_db_model::{ChangeDigest, Effect, SnapshotArtifact, SnapshotRecord};
+    use logical_db_model::{
+        ChangeDigest, Effect, MAX_BASELINE_PAGE_DOCUMENTS, SnapshotArtifact, SnapshotBaseline,
+        SnapshotRecord,
+    };
     use logical_db_protocol::ChangeEnvelope;
     use logical_db_server::{AuthenticationError, Authenticator, Clock, router};
     use logical_db_service::{
-        AcceptResult, Authority, CheckpointCodec, ConsumedResult, ExecutionGrant, PageResult,
-        PruneReceipt, PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore,
-        StoredPage, materialize_snapshot, prune_decision,
+        AcceptResult, Authority, BaselinePageSlice, CheckpointCodec, ConsumedResult,
+        ExecutionGrant, PageResult, PruneReceipt, PruneRefusal, PruneResult, RetentionStore,
+        SealResult, ServiceStore, StoredPage, materialize_snapshot, prune_decision,
     };
 
     use logical_db_model::ActionDigest;
@@ -295,6 +298,34 @@ mod tests {
             let artifact = materialize_snapshot(scope, through, base.as_ref(), &retained_changes)
                 .expect("the journey store materializes bounded validated artifacts");
             ready(Ok(artifact))
+        }
+
+        fn read_baseline_page(
+            &self,
+            scope: Scope,
+            descriptor: &SnapshotBaseline,
+            after: Option<DocumentId>,
+        ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
+            let Some(artifact) = self.retention_state(scope).baseline else {
+                return ready(Ok(BaselinePageSlice {
+                    documents: Vec::new(),
+                    more: false,
+                }));
+            };
+            assert_eq!(
+                &artifact.baseline, descriptor,
+                "the journey store baseline descriptor agrees with its artifact"
+            );
+            let mut documents = artifact
+                .documents
+                .iter()
+                .filter(|document| after.is_none_or(|cursor| document.document > cursor))
+                .take(MAX_BASELINE_PAGE_DOCUMENTS + 1)
+                .cloned()
+                .collect::<Vec<_>>();
+            let more = documents.len() > MAX_BASELINE_PAGE_DOCUMENTS;
+            documents.truncate(MAX_BASELINE_PAGE_DOCUMENTS);
+            ready(Ok(BaselinePageSlice { documents, more }))
         }
 
         fn seal_snapshot(

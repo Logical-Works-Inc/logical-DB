@@ -522,6 +522,7 @@ where
         replica: replica.replica(),
         request: baseline_request_digest(replica.scope(), replica.replica(), after.as_ref()),
         after: after.clone(),
+        after_document: None,
     };
     request.validate().map_err(SyncError::Protocol)?;
     match fetch_baseline(transport, request)
@@ -2166,6 +2167,8 @@ mod tests {
                 })
                 .collect(),
             checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
+            more: false,
+            next_document: None,
         }
     }
 

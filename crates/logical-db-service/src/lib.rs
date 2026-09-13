@@ -12,8 +12,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 use logical_db_model::OperationId;
 use logical_db_model::{
-    ActionDigest, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotRecord,
-    is_behind_retention,
+    ActionDigest, DocumentId, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
+    SnapshotDocument, SnapshotRecord, is_behind_retention,
 };
 use logical_db_protocol::{
     BaselineDocument, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION,
@@ -467,6 +467,15 @@ pub enum ConsumedResult {
 
 /// Durable retention contract for peer-aware log collection.
 ///
+/// One ordered slice of a sealed baseline after an exclusive document cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaselinePageSlice {
+    /// Strictly ascending documents after the requested cursor.
+    pub documents: Vec<SnapshotDocument>,
+    /// Whether further documents follow this slice for the same descriptor.
+    pub more: bool,
+}
+
 /// Reads report the versioned snapshot baseline, the retention floor, and the
 /// peer-consumption watermark. Writes are frontier-bound like page reads: a
 /// grant justified against a moved frontier reports stale authority instead of
@@ -493,6 +502,19 @@ pub trait RetentionStore: ServiceStore {
         scope: Scope,
         through: u64,
     ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send;
+
+    /// Reads one bounded ordered page of a sealed baseline after one cursor.
+    ///
+    /// The slice carries at most `MAX_BASELINE_PAGE_DOCUMENTS` documents,
+    /// strictly ascending after `after`. `more` reports that the same descriptor
+    /// has further documents. The store validates each stored document's own
+    /// integrity; the aggregate digest is the recovering client's terminal check.
+    fn read_baseline_page(
+        &self,
+        scope: Scope,
+        descriptor: &SnapshotBaseline,
+        after: Option<DocumentId>,
+    ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send;
 
     /// Durably records a versioned snapshot baseline for the scope.
     ///
@@ -562,6 +584,15 @@ where
         through: u64,
     ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
         (**self).build_snapshot(scope, through)
+    }
+
+    fn read_baseline_page(
+        &self,
+        scope: Scope,
+        descriptor: &SnapshotBaseline,
+        after: Option<DocumentId>,
+    ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
+        (**self).read_baseline_page(scope, descriptor, after)
     }
 
     fn seal_snapshot(
@@ -1010,11 +1041,13 @@ where
             .map_err(ServiceError::Store)
     }
 
-    /// Returns the sealed state-bearing baseline a recovering client must install.
+    /// Returns one bounded page of the sealed state-bearing baseline a
+    /// recovering client must install.
     ///
-    /// The artifact is rebuilt from durable state and the versioned descriptor
-    /// is recomputed, so a client refuses any page whose documents do not
-    /// reproduce the sealed digest.
+    /// The durable descriptor is read once per request and the ordered document
+    /// slice is read after `request.after_document`, so a baseline larger than
+    /// one page is delivered without materializing the whole artifact. The
+    /// client verifies the aggregate descriptor digest across the pages.
     ///
     /// # Errors
     ///
@@ -1059,12 +1092,12 @@ where
         let Some(SnapshotRecord::State(descriptor)) = sealed else {
             return Ok(ServiceBaseline::Unavailable);
         };
-        let artifact = self
+        let slice = self
             .store
-            .build_snapshot(request.scope, descriptor.position())
+            .read_baseline_page(request.scope, &descriptor, request.after_document)
             .await
             .map_err(ServiceError::Store)?;
-        if artifact.baseline != descriptor {
+        if slice.more && slice.documents.is_empty() {
             eprintln!("logical-db-service: recover: CorruptStoreData");
             return Err(ServiceError::CorruptStoreData);
         }
@@ -1072,10 +1105,15 @@ where
             .checkpoints
             .issue(request.scope, descriptor.position(), now_unix_ms)
             .map_err(ServiceError::Checkpoint)?;
+        let next_document = if slice.more {
+            slice.documents.last().map(|document| document.document)
+        } else {
+            None
+        };
         let page = BaselinePage {
             protocol: PROTOCOL_VERSION,
             descriptor: descriptor.encode().to_vec(),
-            documents: artifact
+            documents: slice
                 .documents
                 .iter()
                 .map(|document| BaselineDocument {
@@ -1085,8 +1123,10 @@ where
                 })
                 .collect(),
             checkpoint,
+            more: slice.more,
+            next_document,
         };
-        page.validate(request.scope)
+        page.validate_page(request.scope)
             .map_err(ServiceError::Protocol)?;
         Ok(ServiceBaseline::Artifact(Box::new(page)))
     }
@@ -1414,6 +1454,14 @@ mod tests {
         ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
             std::future::ready(Ok(self.build_snapshot_result(scope, through)))
         }
+        fn read_baseline_page(
+            &self,
+            scope: Scope,
+            descriptor: &SnapshotBaseline,
+            after: Option<DocumentId>,
+        ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
+            std::future::ready(Ok(self.read_baseline_page_result(scope, descriptor, after)))
+        }
         fn seal_snapshot(
             &self,
             scope: Scope,
@@ -1537,6 +1585,33 @@ mod tests {
                 .collect::<Vec<_>>();
             materialize_snapshot(scope, through, base.as_ref(), &changes)
                 .expect("memory store must build a bounded test artifact")
+        }
+        fn read_baseline_page_result(
+            &self,
+            scope: Scope,
+            descriptor: &SnapshotBaseline,
+            after: Option<DocumentId>,
+        ) -> BaselinePageSlice {
+            let Some(artifact) = self.retention_state(scope).baseline else {
+                return BaselinePageSlice {
+                    documents: Vec::new(),
+                    more: false,
+                };
+            };
+            assert!(
+                &artifact.baseline == descriptor,
+                "memory store baseline descriptor disagrees with its artifact"
+            );
+            let mut documents = artifact
+                .documents
+                .iter()
+                .filter(|document| after.is_none_or(|cursor| document.document > cursor))
+                .take(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 1)
+                .cloned()
+                .collect::<Vec<_>>();
+            let more = documents.len() > logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS;
+            documents.truncate(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
+            BaselinePageSlice { documents, more }
         }
         fn seal_snapshot_result(
             &self,
@@ -2019,8 +2094,91 @@ mod tests {
             replica,
             request: OperationDigest::new([92; 32]),
             after,
+            after_document: None,
         };
         lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+    }
+
+    fn recover_page_at<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        replica: ReplicaId,
+        after_document: Option<DocumentId>,
+        now: u64,
+    ) -> ServiceBaseline
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        let request = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([93; 32]),
+            after: None,
+            after_document,
+        };
+        lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+    }
+
+    #[test]
+    fn recovery_pages_a_baseline_larger_than_one_page() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([6; 32], 100).unwrap(),
+        );
+        let total = logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        let changes = (0..total)
+            .map(|index| {
+                envelope_with(
+                    scope,
+                    replica,
+                    OperationId::new(),
+                    u8::try_from(index % 256).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for chunk in changes.chunks(logical_db_model::MAX_CHANGES_PER_PAGE) {
+            push_all(&service, replica, chunk.to_vec());
+        }
+        assert!(matches!(
+            seal_at(&service, scope, total as u64, 10),
+            SealResult::Sealed { .. }
+        ));
+
+        let ServiceBaseline::Artifact(first) = recover_page_at(&service, scope, replica, None, 11)
+        else {
+            panic!("sealed baseline must be available");
+        };
+        assert!(first.more);
+        assert_eq!(
+            first.documents.len(),
+            logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS
+        );
+        let cursor = first
+            .next_document
+            .expect("continued page carries a cursor");
+        let ServiceBaseline::Artifact(second) =
+            recover_page_at(&service, scope, replica, Some(cursor), 12)
+        else {
+            panic!("continued baseline page must be available");
+        };
+        assert!(!second.more);
+        assert_eq!(second.documents.len(), 44);
+        assert_eq!(second.descriptor, first.descriptor);
+        assert!(second.next_document.is_none());
+
+        let mut accumulator = logical_db_protocol::BaselineAccumulator::new(
+            scope,
+            first.validate_page(scope).unwrap(),
+        );
+        assert!(!accumulator.push(&first).unwrap());
+        assert!(accumulator.push(&second).unwrap());
+        assert_eq!(accumulator.finish().unwrap().documents.len(), total);
     }
 
     fn seal_at<Store, Policy>(

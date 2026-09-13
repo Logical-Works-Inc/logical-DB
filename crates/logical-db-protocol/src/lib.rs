@@ -18,9 +18,10 @@ use lgwks_std::json::serde::{
 };
 pub use logical_db_model::ChangeDigest;
 use logical_db_model::{
-    DocumentId, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE,
-    MAX_PAGE_BYTES, OperationDigest, OperationId, ReplicaId, SNAPSHOT_BASELINE_BYTES, Scope,
-    SnapshotArtifact, SnapshotBaseline, SnapshotDocument, SnapshotRecord,
+    DocumentId, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, MAX_BASELINE_PAGE_DOCUMENTS,
+    MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, OperationDigest, OperationId,
+    ReplicaId, SNAPSHOT_BASELINE_BYTES, Scope, SnapshotArtifact, SnapshotBaseline,
+    SnapshotDigestBuilder, SnapshotDocument, SnapshotRecord,
 };
 use thiserror::Error;
 
@@ -320,6 +321,8 @@ pub struct BaselineRequest {
     pub request: OperationDigest,
     /// Checkpoint the client held when recovery was required, when it had one.
     pub after: Option<Checkpoint>,
+    /// Exclusive document cursor: the page returns documents strictly after it.
+    pub after_document: Option<DocumentId>,
 }
 
 impl BaselineRequest {
@@ -349,13 +352,15 @@ pub struct BaselineDocument {
     pub snapshot: Vec<u8>,
 }
 
-/// One bounded, versioned, state-bearing recovery baseline.
+/// One bounded, versioned page of a state-bearing recovery baseline.
 ///
-/// The service sends the canonical descriptor it sealed plus the ordered
-/// document states through that position and a replacement checkpoint. The
-/// client refuses the whole page unless the documents reproduce the descriptor
-/// digest exactly, so a truncated, reordered, or substituted artifact never
-/// mutates local state.
+/// The service sends the canonical descriptor it sealed plus an ordered slice
+/// of document states and a replacement checkpoint. A single-page baseline
+/// carries the whole artifact; a paged baseline advertises `more` and the
+/// `next_document` cursor a client must resume from. The client refuses the
+/// page unless its documents are strictly ascending, reproduce their own
+/// bounds, and — across the whole sequence — the descriptor digest exactly, so
+/// a truncated, reordered, or substituted artifact never mutates local state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct BaselinePage {
@@ -372,29 +377,82 @@ pub struct BaselinePage {
     pub documents: Vec<BaselineDocument>,
     /// Replacement checkpoint covering `descriptor` exactly.
     pub checkpoint: Checkpoint,
+    /// Whether more documents follow this page for the same descriptor.
+    pub more: bool,
+    /// Exclusive cursor for the next page; present exactly when `more` is true.
+    pub next_document: Option<DocumentId>,
 }
 
 impl BaselinePage {
-    /// Recomputes and verifies the artifact before any durable local mutation.
+    /// Validates one page of a paged baseline and returns its descriptor.
+    ///
+    /// Enforces the protocol version, a decodable state-bearing descriptor,
+    /// strictly ascending non-empty documents within the page bounds, and the
+    /// continuation contract between `more` and `next_document`. It does not
+    /// require the page to carry the whole artifact; the aggregate identity is
+    /// the [`BaselineAccumulator`]'s terminal check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`ProtocolError`] for unsupported versions, a malformed
+    /// or legacy descriptor, documents that violate ordering or size bounds, or
+    /// an inconsistent continuation contract.
+    pub fn validate_page(&self, expected_scope: Scope) -> Result<SnapshotBaseline, ProtocolError> {
+        validate_protocol(self.protocol)?;
+        let descriptor = match SnapshotBaseline::decode(&self.descriptor) {
+            Ok(SnapshotRecord::State(baseline)) => baseline,
+            Ok(SnapshotRecord::LegacyPosition(_)) => {
+                eprintln!("logical-db-protocol: BaselinePage::validate_page: LegacyBaseline");
+                return Err(ProtocolError::InvalidBaselineDescriptor);
+            }
+            Err(error) => {
+                eprintln!("logical-db-protocol: BaselinePage::validate_page descriptor: {error}");
+                return Err(ProtocolError::InvalidBaselineDescriptor);
+            }
+        };
+        let mut builder = SnapshotDigestBuilder::new(
+            expected_scope,
+            descriptor.position(),
+            u64::from(descriptor.document_count()),
+        );
+        for document in &self.documents {
+            let state = SnapshotDocument {
+                document: document.document,
+                snapshot: document.snapshot.clone(),
+                tombstone: document.tombstone,
+            };
+            builder.push(&state).map_err(|error| {
+                eprintln!("logical-db-protocol: BaselinePage::validate_page documents: {error}");
+                ProtocolError::InvalidBaselineDocuments
+            })?;
+        }
+        let continues = match (self.more, self.next_document) {
+            (true, Some(cursor)) => self.documents.last().map(|last| last.document) == Some(cursor),
+            (false, None) => true,
+            (true, None) | (false, Some(_)) => false,
+        };
+        if !continues {
+            eprintln!("logical-db-protocol: BaselinePage::validate_page: NonProgressPage");
+            return Err(ProtocolError::NonProgressPage);
+        }
+        Ok(descriptor)
+    }
+
+    /// Recomputes and verifies a whole single-page artifact before any durable
+    /// local mutation.
     ///
     /// # Errors
     ///
     /// Returns a typed [`ProtocolError`] for unsupported versions, a malformed
     /// or legacy descriptor, a document list that violates ordering or size
-    /// bounds, or documents that do not reproduce the descriptor digest.
+    /// bounds, a page that advertises a continuation, or documents that do not
+    /// reproduce the descriptor digest.
     pub fn validate(&self, expected_scope: Scope) -> Result<SnapshotArtifact, ProtocolError> {
-        validate_protocol(self.protocol)?;
-        let descriptor = match SnapshotBaseline::decode(&self.descriptor) {
-            Ok(SnapshotRecord::State(baseline)) => baseline,
-            Ok(SnapshotRecord::LegacyPosition(_)) => {
-                eprintln!("logical-db-protocol: BaselinePage::validate: LegacyBaseline");
-                return Err(ProtocolError::InvalidBaselineDescriptor);
-            }
-            Err(error) => {
-                eprintln!("logical-db-protocol: BaselinePage::validate descriptor: {error}");
-                return Err(ProtocolError::InvalidBaselineDescriptor);
-            }
-        };
+        let descriptor = self.validate_page(expected_scope)?;
+        if self.more {
+            eprintln!("logical-db-protocol: BaselinePage::validate: BaselineMismatch");
+            return Err(ProtocolError::BaselineMismatch);
+        }
         if descriptor.document_count() as usize != self.documents.len() {
             eprintln!("logical-db-protocol: BaselinePage::validate: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
@@ -415,6 +473,122 @@ impl BaselinePage {
             })?;
         if artifact.baseline != descriptor {
             eprintln!("logical-db-protocol: BaselinePage::validate: BaselineMismatch");
+            return Err(ProtocolError::BaselineMismatch);
+        }
+        Ok(artifact)
+    }
+}
+
+/// Folds validated baseline pages into one artifact.
+///
+/// Every page must carry the same descriptor, continue strictly after the
+/// previous page, and stay within the aggregate document and byte bounds, so a
+/// hostile or corrupt stream fails closed at the page it violates and never
+/// grows local state without bound. The terminal page must complete the
+/// descriptor's document count and digest exactly.
+#[derive(Debug)]
+pub struct BaselineAccumulator {
+    scope: Scope,
+    descriptor: SnapshotBaseline,
+    documents: Vec<SnapshotDocument>,
+    byte_len: usize,
+    last: Option<DocumentId>,
+    complete: bool,
+}
+
+impl BaselineAccumulator {
+    /// Starts an accumulator for one descriptor.
+    #[must_use]
+    pub fn new(scope: Scope, descriptor: SnapshotBaseline) -> Self {
+        Self {
+            scope,
+            descriptor,
+            documents: Vec::new(),
+            byte_len: 0,
+            last: None,
+            complete: false,
+        }
+    }
+
+    /// Returns the descriptor this accumulator completes.
+    #[must_use]
+    pub const fn descriptor(&self) -> &SnapshotBaseline {
+        &self.descriptor
+    }
+
+    /// Folds one page and reports whether the baseline is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`ProtocolError`] when the page is invalid, carries a
+    /// different descriptor, does not continue after the previous page, exceeds
+    /// the aggregate bounds, or arrives after completion.
+    pub fn push(&mut self, page: &BaselinePage) -> Result<bool, ProtocolError> {
+        if self.complete {
+            eprintln!("logical-db-protocol: BaselineAccumulator::push: BaselineMismatch");
+            return Err(ProtocolError::BaselineMismatch);
+        }
+        if page.validate_page(self.scope)? != self.descriptor {
+            eprintln!("logical-db-protocol: BaselineAccumulator::push: BaselineMismatch");
+            return Err(ProtocolError::BaselineMismatch);
+        }
+        if self
+            .documents
+            .len()
+            .checked_add(page.documents.len())
+            .is_none_or(|total| total > MAX_BASELINE_DOCUMENTS)
+        {
+            eprintln!("logical-db-protocol: BaselineAccumulator::push: InvalidBaselineDocuments");
+            return Err(ProtocolError::InvalidBaselineDocuments);
+        }
+        for document in &page.documents {
+            if self.last.is_some_and(|last| last >= document.document) {
+                eprintln!("logical-db-protocol: BaselineAccumulator::push: BaselineMismatch");
+                return Err(ProtocolError::BaselineMismatch);
+            }
+            self.byte_len = self
+                .byte_len
+                .checked_add(document.snapshot.len())
+                .filter(|total| *total <= MAX_BASELINE_BYTES)
+                .ok_or_else(|| {
+                    eprintln!(
+                        "logical-db-protocol: BaselineAccumulator::push: InvalidBaselineDocuments"
+                    );
+                    ProtocolError::InvalidBaselineDocuments
+                })?;
+            self.last = Some(document.document);
+            self.documents.push(SnapshotDocument {
+                document: document.document,
+                snapshot: document.snapshot.clone(),
+                tombstone: document.tombstone,
+            });
+        }
+        self.complete = !page.more;
+        Ok(self.complete)
+    }
+
+    /// Consumes the accumulator and returns the completed artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`ProtocolError`] when the sequence is incomplete or does
+    /// not reproduce the descriptor exactly.
+    pub fn finish(self) -> Result<SnapshotArtifact, ProtocolError> {
+        if !self.complete {
+            eprintln!("logical-db-protocol: BaselineAccumulator::finish: BaselineMismatch");
+            return Err(ProtocolError::BaselineMismatch);
+        }
+        let artifact = SnapshotArtifact::new(
+            self.scope,
+            self.descriptor.position(),
+            self.documents,
+        )
+        .map_err(|error| {
+            eprintln!("logical-db-protocol: BaselineAccumulator::finish documents: {error}");
+            ProtocolError::InvalidBaselineDocuments
+        })?;
+        if artifact.baseline != self.descriptor {
+            eprintln!("logical-db-protocol: BaselineAccumulator::finish: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
         Ok(artifact)
@@ -563,11 +737,11 @@ where
             let capacity = sequence
                 .size_hint()
                 .unwrap_or(0)
-                .min(MAX_BASELINE_DOCUMENTS);
+                .min(MAX_BASELINE_PAGE_DOCUMENTS);
             let mut documents = Vec::with_capacity(capacity);
             let mut aggregate_bytes = 0usize;
             while let Some(document) = sequence.next_element::<BaselineDocument>()? {
-                if documents.len() == MAX_BASELINE_DOCUMENTS {
+                if documents.len() == MAX_BASELINE_PAGE_DOCUMENTS {
                     eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("baseline document count exceeds limit"));
                 }
@@ -1175,6 +1349,8 @@ mod tests {
                 })
                 .collect(),
             checkpoint: Checkpoint::from_wire(vec![7; 8]).unwrap(),
+            more: false,
+            next_document: None,
         }
     }
 
@@ -1242,7 +1418,7 @@ mod tests {
     #[test]
     fn baseline_document_count_is_bounded_during_decode() {
         let mut documents = Vec::new();
-        for _ in 0..=MAX_BASELINE_DOCUMENTS {
+        for _ in 0..=MAX_BASELINE_PAGE_DOCUMENTS {
             documents.push(BaselineDocument {
                 document: DocumentId::new(),
                 tombstone: false,
@@ -1261,8 +1437,70 @@ mod tests {
             .to_vec(),
             documents,
             checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+            more: false,
+            next_document: None,
         };
         let encoded = lgwks_std::json::to_vec(&page).unwrap();
         assert!(lgwks_std::json::from_slice::<BaselinePage>(&encoded).is_err());
+    }
+
+    fn ordered_states(count: usize) -> Vec<SnapshotDocument> {
+        let mut documents = (0..count)
+            .map(|index| SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![u8::try_from(index % 251).unwrap() + 1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        documents
+    }
+
+    fn paged_page(
+        artifact: &SnapshotArtifact,
+        slice: &[SnapshotDocument],
+        more: bool,
+    ) -> BaselinePage {
+        BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: artifact.baseline.encode().to_vec(),
+            documents: slice
+                .iter()
+                .map(|document| BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint: Checkpoint::from_wire(vec![9; 8]).unwrap(),
+            more,
+            next_document: if more {
+                slice.last().map(|document| document.document)
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn accumulator_folds_a_multi_page_baseline_and_refuses_gaps_and_shortfalls() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let documents = ordered_states(MAX_BASELINE_PAGE_DOCUMENTS + 44);
+        let artifact = SnapshotArtifact::new(scope, 11, documents.clone()).unwrap();
+        let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
+        let first_page = paged_page(&artifact, first, true);
+        let second_page = paged_page(&artifact, rest, false);
+        let mut accumulator = BaselineAccumulator::new(scope, artifact.baseline.clone());
+        assert!(!accumulator.push(&first_page).unwrap());
+        assert!(accumulator.push(&second_page).unwrap());
+        assert_eq!(accumulator.finish().unwrap(), artifact);
+
+        let mut gap = BaselineAccumulator::new(scope, artifact.baseline.clone());
+        assert!(!gap.push(&first_page).unwrap());
+        assert_eq!(gap.push(&first_page), Err(ProtocolError::BaselineMismatch));
+
+        let mut short = BaselineAccumulator::new(scope, artifact.baseline.clone());
+        assert!(!short.push(&first_page).unwrap());
+        assert_eq!(short.finish(), Err(ProtocolError::BaselineMismatch));
     }
 }
