@@ -1925,6 +1925,12 @@ mod runtime {
 #[cfg(feature = "fdb")]
 pub use runtime::{FdbServiceStore, FdbStoreError};
 
+/// The `FoundationDB` client API this adapter is built on.
+#[cfg(feature = "fdb")]
+pub use foundationdb;
+/// Order-preserving tuple keys, this adapter's keyspace contract.
+pub use foundationdb_tuple;
+
 #[cfg(test)]
 mod tests {
     use logical_db_model::{AccountId, SpaceId};

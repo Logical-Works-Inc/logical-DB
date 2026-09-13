@@ -15,8 +15,6 @@
 
 use std::{error::Error, fs, io};
 
-use foundationdb::{Database as FdbDatabase, api::FdbApiBuilder};
-use foundationdb_tuple::Subspace;
 use logical_db::{
     AccountId, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId, ReplicaId,
     Scalar, Scope, SpaceId, SyncLimits,
@@ -29,7 +27,11 @@ use logical_db_service::{
     Authority, CheckpointCodec, ConsumedResult, ExecutionGrant, PruneReceipt, PruneResult,
     RetentionStore, SealResult, ServiceStore,
 };
-use logical_db_store_fdb::FdbServiceStore;
+use logical_db_store_fdb::{
+    FdbServiceStore,
+    foundationdb::{Database as FdbDatabase, api::FdbApiBuilder},
+    foundationdb_tuple::Subspace,
+};
 
 const BEARER: &[u8] = b"Bearer recovery-fixture";
 

@@ -1316,8 +1316,6 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "ciborium",
- "foundationdb",
- "foundationdb-tuple",
  "lgwks_bot",
  "lgwks_deps",
  "logical-db",
