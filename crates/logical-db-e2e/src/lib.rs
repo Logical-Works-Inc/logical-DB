@@ -17,9 +17,9 @@ mod tests {
     };
 
     use logical_db::{
-        AccountId, Database, DocumentId, IndexId, IndexValue, Item, Object, OperationDigest,
-        OperationId, PeerId, Projection, ProjectionSemantics, ReplicaId, Scalar, Scope, SpaceId,
-        SyncLimits,
+        AccountId, Database, DatabaseError, DatabaseErrorKind, DocumentId, IndexId, IndexValue,
+        Item, Object, OperationDigest, OperationId, PeerId, Projection, ProjectionSemantics,
+        RemoteChange, ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     };
     use logical_db_http::{HttpTransport, StaticBearer};
     use logical_db_model::{ChangeDigest, Effect, SnapshotArtifact, SnapshotRecord};
@@ -626,7 +626,15 @@ mod tests {
     }
 
     async fn seal_consume_and_prune(store: &MemoryServiceStore, scope: Scope) {
-        let artifact = store.build_snapshot(scope, 1).await.unwrap();
+        seal_consume_and_prune_through(store, scope, 1).await;
+    }
+
+    async fn seal_consume_and_prune_through(
+        store: &MemoryServiceStore,
+        scope: Scope,
+        through: u64,
+    ) {
+        let artifact = store.build_snapshot(scope, through).await.unwrap();
         let frontier = store.frontier(scope).await.unwrap();
         let seal_request = OperationDigest::new([0x52; 32]);
         assert!(matches!(
@@ -644,49 +652,45 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            SealResult::Sealed { position: 1 }
+            SealResult::Sealed { position } if position == through
         ));
         let consumed_request = OperationDigest::new([0x53; 32]);
         assert!(matches!(
             store
                 .mark_consumed(
                     scope,
-                    1,
+                    through,
                     consumed_request,
                     &Grant {
                         scope,
                         effect: Effect::Sync,
-                        action: mark_consumed_action(scope, consumed_request, 1),
+                        action: mark_consumed_action(scope, consumed_request, through),
                         frontier,
                     },
                 )
                 .await
                 .unwrap(),
-            ConsumedResult::Advanced {
-                consumed_through: 1
-            }
+            ConsumedResult::Advanced { consumed_through } if consumed_through == through
         ));
         let prune_request = OperationDigest::new([0x54; 32]);
         assert!(matches!(
             store
                 .prune(
                     scope,
-                    1,
+                    through,
                     None,
                     prune_request,
                     &Grant {
                         scope,
                         effect: Effect::Sync,
-                        action: prune_action(scope, prune_request, 1, None),
+                        action: prune_action(scope, prune_request, through, None),
                         frontier,
                     },
                 )
                 .await
                 .unwrap(),
-            PruneResult::Pruned(PruneReceipt {
-                pruned_through: 1,
-                floor: 1
-            })
+            PruneResult::Pruned(PruneReceipt { pruned_through, floor })
+                if pruned_through == through && floor == through
         ));
     }
 
@@ -757,6 +761,219 @@ mod tests {
         drop((first, second));
         fs::remove_file(first_path).unwrap();
         fs::remove_file(second_path).unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn tombstone_survives_baseline_recovery_and_cannot_resurrect() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(tombstone_baseline_recovery_body());
+    }
+
+    async fn tombstone_baseline_recovery_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([24; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let first_path = path("tombstone-first");
+        let second_path = path("tombstone-second");
+
+        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        first
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([0x61; 32]),
+                |editor| editor.put(&Object::root(), "state", Scalar::String("v1".into())),
+            )
+            .unwrap();
+        // The edit below the delete is the resurrection candidate: once the
+        // recovered baseline carries the tombstone it must never bring the
+        // document back, even if the service re-delivers that older change.
+        let pre_floor = first.pending_changes(0, 10).unwrap();
+        assert_eq!(pre_floor.len(), 1);
+        first
+            .delete(
+                document,
+                OperationId::new(),
+                OperationDigest::new([0x62; 32]),
+            )
+            .unwrap();
+        first
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        assert_eq!(store.frontier(scope).await.unwrap(), 2);
+
+        seal_consume_and_prune_through(&store, scope, 2).await;
+
+        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let report = second
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        assert!(report.recovered);
+        assert!(second.is_deleted(document).unwrap());
+        assert!(
+            second
+                .read(document, |reader| reader.get(&Object::root(), "state"))
+                .unwrap()
+                .is_none()
+        );
+
+        let resurrection = pre_floor
+            .iter()
+            .map(|change| RemoteChange {
+                document: change.document,
+                digest: change.digest,
+                bytes: change.bytes.clone(),
+            })
+            .collect::<Vec<_>>();
+        second
+            .install_remote_page(peer, &resurrection, b"resurrection-attempt")
+            .unwrap();
+        assert!(second.is_deleted(document).unwrap());
+        assert!(
+            second
+                .read(document, |reader| reader.get(&Object::root(), "state"))
+                .unwrap()
+                .is_none()
+        );
+
+        drop((first, second));
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn corrupt_or_incomplete_baseline_leaves_state_and_checkpoint_unchanged() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(corrupt_baseline_refusal_body());
+    }
+
+    async fn corrupt_baseline_refusal_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([25; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let victim_path = path("corrupt-victim");
+
+        let victim = Database::open(&victim_path, scope, ReplicaId::new()).unwrap();
+        victim
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([0x71; 32]),
+                |editor| editor.put(&Object::root(), "state", Scalar::String("keep".into())),
+            )
+            .unwrap();
+        victim
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        let checkpoint_before = victim
+            .checkpoint(peer)
+            .unwrap()
+            .expect("the replica accepted a durable checkpoint");
+        assert!(!victim.is_deleted(document).unwrap());
+        assert_eq!(
+            victim
+                .read(document, |reader| reader.get(&Object::root(), "state"))
+                .unwrap(),
+            Some(Some(Item::Scalar(Scalar::String("keep".into()))))
+        );
+
+        let genuine = store.build_snapshot(scope, 1).await.unwrap();
+        assert_eq!(genuine.documents.len(), 1);
+
+        let mut substituted = genuine.clone();
+        substituted.documents[0].snapshot = vec![0xEE; substituted.documents[0].snapshot.len()];
+
+        let mut truncated = genuine.clone();
+        truncated.documents.pop();
+
+        let mut mismatched = genuine.clone();
+        mismatched.documents[0].tombstone = !mismatched.documents[0].tombstone;
+        // Recomputing the descriptor keeps the artifact internally consistent,
+        // so only the tombstone-versus-document check can refuse it.
+        let mismatched =
+            SnapshotArtifact::new(scope, genuine.baseline.position(), mismatched.documents)
+                .unwrap();
+
+        for (label, artifact) in [
+            ("substituted snapshot payload", substituted),
+            ("truncated document list", truncated),
+            ("mismatched tombstone flag", mismatched),
+        ] {
+            let error = victim
+                .install_baseline(peer, &artifact, b"corrupt-checkpoint")
+                .unwrap_err();
+            assert!(
+                matches!(&error, DatabaseError::InvalidBaseline),
+                "{label} must be refused with a typed failure, got {error:?}"
+            );
+            assert_eq!(error.kind(), DatabaseErrorKind::Other, "{label} kind");
+            assert_eq!(
+                victim.checkpoint(peer).unwrap().as_deref(),
+                Some(checkpoint_before.as_slice()),
+                "{label} must leave the checkpoint byte-for-byte unchanged"
+            );
+            assert!(
+                !victim.is_deleted(document).unwrap(),
+                "{label} must not tombstone the existing document"
+            );
+            assert_eq!(
+                victim
+                    .read(document, |reader| reader.get(&Object::root(), "state"))
+                    .unwrap(),
+                Some(Some(Item::Scalar(Scalar::String("keep".into())))),
+                "{label} must leave the readable state unchanged"
+            );
+        }
+
+        drop(victim);
+        fs::remove_file(victim_path).unwrap();
         server.abort();
     }
 }
