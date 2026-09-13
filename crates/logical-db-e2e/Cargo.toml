@@ -19,6 +19,7 @@ uuid.workspace = true
 [dev-dependencies]
 axum.workspace = true
 ciborium.workspace = true
+lgwks_deps.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }

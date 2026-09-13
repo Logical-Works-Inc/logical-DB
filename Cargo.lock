@@ -1317,6 +1317,7 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
+ "lgwks_deps",
  "logical-db",
  "logical-db-cairn",
  "logical-db-episode",

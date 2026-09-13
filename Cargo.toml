@@ -62,6 +62,9 @@ tower = { version = "=0.5.3", features = ["util"] }
 # collapses this to one version; until then the pair is the accurate state.
 lgwks_std = { version = "0.6.1", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2" }
 lgwks_bot = { version = "0.3.0", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", features = ["net", "signal"] }
+# The dependency gate itself. `default-features = false` keeps the storefront's
+# Rust scanner out: the contract lane only needs `check_dependencies`.
+lgwks_deps = { version = "0.1.5", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
