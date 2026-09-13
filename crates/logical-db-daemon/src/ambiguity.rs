@@ -184,7 +184,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 drop(network);
                 return Ok(());
             }
-            Ok(AcceptResult::Accepted) | Err(_) => {}
+            Ok(result) if probe_result_is_nonterminal(result) => {}
+            Err(_) => {}
             Ok(other) => {
                 eprintln!("fdb-ambiguity: unexpected acceptance result: {other:?}");
                 return Err(
@@ -194,6 +195,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     Err(io::Error::other("FDB buggify did not exercise a post-commit unknown result").into())
+}
+
+fn probe_result_is_nonterminal(result: AcceptResult) -> bool {
+    matches!(result, AcceptResult::Accepted | AcceptResult::Duplicate)
 }
 
 async fn verify_live_baseline_retention(
@@ -1238,7 +1243,18 @@ async fn verify_rebound_grants(
 mod tests {
     use logical_db_model::{AccountId, Scope, SpaceId};
 
-    use super::{page_action, run};
+    use super::{page_action, probe_result_is_nonterminal, run};
+    use logical_db_service::AcceptResult;
+
+    #[test]
+    fn ambiguity_probe_continues_after_durable_duplicate() {
+        assert!(probe_result_is_nonterminal(AcceptResult::Accepted));
+        assert!(probe_result_is_nonterminal(AcceptResult::Duplicate));
+        assert!(!probe_result_is_nonterminal(
+            AcceptResult::RecoveredUnknownCommit
+        ));
+        assert!(!probe_result_is_nonterminal(AcceptResult::Conflict));
+    }
 
     #[test]
     fn page_fixture_identity_binds_scope_position_and_limits() {

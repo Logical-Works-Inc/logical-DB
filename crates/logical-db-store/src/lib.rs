@@ -786,92 +786,113 @@ impl EmbeddedStore {
     /// Returns a validation or storage error. Reusing an operation identity
     /// for different change bytes returns [`StoreError::OperationConflict`].
     pub fn commit_local(&self, commit: LocalCommit<'_>) -> Result<CommitOutcome, StoreError> {
-        if !is_nonempty_bounded(commit.snapshot.len(), MAX_SNAPSHOT_BYTES) {
-            let error = StoreError::InvalidSnapshotSize(commit.snapshot.len());
-            eprintln!("logical-db-store: {error:?}");
-            return Err(error);
-        }
-        validate_indexes(commit.indexes)?;
+        self.commit_local_batch(std::slice::from_ref(&commit))?
+            .pop()
+            .ok_or(StoreError::EmptyLocalBatch)
+    }
 
-        let scope = commit.change.scope;
-        let operation_key = key_operation(scope, commit.change.operation);
+    /// Atomically saves several local document transitions in one durable
+    /// transaction. Every snapshot and revision is checked before any row is
+    /// written, so a stale or invalid member leaves the complete batch absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, stale-read, operation, or storage error. A
+    /// successful commit returns one outcome per input in input order.
+    pub fn commit_local_batch(
+        &self,
+        commits: &[LocalCommit<'_>],
+    ) -> Result<Vec<CommitOutcome>, StoreError> {
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut documents = BTreeSet::new();
+        let mut operations = BTreeSet::new();
+        for commit in commits {
+            if !is_nonempty_bounded(commit.snapshot.len(), MAX_SNAPSHOT_BYTES) {
+                let error = StoreError::InvalidSnapshotSize(commit.snapshot.len());
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            validate_indexes(commit.indexes)?;
+            if !documents.insert(commit.change.document) {
+                return Err(StoreError::DuplicateBatchDocument);
+            }
+            if !operations.insert(commit.change.operation) {
+                return Err(StoreError::DuplicateBatchOperation);
+            }
+        }
+
+        let scope = commits[0].change.scope;
+        if commits.iter().any(|commit| commit.change.scope != scope) {
+            return Err(StoreError::MixedBatchScope);
+        }
         let mut transaction = self.database.begin_write()?;
         transaction.set_durability(Durability::Immediate)?;
         let mut table = transaction.open_table(DATA)?;
         ensure_not_migrating(&table, scope)?;
-        if let Some(sequence) = existing_local_sequence(&table, &commit, &operation_key)? {
-            return Ok(CommitOutcome::Duplicate { sequence });
-        }
 
-        let revision_key = key_revision(scope, commit.change.document);
-        let current_revision = table
-            .get(revision_key.as_slice())?
-            .map(|value| decode_revision(value.value()))
-            .transpose()?;
-        if current_revision != commit.expected_revision {
-            let error = StoreError::StaleDocument;
-            eprintln!("logical-db-store: {error:?}");
-            return Err(error);
+        let mut outcomes = Vec::with_capacity(commits.len());
+        let mut current_revisions = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let operation_key = key_operation(scope, commit.change.operation);
+            if let Some(sequence) = existing_local_sequence(&table, commit, &operation_key)? {
+                outcomes.push(Some(CommitOutcome::Duplicate { sequence }));
+                current_revisions.push(None);
+                continue;
+            }
+            let revision_key = key_revision(scope, commit.change.document);
+            let current_revision = table
+                .get(revision_key.as_slice())?
+                .map(|value| decode_revision(value.value()))
+                .transpose()?;
+            if current_revision != commit.expected_revision {
+                let error = StoreError::StaleDocument;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            check_tombstone_transition(&table, scope, commit.change.document, commit.tombstone)?;
+            outcomes.push(None);
+            current_revisions.push(current_revision);
         }
-        let next_revision = match current_revision {
-            Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
-            None => DocumentRevision::new(1),
-        };
-        check_tombstone_transition(&table, scope, commit.change.document, commit.tombstone)?;
 
         let sequence_key = key_sequence(scope);
-        let previous = table
+        let mut sequence = table
             .get(sequence_key.as_slice())?
             .map(|value| decode_u64(value.value()))
             .transpose()?
             .unwrap_or(0);
-        let sequence = previous
-            .checked_add(1)
-            .ok_or(StoreError::SequenceExhausted)?;
-        let event_sequence = table
-            .get(key_event_sequence(scope).as_slice())?
+        let event_sequence_key = key_event_sequence(scope);
+        let mut event_sequence = table
+            .get(event_sequence_key.as_slice())?
             .map(|value| decode_u64(value.value()))
             .transpose()?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(StoreError::SequenceExhausted)?;
-
-        let document_key = key_snapshot(scope, commit.change.document);
-        let change_key = key_change(scope, commit.change.document, commit.change.digest);
-        let outbox_key = key_outbox(scope, sequence);
-        let operation_value = encode_operation(
-            commit.change.document,
-            commit.change.request,
-            commit.change.digest,
-            sequence,
-        );
-        let outbox_value = encode_outbox(commit.change);
-        let sequence_value = sequence.to_be_bytes();
-
-        table.insert(document_key.as_slice(), commit.snapshot)?;
-        table.insert(change_key.as_slice(), commit.change.bytes)?;
-        table.insert(operation_key.as_slice(), operation_value.as_slice())?;
-        table.insert(outbox_key.as_slice(), outbox_value.as_slice())?;
-        table.insert(sequence_key.as_slice(), sequence_value.as_slice())?;
-        table.insert(
-            revision_key.as_slice(),
-            next_revision.get().to_be_bytes().as_slice(),
-        )?;
-        if commit.tombstone {
-            write_tombstone(&mut table, scope, commit.change.document)?;
+            .unwrap_or(0);
+        for (index, commit) in commits.iter().enumerate() {
+            if outcomes[index].is_some() {
+                continue;
+            }
+            commit_local_member(
+                &mut table,
+                scope,
+                commit,
+                current_revisions[index],
+                &mut sequence,
+                &mut event_sequence,
+            )?;
+            outcomes[index] = Some(CommitOutcome::Applied { sequence });
         }
-        replace_indexes(&mut table, scope, commit.change.document, commit.indexes)?;
+        table.insert(sequence_key.as_slice(), sequence.to_be_bytes().as_slice())?;
         table.insert(
-            key_event(scope, event_sequence).as_slice(),
-            encode_event(commit.change.document, commit.change.digest).as_slice(),
-        )?;
-        table.insert(
-            key_event_sequence(scope).as_slice(),
+            event_sequence_key.as_slice(),
             event_sequence.to_be_bytes().as_slice(),
         )?;
         drop(table);
         transaction.commit()?;
-        Ok(CommitOutcome::Applied { sequence })
+        outcomes
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(StoreError::CorruptInternalValue)
     }
 
     /// Loads the durable exact-request binding for an operation, when present.
@@ -1492,6 +1513,18 @@ pub enum StoreError {
     /// Immutable change bytes violated the local resource bound.
     #[error("change byte length {0} is outside local bounds")]
     InvalidChangeSize(usize),
+    /// A local batch had no transitions to commit.
+    #[error("local commit batch is empty")]
+    EmptyLocalBatch,
+    /// A local batch attempted to update one document more than once.
+    #[error("local commit batch contains a duplicate document")]
+    DuplicateBatchDocument,
+    /// A local batch attempted to reuse one operation identity.
+    #[error("local commit batch contains a duplicate operation")]
+    DuplicateBatchOperation,
+    /// A local batch mixed ownership scopes.
+    #[error("local commit batch contains multiple scopes")]
+    MixedBatchScope,
     /// Complete snapshot bytes violated the local resource bound.
     #[error("snapshot byte length {0} is outside local bounds")]
     InvalidSnapshotSize(usize),
@@ -1622,6 +1655,60 @@ pub enum StoreError {
     /// A restore cannot finalize because durable revisions diverge from its replay.
     #[error("versioned restore cannot finalize before its replayed revisions match")]
     RestoreIncomplete,
+}
+
+fn commit_local_member(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    commit: &LocalCommit<'_>,
+    current_revision: Option<DocumentRevision>,
+    sequence: &mut u64,
+    event_sequence: &mut u64,
+) -> Result<(), StoreError> {
+    let next_revision = match current_revision {
+        Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+        None => DocumentRevision::new(1),
+    };
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or(StoreError::SequenceExhausted)?;
+    *event_sequence = event_sequence
+        .checked_add(1)
+        .ok_or(StoreError::SequenceExhausted)?;
+    let operation_key = key_operation(scope, commit.change.operation);
+    let operation_value = encode_operation(
+        commit.change.document,
+        commit.change.request,
+        commit.change.digest,
+        *sequence,
+    );
+    let outbox_value = encode_outbox(commit.change);
+    table.insert(
+        key_snapshot(scope, commit.change.document).as_slice(),
+        commit.snapshot,
+    )?;
+    table.insert(
+        key_change(scope, commit.change.document, commit.change.digest).as_slice(),
+        commit.change.bytes,
+    )?;
+    table.insert(operation_key.as_slice(), operation_value.as_slice())?;
+    table.insert(
+        key_outbox(scope, *sequence).as_slice(),
+        outbox_value.as_slice(),
+    )?;
+    table.insert(
+        key_revision(scope, commit.change.document).as_slice(),
+        next_revision.get().to_be_bytes().as_slice(),
+    )?;
+    if commit.tombstone {
+        write_tombstone(table, scope, commit.change.document)?;
+    }
+    replace_indexes(table, scope, commit.change.document, commit.indexes)?;
+    table.insert(
+        key_event(scope, *event_sequence).as_slice(),
+        encode_event(commit.change.document, commit.change.digest).as_slice(),
+    )?;
+    Ok(())
 }
 
 fn existing_local_sequence(

@@ -13,6 +13,13 @@ ALLOC (Application Ledger of record with Ontology, Clocks, and Checkpoints):
 data and its meaning share one content-addressed ledger, so every read cites
 the immutable changes that produced it.
 
+This is the Logical-DB substrate vision, not a claim that this workspace is
+the canonical LEM ORIGIN database. The current semantic crates provide a
+bounded v1 local model and an in-memory log; LEM’s locked v0 BLAKE3 wire and
+Fjall-backed append-only authority remain external until a versioned adapter,
+source-preserving migration, and independent handoff journey exist. See
+`docs/adr/0001-semantic-plane-boundary.md`.
+
 ## What is data here
 
 - A change is immutable and content-addressed. Episode identity is

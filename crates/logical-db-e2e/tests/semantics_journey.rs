@@ -4,7 +4,8 @@
 //! [`OriginLog`], derives the Cairn [`Observation`] from its [`EpisodeId`],
 //! persists the CBOR snapshot bytes as a facade [`Database`] document, then
 //! reloads and re-verifies identity, digest, and the [`LocalWorldRecord`]
-//! evidence-subset guard after reopen.
+//! evidence-subset guard after reopen. This is a local semantic-port journey,
+//! not proof of consumption by canonical LEM ORIGIN storage.
 //!
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
