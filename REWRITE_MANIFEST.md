@@ -69,8 +69,14 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   from caller intent/idempotency identity. The hosted FDB journey holds one
   action grant fixed while mutating every write field, proves rejection without
   frontier advance, and preserves exact-byte retry (issue #27).
-- [ ] Include explicit application-supplied projection semantic identity in
-  the durable schema digest and migration proof (issue #29).
+- [x] Include explicit application-supplied projection semantic identity in
+  the durable schema digest and migration proof (issue #29). `Projection`
+  requires a `ProjectionSemantics` (nonzero version or opaque digest) that is
+  hashed with its `IndexId` into the v2 schema digest; a changed semantics under
+  the same index and schema version returns migration-required, and
+  `Database::migrate_schema` rebuilds the rows atomically. Covered by the
+  `changed_projection_semantics_requires_migration_and_rebuilds_rows` facade
+  test.
 - [x] Native Windows CI passed data placement, file locking, concurrent open,
   Unicode, read-only paths, process termination, loopback HTTP, and all default
   workspace tests. Public TLS remains a deployment-host boundary, not an

@@ -127,7 +127,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use logical_db::{BatchEdit, Database, DatabaseError, MigrationReport, Projection};
+pub use logical_db::{
+    BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
+};
 use logical_db::{EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar};
 use logical_db_model::MAX_CHANGE_BYTES;
 pub use logical_db_model::{
@@ -140,6 +142,11 @@ use uuid::Uuid;
 
 /// Application schema version binding the cache projections to a scope.
 pub const KV_SCHEMA_VERSION: u32 = 1;
+/// Semantic version of [`kv_projections`]. It is separate from
+/// [`KV_SCHEMA_VERSION`] so a change to either projection function's output for
+/// any slot forces [`KvCache::migrate_schema`] instead of reopening a stale
+/// index. Bump it whenever the projection logic changes.
+pub const KV_PROJECTION_SEMANTICS: ProjectionSemantics = ProjectionSemantics::V1;
 /// Newest envelope layout version this cache writes and reads: `1` for
 /// inline values, `2` for tiered values carrying a sidecar reference.
 /// Inline values keep version `1` so readers that predate tiering keep
@@ -1665,7 +1672,7 @@ impl KvCache {
 #[must_use]
 pub fn kv_projections() -> Vec<Projection> {
     vec![
-        Projection::new(EXPIRY_INDEX, |reader| {
+        Projection::new(EXPIRY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -1677,7 +1684,7 @@ pub fn kv_projections() -> Vec<Projection> {
                 Some(_) => None,
             })
         }),
-        Projection::new(RECENCY_INDEX, |reader| {
+        Projection::new(RECENCY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }

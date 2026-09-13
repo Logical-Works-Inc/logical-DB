@@ -26,12 +26,13 @@ discard CRDT conflicts behind a last-writer-looking getter.
 ```rust
 use logical_db::{
     AccountId, Database, DocumentId, IndexId, IndexValue, Item, Object,
-    OperationDigest, OperationId, Projection, ReplicaId, Scalar, Scope, SpaceId,
+    OperationDigest, OperationId, Projection, ProjectionSemantics, ReplicaId, Scalar, Scope,
+    SpaceId,
 };
 
 let scope = Scope::new(AccountId::new(), SpaceId::new());
 let kind = IndexId::new(); // production apps persist a stable schema UUID
-let projection = Projection::new(kind, |reader| {
+let projection = Projection::new(kind, ProjectionSemantics::V1, |reader| {
     Ok(match reader.get(&Object::root(), "kind")? {
         Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
         _ => None,
@@ -59,9 +60,17 @@ Use `Database::open` when the host supplies an explicit path.
 `Database::open_default` selects the native per-user data root (`LOCALAPPDATA`
 on Windows) and creates only the app-private parent directories. A database file
 is durably bound to one `ReplicaId` and one exact schema/projection digest.
-Schema changes use `Database::migrate_schema`: it persists the target identity
-and document cursor, rebuilds indexes in bounded revision-checked pages, resumes
-after interruption, and swaps the schema binding only after the final page.
+Every `Projection` carries an explicit application-declared
+`ProjectionSemantics` (a nonzero version or an opaque digest) that is bound into
+that digest: authors must bump it whenever a projection function's output for
+any document can change, and a changed semantics under the same `IndexId` and
+schema version fails closed with migration-required instead of serving stale
+rows. The digest domain is versioned as v2; a database bound by an earlier build
+that recorded no projection semantics fails closed and needs one
+`Database::migrate_schema` to the v2 binding. Schema changes use
+`Database::migrate_schema`: it persists the target identity and document cursor,
+rebuilds indexes in bounded revision-checked pages, resumes after interruption,
+and swaps the schema binding only after the final page.
 
 Enable the facade's `http` feature to import `logical_db::http::{HttpTransport,
 CredentialProvider, StaticBearer}` without coupling an app to internal crates.

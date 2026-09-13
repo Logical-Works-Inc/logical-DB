@@ -14,6 +14,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroU32,
     path::Path,
     sync::Arc,
 };
@@ -101,20 +102,78 @@ type ProjectionFunction = dyn for<'document> Fn(&mut Reader<'document>) -> Resul
 type BatchEditFunction =
     dyn for<'document> FnOnce(&mut Editor<'document>) -> Result<(), CrdtError> + Send;
 
+/// Application-declared semantic identity of one materialized projection.
+///
+/// The durable schema digest binds every [`IndexId`] to this identity, so two
+/// projection functions that share an index identity but compute different rows
+/// cannot share one schema binding. The application states the identity because
+/// projection meaning is not derivable from Rust closure machine code: bump the
+/// version, or change the digest, whenever the function's output for any
+/// document can change. Changing only the function while leaving the declared
+/// semantics fixed is a caller defect this type cannot detect; it is what makes
+/// that obligation explicit and binds the declared identity, so a stale
+/// materialized index set is refused with [`StoreError::SchemaMigrationRequired`]
+/// until an explicit [`Database::migrate_schema`] rebuilds it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProjectionSemantics {
+    /// Monotonic, nonzero application-declared projection version.
+    Version(NonZeroU32),
+    /// Opaque application-computed semantic fingerprint.
+    Digest([u8; 32]),
+}
+
+impl ProjectionSemantics {
+    /// The first semantic version, for a projection whose logic never changed.
+    pub const V1: Self = Self::Version(NonZeroU32::MIN);
+
+    /// Declares a semantic version; zero is not a version.
+    #[must_use]
+    pub const fn version(version: u32) -> Option<Self> {
+        match NonZeroU32::new(version) {
+            Some(version) => Some(Self::Version(version)),
+            None => None,
+        }
+    }
+
+    /// Declares an opaque semantic fingerprint owned by the application.
+    #[must_use]
+    pub const fn digest(digest: [u8; 32]) -> Self {
+        Self::Digest(digest)
+    }
+
+    /// Writes the canonical identity bytes into a schema digest.
+    fn encode_into(&self, digest: &mut Sha256) {
+        match self {
+            Self::Version(version) => {
+                digest.update(b"version-v1");
+                digest.update(version.get().to_be_bytes());
+            }
+            Self::Digest(fingerprint) => {
+                digest.update(b"digest-v1");
+                digest.update(fingerprint);
+            }
+        }
+    }
+}
+
 /// One application-owned materialized secondary-index projection.
 #[derive(Clone)]
 pub struct Projection {
     index: IndexId,
+    semantics: ProjectionSemantics,
     function: Arc<ProjectionFunction>,
 }
 
 impl Projection {
-    /// Creates a projection with a stable schema identity.
+    /// Creates a projection with an explicit application-declared semantics.
     ///
     /// Projection code must be deterministic for the same materialized
-    /// document. Changing its meaning requires a new schema migration.
+    /// document. The supplied [`ProjectionSemantics`] is bound into the durable
+    /// schema digest; changing the projection's meaning requires changed
+    /// semantics and a deliberate [`Database::migrate_schema`].
     pub fn new(
         index: IndexId,
+        semantics: ProjectionSemantics,
         function: impl for<'document> Fn(
             &mut Reader<'document>,
         ) -> Result<Option<IndexValue>, CrdtError>
@@ -124,6 +183,7 @@ impl Projection {
     ) -> Self {
         Self {
             index,
+            semantics,
             function: Arc::new(function),
         }
     }
@@ -132,6 +192,12 @@ impl Projection {
     #[must_use]
     pub const fn index(&self) -> IndexId {
         self.index
+    }
+
+    /// Returns the application-declared semantic identity.
+    #[must_use]
+    pub const fn semantics(&self) -> ProjectionSemantics {
+        self.semantics
     }
 }
 
@@ -259,9 +325,9 @@ impl Database {
 
     /// Opens a replica under an exact durable application schema contract.
     ///
-    /// The version and stable projection identities are hashed and bound to the
-    /// scope. A changed projection contract is refused until a migration tool
-    /// deliberately rewrites materialized rows.
+    /// The version and stable `(index, semantics)` projection identities are
+    /// hashed and bound to the scope. A changed projection contract is refused
+    /// until a migration tool deliberately rewrites materialized rows.
     ///
     /// # Errors
     ///
@@ -1661,19 +1727,25 @@ fn projection_digest(
         eprintln!("logical-db: schema version cannot be zero");
         return Err(DatabaseError::InvalidSchemaVersion);
     }
-    let mut identities = BTreeSet::new();
-    if projections
-        .iter()
-        .any(|projection| !identities.insert(projection.index))
-    {
-        eprintln!("logical-db: projection identities must be unique");
-        return Err(DatabaseError::DuplicateProjection);
+    let mut identities = BTreeMap::new();
+    for projection in projections {
+        if identities
+            .insert(projection.index, projection.semantics)
+            .is_some()
+        {
+            eprintln!("logical-db: projection identities must be unique");
+            return Err(DatabaseError::DuplicateProjection);
+        }
     }
     let mut digest = Sha256::new();
-    digest.update(b"logical-db-schema-v1");
+    // v2 binds each index identity to its declared semantics. A v1 binding
+    // recorded no projection semantics, so it cannot be assumed to match and
+    // fails closed into an explicit migration instead.
+    digest.update(b"logical-db-schema-v2");
     digest.update(schema_version.to_be_bytes());
-    for identity in identities {
-        digest.update(identity.as_uuid().as_bytes());
+    for (index, semantics) in identities {
+        digest.update(index.as_uuid().as_bytes());
+        semantics.encode_into(&mut digest);
     }
     Ok(digest.finalize().into())
 }
@@ -2061,7 +2133,7 @@ mod tests {
         let replica = ReplicaId::new();
         let document = DocumentId::new();
         let index = IndexId::new();
-        let projection = Projection::new(index, |reader| {
+        let projection = Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,
@@ -2117,6 +2189,173 @@ mod tests {
     }
 
     #[test]
+    fn changed_projection_semantics_requires_migration_and_rebuilds_rows() {
+        let path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let document = DocumentId::new();
+        let index = IndexId::new();
+        assert!(ProjectionSemantics::version(0).is_none());
+        let changed_semantics = ProjectionSemantics::version(2).unwrap();
+        {
+            let database = Database::open_with_schema(
+                &path,
+                scope,
+                replica,
+                1,
+                vec![Projection::new(index, ProjectionSemantics::V1, |reader| {
+                    Ok(match reader.get(&Object::root(), "kind")? {
+                        Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
+                        _ => None,
+                    })
+                })],
+            )
+            .unwrap();
+            database
+                .edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new([1; 32]),
+                    |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+                )
+                .unwrap();
+            assert_eq!(
+                database
+                    .query_index(index, &IndexValue::Text("note".into()), None, 10)
+                    .unwrap(),
+                vec![document]
+            );
+        }
+        let changed = || {
+            Projection::new(index, changed_semantics, |reader| {
+                Ok(match reader.get(&Object::root(), "kind")? {
+                    Some(Item::Scalar(Scalar::String(value))) => {
+                        Some(IndexValue::Text(value.to_uppercase()))
+                    }
+                    _ => None,
+                })
+            })
+        };
+        // Same index identity and schema version, different declared semantics:
+        // the durable digest no longer matches and stale rows are refused.
+        assert!(matches!(
+            Database::open_with_schema(&path, scope, replica, 1, vec![changed()]),
+            Err(DatabaseError::Store(StoreError::SchemaMigrationRequired))
+        ));
+        // One index identity cannot hold two semantics at once, so the
+        // migration target stays unambiguous.
+        assert!(matches!(
+            Database::open_with_schema(
+                &path,
+                scope,
+                replica,
+                1,
+                vec![
+                    Projection::new(index, ProjectionSemantics::V1, |_reader| Ok(None)),
+                    changed(),
+                ],
+            ),
+            Err(DatabaseError::DuplicateProjection)
+        ));
+        let (database, report) =
+            Database::migrate_schema(&path, scope, replica, 1, vec![changed()], 10).unwrap();
+        assert_eq!(report.documents, 1);
+        assert!(
+            database
+                .query_index(index, &IndexValue::Text("note".into()), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .query_index(index, &IndexValue::Text("NOTE".into()), None, 10)
+                .unwrap(),
+            vec![document]
+        );
+        drop(database);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opaque_projection_digest_semantics_bind_and_migrate_like_versions() {
+        let path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let document = DocumentId::new();
+        let index = IndexId::new();
+        let first = ProjectionSemantics::digest([1; 32]);
+        let second = ProjectionSemantics::digest([2; 32]);
+        assert_ne!(first, second);
+        {
+            let database = Database::open_with_schema(
+                &path,
+                scope,
+                replica,
+                3,
+                vec![Projection::new(index, first, |reader| {
+                    Ok(match reader.get(&Object::root(), "kind")? {
+                        Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
+                        _ => None,
+                    })
+                })],
+            )
+            .unwrap();
+            database
+                .edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new([3; 32]),
+                    |editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())),
+                )
+                .unwrap();
+        }
+        // The same opaque digest reopens the schema that recorded it.
+        drop(
+            Database::open_with_schema(
+                &path,
+                scope,
+                replica,
+                3,
+                vec![Projection::new(index, first, |_reader| Ok(None))],
+            )
+            .unwrap(),
+        );
+        // A different digest under the same index and schema version must
+        // migrate rather than reuse the recorded rows.
+        assert!(matches!(
+            Database::open_with_schema(
+                &path,
+                scope,
+                replica,
+                3,
+                vec![Projection::new(index, second, |_reader| Ok(None))],
+            ),
+            Err(DatabaseError::Store(StoreError::SchemaMigrationRequired))
+        ));
+        let (database, _) = Database::migrate_schema(
+            &path,
+            scope,
+            replica,
+            3,
+            vec![Projection::new(index, second, |reader| {
+                Ok(reader
+                    .get(&Object::root(), "kind")?
+                    .map(|_| IndexValue::Text("digest-v2".into())))
+            })],
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            database
+                .query_index(index, &IndexValue::Text("digest-v2".into()), None, 10)
+                .unwrap(),
+            vec![document]
+        );
+        drop(database);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn facade_schema_migration_resumes_after_projection_failure_without_mixed_indexes() {
         let path = path();
         let scope = Scope::new(AccountId::new(), SpaceId::new());
@@ -2143,7 +2382,7 @@ mod tests {
         drop(Database::open_with_schema(&path, scope, replica, 1, vec![]).unwrap());
 
         let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let failing = Projection::new(index, {
+        let failing = Projection::new(index, ProjectionSemantics::V1, {
             let fail_once = Arc::clone(&fail_once);
             move |reader| {
                 if fail_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -2164,7 +2403,7 @@ mod tests {
             Err(DatabaseError::Store(StoreError::MigrationInProgress))
         ));
 
-        let projection = Projection::new(index, |reader| {
+        let projection = Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,
@@ -2194,7 +2433,7 @@ mod tests {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let index = IndexId::new();
-        let projection = Projection::new(index, |reader| {
+        let projection = Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,
@@ -2367,7 +2606,7 @@ mod tests {
         let document = DocumentId::new();
         let peer = PeerId::new();
         let index = IndexId::new();
-        let projection = Projection::new(index, |reader| {
+        let projection = Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,
@@ -2732,7 +2971,7 @@ mod tests {
         let replica = ReplicaId::new();
         let document = DocumentId::new();
         let index = IndexId::new();
-        let projection = Projection::new(index, |reader| {
+        let projection = Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,
@@ -2811,7 +3050,7 @@ mod tests {
     }
 
     fn kind_projection(index: IndexId) -> Projection {
-        Projection::new(index, |reader| {
+        Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,

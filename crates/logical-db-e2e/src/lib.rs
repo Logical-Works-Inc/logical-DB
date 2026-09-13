@@ -18,7 +18,8 @@ mod tests {
 
     use logical_db::{
         AccountId, Database, DocumentId, IndexId, IndexValue, Item, Object, OperationDigest,
-        OperationId, PeerId, Projection, ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
+        OperationId, PeerId, Projection, ProjectionSemantics, ReplicaId, Scalar, Scope, SpaceId,
+        SyncLimits,
     };
     use logical_db_http::{HttpTransport, StaticBearer};
     use logical_db_model::{ChangeDigest, Effect};
@@ -202,7 +203,7 @@ mod tests {
     }
 
     fn projection(index: IndexId) -> Projection {
-        Projection::new(index, |reader| {
+        Projection::new(index, ProjectionSemantics::V1, |reader| {
             Ok(match reader.get(&Object::root(), "kind")? {
                 Some(Item::Scalar(Scalar::String(value))) => Some(IndexValue::Text(value)),
                 _ => None,
