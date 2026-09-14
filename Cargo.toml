@@ -52,6 +52,14 @@ tower = { version = "=0.5.3", features = ["util"] }
 # The estate foundation. `lgwks_bot` is the single async entry
 # (INV-RT-SINGLE-ENTRY): its `tokio` edge is owned by `lgwks_deps` inside the
 # foundation, so no logical-db crate authors `tokio` or `futures`.
+#
+# Transitive boundary, not one unified identity: the lockfile carries TWO
+# `lgwks_std` versions. 0.6.1 is this workspace's direct estate edge; 0.5.1
+# arrives only through the git-pinned `braid-run` authority adapter. They are
+# separate crate identities that coexist in one binary and never share types,
+# so a `lgwks_std` type crossing the Braid boundary must be converted at the
+# adapter, not assumed compatible. Upgrading Braid's estate edge is what
+# collapses this to one version; until then the pair is the accurate state.
 lgwks_std = { version = "0.6.1", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2" }
 lgwks_bot = { version = "0.3.0", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", features = ["net", "signal"] }
 

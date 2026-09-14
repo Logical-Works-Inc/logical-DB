@@ -492,4 +492,70 @@ mod tests {
         assert!(parse_non_nil_uuid(&Uuid::nil().to_string(), "nil").is_err());
         assert!(parse_non_nil_uuid(&Uuid::now_v7().to_string(), "valid").is_ok());
     }
+
+    #[test]
+    fn the_daemon_starts_serves_and_releases_its_listener_on_shutdown() {
+        test_runtime().block_on(daemon_lifecycle_body());
+    }
+
+    async fn daemon_lifecycle_body() {
+        use std::{net::SocketAddr, sync::Arc};
+        let authentication =
+            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", scope(41))
+                .expect("authenticator");
+        let application = router(
+            RefusedStore,
+            authentication,
+            CheckpointCodec::new(KEY, 86_400_000).expect("codec"),
+            SystemClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind daemon listener");
+        let address: SocketAddr = listener.local_addr().expect("daemon address");
+        let stopped = Arc::new(lgwks_bot::rt::sync::Notify::new());
+        let shutdown = Arc::clone(&stopped);
+        let serving = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, application)
+                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .await
+                .expect("daemon serve");
+        });
+
+        let status = unauthenticated_push_status(address);
+        assert!(status.starts_with("HTTP/1.1 4"), "daemon served {status}");
+
+        stopped.notify_waiters();
+        lgwks_bot::rt::task::yield_now().await;
+        serving.await.expect("serve task joined");
+
+        let rebound = std::net::TcpListener::bind(address);
+        assert!(rebound.is_ok(), "the daemon kept its listener bound");
+    }
+
+    fn unauthenticated_push_status(address: std::net::SocketAddr) -> String {
+        use std::{
+            io::{Read, Write},
+            net::TcpStream,
+            time::Duration,
+        };
+        let mut stream = TcpStream::connect(address).expect("connect daemon");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        stream
+            .write_all(
+                b"POST /v1/changes:push HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+                  content-type: application/vnd.logical-db.v1+cbor\r\n\
+                  content-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .expect("write request");
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        String::from_utf8_lossy(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
 }
