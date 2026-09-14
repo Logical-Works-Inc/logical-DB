@@ -9,6 +9,22 @@
 # rejected for a stated reason. Adding a block here is an approval; the commit
 # that adds it is the signature.
 #
+# Scope, stated exactly. `source` is a CLASS (`registry`, `git`, `path`,
+# `other`), never a URL or a revision, so this register cannot witness that a
+# git edge still points at the commit it was approved at. Pinning the real
+# origin is the lockfile's job: `Cargo.lock` records the full
+# `git+<url>?rev=<sha>` source, and the `--locked` build plus the `cargo deny`
+# source-policy lane fail when the two disagree. `version` is a manifest
+# requirement string, so a drifted requirement is refused here while a drifted
+# resolved version remains a lockfile concern.
+#
+# Attestation state. `approved_by` and `review` are the author's PROPOSED
+# attestation, not proof of one: they name who the author believes approved the
+# edge and where the argument lives. An entry becomes ratified only when the
+# Director approves the commit that adds it. Until then every entry below is
+# proposed authority, and merging one without that approval leaves an
+# unratified edge no matter what these two fields claim.
+#
 # The estate surfaces are `lgwks_std` (the std+ core) and `lgwks_bot` (the
 # async and runner surface). `lgwks_std` is self-exempt in the gate because it
 # is the substrate, and the ecosystem's single `tokio` edge is owned by
