@@ -49,6 +49,7 @@ fn killed_restore_commits_nothing_and_a_clean_rerun_recovers() -> Result<(), Box
         .block_on(journey())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn journey() -> Result<(), Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     #[allow(unsafe_code)]
@@ -151,6 +152,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 
     drop((first, transport));
     server.abort();
+    let _ = server.await;
+    drop(prune_store);
     drop(network);
     let _ = fs::remove_file(&first_path);
     let _ = fs::remove_file(&consumer_path);

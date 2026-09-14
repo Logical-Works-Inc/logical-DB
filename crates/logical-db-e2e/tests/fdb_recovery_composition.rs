@@ -220,6 +220,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 
     drop((first, second));
     server.abort();
+    let _ = server.await;
+    drop(prune_store);
     drop(network);
     let _ = fs::remove_file(&first_path);
     let _ = fs::remove_file(&second_path);

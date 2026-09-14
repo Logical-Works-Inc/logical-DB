@@ -133,7 +133,9 @@ jobs:
         run: |
           export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
           cargo check -p logical-db-store-fdb --features fdb --locked
+          cargo check -p logical-db-e2e --features fdb --all-targets --locked
           cargo clippy -p logical-db-daemon --features fdb --all-targets --locked -- -D warnings
+          cargo clippy -p logical-db-e2e --features fdb --all-targets --locked -- -D warnings
           cargo test -p logical-db-store-fdb --features fdb --locked
           cargo test -p logical-db-daemon --features fdb --locked
       - name: run retained FDB ambiguity journey
@@ -179,3 +181,5 @@ jobs:
             --features fdb --locked
           cargo test -p logical-db-e2e --features fdb --locked \
             --test fdb_recovery_composition -- --nocapture
+          cargo test -p logical-db-e2e --features fdb --locked \
+            --test fdb_process_kill_restore -- --nocapture
