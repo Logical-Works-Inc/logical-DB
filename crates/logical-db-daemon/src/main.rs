@@ -264,8 +264,8 @@ mod tests {
         SnapshotArtifact, SnapshotBaseline, SnapshotRecord,
     };
     use logical_db_protocol::{
-        ChangeEnvelope, PROTOCOL_VERSION, PageAction, PullRequest, PushOutcome, PushRequest,
-        RecoveryAction, RejectionCode,
+        BaselineRequest, ChangeEnvelope, PROTOCOL_VERSION, PageAction, PullRequest, PushOutcome,
+        PushRequest, RecoveryAction, RejectionCode,
     };
     use logical_db_service::{
         AcceptResult, Authority, BaselinePageResult, CheckpointCodec, ConsumedResult,
@@ -613,23 +613,98 @@ mod tests {
         assert!(rebound.is_ok(), "the daemon kept its listener bound");
     }
 
+    #[test]
+    fn recovery_is_refused_before_the_baseline_store_is_contacted() {
+        test_runtime().block_on(recovery_refusal_body());
+    }
+
+    async fn recovery_refusal_body() {
+        use std::{net::SocketAddr, sync::Arc};
+        let authentication =
+            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", scope(41))
+                .expect("authenticator");
+        let application = router(
+            RefusedStore,
+            authentication,
+            CheckpointCodec::new(KEY, 86_400_000).expect("codec"),
+            SystemClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind daemon listener");
+        let address: SocketAddr = listener.local_addr().expect("daemon address");
+        let stopped = Arc::new(lgwks_bot::rt::sync::Notify::new());
+        let shutdown = Arc::clone(&stopped);
+        let serving = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, application)
+                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .await
+                .expect("daemon serve");
+        });
+
+        // A well-formed recovery request with the correct bearer and scope:
+        // every earlier boundary (representation, authentication, protocol
+        // validation) passes, so only the recovery authorization may refuse.
+        // `frontier` is read before authorization by design; any contact with
+        // the retention surface trips the RefusedStore sentinel instead.
+        let request = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope: scope(41),
+            replica: ReplicaId::new(),
+            request: OperationDigest::new([4; 32]),
+            after: None,
+            after_document: None,
+        };
+        let mut body = Vec::new();
+        ciborium::into_writer(&request, &mut body).expect("encode baseline request");
+        let status = post_status(
+            address,
+            "/v1/recovery:baseline",
+            &body,
+            "Bearer correct-correct-correct-correct-0041",
+        );
+        assert_eq!(status, "HTTP/1.1 403 Forbidden", "daemon served {status}");
+
+        stopped.notify_waiters();
+        lgwks_bot::rt::task::yield_now().await;
+        serving.await.expect("serve task joined");
+    }
+
     fn unauthenticated_push_status(address: std::net::SocketAddr) -> String {
+        post_status(address, "/v1/changes:push", b"", "")
+    }
+
+    fn post_status(
+        address: std::net::SocketAddr,
+        path: &str,
+        body: &[u8],
+        authorization: &str,
+    ) -> String {
         use std::{
             io::{Read, Write},
             net::TcpStream,
             time::Duration,
         };
+        let authorization_line = if authorization.is_empty() {
+            String::new()
+        } else {
+            format!("authorization: {authorization}\r\n")
+        };
         let mut stream = TcpStream::connect(address).expect("connect daemon");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
-        stream
-            .write_all(
-                b"POST /v1/changes:push HTTP/1.1\r\nhost: 127.0.0.1\r\n\
-                  content-type: application/vnd.logical-db.v1+cbor\r\n\
-                  content-length: 0\r\nconnection: close\r\n\r\n",
-            )
-            .expect("write request");
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+             content-type: application/vnd.logical-db.v1+cbor\r\n\
+             accept: application/vnd.logical-db.v1+cbor\r\n\
+             {authorization_line}\
+             content-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        stream.write_all(&head).expect("write request head");
+        stream.write_all(body).expect("write request body");
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
         String::from_utf8_lossy(&response)
