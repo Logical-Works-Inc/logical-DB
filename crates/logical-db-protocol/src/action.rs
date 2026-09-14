@@ -4,7 +4,9 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 
-use logical_db_model::{ActionDigest, OperationDigest, ReplicaId, Scope, SnapshotBaseline};
+use logical_db_model::{
+    ActionDigest, DocumentId, OperationDigest, ReplicaId, Scope, SnapshotBaseline,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{ChangeEnvelope, Checkpoint, PROTOCOL_VERSION};
@@ -42,6 +44,39 @@ impl PageAction {
     }
 }
 
+/// Server-normalized recovery parameters after authenticated request decoding.
+///
+/// The store receives these actual parameters and independently recomputes
+/// their action digest, so a caller cannot preserve the intent while
+/// substituting the checkpoint or the exclusive document cursor behind a grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryAction {
+    /// Scope whose recovery baseline is read.
+    pub scope: Scope,
+    /// Recovering replica bound into the invocation.
+    pub replica: ReplicaId,
+    /// Caller-provided intent identity, never itself an authorization digest.
+    pub intent: OperationDigest,
+    /// Validated triggering checkpoint, when the caller held one.
+    pub after: Option<Checkpoint>,
+    /// Exclusive document cursor selecting this page, when resuming.
+    pub after_document: Option<DocumentId>,
+}
+
+impl RecoveryAction {
+    /// Recomputes the canonical action digest from the actual parameters.
+    #[must_use]
+    pub fn digest(&self) -> ActionDigest {
+        recover_action(
+            self.scope,
+            self.replica,
+            self.intent,
+            self.after.as_ref(),
+            self.after_document.as_ref(),
+        )
+    }
+}
+
 /// Hashes every change field, including intent and the exact payload bytes.
 ///
 /// Admission must validate protocol bounds and native CRDT bytes first. The
@@ -69,13 +104,15 @@ pub fn seal_snapshot_action(
     ActionDigest::new(digest.finalize().into())
 }
 
-/// Binds a recovery fetch to the scope, replica, intent, and triggering checkpoint.
+/// Binds a recovery fetch to the scope, replica, intent, triggering checkpoint,
+/// and exclusive document cursor.
 #[must_use]
 pub fn recover_action(
     scope: Scope,
     replica: ReplicaId,
     intent: OperationDigest,
     after: Option<&Checkpoint>,
+    after_document: Option<&DocumentId>,
 ) -> ActionDigest {
     let mut digest = action_hash(b"recover-baseline", scope, intent);
     frame(&mut digest, replica.as_uuid().as_bytes());
@@ -83,6 +120,13 @@ pub fn recover_action(
         Some(checkpoint) => {
             frame(&mut digest, &[1]);
             frame(&mut digest, checkpoint.as_wire());
+        }
+        None => frame(&mut digest, &[0]),
+    }
+    match after_document {
+        Some(document) => {
+            frame(&mut digest, &[1]);
+            frame(&mut digest, document.as_uuid().as_bytes());
         }
         None => frame(&mut digest, &[0]),
     }

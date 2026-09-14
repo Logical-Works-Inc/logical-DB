@@ -12,13 +12,13 @@ use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 use logical_db_model::OperationId;
 use logical_db_model::{
-    ActionDigest, DocumentId, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
+    ActionDigest, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
     SnapshotDocument, SnapshotRecord, is_behind_retention,
 };
 use logical_db_protocol::{
     BaselineDocument, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION,
     PageAction, ProtocolError, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
-    RejectionCode, mark_consumed_action, prune_action, recover_action, seal_snapshot_action,
+    RecoveryAction, RejectionCode, mark_consumed_action, prune_action, seal_snapshot_action,
     write_action,
 };
 use sha2::Sha256;
@@ -476,6 +476,15 @@ pub struct BaselinePageSlice {
     pub more: bool,
 }
 
+/// Durable outcome of one grant-bound recovery page read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaselinePageResult {
+    /// The read observed the justified frontier and returned a page slice.
+    Page(BaselinePageSlice),
+    /// The scope frontier moved after the invocation was justified.
+    StaleAuthority,
+}
+
 /// Reads report the versioned snapshot baseline, the retention floor, and the
 /// peer-consumption watermark. Writes are frontier-bound like page reads: a
 /// grant justified against a moved frontier reports stale authority instead of
@@ -503,18 +512,21 @@ pub trait RetentionStore: ServiceStore {
         through: u64,
     ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send;
 
-    /// Reads one bounded ordered page of a sealed baseline after one cursor.
+    /// Reads one bounded ordered page of a sealed baseline for one cursor.
     ///
     /// The slice carries at most `MAX_BASELINE_PAGE_DOCUMENTS` documents,
-    /// strictly ascending after `after`. `more` reports that the same descriptor
-    /// has further documents. The store validates each stored document's own
-    /// integrity; the aggregate digest is the recovering client's terminal check.
+    /// strictly ascending after `action.after_document`. `more` reports that the
+    /// same descriptor has further documents. The store recomputes the
+    /// normalized action digest from the actual parameters and refuses a grant
+    /// issued for any other checkpoint or cursor; it validates each stored
+    /// document's own integrity, and the aggregate digest is the recovering
+    /// client's terminal check.
     fn read_baseline_page(
         &self,
-        scope: Scope,
+        action: &RecoveryAction,
         descriptor: &SnapshotBaseline,
-        after: Option<DocumentId>,
-    ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send;
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send;
 
     /// Durably records a versioned snapshot baseline for the scope.
     ///
@@ -588,11 +600,11 @@ where
 
     fn read_baseline_page(
         &self,
-        scope: Scope,
+        action: &RecoveryAction,
         descriptor: &SnapshotBaseline,
-        after: Option<DocumentId>,
-    ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
-        (**self).read_baseline_page(scope, descriptor, after)
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+        (**self).read_baseline_page(action, descriptor, grant)
     }
 
     fn seal_snapshot(
@@ -1065,21 +1077,25 @@ where
             .frontier(request.scope)
             .await
             .map_err(ServiceError::Store)?;
-        if self
-            .policy
-            .authorize(
-                request.scope,
-                Effect::Sync,
-                recover_action(
-                    request.scope,
-                    request.replica,
-                    request.request,
-                    request.after.as_ref(),
-                ),
-                frontier,
-                now_unix_ms,
-            )
-            .is_none()
+        let action = RecoveryAction {
+            scope: request.scope,
+            replica: request.replica,
+            intent: request.request,
+            after: request.after.clone(),
+            after_document: request.after_document,
+        };
+        let digest = action.digest();
+        let Some(grant) =
+            self.policy
+                .authorize(request.scope, Effect::Sync, digest, frontier, now_unix_ms)
+        else {
+            eprintln!("logical-db-service: recover: Forbidden");
+            return Err(ServiceError::Forbidden);
+        };
+        if grant.scope() != request.scope
+            || grant.effect() != Effect::Sync
+            || grant.action() != digest
+            || grant.frontier() != frontier
         {
             eprintln!("logical-db-service: recover: Forbidden");
             return Err(ServiceError::Forbidden);
@@ -1092,11 +1108,18 @@ where
         let Some(SnapshotRecord::State(descriptor)) = sealed else {
             return Ok(ServiceBaseline::Unavailable);
         };
-        let slice = self
+        let slice = match self
             .store
-            .read_baseline_page(request.scope, &descriptor, request.after_document)
+            .read_baseline_page(&action, &descriptor, &grant)
             .await
-            .map_err(ServiceError::Store)?;
+            .map_err(ServiceError::Store)?
+        {
+            BaselinePageResult::Page(slice) => slice,
+            BaselinePageResult::StaleAuthority => {
+                eprintln!("logical-db-service: recover: StaleAuthority");
+                return Err(ServiceError::StaleAuthority);
+            }
+        };
         if slice.more && slice.documents.is_empty() {
             eprintln!("logical-db-service: recover: CorruptStoreData");
             return Err(ServiceError::CorruptStoreData);
@@ -1279,6 +1302,8 @@ mod tests {
 
     use super::*;
 
+    use logical_db_protocol::recover_action;
+
     struct Allow;
     struct Stale;
     struct Grant {
@@ -1342,6 +1367,41 @@ mod tests {
                 effect,
                 action,
                 frontier: frontier.checked_sub(1).unwrap_or(1),
+            })
+        }
+    }
+
+    /// Certifies exactly one captured invocation, like a host authority that
+    /// binds a grant to the action digest it justified.
+    struct ExactRecovery {
+        scope: Scope,
+        action: ActionDigest,
+        frontier: u64,
+    }
+
+    impl Authority for ExactRecovery {
+        type Grant = Grant;
+
+        fn authorize(
+            &self,
+            scope: Scope,
+            effect: Effect,
+            action: ActionDigest,
+            frontier: u64,
+            _now: u64,
+        ) -> Option<Self::Grant> {
+            if scope != self.scope
+                || effect != Effect::Sync
+                || action != self.action
+                || frontier != self.frontier
+            {
+                return None;
+            }
+            Some(Grant {
+                scope,
+                effect,
+                action,
+                frontier,
             })
         }
     }
@@ -1456,11 +1516,11 @@ mod tests {
         }
         fn read_baseline_page(
             &self,
-            scope: Scope,
+            action: &RecoveryAction,
             descriptor: &SnapshotBaseline,
-            after: Option<DocumentId>,
-        ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
-            std::future::ready(Ok(self.read_baseline_page_result(scope, descriptor, after)))
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+            std::future::ready(Ok(self.read_baseline_page_result(action, descriptor, grant)))
         }
         fn seal_snapshot(
             &self,
@@ -1588,15 +1648,21 @@ mod tests {
         }
         fn read_baseline_page_result(
             &self,
-            scope: Scope,
+            action: &RecoveryAction,
             descriptor: &SnapshotBaseline,
-            after: Option<DocumentId>,
-        ) -> BaselinePageSlice {
-            let Some(artifact) = self.retention_state(scope).baseline else {
-                return BaselinePageSlice {
+            grant: &impl ExecutionGrant,
+        ) -> BaselinePageResult {
+            if self
+                .check_retention_grant(action.scope, action.digest(), grant)
+                .is_none()
+            {
+                return BaselinePageResult::StaleAuthority;
+            }
+            let Some(artifact) = self.retention_state(action.scope).baseline else {
+                return BaselinePageResult::Page(BaselinePageSlice {
                     documents: Vec::new(),
                     more: false,
-                };
+                });
             };
             assert!(
                 &artifact.baseline == descriptor,
@@ -1605,13 +1671,17 @@ mod tests {
             let mut documents = artifact
                 .documents
                 .iter()
-                .filter(|document| after.is_none_or(|cursor| document.document > cursor))
+                .filter(|document| {
+                    action
+                        .after_document
+                        .is_none_or(|cursor| document.document > cursor)
+                })
                 .take(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 1)
                 .cloned()
                 .collect::<Vec<_>>();
             let more = documents.len() > logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS;
             documents.truncate(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
-            BaselinePageSlice { documents, more }
+            BaselinePageResult::Page(BaselinePageSlice { documents, more })
         }
         fn seal_snapshot_result(
             &self,
@@ -2120,6 +2190,54 @@ mod tests {
             after_document,
         };
         lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+    }
+
+    #[test]
+    fn a_recovery_grant_for_one_cursor_cannot_authorize_another() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let intent = OperationDigest::new([92; 32]);
+        let cursor = DocumentId::new();
+        let authorized = recover_action(scope, replica, intent, None, None);
+        let captured = recover_action(scope, replica, intent, None, Some(&cursor));
+        assert_ne!(
+            authorized, captured,
+            "the exclusive cursor must change the recover action digest"
+        );
+
+        let service = ProtocolService::new(
+            Memory::default(),
+            ExactRecovery {
+                scope,
+                action: authorized,
+                frontier: 0,
+            },
+            CheckpointCodec::new([6; 32], 100).unwrap(),
+        );
+        let other = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: intent,
+            after: None,
+            after_document: Some(cursor),
+        };
+        assert!(matches!(
+            lgwks_std::task::block_on(service.recover(&other, 10)),
+            Err(ServiceError::Forbidden)
+        ));
+        let exact = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: intent,
+            after: None,
+            after_document: None,
+        };
+        assert!(matches!(
+            lgwks_std::task::block_on(service.recover(&exact, 10)),
+            Ok(ServiceBaseline::Unavailable)
+        ));
     }
 
     #[test]

@@ -29,14 +29,15 @@ mod tests {
     use logical_db_protocol::ChangeEnvelope;
     use logical_db_server::{AuthenticationError, Authenticator, Clock, router};
     use logical_db_service::{
-        AcceptResult, Authority, BaselinePageSlice, CheckpointCodec, ConsumedResult,
-        ExecutionGrant, PageResult, PruneReceipt, PruneRefusal, PruneResult, RetentionStore,
-        SealResult, ServiceStore, StoredPage, materialize_snapshot, prune_decision,
+        AcceptResult, Authority, BaselinePageResult, BaselinePageSlice, CheckpointCodec,
+        ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneRefusal, PruneResult,
+        RetentionStore, SealResult, ServiceStore, StoredPage, materialize_snapshot, prune_decision,
     };
 
     use logical_db_model::ActionDigest;
     use logical_db_protocol::{
-        PageAction, mark_consumed_action, prune_action, seal_snapshot_action, write_action,
+        PageAction, RecoveryAction, mark_consumed_action, prune_action, seal_snapshot_action,
+        write_action,
     };
 
     struct Allow;
@@ -302,15 +303,21 @@ mod tests {
 
         fn read_baseline_page(
             &self,
-            scope: Scope,
+            action: &RecoveryAction,
             descriptor: &SnapshotBaseline,
-            after: Option<DocumentId>,
-        ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
-            let Some(artifact) = self.retention_state(scope).baseline else {
-                return ready(Ok(BaselinePageSlice {
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+            if self
+                .check_retention_grant(action.scope, action.digest(), grant)
+                .is_none()
+            {
+                return ready(Ok(BaselinePageResult::StaleAuthority));
+            }
+            let Some(artifact) = self.retention_state(action.scope).baseline else {
+                return ready(Ok(BaselinePageResult::Page(BaselinePageSlice {
                     documents: Vec::new(),
                     more: false,
-                }));
+                })));
             };
             assert_eq!(
                 &artifact.baseline, descriptor,
@@ -319,13 +326,20 @@ mod tests {
             let mut documents = artifact
                 .documents
                 .iter()
-                .filter(|document| after.is_none_or(|cursor| document.document > cursor))
+                .filter(|document| {
+                    action
+                        .after_document
+                        .is_none_or(|cursor| document.document > cursor)
+                })
                 .take(MAX_BASELINE_PAGE_DOCUMENTS + 1)
                 .cloned()
                 .collect::<Vec<_>>();
             let more = documents.len() > MAX_BASELINE_PAGE_DOCUMENTS;
             documents.truncate(MAX_BASELINE_PAGE_DOCUMENTS);
-            ready(Ok(BaselinePageSlice { documents, more }))
+            ready(Ok(BaselinePageResult::Page(BaselinePageSlice {
+                documents,
+                more,
+            })))
         }
 
         fn seal_snapshot(

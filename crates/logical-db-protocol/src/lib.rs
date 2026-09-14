@@ -8,8 +8,8 @@
 
 mod action;
 pub use action::{
-    PageAction, mark_consumed_action, prune_action, recover_action, seal_snapshot_action,
-    write_action,
+    PageAction, RecoveryAction, mark_consumed_action, prune_action, recover_action,
+    seal_snapshot_action, write_action,
 };
 
 use lgwks_std::json::serde::{
@@ -399,6 +399,23 @@ impl BaselinePage {
     /// an inconsistent continuation contract.
     pub fn validate_page(&self, expected_scope: Scope) -> Result<SnapshotBaseline, ProtocolError> {
         validate_protocol(self.protocol)?;
+        if self.documents.len() > MAX_BASELINE_PAGE_DOCUMENTS {
+            eprintln!(
+                "logical-db-protocol: BaselinePage::validate_page: document count over limit"
+            );
+            return Err(ProtocolError::InvalidBaselineDocuments);
+        }
+        let page_bytes = self
+            .documents
+            .iter()
+            .try_fold(0_usize, |total, document| {
+                total.checked_add(document.snapshot.len())
+            })
+            .ok_or(ProtocolError::InvalidBaselineDocuments)?;
+        if page_bytes > MAX_BASELINE_BYTES {
+            eprintln!("logical-db-protocol: BaselinePage::validate_page: page bytes over limit");
+            return Err(ProtocolError::InvalidBaselineDocuments);
+        }
         let descriptor = match SnapshotBaseline::decode(&self.descriptor) {
             Ok(SnapshotRecord::State(baseline)) => baseline,
             Ok(SnapshotRecord::LegacyPosition(_)) => {
@@ -1442,6 +1459,57 @@ mod tests {
         };
         let encoded = lgwks_std::json::to_vec(&page).unwrap();
         assert!(lgwks_std::json::from_slice::<BaselinePage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn baseline_page_validator_refuses_typed_pages_over_its_bounds() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let descriptor =
+            SnapshotBaseline::new(0, logical_db_model::BaselineDigest::new([0; 32]), 0, 0)
+                .encode()
+                .to_vec();
+        let checkpoint = Checkpoint::from_wire(vec![1]).unwrap();
+        let counted = BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: descriptor.clone(),
+            documents: (0..=MAX_BASELINE_PAGE_DOCUMENTS)
+                .map(|_| BaselineDocument {
+                    document: DocumentId::new(),
+                    tombstone: false,
+                    snapshot: vec![1],
+                })
+                .collect(),
+            checkpoint: checkpoint.clone(),
+            more: false,
+            next_document: None,
+        };
+        assert_eq!(
+            counted.validate_page(scope),
+            Err(ProtocolError::InvalidBaselineDocuments)
+        );
+        let oversized = BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor,
+            documents: vec![
+                BaselineDocument {
+                    document: DocumentId::new(),
+                    tombstone: false,
+                    snapshot: vec![0; MAX_BASELINE_BYTES / 2 + 1],
+                },
+                BaselineDocument {
+                    document: DocumentId::new(),
+                    tombstone: false,
+                    snapshot: vec![0; MAX_BASELINE_BYTES / 2 + 1],
+                },
+            ],
+            checkpoint,
+            more: false,
+            next_document: None,
+        };
+        assert_eq!(
+            oversized.validate_page(scope),
+            Err(ProtocolError::InvalidBaselineDocuments)
+        );
     }
 
     fn ordered_states(count: usize) -> Vec<SnapshotDocument> {

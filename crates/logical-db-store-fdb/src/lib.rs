@@ -550,14 +550,14 @@ mod runtime {
         SnapshotDocument, SnapshotRecord,
     };
     use logical_db_protocol::{
-        ChangeEnvelope, PageAction, mark_consumed_action, prune_action, seal_snapshot_action,
-        write_action,
+        ChangeEnvelope, PageAction, RecoveryAction, mark_consumed_action, prune_action,
+        seal_snapshot_action, write_action,
     };
     use logical_db_service::{
-        AcceptResult, BaselinePageSlice, ConsumedResult, ExecutionGrant, PageResult, PruneReceipt,
-        PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore,
-        SnapshotMaterializationError, StoreFailureClass, StoredPage, materialize_snapshot,
-        prune_decision,
+        AcceptResult, BaselinePageResult, BaselinePageSlice, ConsumedResult, ExecutionGrant,
+        PageResult, PruneReceipt, PruneRefusal, PruneResult, RetentionStore, SealResult,
+        ServiceStore, SnapshotMaterializationError, StoreFailureClass, StoredPage,
+        materialize_snapshot, prune_decision,
     };
     use thiserror::Error;
 
@@ -869,22 +869,35 @@ mod runtime {
 
         async fn read_baseline_page(
             &self,
-            scope: Scope,
+            action: &RecoveryAction,
             descriptor: &SnapshotBaseline,
-            after: Option<DocumentId>,
-        ) -> Result<BaselinePageSlice, Self::Error> {
-            let scope_space = self.scope_space(scope);
+            grant: &impl ExecutionGrant,
+        ) -> Result<BaselinePageResult, Self::Error> {
+            if grant.scope() != action.scope
+                || grant.effect() != Effect::Sync
+                || grant.action() != action.digest()
+            {
+                return Ok(BaselinePageResult::StaleAuthority);
+            }
+            let expected_frontier = grant.frontier();
+            let scope_space = self.scope_space(action.scope);
             let spaces = baseline_spaces(&scope_space);
+            let sequence_key = scope_space.pack(&(KIND_SEQUENCE,));
             let descriptor = descriptor.clone();
-            let after = after.map(|document| document.as_uuid());
+            let after = action.after_document.map(DocumentId::as_uuid);
             self.database
                 .run(move |transaction, _maybe_committed| {
                     let spaces = spaces.clone();
+                    let sequence_key = sequence_key.clone();
                     let descriptor = descriptor.clone();
                     async move {
                         configure_transaction(&transaction)?;
+                        if read_frontier(&transaction, &sequence_key).await? != expected_frontier {
+                            return Ok(BaselinePageResult::StaleAuthority);
+                        }
                         read_baseline_page_transaction(&transaction, &spaces, &descriptor, after)
                             .await
+                            .map(BaselinePageResult::Page)
                     }
                 })
                 .await

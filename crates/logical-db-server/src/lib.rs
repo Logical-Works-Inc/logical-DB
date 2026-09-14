@@ -484,15 +484,15 @@ mod tests {
         ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
     use logical_db_service::{
-        AcceptResult, BaselinePageSlice, ConsumedResult, ExecutionGrant, PageResult, PruneRefusal,
-        PruneResult, SealResult, StoredPage,
+        AcceptResult, BaselinePageResult, BaselinePageSlice, ConsumedResult, ExecutionGrant,
+        PageResult, PruneRefusal, PruneResult, SealResult, StoredPage,
     };
     use tower::ServiceExt;
 
     use super::*;
 
     use logical_db_model::ActionDigest;
-    use logical_db_protocol::{PageAction, write_action};
+    use logical_db_protocol::{PageAction, RecoveryAction, write_action};
 
     struct Allow;
     #[derive(Clone, Copy)]
@@ -867,14 +867,14 @@ mod tests {
                 }
                 fn read_baseline_page(
                     &self,
-                    _scope: Scope,
+                    _action: &RecoveryAction,
                     _descriptor: &SnapshotBaseline,
-                    _after: Option<DocumentId>,
-                ) -> impl Future<Output = Result<BaselinePageSlice, Self::Error>> + Send {
-                    ready(Ok(BaselinePageSlice {
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+                    ready(Ok(BaselinePageResult::Page(BaselinePageSlice {
                         documents: Vec::new(),
                         more: false,
-                    }))
+                    })))
                 }
                 fn seal_snapshot(
                     &self,
