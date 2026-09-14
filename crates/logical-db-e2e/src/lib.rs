@@ -923,6 +923,147 @@ mod tests {
     }
 
     #[test]
+    fn a_local_edit_landing_between_recovery_pages_survives_the_install() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(local_edit_between_pages_body());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn local_edit_between_pages_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([27; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let first_path = path("interleave-first");
+        let second_path = path("interleave-second");
+        let total = MAX_BASELINE_PAGE_DOCUMENTS + 1;
+        let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
+
+        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        for (batch, chunk) in documents.chunks(150).enumerate() {
+            let edits = chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, document)| {
+                    let index = batch * 150 + offset;
+                    BatchEdit::new(
+                        *document,
+                        OperationId::new(),
+                        OperationDigest::new([u8::try_from(index % 256).unwrap(); 32]),
+                        move |editor| {
+                            editor.put(
+                                &Object::root(),
+                                "page",
+                                Scalar::Integer(i64::try_from(index).unwrap()),
+                            )
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            first.edit_many(edits).unwrap();
+        }
+        let seeded = u64::try_from(total).unwrap();
+        for _round in 0..8 {
+            first
+                .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+                .await
+                .unwrap();
+            if store.frontier(scope).await.unwrap() == seeded {
+                break;
+            }
+        }
+        assert_eq!(store.frontier(scope).await.unwrap(), seeded);
+        seal_consume_and_prune_through(&store, scope, seeded).await;
+
+        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let local_document = DocumentId::new();
+        let local_operation = OperationId::new();
+        let mut calls = 0usize;
+        let mut landed = false;
+        let report = second
+            .synchronize(peer, &mut transport, SyncLimits::default(), || {
+                calls += 1;
+                if calls == 2 {
+                    assert!(
+                        second
+                            .read(documents[0], |reader| reader.get(&Object::root(), "page"))
+                            .unwrap()
+                            .is_none(),
+                        "the edit must land after the first page and before any install"
+                    );
+                    second
+                        .edit(
+                            local_document,
+                            local_operation,
+                            OperationDigest::new([0xb7; 32]),
+                            |editor| editor.put(&Object::root(), "local", Scalar::Integer(7)),
+                        )
+                        .unwrap();
+                    landed = true;
+                }
+                false
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            landed,
+            "the recovery loop must reach its between-pages seam, saw {calls} calls"
+        );
+        assert!(report.recovered, "the replica must still take the baseline");
+        assert_eq!(
+            second
+                .read(local_document, |reader| reader
+                    .get(&Object::root(), "local"))
+                .unwrap(),
+            Some(Some(Item::Scalar(Scalar::Integer(7)))),
+            "an edit that lands mid-recovery must survive the install"
+        );
+        for (index, document) in documents.iter().enumerate() {
+            assert_eq!(
+                second
+                    .read(*document, |reader| reader.get(&Object::root(), "page"))
+                    .unwrap(),
+                Some(Some(Item::Scalar(Scalar::Integer(
+                    i64::try_from(index).unwrap()
+                )))),
+                "baseline document {index} must still install around a concurrent edit"
+            );
+        }
+        let pending = second.pending_changes(0, 8).unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|change| change.operation == local_operation),
+            "the concurrent edit must remain in the outbox for upload"
+        );
+
+        drop((first, second));
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+        server.abort();
+    }
+
+    #[test]
     fn tombstone_survives_baseline_recovery_and_cannot_resurrect() {
         lgwks_bot::Builder::new()
             .worker_threads(std::num::NonZeroUsize::new(2))
