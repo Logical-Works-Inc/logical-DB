@@ -3,8 +3,11 @@
 //! Spawned as a real child process by the process-kill recovery journey. On the
 //! first *continued* baseline page it writes a ready file and pauses, so the
 //! parent can terminate it while the accumulator already holds earlier pages but
-//! before the replica has committed anything. A run with a zero pause recovers
-//! the whole baseline and reports it, standing in for the external consumer.
+//! before the replica has committed anything. A second seam signals *after*
+//! `synchronize` returns, so the parent can terminate a child whose baseline
+//! commit is already durable and check what survives it. A run with both pauses
+//! at zero recovers the whole baseline and reports it, standing in for the
+//! external consumer.
 //!
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32 S33
@@ -80,6 +83,12 @@ async fn recover() -> Result<(), Box<dyn Error>> {
     let bearer = StaticBearer::new(&required(&arguments, 7, "bearer")?)?;
     let ready = PathBuf::from(required(&arguments, 8, "ready path")?);
     let pause = Duration::from_millis(required(&arguments, 9, "pause ms")?.parse()?);
+    let committed = arguments.get(10).map(PathBuf::from);
+    let post_pause = arguments
+        .get(11)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_default();
 
     let database = Database::open(&path, scope, replica)?;
     let mut transport = PausingTransport {
@@ -93,6 +102,12 @@ async fn recover() -> Result<(), Box<dyn Error>> {
     if !report.recovered {
         eprintln!("recovery-consumer: no baseline was installed");
         return Err(io::Error::other("expected a state-bearing baseline").into());
+    }
+    if let Some(path) = committed.filter(|_| !post_pause.is_zero()) {
+        if let Err(error) = std::fs::write(&path, b"committed\n") {
+            eprintln!("recovery-consumer: committed signal: {error}");
+        }
+        std::thread::sleep(post_pause);
     }
     println!(
         "PASS recovery-consumer recovered={} pushed={} pulled={}",

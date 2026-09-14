@@ -83,6 +83,9 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let first_path = std::env::temp_dir().join(format!("logical-db-kill-first-{run}.redb"));
     let consumer_path = std::env::temp_dir().join(format!("logical-db-kill-consumer-{run}.redb"));
     let ready = std::env::temp_dir().join(format!("logical-db-kill-ready-{run}"));
+    let committed_ready =
+        std::env::temp_dir().join(format!("logical-db-kill-committed-ready-{run}"));
+    let committed_path = std::env::temp_dir().join(format!("logical-db-kill-committed-{run}.redb"));
     let consumer_replica = ReplicaId::new();
     let consumer_peer = PeerId::new();
     let total = u64::try_from(BASELINE_DOCUMENTS)?;
@@ -109,8 +112,10 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         &endpoint,
         &ready,
         KILL_PAUSE_MS,
+        &committed_ready,
+        0,
     );
-    await_ready(&mut killed, &ready)?;
+    await_ready(&mut killed, &ready, "page two")?;
     killed.kill()?;
     if killed.wait()?.success() {
         eprintln!("fdb-process-kill-restore: the consumer exited before it could be killed");
@@ -132,6 +137,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         &endpoint,
         &ready,
         0,
+        &committed_ready,
+        0,
     );
     let status = rerun.wait()?;
     if !status.success() {
@@ -146,8 +153,43 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         &documents,
     )?;
 
+    let committed_replica = ReplicaId::new();
+    let committed_peer = PeerId::new();
+    let mut post_commit = spawn_consumer(
+        &committed_path,
+        scope,
+        committed_replica,
+        committed_peer,
+        &endpoint,
+        &ready,
+        0,
+        &committed_ready,
+        KILL_PAUSE_MS,
+    );
+    await_ready(&mut post_commit, &committed_ready, "the durable commit")?;
+    post_commit.kill()?;
+    if post_commit.wait()?.success() {
+        eprintln!(
+            "fdb-process-kill-restore: the consumer exited after committing before it could be killed"
+        );
+        return Err(io::Error::other("the post-commit consumer was not terminated").into());
+    }
+    assert_recovered(
+        &committed_path,
+        scope,
+        committed_replica,
+        committed_peer,
+        &documents,
+    )
+    .map_err(|error| {
+        eprintln!(
+            "fdb-process-kill-restore: the state after a post-commit kill was not durable: {error}"
+        );
+        error
+    })?;
+
     println!(
-        "PASS fdb-process-kill-restore killed_before_commit=true documents={total} checkpoint_advanced=true store=real-fdb"
+        "PASS fdb-process-kill-restore killed_before_commit=true killed_after_commit=true documents={total} checkpoint_advanced=true store=real-fdb"
     );
 
     drop((first, transport));
@@ -158,6 +200,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let _ = fs::remove_file(&first_path);
     let _ = fs::remove_file(&consumer_path);
     let _ = fs::remove_file(&ready);
+    let _ = fs::remove_file(&committed_ready);
+    let _ = fs::remove_file(&committed_path);
     Ok(())
 }
 
@@ -307,6 +351,8 @@ fn spawn_consumer(
     endpoint: &Url,
     ready: &Path,
     pause_ms: u64,
+    committed: &Path,
+    post_pause_ms: u64,
 ) -> ConsumerChild {
     let child = Command::new(env!("CARGO_BIN_EXE_recovery_consumer"))
         .arg(path)
@@ -318,18 +364,20 @@ fn spawn_consumer(
         .arg("recovery-fixture")
         .arg(ready)
         .arg(pause_ms.to_string())
+        .arg(committed)
+        .arg(post_pause_ms.to_string())
         .spawn()
         .expect("the recovery consumer must spawn");
     ConsumerChild { child }
 }
 
-fn await_ready(child: &mut ConsumerChild, ready: &Path) -> Result<(), Box<dyn Error>> {
+fn await_ready(child: &mut ConsumerChild, ready: &Path, stage: &str) -> Result<(), Box<dyn Error>> {
     for _poll in 0..2_000 {
         if ready.exists() {
             return Ok(());
         }
         if child.try_wait()?.is_some() {
-            eprintln!("fdb-process-kill-restore: the consumer exited before page two");
+            eprintln!("fdb-process-kill-restore: the consumer exited before {stage}");
             return Err(io::Error::other("the consumer exited before the kill seam").into());
         }
         thread::sleep(Duration::from_millis(10));
