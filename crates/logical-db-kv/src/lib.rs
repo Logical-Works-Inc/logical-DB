@@ -1859,6 +1859,13 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 }
 
 fn hex_to_digest(name: &str) -> Option<[u8; 32]> {
+    if name.len() != 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
     lgwks_std::hex::decode(name).ok()?.try_into().ok()
 }
 
@@ -3308,5 +3315,25 @@ mod tests {
             );
         }
         cleanup(&db_path);
+    }
+
+    #[test]
+    fn blob_names_are_canonical_lowercase_hex_and_reject_every_near_miss() {
+        let canonical = hex_digest(&[0xab; 32]);
+        assert_eq!(canonical.len(), 64);
+        assert_eq!(hex_to_digest(&canonical), Some([0xab; 32]));
+        assert!(is_blob_name(&canonical));
+        let short = canonical[..63].to_owned();
+        let long = format!("{canonical}0");
+        let mixed_case = canonical.replace('a', "A");
+        let invalid_digit = format!("z{}", &canonical[1..]);
+        assert_eq!(hex_to_digest(&short), None);
+        assert_eq!(hex_to_digest(&long), None);
+        assert_eq!(hex_to_digest(&mixed_case), None);
+        assert_eq!(hex_to_digest(&invalid_digit), None);
+        assert!(!is_blob_name(&short));
+        assert!(!is_blob_name(&long));
+        assert!(!is_blob_name(&mixed_case));
+        assert!(!is_blob_name(&invalid_digit));
     }
 }
