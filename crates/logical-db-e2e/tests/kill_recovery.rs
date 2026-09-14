@@ -44,15 +44,15 @@ fn forced_termination_never_exposes_a_partial_embedded_transition() {
         if page.is_empty() {
             break;
         }
-        cursor = page.last().unwrap().sequence;
+        cursor = page.last().unwrap().sequence();
         events.extend(page);
     }
     assert!(!events.is_empty());
     for (offset, event) in events.iter().enumerate() {
-        assert_eq!(event.sequence, u64::try_from(offset + 1).unwrap());
+        assert_eq!(event.sequence(), u64::try_from(offset + 1).unwrap());
         assert!(matches!(
             database
-                .read(event.document, |reader| reader
+                .read(event.document().unwrap(), |reader| reader
                     .get(&Object::root(), "sequence"))
                 .unwrap(),
             Some(Some(Item::Scalar(Scalar::Unsigned(_))))

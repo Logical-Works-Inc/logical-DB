@@ -1086,9 +1086,28 @@ impl Database {
                 },
             )
             .collect::<Vec<_>>();
-        self.store
-            .install_remote_page(self.scope, peer, &durable_documents, &[], checkpoint)?;
+        self.store.install_remote_baseline(
+            self.scope,
+            peer,
+            &durable_documents,
+            &[],
+            checkpoint,
+        )?;
         Ok(())
+    }
+
+    /// Returns this scope's durable baseline generation, `0` before any install.
+    ///
+    /// A subscription that tracks both its [`Self::changes_since`] cursor and
+    /// this generation can detect a baseline install even when the install
+    /// carried no change of its own, because installing a baseline advances the
+    /// generation atomically with the replaced state and checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or corruption failure.
+    pub fn baseline_generation(&self) -> Result<u64, DatabaseError> {
+        Ok(self.store.baseline_generation(self.scope)?)
     }
 
     /// Exports one versioned logical backup of this scope.
@@ -1144,22 +1163,33 @@ impl Database {
             }
             let complete = events.len() < 256;
             for event in &events {
+                let ChangeEvent::Document {
+                    sequence,
+                    document,
+                    digest,
+                } = event
+                else {
+                    // A baseline install carries no replayable change of its
+                    // own; its snapshots are exported by the scan below.
+                    cursor = event.sequence();
+                    continue;
+                };
                 let bytes = self
                     .store
-                    .load_change(self.scope, event.document, event.digest)?
-                    .ok_or(DatabaseError::MissingChange(event.digest))?;
-                let (operation, request) = match bindings.get(&(event.document, event.digest)) {
+                    .load_change(self.scope, *document, *digest)?
+                    .ok_or(DatabaseError::MissingChange(*digest))?;
+                let (operation, request) = match bindings.get(&(*document, *digest)) {
                     Some(binding) => *binding,
-                    None => restore_operation(event.document, event.digest),
+                    None => restore_operation(*document, *digest),
                 };
                 entries.push(ExportEntry {
-                    document: event.document,
+                    document: *document,
                     operation,
                     request,
-                    digest: event.digest,
+                    digest: *digest,
                     bytes,
                 });
-                cursor = event.sequence;
+                cursor = *sequence;
             }
             if complete {
                 break;
@@ -2965,7 +2995,7 @@ mod tests {
             for event in events {
                 cursor += 1;
                 observed += 1;
-                assert_eq!(event.sequence, cursor);
+                assert_eq!(event.sequence(), cursor);
             }
         }
         assert_eq!(observed, 128);
@@ -3606,7 +3636,7 @@ mod tests {
         assert!(
             source_events
                 .windows(2)
-                .all(|pair| pair[0].sequence + 1 == pair[1].sequence)
+                .all(|pair| pair[0].sequence() + 1 == pair[1].sequence())
         );
         let source_pending = source.pending_changes(0, 256).unwrap();
         assert_eq!(source_pending.len(), 5);

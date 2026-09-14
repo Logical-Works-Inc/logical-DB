@@ -130,7 +130,9 @@ use std::{
 pub use logical_db::{
     BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
 };
-use logical_db::{EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar};
+use logical_db::{
+    ChangeEvent, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar,
+};
 use logical_db_model::MAX_CHANGE_BYTES;
 pub use logical_db_model::{
     AccountId, DocumentId, DocumentRevision, IndexId, IndexValue, NamespaceCheckpoint,
@@ -290,6 +292,12 @@ pub enum KvError {
     /// A namespace checkpoint map was malformed.
     #[error("namespace checkpoint map is malformed")]
     CorruptCheckpointMap,
+    /// The replica's scope was rewritten by a baseline install, whose recovered
+    /// documents carry no events. Maintenance that reclaims by the
+    /// event-derived document set fails closed instead of reclaiming bytes that
+    /// a recovered document still references.
+    #[error("replica scope was rewritten by a baseline install")]
+    ScopeRewritten,
     /// A namespace checkpoint map used a foreign layout version.
     #[error("namespace checkpoint map version {actual} is unsupported")]
     UnsupportedCheckpointMapVersion {
@@ -690,8 +698,13 @@ impl KvCache {
             }
             let complete = events.len() < MAX_PAGE_LIMIT;
             for event in &events {
-                observed.insert(event.document, event.sequence);
-                after = event.sequence;
+                if let ChangeEvent::Document {
+                    document, sequence, ..
+                } = event
+                {
+                    observed.insert(*document, *sequence);
+                }
+                after = event.sequence();
             }
             if complete {
                 break;
@@ -1637,8 +1650,14 @@ impl KvCache {
             }
             let complete = events.len() < MAX_PAGE_LIMIT;
             for event in &events {
-                documents.insert(event.document);
-                after = event.sequence;
+                let ChangeEvent::Document {
+                    document, sequence, ..
+                } = event
+                else {
+                    return Err(KvError::ScopeRewritten);
+                };
+                documents.insert(*document);
+                after = *sequence;
             }
             if complete {
                 break;

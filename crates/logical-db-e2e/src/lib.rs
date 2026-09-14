@@ -17,9 +17,9 @@ mod tests {
     };
 
     use logical_db::{
-        AccountId, Database, DatabaseError, DatabaseErrorKind, DocumentId, IndexId, IndexValue,
-        Item, Object, OperationDigest, OperationId, PeerId, Projection, ProjectionSemantics,
-        RemoteChange, ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
+        AccountId, ChangeEvent, Database, DatabaseError, DatabaseErrorKind, DocumentId, IndexId,
+        IndexValue, Item, Object, OperationDigest, OperationId, PeerId, Projection,
+        ProjectionSemantics, RemoteChange, ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     };
     use logical_db_http::{HttpTransport, StaticBearer};
     use logical_db_model::{ChangeDigest, Effect, SnapshotArtifact, SnapshotRecord};
@@ -449,10 +449,14 @@ mod tests {
         );
         let events = database.changes_since(0, 10).unwrap();
         assert_eq!(events.len(), 3);
-        assert!(events.iter().all(|event| event.document == document));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.document() == Some(document))
+        );
         assert!(
             database
-                .changes_since(events.last().unwrap().sequence, 10)
+                .changes_since(events.last().unwrap().sequence(), 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1070,5 +1074,111 @@ mod tests {
         drop(reopened);
         fs::remove_file(victim_path).unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn recovery_publishes_a_durable_invalidation_for_a_held_cursor() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = Arc::new(MemoryServiceStore::default());
+                let app = router(
+                    Arc::clone(&store),
+                    TestAuthentication,
+                    CheckpointCodec::new([27; 32], 60_000).unwrap(),
+                    FixedClock,
+                );
+                let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = lgwks_bot::rt::task::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let endpoint = format!("http://{address}/").parse().unwrap();
+                let mut transport =
+                    HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+                let scope = Scope::new(AccountId::new(), SpaceId::new());
+                let document = DocumentId::new();
+                let peer = PeerId::new();
+                let victim_path = path("invalidate-victim");
+                let replica = ReplicaId::new();
+                let victim = Database::open(&victim_path, scope, replica).unwrap();
+
+                victim
+                    .edit(
+                        document,
+                        OperationId::new(),
+                        OperationDigest::new([0x91; 32]),
+                        |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
+                    )
+                    .unwrap();
+                victim
+                    .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+                    .await
+                    .unwrap();
+
+                // A subscriber holds a cursor immediately before recovery.
+                let held = victim.changes_since(0, 256).unwrap();
+                let cursor = held.last().unwrap().sequence();
+                assert_eq!(victim.baseline_generation().unwrap(), 0);
+
+                let baseline = store.build_snapshot(scope, 1).await.unwrap();
+                victim
+                    .install_baseline(peer, &baseline, b"invalidate-checkpoint")
+                    .unwrap();
+
+                // The install carries no change of its own, so nothing in the
+                // pre-recovery stream reveals it; the committed invalidation
+                // must still be exposed to the held cursor and be durable.
+                assert_eq!(victim.baseline_generation().unwrap(), 1);
+                let page = victim.changes_since(cursor, 256).unwrap();
+                assert_eq!(page.len(), 1, "the baseline install must be visible");
+                assert!(matches!(
+                    page[0],
+                    ChangeEvent::Baseline { generation: 1, .. }
+                ));
+                assert!(page[0].digest().is_none());
+                drop(victim);
+
+                let reopened = Database::open(&victim_path, scope, replica).unwrap();
+                assert_eq!(reopened.baseline_generation().unwrap(), 1);
+                let replayed = reopened.changes_since(cursor, 256).unwrap();
+                assert!(
+                    matches!(
+                        replayed.as_slice(),
+                        [ChangeEvent::Baseline { generation: 1, .. }]
+                    ),
+                    "the invalidation must survive reopen"
+                );
+                // The consumer rebuilds its view from the recovered state.
+                assert_eq!(
+                    reopened
+                        .read(document, |reader| reader.get(&Object::root(), "state"))
+                        .unwrap(),
+                    Some(Some(Item::Scalar(Scalar::Integer(1))))
+                );
+                // A recovered replica's backup must round-trip through restore
+                // even though its baseline marker carries no change of its own.
+                let exported = reopened.export().unwrap();
+                drop(reopened);
+                fs::remove_file(victim_path).unwrap();
+
+                let restored_path = path("invalidate-restored");
+                let restored = Database::open(&restored_path, scope, ReplicaId::new()).unwrap();
+                restored.restore(&exported).unwrap();
+                assert_eq!(
+                    restored
+                        .read(document, |reader| reader.get(&Object::root(), "state"))
+                        .unwrap(),
+                    Some(Some(Item::Scalar(Scalar::Integer(1))))
+                );
+                drop(restored);
+                fs::remove_file(restored_path).unwrap();
+                server.abort();
+            });
     }
 }

@@ -40,6 +40,8 @@ const KIND_MIGRATION: u8 = 14;
 const KIND_UPSTREAM: u8 = 15;
 const KIND_TOMBSTONE: u8 = 16;
 const KIND_RESTORE: u8 = 17;
+const KIND_BASELINE: u8 = 18;
+const KIND_BASELINE_EVENT: u8 = 19;
 /// Magic prefix identifying a versioned logical export payload.
 const EXPORT_MAGIC: [u8; 5] = [b'L', b'D', b'B', b'E', 0x01];
 /// Version of the logical export payload defined in this module.
@@ -62,6 +64,7 @@ const MAX_INDEX_VALUE_BYTES: usize = 4_096;
 const SCHEMA_VALUE_BYTES: usize = 36;
 const MIGRATION_VALUE_BYTES: usize = 53;
 const EVENT_VALUE_BYTES: usize = 48;
+const BASELINE_VALUE_BYTES: usize = 8;
 
 /// A validated local CRDT change without any transport-layer representation.
 #[derive(Clone, Copy)]
@@ -170,14 +173,62 @@ pub struct IndexHit {
 }
 
 /// One durable materialized-state invalidation for subscriptions and catch-up.
+///
+/// The two variants share one monotonic sequence, so a single cursor orders
+/// document changes against whole-scope baseline installs. A baseline install
+/// that carries no change of its own still advances the stream, so a
+/// subscription cursor taken before it can never silently observe a replaced
+/// scope as though nothing happened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ChangeEvent {
-    /// Monotonic cursor within the logical scope.
-    pub sequence: u64,
-    /// Document whose materialized representation changed.
-    pub document: DocumentId,
-    /// Immutable change that caused the invalidation.
-    pub digest: ChangeDigest,
+pub enum ChangeEvent {
+    /// A document's materialized representation changed.
+    Document {
+        /// Monotonic cursor within the logical scope.
+        sequence: u64,
+        /// Document whose materialized representation changed.
+        document: DocumentId,
+        /// Immutable change that caused the invalidation.
+        digest: ChangeDigest,
+    },
+    /// A baseline advanced the scope's materialized generation.
+    ///
+    /// A cursor at or before this sequence must rebuild from the floor rather
+    /// than replay history, because the install may have replaced state whose
+    /// originating changes are absent or already pruned.
+    Baseline {
+        /// Monotonic cursor within the logical scope.
+        sequence: u64,
+        /// Monotonic generation installed at this sequence.
+        generation: u64,
+    },
+}
+
+impl ChangeEvent {
+    /// Returns the monotonic cursor of this invalidation.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Document { sequence, .. } | Self::Baseline { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Returns the invalidated document, or `None` for a baseline invalidation.
+    #[must_use]
+    pub fn document(&self) -> Option<DocumentId> {
+        match self {
+            Self::Document { document, .. } => Some(*document),
+            Self::Baseline { .. } => None,
+        }
+    }
+
+    /// Returns the immutable change digest, or `None` for a baseline invalidation.
+    #[must_use]
+    pub fn digest(&self) -> Option<ChangeDigest> {
+        match self {
+            Self::Document { digest, .. } => Some(*digest),
+            Self::Baseline { .. } => None,
+        }
+    }
 }
 
 /// One immutable document input for a resumable materialized-index migration.
@@ -1033,44 +1084,74 @@ impl EmbeddedStore {
         if after == u64::MAX {
             return Ok(Vec::new());
         }
-        let start = key_event(scope, after + 1);
-        let end =
-            next_prefix(&prefix(scope, KIND_EVENT)).ok_or(StoreError::CorruptInternalValue)?;
         let transaction = self.database.begin_read()?;
         let table = transaction.open_table(DATA)?;
         ensure_not_migrating(&table, scope)?;
-        table
-            .range(start.as_slice()..end.as_slice())?
-            .take(limit)
-            .map(|entry| {
-                let (key, value) = entry?;
-                let event = decode_event(
-                    decode_sequence_key_for_kind(key.value(), KIND_EVENT)?,
-                    value.value(),
-                )?;
-                let change = table
-                    .get(key_change(scope, event.document, event.digest).as_slice())?
-                    .ok_or(StoreError::CorruptInternalValue)?;
-                if !is_nonempty_bounded(change.value().len(), MAX_CHANGE_BYTES) {
-                    let error = StoreError::CorruptInternalValue;
-                    eprintln!("logical-db-store: {error:?}");
-                    return Err(error);
-                }
-                let snapshot = table
-                    .get(key_snapshot(scope, event.document).as_slice())?
-                    .ok_or(StoreError::CorruptInternalValue)?;
-                if !is_nonempty_bounded(snapshot.value().len(), MAX_SNAPSHOT_BYTES) {
-                    let error = StoreError::CorruptInternalValue;
-                    eprintln!("logical-db-store: {error:?}");
-                    return Err(error);
-                }
-                let revision = table
-                    .get(key_revision(scope, event.document).as_slice())?
-                    .ok_or(StoreError::CorruptInternalValue)?;
-                decode_revision(revision.value())?;
-                Ok(event)
-            })
-            .collect()
+        let mut events = Vec::new();
+        let start = key_event(scope, after + 1);
+        let end =
+            next_prefix(&prefix(scope, KIND_EVENT)).ok_or(StoreError::CorruptInternalValue)?;
+        for entry in table.range(start.as_slice()..end.as_slice())?.take(limit) {
+            let (key, value) = entry?;
+            let sequence = decode_sequence_key_for_kind(key.value(), KIND_EVENT)?;
+            let event = decode_event(sequence, value.value())?;
+            let ChangeEvent::Document {
+                document, digest, ..
+            } = event
+            else {
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            };
+            let change = table
+                .get(key_change(scope, document, digest).as_slice())?
+                .ok_or(StoreError::CorruptInternalValue)?;
+            if !is_nonempty_bounded(change.value().len(), MAX_CHANGE_BYTES) {
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            let snapshot = table
+                .get(key_snapshot(scope, document).as_slice())?
+                .ok_or(StoreError::CorruptInternalValue)?;
+            if !is_nonempty_bounded(snapshot.value().len(), MAX_SNAPSHOT_BYTES) {
+                let error = StoreError::CorruptInternalValue;
+                eprintln!("logical-db-store: {error:?}");
+                return Err(error);
+            }
+            let revision = table
+                .get(key_revision(scope, document).as_slice())?
+                .ok_or(StoreError::CorruptInternalValue)?;
+            decode_revision(revision.value())?;
+            events.push(event);
+        }
+        let start = key_baseline_event(scope, after + 1);
+        let end = next_prefix(&prefix(scope, KIND_BASELINE_EVENT))
+            .ok_or(StoreError::CorruptInternalValue)?;
+        for entry in table.range(start.as_slice()..end.as_slice())?.take(limit) {
+            let (key, value) = entry?;
+            let sequence = decode_sequence_key_for_kind(key.value(), KIND_BASELINE_EVENT)?;
+            events.push(decode_baseline_event(sequence, value.value())?);
+        }
+        events.sort_by_key(ChangeEvent::sequence);
+        events.truncate(limit);
+        Ok(events)
+    }
+
+    /// Reads the scope's durable baseline generation, `0` before any install.
+    ///
+    /// # Errors
+    ///
+    /// Returns a corruption or storage failure.
+    pub fn baseline_generation(&self, scope: Scope) -> Result<u64, StoreError> {
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        let generation = table
+            .get(key_baseline(scope).as_slice())?
+            .map(|value| decode_u64(value.value()))
+            .transpose()?;
+        Ok(generation.unwrap_or(0))
     }
 
     /// Loads one immutable change by its native digest.
@@ -1272,6 +1353,44 @@ impl EmbeddedStore {
         changes: &[RemoteChange<'_>],
         checkpoint: &[u8],
     ) -> Result<(), StoreError> {
+        self.install_remote_page_inner(scope, peer, documents, changes, checkpoint, false)
+    }
+
+    /// Installs one recovered baseline page and durably invalidates the scope.
+    ///
+    /// Identical to [`Self::install_remote_page`] except that, in the same
+    /// transaction, it advances the scope's monotonic baseline generation and
+    /// publishes a [`ChangeEvent::Baseline`] invalidation. A subscription
+    /// cursor taken before this install can therefore never observe a replaced
+    /// scope as though nothing happened, even when the install carries no
+    /// changes of its own. No local outbox operation is manufactured and no
+    /// pruned change is replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, staleness, corruption, or storage failure
+    /// as [`Self::install_remote_page`].
+    pub fn install_remote_baseline(
+        &self,
+        scope: Scope,
+        peer: PeerId,
+        documents: &[RemoteDocument<'_>],
+        changes: &[RemoteChange<'_>],
+        checkpoint: &[u8],
+    ) -> Result<(), StoreError> {
+        self.install_remote_page_inner(scope, peer, documents, changes, checkpoint, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn install_remote_page_inner(
+        &self,
+        scope: Scope,
+        peer: PeerId,
+        documents: &[RemoteDocument<'_>],
+        changes: &[RemoteChange<'_>],
+        checkpoint: &[u8],
+        baseline: bool,
+    ) -> Result<(), StoreError> {
         validate_remote_page(documents, changes, checkpoint)?;
 
         let mut transaction = self.database.begin_write()?;
@@ -1323,6 +1442,26 @@ impl EmbeddedStore {
             table.insert(
                 key_event(scope, event_sequence).as_slice(),
                 encode_event(document, digest).as_slice(),
+            )?;
+        }
+        if baseline {
+            let generation = table
+                .get(key_baseline(scope).as_slice())?
+                .map(|value| decode_u64(value.value()))
+                .transpose()?
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(StoreError::SequenceExhausted)?;
+            event_sequence = event_sequence
+                .checked_add(1)
+                .ok_or(StoreError::SequenceExhausted)?;
+            table.insert(
+                key_baseline_event(scope, event_sequence).as_slice(),
+                generation.to_be_bytes().as_slice(),
+            )?;
+            table.insert(
+                key_baseline(scope).as_slice(),
+                generation.to_be_bytes().as_slice(),
             )?;
         }
         table.insert(
@@ -2043,6 +2182,16 @@ fn key_event(scope: Scope, sequence: u64) -> Vec<u8> {
     key
 }
 
+fn key_baseline(scope: Scope) -> Vec<u8> {
+    prefix(scope, KIND_BASELINE)
+}
+
+fn key_baseline_event(scope: Scope, sequence: u64) -> Vec<u8> {
+    let mut key = prefix(scope, KIND_BASELINE_EVENT);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
 fn key_migration(scope: Scope) -> Vec<u8> {
     prefix(scope, KIND_MIGRATION)
 }
@@ -2377,10 +2526,22 @@ fn decode_event(sequence: u64, bytes: &[u8]) -> Result<ChangeEvent, StoreError> 
         .try_into()
         .map(ChangeDigest::new)
         .map_err(malformed_store)?;
-    Ok(ChangeEvent {
+    Ok(ChangeEvent::Document {
         sequence,
         document,
         digest,
+    })
+}
+
+fn decode_baseline_event(sequence: u64, bytes: &[u8]) -> Result<ChangeEvent, StoreError> {
+    if bytes.len() != BASELINE_VALUE_BYTES {
+        let error = StoreError::CorruptInternalValue;
+        eprintln!("logical-db-store: {error:?}");
+        return Err(error);
+    }
+    Ok(ChangeEvent::Baseline {
+        sequence,
+        generation: decode_u64(bytes)?,
     })
 }
 
@@ -3375,7 +3536,7 @@ mod tests {
         );
         assert_eq!(
             store.changes_since(scope, 0, 10).unwrap(),
-            vec![ChangeEvent {
+            vec![ChangeEvent::Document {
                 sequence: 1,
                 document,
                 digest: first.digest,
@@ -3409,7 +3570,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.outbox_page(scope, 0, 10).unwrap()[0].sequence, 2);
-        assert_eq!(store.changes_since(scope, 1, 10).unwrap()[0].sequence, 2);
+        assert_eq!(store.changes_since(scope, 1, 10).unwrap()[0].sequence(), 2);
         assert!(matches!(
             store.outbox_page(scope, 0, 0),
             Err(StoreError::InvalidOutboxLimit(0))
@@ -3921,7 +4082,7 @@ mod tests {
         let event = encode_event(document, digest);
         assert_eq!(
             decode_event(4, &event).unwrap(),
-            ChangeEvent {
+            ChangeEvent::Document {
                 sequence: 4,
                 document,
                 digest,
@@ -4259,7 +4420,7 @@ mod tests {
         assert_eq!(store.history_page(scope, 0, 256).unwrap().len(), 2);
         let events = store.changes_since(scope, 0, 256).unwrap();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[2].digest, remote_digest);
+        assert_eq!(events[2].digest(), Some(remote_digest));
         drop(store);
         fs::remove_file(path).unwrap();
     }
