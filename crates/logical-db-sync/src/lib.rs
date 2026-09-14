@@ -2397,6 +2397,59 @@ mod tests {
         assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
     }
 
+    fn non_progressing_page(scope: Scope) -> BaselinePage {
+        let mut documents = (0..2)
+            .map(|_| logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        let artifact = SnapshotArtifact::new(scope, 5, documents.clone()).unwrap();
+        let mut page = page_for(&artifact, &documents, true);
+        // A continued page whose cursor points back inside the page body rather
+        // than strictly past it must be refused before the next fetch.
+        page.next_document = Some(documents[0].document);
+        page
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_a_page_cursor_does_not_advance() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let mut pages = std::collections::VecDeque::new();
+        pages.push_back(non_progressing_page(scope));
+        let requests = std::cell::Cell::new(0usize);
+        let mut wire = BudgetWire {
+            pages,
+            requests: &requests,
+            cancel: std::rc::Rc::new(std::cell::Cell::new(false)),
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || false,
+        ));
+        assert!(matches!(
+            result,
+            Err(SyncError::Protocol(ProtocolError::NonProgressPage))
+        ));
+        assert_eq!(
+            requests.get(),
+            1,
+            "a non-advancing cursor stops before a second fetch"
+        );
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "a non-advancing recovery must install nothing"
+        );
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+    }
+
     fn recovery_page(scope: Scope, position: u64) -> BaselinePage {
         let artifact = SnapshotArtifact::new(
             scope,

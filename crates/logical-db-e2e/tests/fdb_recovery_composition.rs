@@ -19,6 +19,7 @@ use logical_db::{
     AccountId, BatchEdit, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId,
     ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     http::{HttpTransport, StaticBearer, Url},
+    transport::{BaselineRequest, BaselineResult, Transport},
 };
 use logical_db_model::{ActionDigest, Effect, MAX_BASELINE_PAGE_DOCUMENTS};
 use logical_db_protocol::{mark_consumed_action, prune_action, seal_snapshot_action};
@@ -228,8 +229,66 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let frontier = read_frontier(&prune_store, scope).await?;
+    // Range-reader boundary: page the public route by cursor and prove the FDB
+    // continuation splits at the page limit, advances, and loses or duplicates
+    // no document.
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor: Option<DocumentId> = None;
+    let mut pages = 0usize;
+    loop {
+        let request = BaselineRequest {
+            protocol: logical_db_protocol::PROTOCOL_VERSION,
+            scope,
+            replica: ReplicaId::new(),
+            request: OperationDigest::new([0x11; 32]),
+            after: None,
+            after_document: cursor,
+        };
+        let BaselineResult::Artifact(page) = transport.baseline(request).await? else {
+            eprintln!("fdb-recovery-composition: range walk lost the sealed baseline");
+            return Err(io::Error::other("range walk lost the sealed baseline").into());
+        };
+        page.validate_page(scope)?;
+        if page.documents.len() > MAX_BASELINE_PAGE_DOCUMENTS {
+            eprintln!(
+                "fdb-recovery-composition: page len={} exceeded the limit",
+                page.documents.len()
+            );
+            return Err(io::Error::other("a page exceeded the document limit").into());
+        }
+        pages += 1;
+        for document in &page.documents {
+            seen.insert(document.document);
+        }
+        let Some(next) = page.next_document else {
+            break;
+        };
+        if !page.more {
+            eprintln!("fdb-recovery-composition: a final page carried a continuation cursor");
+            return Err(io::Error::other("a final page carried a continuation cursor").into());
+        }
+        if cursor.is_some_and(|previous| next <= previous) {
+            eprintln!("fdb-recovery-composition: a page cursor did not strictly advance");
+            return Err(io::Error::other("a page cursor did not strictly advance").into());
+        }
+        cursor = Some(next);
+    }
+    if pages < 2 {
+        eprintln!(
+            "fdb-recovery-composition: the range reader served the baseline in {pages} page(s)"
+        );
+        return Err(io::Error::other("the range reader did not split the baseline").into());
+    }
+    if seen.len() != total {
+        eprintln!(
+            "fdb-recovery-composition: range walk saw {} of {total} documents across {pages} pages",
+            seen.len()
+        );
+        return Err(io::Error::other("range walk lost or duplicated a document").into());
+    }
+
     let floor = read_floor(&prune_store, scope).await?;
+    let frontier = read_frontier(&prune_store, scope).await?;
     if frontier != seeded_target || floor != seeded_target {
         eprintln!("fdb-recovery-composition: durable retention frontier={frontier} floor={floor}");
         return Err(io::Error::other("prune did not retain the sealed baseline").into());
