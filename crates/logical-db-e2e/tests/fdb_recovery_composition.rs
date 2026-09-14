@@ -16,7 +16,7 @@
 use std::{error::Error, fs, io};
 
 use logical_db::{
-    AccountId, BatchEdit, Database, DocumentId, Object, OperationDigest, OperationId, PeerId,
+    AccountId, BatchEdit, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId,
     ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     http::{HttpTransport, StaticBearer, Url},
 };
@@ -152,6 +152,9 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         std::env::temp_dir().join(format!("logical-db-fdb-recovery-second-{run}.redb"));
     let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
     let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
+    // The first document of page two is deleted on the seeding replica, so its
+    // tombstone crosses the page boundary inside the sealed baseline.
+    let tombstoned = documents[MAX_BASELINE_PAGE_DOCUMENTS];
 
     let first = Database::open(&first_path, scope, ReplicaId::new())?;
     for (batch, chunk) in documents.chunks(150).enumerate() {
@@ -171,21 +174,29 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
         first.edit_many(edits)?;
     }
+    first
+        .delete(
+            tombstoned,
+            OperationId::new(),
+            OperationDigest::new([0x7a; 32]),
+        )
+        .unwrap();
+    let seeded_target = u64::try_from(total + 1)?;
     for _round in 0..8 {
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
             .await?;
-        if read_frontier(&prune_store, scope).await? == u64::try_from(total)? {
+        if read_frontier(&prune_store, scope).await? == seeded_target {
             break;
         }
     }
     let seeded = read_frontier(&prune_store, scope).await?;
-    if seeded != u64::try_from(total)? {
+    if seeded != seeded_target {
         eprintln!("fdb-recovery-composition: first replica seeded frontier={seeded}");
         return Err(io::Error::other("first replica did not seed every document").into());
     }
 
-    seal_consume_and_prune(&prune_store, scope, u64::try_from(total)?).await?;
+    seal_consume_and_prune(&prune_store, scope, seeded_target).await?;
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
@@ -195,18 +206,30 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         eprintln!("fdb-recovery-composition: fresh replica did not install a baseline");
         return Err(io::Error::other("fresh replica did not require recovery").into());
     }
-    for document in &documents {
-        if second
-            .read(*document, |reader| reader.get(&Object::root(), "state"))?
-            .is_none()
-        {
-            eprintln!("fdb-recovery-composition: replica state diverged after recovery");
-            return Err(io::Error::other("recovered replica lost a document").into());
+    if !second.is_deleted(tombstoned)? {
+        eprintln!("fdb-recovery-composition: boundary tombstone did not survive recovery");
+        return Err(io::Error::other("recovered replica lost a boundary tombstone").into());
+    }
+    for (index, document) in documents.iter().enumerate() {
+        let observed = second.read(*document, |reader| reader.get(&Object::root(), "state"))?;
+        if *document == tombstoned {
+            if observed.is_some() {
+                eprintln!("fdb-recovery-composition: boundary tombstone resurrected");
+                return Err(io::Error::other("recovered replica resurrected a tombstone").into());
+            }
+        } else {
+            let expected = i64::try_from(index % 1_000)?;
+            if observed != Some(Some(Item::Scalar(Scalar::Integer(expected)))) {
+                eprintln!(
+                    "fdb-recovery-composition: replica state diverged at index={index} observed={observed:?}"
+                );
+                return Err(io::Error::other("recovered replica lost a seeded value").into());
+            }
         }
     }
     let frontier = read_frontier(&prune_store, scope).await?;
     let floor = read_floor(&prune_store, scope).await?;
-    if frontier != u64::try_from(total)? || floor != u64::try_from(total)? {
+    if frontier != seeded_target || floor != seeded_target {
         eprintln!("fdb-recovery-composition: durable retention frontier={frontier} floor={floor}");
         return Err(io::Error::other("prune did not retain the sealed baseline").into());
     }

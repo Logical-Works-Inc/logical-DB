@@ -847,6 +847,9 @@ mod tests {
         let second_path = path("paged-recovery-second");
         let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
         let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
+        // The first document of page two is deleted on the seeding replica, so
+        // its tombstone crosses the page boundary inside the sealed baseline.
+        let tombstoned = documents[MAX_BASELINE_PAGE_DOCUMENTS];
 
         let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
         for (batch, chunk) in documents.chunks(150).enumerate() {
@@ -866,21 +869,26 @@ mod tests {
                 .collect::<Vec<_>>();
             first.edit_many(edits).unwrap();
         }
+        first
+            .delete(
+                tombstoned,
+                OperationId::new(),
+                OperationDigest::new([0x7a; 32]),
+            )
+            .unwrap();
+        let seeded = u64::try_from(total + 1).unwrap();
         for _round in 0..8 {
             first
                 .synchronize(peer, &mut transport, SyncLimits::default(), || false)
                 .await
                 .unwrap();
-            if store.frontier(scope).await.unwrap() == u64::try_from(total).unwrap() {
+            if store.frontier(scope).await.unwrap() == seeded {
                 break;
             }
         }
-        assert_eq!(
-            store.frontier(scope).await.unwrap(),
-            u64::try_from(total).unwrap()
-        );
+        assert_eq!(store.frontier(scope).await.unwrap(), seeded);
 
-        seal_consume_and_prune_through(&store, scope, u64::try_from(total).unwrap()).await;
+        seal_consume_and_prune_through(&store, scope, seeded).await;
 
         let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
         let report = second
@@ -888,14 +896,24 @@ mod tests {
             .await
             .unwrap();
         assert!(report.recovered, "a >256-document baseline must recover");
-        for document in &documents {
-            assert!(
-                second
-                    .read(*document, |reader| reader.get(&Object::root(), "page"))
-                    .unwrap()
-                    .is_some(),
-                "every document in the paged baseline is installed"
-            );
+        assert!(
+            second.is_deleted(tombstoned).unwrap(),
+            "a tombstone crossing the page boundary must survive recovery"
+        );
+        for (index, document) in documents.iter().enumerate() {
+            let observed = second
+                .read(*document, |reader| reader.get(&Object::root(), "page"))
+                .unwrap();
+            if *document == tombstoned {
+                assert_eq!(observed, None, "the boundary tombstone must not resurrect");
+            } else {
+                let expected = i64::try_from(index % 1_000).unwrap();
+                assert_eq!(
+                    observed,
+                    Some(Some(Item::Scalar(Scalar::Integer(expected)))),
+                    "document {index} must carry its seeded value after paged recovery"
+                );
+            }
         }
 
         drop((first, second));
