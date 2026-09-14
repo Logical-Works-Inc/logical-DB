@@ -976,4 +976,99 @@ mod tests {
         fs::remove_file(victim_path).unwrap();
         server.abort();
     }
+
+    #[test]
+    fn recovery_merges_a_local_edit_the_baseline_predates() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(recovery_merges_a_local_edit_body());
+    }
+
+    async fn recovery_merges_a_local_edit_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([26; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+        let peer = PeerId::new();
+        let victim_path = path("merge-victim");
+        let replica = ReplicaId::new();
+        let victim = Database::open(&victim_path, scope, replica).unwrap();
+
+        victim
+            .edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([0x81; 32]),
+                |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
+            )
+            .unwrap();
+        victim
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+
+        let baseline = store.build_snapshot(scope, 1).await.unwrap();
+        assert_eq!(baseline.documents.len(), 1);
+
+        let local_operation = OperationId::new();
+        victim
+            .edit(
+                document,
+                local_operation,
+                OperationDigest::new([0x82; 32]),
+                |editor| editor.put(&Object::root(), "state", Scalar::Integer(2)),
+            )
+            .unwrap();
+        assert_eq!(victim.pending_changes(0, 10).unwrap().len(), 1);
+
+        victim
+            .install_baseline(peer, &baseline, b"merge-checkpoint")
+            .unwrap();
+
+        assert_eq!(
+            victim
+                .read(document, |reader| reader.get(&Object::root(), "state"))
+                .unwrap(),
+            Some(Some(Item::Scalar(Scalar::Integer(2)))),
+            "the baseline predates the local edit, so the merged value must keep it"
+        );
+        let pending = victim.pending_changes(0, 10).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "recovery must not consume the local outbox"
+        );
+        assert_eq!(pending[0].operation, local_operation);
+        drop(victim);
+
+        let reopened = Database::open(&victim_path, scope, replica).unwrap();
+        assert_eq!(
+            reopened
+                .read(document, |reader| reader.get(&Object::root(), "state"))
+                .unwrap(),
+            Some(Some(Item::Scalar(Scalar::Integer(2)))),
+            "the merged local edit must survive reopen"
+        );
+        drop(reopened);
+        fs::remove_file(victim_path).unwrap();
+        server.abort();
+    }
 }

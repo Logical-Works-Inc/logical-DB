@@ -579,6 +579,7 @@ struct NamespacePullContext<'a, F> {
     now_unix_ms: u64,
     policy: NamespacePolicy,
     after: &'a mut Option<Checkpoint>,
+    restarted_after_expiry: &'a mut bool,
 }
 
 async fn pull_namespace_page<R, T, F>(
@@ -613,11 +614,25 @@ where
         .map_err(NamespaceSyncError::Transport)?;
     let page = match pulled {
         PullResult::Page(page) => page,
-        PullResult::CheckpointExpired | PullResult::BaselineRequired => {
-            eprintln!("logical-db-sync: namespace checkpoint requires baseline recovery");
+        PullResult::BaselineRequired => {
+            eprintln!("logical-db-sync: namespace recovery requires an unsupported baseline");
             return Err(NamespaceSyncError::Protocol(
                 ProtocolError::InvalidCheckpoint,
             ));
+        }
+        PullResult::CheckpointExpired => {
+            if *context.restarted_after_expiry {
+                eprintln!("logical-db-sync: namespace checkpoint expired twice in one cycle");
+                return Err(NamespaceSyncError::Protocol(
+                    ProtocolError::InvalidCheckpoint,
+                ));
+            }
+            *context.restarted_after_expiry = true;
+            eprintln!(
+                "logical-db-sync: namespace checkpoint expired; restarting from the floor once"
+            );
+            *context.after = None;
+            return Ok(None);
         }
     };
     page.validate(replica.scope())
@@ -831,6 +846,7 @@ where
     let start = namespace_start(replica, peer, namespace, now_unix_ms)?;
     let mut checkpoints = start.checkpoints;
     let mut after = start.after;
+    let mut restarted_after_expiry = false;
     if start.recovered {
         report.full_resync = true;
     }
@@ -842,6 +858,7 @@ where
             now_unix_ms,
             policy,
             after: &mut after,
+            restarted_after_expiry: &mut restarted_after_expiry,
         };
         let Some(page) = pull_namespace_page(replica, peer, transport, &mut context).await? else {
             report.full_resync = true;
@@ -2617,6 +2634,115 @@ mod tests {
         .unwrap();
         assert_eq!(rerun.pulled, 0);
         assert!(!rerun.more);
+    }
+
+    #[test]
+    fn namespace_expiry_restarts_once_from_the_floor() {
+        let scope = log_scope();
+        let replica = NsReplica::fresh(scope, Vec::new());
+        let mut checkpoints = NamespaceCheckpoints::new();
+        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut restarted = false;
+        let is_mine = |_: DocumentId| true;
+        let mut wire =
+            ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
+        let mut context = NamespacePullContext {
+            namespace: "quiet",
+            is_mine: &is_mine,
+            checkpoints: &mut checkpoints,
+            now_unix_ms: 1_000,
+            policy: online_policy(16, 8),
+            after: &mut after,
+            restarted_after_expiry: &mut restarted,
+        };
+        let first = lgwks_std::task::block_on(pull_namespace_page(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            &mut context,
+        ))
+        .unwrap();
+        assert!(
+            first.is_none(),
+            "an ordinary expiry must restart instead of failing closed"
+        );
+        assert!(
+            *context.restarted_after_expiry,
+            "the bounded restart must be recorded"
+        );
+        assert!(
+            context.after.is_none(),
+            "the restart must pull from the floor"
+        );
+        let second = lgwks_std::task::block_on(pull_namespace_page(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            &mut context,
+        ))
+        .unwrap();
+        assert_eq!(second, Some((0, false)));
+    }
+
+    #[test]
+    fn namespace_repeated_expiry_and_baseline_required_fail_closed() {
+        let scope = log_scope();
+        let replica = NsReplica::fresh(scope, Vec::new());
+        let is_mine = |_: DocumentId| true;
+        let mut checkpoints = NamespaceCheckpoints::new();
+        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut restarted = true;
+        let mut expired = ScriptWire::with_pulls(vec![PullResult::CheckpointExpired]);
+        {
+            let mut context = NamespacePullContext {
+                namespace: "quiet",
+                is_mine: &is_mine,
+                checkpoints: &mut checkpoints,
+                now_unix_ms: 1_000,
+                policy: online_policy(16, 8),
+                after: &mut after,
+                restarted_after_expiry: &mut restarted,
+            };
+            assert!(matches!(
+                lgwks_std::task::block_on(pull_namespace_page(
+                    &replica,
+                    PeerId::new(),
+                    &mut expired,
+                    &mut context,
+                )),
+                Err(NamespaceSyncError::Protocol(
+                    ProtocolError::InvalidCheckpoint
+                ))
+            ));
+        }
+
+        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut restarted = false;
+        let mut baseline = ScriptWire::with_pulls(vec![PullResult::BaselineRequired]);
+        let mut context = NamespacePullContext {
+            namespace: "quiet",
+            is_mine: &is_mine,
+            checkpoints: &mut checkpoints,
+            now_unix_ms: 1_000,
+            policy: online_policy(16, 8),
+            after: &mut after,
+            restarted_after_expiry: &mut restarted,
+        };
+        assert!(matches!(
+            lgwks_std::task::block_on(pull_namespace_page(
+                &replica,
+                PeerId::new(),
+                &mut baseline,
+                &mut context,
+            )),
+            Err(NamespaceSyncError::Protocol(
+                ProtocolError::InvalidCheckpoint
+            ))
+        ));
+        assert!(
+            !*context.restarted_after_expiry,
+            "baseline-required must fail closed without spending the restart"
+        );
     }
 
     #[test]

@@ -1022,11 +1022,14 @@ impl Database {
 
     /// Atomically installs a verified state-bearing baseline and its checkpoint.
     ///
-    /// The artifact's content identity is verified before any durable mutation,
-    /// then each document is re-projected locally and the whole set commits with
-    /// the replacement checkpoint in one transaction. Local changes are never
-    /// lost: every local change is either covered by the baseline or re-delivered
-    /// by the log suffix the client resumes from, so recovery converges.
+    /// The artifact's content identity is verified before any durable mutation.
+    /// Each baseline document is then merged with the replica's current
+    /// convergent state rather than replacing it, so a local edit the baseline
+    /// predates survives recovery; the merged state is re-projected and the whole
+    /// set commits with the replacement checkpoint in one transaction. Local
+    /// changes are never lost: every local change is either covered by the
+    /// baseline, retained by the merge, or re-delivered by the log suffix the
+    /// client resumes from, so recovery converges.
     ///
     /// # Errors
     ///
@@ -1045,32 +1048,43 @@ impl Database {
         })?;
         let mut materialized = Vec::with_capacity(artifact.documents.len());
         for document in &artifact.documents {
-            let expected_revision = self
-                .store
-                .load_snapshot(self.scope, document.document)?
-                .map(|snapshot| snapshot.revision);
+            let local = self.store.load_snapshot(self.scope, document.document)?;
+            let expected_revision = local.as_ref().map(|snapshot| snapshot.revision);
             let mut state = Document::load(&document.snapshot)?;
-            let tombstoned = state.is_deleted()?;
-            if tombstoned != document.tombstone {
+            if state.is_deleted()? != document.tombstone {
                 eprintln!("logical-db: install_baseline tombstone flag mismatch");
                 return Err(DatabaseError::InvalidBaseline);
             }
+            if let Some(local) = &local {
+                let mut current = Document::load(&local.bytes)?;
+                state.merge(&mut current)?;
+            }
+            let tombstoned = state.is_deleted()?;
             let indexes = if tombstoned {
                 Vec::new()
             } else {
                 self.project(&mut state)?
             };
-            materialized.push((document, expected_revision, indexes));
+            let snapshot = state.save()?;
+            materialized.push((
+                document.document,
+                expected_revision,
+                snapshot,
+                indexes,
+                tombstoned,
+            ));
         }
         let durable_documents = materialized
             .iter()
-            .map(|(document, expected_revision, indexes)| RemoteDocument {
-                document: document.document,
-                expected_revision: *expected_revision,
-                snapshot: &document.snapshot,
-                indexes,
-                tombstone: document.tombstone,
-            })
+            .map(
+                |(document, expected_revision, snapshot, indexes, tombstoned)| RemoteDocument {
+                    document: *document,
+                    expected_revision: *expected_revision,
+                    snapshot,
+                    indexes,
+                    tombstone: *tombstoned,
+                },
+            )
             .collect::<Vec<_>>();
         self.store
             .install_remote_page(self.scope, peer, &durable_documents, &[], checkpoint)?;
