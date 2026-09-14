@@ -118,6 +118,7 @@ fn fdb_recovery_composition() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Runtime::new()?.block_on(journey())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn journey() -> Result<(), Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     #[allow(unsafe_code)]

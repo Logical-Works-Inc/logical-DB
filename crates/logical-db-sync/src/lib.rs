@@ -9,9 +9,10 @@
 use std::{error::Error, fmt, time::Duration};
 
 use logical_db_model::{
-    ChangeDigest, DocumentId, ModelError, NAMESPACE_CHECKPOINT_TTL_MS, NamespaceCheckpoint,
-    NamespaceCheckpoints, NamespacePolicy, NetworkCondition, OperationDigest, OperationId, PeerId,
-    ReplicaId, Scope, SnapshotArtifact, is_namespace_checkpoint_expired, validate_namespace,
+    ChangeDigest, DocumentId, MAX_BASELINE_BYTES, ModelError, NAMESPACE_CHECKPOINT_TTL_MS,
+    NamespaceCheckpoint, NamespaceCheckpoints, NamespacePolicy, NetworkCondition, OperationDigest,
+    OperationId, PeerId, ReplicaId, Scope, SnapshotArtifact, is_namespace_checkpoint_expired,
+    validate_namespace,
 };
 use logical_db_protocol::{
     BaselineAccumulator, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint,
@@ -22,6 +23,11 @@ use sha2::{Digest, Sha256};
 
 /// Maximum pull pages processed by one foreground synchronization cycle.
 pub const MAX_PAGES_PER_CYCLE: usize = 32;
+
+/// Maximum baseline pages one recovery may request: the whole aggregate
+/// artifact at the smallest legal page (`MAX_BASELINE_DOCUMENTS` divided by
+/// `MAX_BASELINE_PAGE_DOCUMENTS`).
+pub const MAX_RECOVERY_PAGES: u16 = 256;
 
 /// One durable local change with its private acknowledgement position.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +173,10 @@ pub struct SyncLimits {
     pub bytes_per_page: u32,
     /// Maximum pull pages before yielding to the host.
     pub pages_per_cycle: u8,
+    /// Maximum baseline pages one recovery may request before refusing.
+    pub recovery_pages: u16,
+    /// Maximum encoded baseline bytes one recovery may request before refusing.
+    pub recovery_bytes: u64,
 }
 
 impl Default for SyncLimits {
@@ -175,6 +185,8 @@ impl Default for SyncLimits {
             changes_per_page: 128,
             bytes_per_page: 4 * 1_048_576,
             pages_per_cycle: 16,
+            recovery_pages: MAX_RECOVERY_PAGES,
+            recovery_bytes: u64::from(MAX_RECOVERY_PAGES) * MAX_BASELINE_BYTES as u64,
         }
     }
 }
@@ -196,6 +208,14 @@ impl SyncLimits {
         request.validate()?;
         if self.pages_per_cycle == 0 || usize::from(self.pages_per_cycle) > MAX_PAGES_PER_CYCLE {
             eprintln!("logical-db-sync: pages per cycle exceeds the configured bound");
+            return Err(ProtocolError::PageLimit);
+        }
+        if self.recovery_pages == 0 || self.recovery_pages > MAX_RECOVERY_PAGES {
+            eprintln!("logical-db-sync: recovery pages exceeds the configured bound");
+            return Err(ProtocolError::PageLimit);
+        }
+        if self.recovery_bytes < MAX_BASELINE_BYTES as u64 {
+            eprintln!("logical-db-sync: recovery bytes cannot carry one legal page");
             return Err(ProtocolError::PageLimit);
         }
         Ok(self)
@@ -237,6 +257,8 @@ pub enum SyncError<ReplicaError, TransportError> {
     },
     /// Host requested cancellation between atomic operations.
     Cancelled,
+    /// Recovery exceeded its declared request or byte budget before completing.
+    RecoveryBudgetExhausted,
 }
 
 impl<R: fmt::Display, T: fmt::Display> fmt::Display for SyncError<R, T> {
@@ -254,6 +276,9 @@ impl<R: fmt::Display, T: fmt::Display> fmt::Display for SyncError<R, T> {
                 )
             }
             Self::Cancelled => formatter.write_str("synchronization was cancelled"),
+            Self::RecoveryBudgetExhausted => {
+                formatter.write_str("recovery exceeded its bounded request or byte budget")
+            }
         }
     }
 }
@@ -318,6 +343,9 @@ where
                 transport,
                 &mut after,
                 &mut restarted_after_expiry,
+                limits,
+                &mut cancelled,
+                &mut report,
             )
             .await?
             {
@@ -504,12 +532,16 @@ where
 /// never a partial install. `false` reports that no baseline is sealed for the
 /// scope, so the durable log still covers every position and the caller restarts
 /// from the floor.
+#[allow(clippy::too_many_arguments)]
 async fn install_recovery<R, T>(
     replica: &R,
     peer: PeerId,
     transport: &mut T,
     after: &mut Option<Checkpoint>,
     restarted: &mut bool,
+    limits: SyncLimits,
+    cancelled: &mut impl FnMut() -> bool,
+    report: &mut SyncReport,
 ) -> Result<bool, SyncError<R::Error, T::Error>>
 where
     R: ReplicaPort,
@@ -520,6 +552,10 @@ where
         return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
     }
     *restarted = true;
+    if cancelled() {
+        eprintln!("logical-db-sync: recovery cancelled before the first page");
+        return Err(SyncError::Cancelled);
+    }
     let BaselineResult::Artifact(page) =
         request_baseline_page(transport, replica, after.as_ref(), None).await?
     else {
@@ -529,8 +565,16 @@ where
     let descriptor = page
         .validate_page(replica.scope())
         .map_err(SyncError::Protocol)?;
+    let declared = descriptor.document_count() as usize;
     let mut accumulator = BaselineAccumulator::new(replica.scope(), descriptor);
     let mut checkpoint = page.checkpoint.clone();
+    let mut fetched = 1usize;
+    let mut bytes = page_snapshot_bytes(&page);
+    let mut accumulated = page.documents.len();
+    if accumulated > declared || bytes > limits.recovery_bytes {
+        eprintln!("logical-db-sync: the first recovery page exceeds its declared bounds");
+        return Err(SyncError::RecoveryBudgetExhausted);
+    }
     let mut complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
     let mut cursor = page.next_document;
     while !complete {
@@ -538,22 +582,54 @@ where
             eprintln!("logical-db-sync: a continued recovery carried no cursor");
             return Err(SyncError::Protocol(ProtocolError::NonProgressPage));
         };
+        if cancelled() {
+            eprintln!("logical-db-sync: recovery cancelled between baseline pages");
+            return Err(SyncError::Cancelled);
+        }
+        if fetched >= usize::from(limits.recovery_pages) {
+            eprintln!("logical-db-sync: recovery exceeded its page budget");
+            return Err(SyncError::RecoveryBudgetExhausted);
+        }
         let BaselineResult::Artifact(page) =
             request_baseline_page(transport, replica, after.as_ref(), Some(next)).await?
         else {
             eprintln!("logical-db-sync: a continued recovery reported no baseline");
             return Err(SyncError::Protocol(ProtocolError::BaselineMismatch));
         };
+        fetched += 1;
+        bytes = bytes
+            .checked_add(page_snapshot_bytes(&page))
+            .ok_or(SyncError::RecoveryBudgetExhausted)?;
+        accumulated = accumulated
+            .checked_add(page.documents.len())
+            .ok_or(SyncError::Protocol(ProtocolError::BaselineMismatch))?;
+        if accumulated > declared || bytes > limits.recovery_bytes {
+            eprintln!("logical-db-sync: recovery exceeded its declared bounds");
+            return Err(SyncError::RecoveryBudgetExhausted);
+        }
         checkpoint = page.checkpoint.clone();
         complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
         cursor = page.next_document;
+    }
+    if cancelled() {
+        eprintln!("logical-db-sync: recovery cancelled before installing the baseline");
+        return Err(SyncError::Cancelled);
     }
     let artifact = accumulator.finish().map_err(SyncError::Protocol)?;
     replica
         .install_baseline(peer, &artifact, checkpoint.as_wire())
         .map_err(SyncError::Replica)?;
     *after = Some(checkpoint);
+    report.pages += fetched;
     Ok(true)
+}
+
+/// Encoded snapshot bytes carried by one baseline page.
+fn page_snapshot_bytes(page: &BaselinePage) -> u64 {
+    page.documents
+        .iter()
+        .map(|document| document.snapshot.len() as u64)
+        .sum()
 }
 
 /// Requests exactly one bounded baseline page at one exclusive cursor.
@@ -1796,7 +1872,7 @@ fn defer_transport<TransportError>(
 mod tests {
     use std::{convert::Infallible, future::Future};
 
-    use logical_db_model::{AccountId, SpaceId};
+    use logical_db_model::{AccountId, MAX_BASELINE_PAGE_DOCUMENTS, SpaceId};
     use logical_db_protocol::RejectionCode;
 
     use super::*;
@@ -2099,6 +2175,8 @@ mod tests {
             changes_per_page: logical_db_model::MAX_CHANGES_PER_PAGE.try_into().unwrap(),
             bytes_per_page: logical_db_model::MAX_PAGE_BYTES.try_into().unwrap(),
             pages_per_cycle: MAX_PAGES_PER_CYCLE.try_into().unwrap(),
+            recovery_pages: MAX_RECOVERY_PAGES,
+            recovery_bytes: u64::MAX,
         };
         assert_eq!(valid.validate(), Ok(valid));
         for invalid in [
@@ -2124,6 +2202,18 @@ mod tests {
             },
             SyncLimits {
                 pages_per_cycle: valid.pages_per_cycle + 1,
+                ..valid
+            },
+            SyncLimits {
+                recovery_pages: 0,
+                ..valid
+            },
+            SyncLimits {
+                recovery_pages: valid.recovery_pages + 1,
+                ..valid
+            },
+            SyncLimits {
+                recovery_bytes: MAX_BASELINE_BYTES as u64 - 1,
                 ..valid
             },
         ] {
@@ -2184,6 +2274,127 @@ mod tests {
             };
             std::future::ready(Ok(result))
         }
+    }
+
+    struct BudgetWire<'a> {
+        pages: std::collections::VecDeque<BaselinePage>,
+        requests: &'a std::cell::Cell<usize>,
+        cancel: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Transport for BudgetWire<'_> {
+        type Error = Infallible;
+
+        fn push(
+            &mut self,
+            _request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
+            std::future::ready(Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: Vec::new(),
+            }))
+        }
+
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
+            std::future::ready(Ok(PullResult::BaselineRequired))
+        }
+
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            self.requests.set(self.requests.get() + 1);
+            let result = self
+                .pages
+                .pop_front()
+                .map_or(BaselineResult::Unavailable, BaselineResult::Artifact);
+            if self.requests.get() == 1 {
+                self.cancel.set(true);
+            }
+            std::future::ready(Ok(result))
+        }
+    }
+
+    fn paged_recovery_pages(scope: Scope) -> std::collections::VecDeque<BaselinePage> {
+        let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        let mut documents = (0..total)
+            .map(|_| logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        let artifact = SnapshotArtifact::new(scope, 7, documents.clone()).unwrap();
+        let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
+        let mut pages = std::collections::VecDeque::new();
+        pages.push_back(page_for(&artifact, first, true));
+        pages.push_back(page_for(&artifact, rest, false));
+        pages
+    }
+
+    #[test]
+    fn recovery_stops_between_pages_when_cancelled() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let pages = paged_recovery_pages(scope);
+        let requests = std::cell::Cell::new(0usize);
+        let cancel = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut wire = BudgetWire {
+            pages,
+            requests: &requests,
+            cancel: std::rc::Rc::clone(&cancel),
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || cancel.get(),
+        ));
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert_eq!(requests.get(), 1, "cancellation must stop the next fetch");
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "a cancelled recovery must install nothing"
+        );
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+    }
+
+    #[test]
+    fn recovery_refuses_to_exceed_its_page_budget_without_mutating_state() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let pages = paged_recovery_pages(scope);
+        let requests = std::cell::Cell::new(0usize);
+        let mut wire = BudgetWire {
+            pages,
+            requests: &requests,
+            cancel: std::rc::Rc::new(std::cell::Cell::new(false)),
+        };
+        let limits = SyncLimits {
+            recovery_pages: 1,
+            ..SyncLimits::default()
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            limits,
+            || false,
+        ));
+        assert!(matches!(result, Err(SyncError::RecoveryBudgetExhausted)));
+        assert_eq!(requests.get(), 1, "one page is the whole declared budget");
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "an exhausted recovery must install nothing"
+        );
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
     }
 
     fn recovery_page(scope: Scope, position: u64) -> BaselinePage {
@@ -2272,7 +2483,10 @@ mod tests {
         .unwrap();
         assert!(report.recovered);
         assert!(!report.full_resync);
-        assert_eq!(report.pages, 1);
+        assert_eq!(
+            report.pages, 2,
+            "the recovery page and the suffix page are both accounted"
+        );
         let baselines = replica.baselines.borrow();
         assert_eq!(baselines.len(), 1);
         assert_eq!(baselines[0].1, baseline_checkpoint);
