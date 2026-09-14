@@ -1077,6 +1077,134 @@ mod tests {
     }
 
     #[test]
+    fn recovery_preserves_a_local_backlog_larger_than_one_upload_batch() {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+            .block_on(recovery_preserves_a_large_backlog_body());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn recovery_preserves_a_large_backlog_body() {
+        let store = Arc::new(MemoryServiceStore::default());
+        let app = router(
+            Arc::clone(&store),
+            TestAuthentication,
+            CheckpointCodec::new([26; 32], 60_000).unwrap(),
+            FixedClock,
+        );
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = lgwks_bot::rt::task::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = format!("http://{address}/").parse().unwrap();
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let peer = PeerId::new();
+        let replica = ReplicaId::new();
+        let backlog_path = path("backlog-victim");
+        let victim = Database::open(&backlog_path, scope, replica).unwrap();
+
+        let seeded = DocumentId::new();
+        victim
+            .edit(
+                seeded,
+                OperationId::new(),
+                OperationDigest::new([0x81; 32]),
+                |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
+            )
+            .unwrap();
+        victim
+            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+            .await
+            .unwrap();
+        let baseline = store.build_snapshot(scope, 1).await.unwrap();
+
+        let batch = usize::from(SyncLimits::default().changes_per_page);
+        let backlog = batch + 2;
+        let mut documents = Vec::with_capacity(backlog);
+        let mut operations = Vec::with_capacity(backlog);
+        for index in 0..backlog {
+            let document = DocumentId::new();
+            let operation = OperationId::new();
+            let mut digest = [0u8; 32];
+            digest[0] = 0x90;
+            digest[1] = u8::try_from(index & 0xff).expect("fixture index fits");
+            digest[2] = u8::try_from((index >> 8) & 0xff).expect("fixture index fits");
+            victim
+                .edit(
+                    document,
+                    operation,
+                    OperationDigest::new(digest),
+                    |editor| {
+                        editor.put(
+                            &Object::root(),
+                            "state",
+                            Scalar::Integer(i64::try_from(index).unwrap() + 10),
+                        )
+                    },
+                )
+                .unwrap();
+            documents.push(document);
+            operations.push(operation);
+        }
+
+        let before = victim.pending_changes(0, backlog + 8).unwrap();
+        assert!(
+            before.len() > batch,
+            "the fixture backlog must exceed one upload batch, saw {} of {batch}",
+            before.len()
+        );
+
+        victim
+            .install_baseline(peer, &baseline, b"backlog-checkpoint")
+            .unwrap();
+
+        let after = victim.pending_changes(0, backlog + 8).unwrap();
+        assert_eq!(
+            after.len(),
+            backlog,
+            "recovery must keep every unsent change in a multi-batch backlog"
+        );
+        let kept: Vec<_> = after.iter().map(|change| change.operation).collect();
+        assert_eq!(kept, operations, "the backlog must keep its exact order");
+        for (index, document) in documents.iter().enumerate() {
+            assert_eq!(
+                victim
+                    .read(*document, |reader| reader.get(&Object::root(), "state"))
+                    .unwrap(),
+                Some(Some(Item::Scalar(Scalar::Integer(
+                    i64::try_from(index).unwrap() + 10
+                )))),
+                "local change {index} of a multi-batch backlog must survive recovery"
+            );
+        }
+        assert_eq!(
+            victim
+                .read(seeded, |reader| reader.get(&Object::root(), "state"))
+                .unwrap(),
+            Some(Some(Item::Scalar(Scalar::Integer(1)))),
+            "the acknowledged seed change must not regress"
+        );
+        drop(victim);
+        let reopened = Database::open(&backlog_path, scope, replica).unwrap();
+        assert_eq!(
+            reopened.pending_changes(0, backlog + 8).unwrap().len(),
+            backlog,
+            "the preserved backlog must be durable, not in-memory only"
+        );
+        drop(reopened);
+        fs::remove_file(backlog_path).unwrap();
+        server.abort();
+    }
+
+    #[test]
     fn recovery_publishes_a_durable_invalidation_for_a_held_cursor() {
         lgwks_bot::Builder::new()
             .worker_threads(std::num::NonZeroUsize::new(2))
