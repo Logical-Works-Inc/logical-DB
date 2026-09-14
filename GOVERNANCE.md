@@ -49,9 +49,18 @@ document state and tombstone markers, while retaining readable v1 position-only
 records as migration data that cannot authorize pruning. FoundationDB rebuilds,
 rechecks, and atomically seals the artifact, and validates the descriptor and
 its stored manifests and chunks in the prune transaction. This establishes the
-server-side prune gate. It does not close issue #28: paged HTTP recovery and
-atomic client installation of recovered state and checkpoint are the next stack
-layer. No hosted full-recovery evidence is claimed here.
+server-side prune gate.
+
+Recovery status, stated once here and referenced everywhere else:
+**implementation present** — the v2 artifact, the paged HTTP baseline protocol,
+and one atomic client install of recovered state and checkpoint exist on
+`main` (PRs #49 through #53). **Local execution reported** — the 2026-09-14
+local live-cluster receipts below exercise `fdb_recovery_composition` and the
+process-kill restore journey. **Not yet established** — issue #28 stays open
+for its outstanding acceptance checklist: expired-checkpoint recovery exercised
+through the public transport and the position-1 prune/fresh-replica
+counterexample verified item-by-item, plus reproduction on a runnable hosted or
+self-hosted lane. No hosted full-recovery evidence is claimed.
 
 ## Recorded product decision
 
@@ -118,9 +127,9 @@ implementation's correctness dependencies.
 
 Embedded tombstones and export/restore are implemented and have retained tests.
 The server retention path now also carries tombstone state in the bounded v2
-artifact and gates pruning on that artifact. Neither path proves the missing
-paged HTTP recovery/client-install journey or completion of every
-process-interruption/deployment scenario.
+artifact and gates pruning on that artifact. What remains for #28 is the
+acceptance checklist named in the recovery-status paragraph above, not the
+implementation of the paged route or the atomic install.
 
 Canonical action encoding is owned by `logical-db-protocol`. It uses SHA-256
 over u64 big-endian length frames and a `logical-db-action-v1` domain. A golden
@@ -133,6 +142,16 @@ A reviewable change requires its PR, all protected checks green on the exact
 head, a clean isolated checkout, and direct execution of its affected public
 journey. Human review and merge follow. Post-merge checks are separate evidence.
 
+Merge gate while hosted execution is unavailable, stated once: source review
+may proceed against local receipts, but merge eligibility requires executed
+reproduction of the affected lanes on hosted or self-hosted CI. A bounded
+exception requires explicit Director authorization recorded in this ledger with
+its replacement evidence enumerated; a local PASS claim alone is never a
+satisfied execution gate. PR #55 carries such an exception: the Director
+authorized merge after hardening on 2026-09-14, with replacement evidence being
+the local receipts pinned in `evidence/2026-09-14-local-fdb-receipt.md` and the
+Director's own review of the exact head. This exception covers PR #55 only.
+
 Production completion additionally requires a ratified product scope and every
 applicable acceptance row satisfied. A green PR does not close unfinished
 roadmap issues. Do not copy historical checkmarks into a current release claim.
@@ -144,12 +163,12 @@ calls without a shell. No threshold or detector was changed to hide them.
 
 Verification notes, 2026-09-14 audit: hosted CI is billing-blocked, so no PR
 after #47 carries hosted check evidence and the seven-protected-checks gate
-cannot execute until the self-hosted runner exists; merge review must rely on
-the local receipts recorded above and must not describe hosted checks as green.
-Branch protection on `main` is disabled, so merges are currently ungated
-mechanically. The unstaged KV edit preserved during PR #36 is no longer
-present in the working copy and its disposition is untracked; any future
-appearance of that edit requires explicit review, not silent import.
+cannot execute until the self-hosted runner exists; hosted checks must never be
+described as green while blocked. Branch protection on `main` is disabled, so
+merges are currently ungated mechanically; the paragraph above defines the
+operative gate in that state. The unstaged KV edit preserved during PR #36 is
+no longer present in the working copy and its disposition is untracked; any
+future appearance of that edit requires explicit review, not silent import.
 
 Unrelated working changes remain outside a delivery patch. The original
 checkout's unstaged KV edit was preserved during PR #36; later work must not
