@@ -1,0 +1,30 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28",
+  "id": "projection-semantics-v1",
+  "actor": "Logical-DB embedded app author",
+  "job": "bind an application-declared projection semantic identity into the durable schema digest and rebuild indexes through one explicit migration",
+  "artifact": "logical_db::Projection, ProjectionSemantics, SchemaMigrationRequired, and Database::migrate_schema",
+  "initial_state": "empty temporary redb replica bound to schema version 1 with one index identity declaring semantics V1",
+  "expectation": "a changed projection function under the same index identity and schema version is refused until an explicit resumable migration rebuilds every row",
+  "perturbation": "reopen the same file with the same IndexId and schema version while declaring semantics V2 and a function whose output differs for the stored document",
+  "observations": [
+    "ProjectionSemantics::version(0) is refused; a nonzero version or an opaque digest is required",
+    "reopen with changed semantics returns DatabaseError::Store(StoreError::SchemaMigrationRequired) without touching state",
+    "declaring one index identity twice in the target set returns DatabaseError::DuplicateProjection",
+    "an opaque digest semantics identity binds and reopens the same schema, while a different digest under the same index and version also requires migration",
+    "Database::migrate_schema with the V2 semantics rebuilds the single document in bounded revision-checked pages",
+    "the stale V1 value query returns no rows and the V2 value query returns the document"
+  ],
+  "invariant": "a persisted reverse-index row set is valid only for the exact schema version and {(IndexId, ProjectionSemantics)} set that produced it",
+  "verdict": "pass",
+  "limitations": [
+    "the journey drives the public embedded facade, not a multi-process deployment",
+    "existing databases bound before the digest v1 to v2 change require one explicit migration; there is no silent adoption path by design"
+  ],
+  "evidence": [
+    "crates/logical-db/src/lib.rs projection_digest",
+    "crates/logical-db/src/lib.rs changed_projection_semantics_requires_migration_and_rebuilds_rows",
+    "crates/logical-db-kv/src/lib.rs KV_PROJECTION_SEMANTICS",
+    "crates/logical-db-e2e/src/lib.rs projection helper"
+  ]
+}

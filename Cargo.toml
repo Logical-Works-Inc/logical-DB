@@ -33,20 +33,40 @@ repository = "https://github.com/srinji-kaggss/logical-DB"
 [workspace.dependencies]
 automerge = "=0.11.0"
 redb = "=4.2.0"
-serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.20"
 uuid = { version = "=1.26.0", features = ["serde", "v7"] }
 hmac = "=0.13.0"
 sha2 = "=0.11.0"
-futures = "=0.3.34"
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
 foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] }
 serde_bytes = "=0.11.19"
 ciborium = "=0.2.2"
-reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "http2", "system-proxy", "stream"] }
+# FROZEN BOUNDARY (async surface): `reqwest` and `axum` are the async HTTP
+# client/server the estate does not yet supply. Every runtime *mechanic*
+# (executor, spawn, timers, channels, sockets, signals) is sourced from
+# `lgwks_bot`; these two are registered boundaries pending the estate client.
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "http2", "system-proxy"] }
 axum = "=0.8.9"
-tokio = { version = "=1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "=0.5.3", features = ["util"] }
+# The estate foundation. `lgwks_bot` is the single async entry
+# (INV-RT-SINGLE-ENTRY): its `tokio` edge is owned by `lgwks_deps` inside the
+# foundation, so no logical-db crate authors `tokio` or `futures`.
+#
+# Transitive boundary, not one unified identity: the lockfile carries TWO
+# `lgwks_std` versions. 0.6.1 is this workspace's direct estate edge; 0.5.1
+# arrives only through the git-pinned `braid-run` authority adapter. They are
+# separate crate identities that coexist in one binary and never share types,
+# so a `lgwks_std` type crossing the Braid boundary must be converted at the
+# adapter, not assumed compatible. Upgrading Braid's estate edge is what
+# collapses this to one version; until then the pair is the accurate state.
+#
+# `json` re-exports the serde crate the estate owns, so logical-db derives
+# through `lgwks_std::json::{Serialize, Deserialize}` and never declares serde.
+lgwks_std = { version = "0.6.1", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", features = ["json"] }
+lgwks_bot = { version = "0.3.0", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", features = ["net", "signal"] }
+# The dependency gate itself. `default-features = false` keeps the storefront's
+# Rust scanner out: the contract lane only needs `check_dependencies`.
+lgwks_deps = { version = "0.1.5", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -154,6 +154,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -265,7 +271,7 @@ dependencies = [
  "braid-flow-plan",
  "braid-ir",
  "braid-verify",
- "lgwks_std",
+ "lgwks_std 0.5.1",
 ]
 
 [[package]]
@@ -914,7 +920,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1054,6 +1060,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
+name = "iri-string"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1663ee7d8cf2900cc1414b1e1eec9f348d6eaa3bcab07579f4726a4b8499f447"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1154,10 +1170,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c83bff1d572d6b9aeef67ddfc8448e4a3737909cb28e81f97c791b9018703e52"
 
 [[package]]
+name = "lgwks_bot"
+version = "0.3.0"
+source = "git+https://github.com/srinji-kaggss/logicalworks-crates?rev=88d2a75b8988c37e77118cdf69b80a7fde5c3fb2#88d2a75b8988c37e77118cdf69b80a7fde5c3fb2"
+dependencies = [
+ "lgwks_deps",
+ "lgwks_std 0.6.1",
+]
+
+[[package]]
+name = "lgwks_deps"
+version = "0.1.5"
+source = "git+https://github.com/srinji-kaggss/logicalworks-crates?rev=88d2a75b8988c37e77118cdf69b80a7fde5c3fb2#88d2a75b8988c37e77118cdf69b80a7fde5c3fb2"
+dependencies = [
+ "lgwks_std 0.6.1",
+ "tokio",
+]
+
+[[package]]
 name = "lgwks_std"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a0efb0e7bb1bab681311540040d80a2d9fae5a1c4a1ef4af8f916774c039c44"
+
+[[package]]
+name = "lgwks_std"
+version = "0.6.1"
+source = "git+https://github.com/srinji-kaggss/logicalworks-crates?rev=88d2a75b8988c37e77118cdf69b80a7fde5c3fb2#88d2a75b8988c37e77118cdf69b80a7fde5c3fb2"
+dependencies = [
+ "iri-string",
+ "serde",
+ "serde_json",
+ "ureq",
+]
 
 [[package]]
 name = "libc"
@@ -1191,7 +1236,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "logical-db"
 version = "0.1.0"
 dependencies = [
- "futures",
+ "lgwks_std 0.6.1",
  "logical-db-cairn",
  "logical-db-crdt",
  "logical-db-episode",
@@ -1228,7 +1273,7 @@ dependencies = [
 name = "logical-db-cairn"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "lgwks_std 0.6.1",
  "sha2",
  "thiserror",
  "uuid",
@@ -1252,6 +1297,7 @@ dependencies = [
  "foundationdb",
  "foundationdb-tuple",
  "hmac",
+ "lgwks_bot",
  "logical-db-braid",
  "logical-db-crdt",
  "logical-db-model",
@@ -1261,7 +1307,6 @@ dependencies = [
  "logical-db-store-fdb",
  "reqwest",
  "sha2",
- "tokio",
  "uuid",
 ]
 
@@ -1271,6 +1316,8 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "ciborium",
+ "lgwks_bot",
+ "lgwks_deps",
  "logical-db",
  "logical-db-cairn",
  "logical-db-episode",
@@ -1279,7 +1326,7 @@ dependencies = [
  "logical-db-protocol",
  "logical-db-server",
  "logical-db-service",
- "tokio",
+ "logical-db-store-fdb",
  "uuid",
 ]
 
@@ -1288,8 +1335,8 @@ name = "logical-db-episode"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "lgwks_std 0.6.1",
  "logical-db-cairn",
- "serde",
  "sha2",
  "thiserror",
  "uuid",
@@ -1301,21 +1348,21 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "ciborium",
- "futures",
+ "lgwks_bot",
+ "lgwks_std 0.6.1",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-sync",
  "reqwest",
- "serde",
  "serde_bytes",
  "thiserror",
- "tokio",
 ]
 
 [[package]]
 name = "logical-db-kv"
 version = "0.1.0"
 dependencies = [
+ "lgwks_std 0.6.1",
  "logical-db",
  "logical-db-model",
  "sha2",
@@ -1327,7 +1374,7 @@ dependencies = [
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "lgwks_std 0.6.1",
  "sha2",
  "thiserror",
  "uuid",
@@ -1345,8 +1392,8 @@ name = "logical-db-protocol"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "lgwks_std 0.6.1",
  "logical-db-model",
- "serde",
  "serde_bytes",
  "sha2",
  "thiserror",
@@ -1358,13 +1405,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "ciborium",
+ "lgwks_bot",
+ "lgwks_std 0.6.1",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-service",
- "serde",
  "serde_bytes",
- "tokio",
  "tower",
 ]
 
@@ -1372,8 +1419,8 @@ dependencies = [
 name = "logical-db-service"
 version = "0.1.0"
 dependencies = [
- "futures",
  "hmac",
+ "lgwks_std 0.6.1",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1409,7 +1456,7 @@ dependencies = [
 name = "logical-db-sync"
 version = "0.1.0"
 dependencies = [
- "futures",
+ "lgwks_std 0.6.1",
  "logical-db-model",
  "logical-db-protocol",
  "sha2",
@@ -1666,10 +1713,9 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
- "futures-util",
  "h2",
  "http",
  "http-body",
@@ -1688,14 +1734,12 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
  "web-sys",
 ]
 
@@ -1735,7 +1779,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -2311,6 +2357,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b0809a01d1ca5a51ca70db32bb2a19157582a526505ef3c19e3b343a59aa5ad"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2321,6 +2395,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -2421,19 +2501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-streams"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2458,6 +2525,15 @@ name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

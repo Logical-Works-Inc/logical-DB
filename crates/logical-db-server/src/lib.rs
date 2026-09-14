@@ -26,12 +26,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use logical_db_protocol::{PullRequest, PushRequest};
+use lgwks_bot::rt::{sync::Semaphore, time::timeout};
+use lgwks_std::json::serde;
+use logical_db_protocol::{BaselineRequest, PullRequest, PushRequest};
 use logical_db_service::{
-    Authority, CheckpointCodec, ProtocolService, ServiceError, ServicePull, ServiceStore,
-    StoreFailureClass,
+    Authority, CheckpointCodec, ProtocolService, RetentionStore, ServiceBaseline, ServiceError,
+    ServicePull, ServiceStore, StoreFailureClass,
 };
-use tokio::{sync::Semaphore, time::timeout};
 
 /// Versioned representation accepted and emitted by the synchronization API.
 pub const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";
@@ -133,7 +134,7 @@ pub fn router<Store, Authentication, Time>(
     clock: Time,
 ) -> Router
 where
-    Store: ServiceStore + 'static,
+    Store: RetentionStore + 'static,
     Store::Error: Send + 'static,
     Authentication: Authenticator + 'static,
     Time: Clock + 'static,
@@ -157,7 +158,7 @@ fn router_with_limits<Store, Authentication, Time>(
     deadline: Duration,
 ) -> Router
 where
-    Store: ServiceStore + 'static,
+    Store: RetentionStore + 'static,
     Store::Error: Send + 'static,
     Authentication: Authenticator + 'static,
     Time: Clock + 'static,
@@ -180,6 +181,10 @@ where
         .route(
             "/v1/changes:pull",
             post(pull::<Store, Authentication, Time>),
+        )
+        .route(
+            "/v1/recovery:baseline",
+            post(recover::<Store, Authentication, Time>),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(admission, admit_request))
@@ -253,6 +258,37 @@ where
         {
             ServicePull::Page(page) => encode_response(StatusCode::OK, &page),
             ServicePull::CheckpointExpired => Err(ApiError::CheckpointExpired),
+            ServicePull::BaselineRequired { .. } => Err(ApiError::BaselineRequired),
+        }
+    }
+    .await;
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn recover<Store, Authentication, Time>(
+    State(state): State<ApiState<Store, Authentication, Time>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    Store: RetentionStore + 'static,
+    Store::Error: Send + 'static,
+    Authentication: Authenticator + 'static,
+    Time: Clock + 'static,
+{
+    let result = async {
+        validate_representation(&headers)?;
+        let now = state.clock.now_unix_ms().ok_or(ApiError::Clock)?;
+        let policy = authenticate(&state, &headers, now)?;
+        let request: BaselineRequest = decode(&body)?;
+        let service = ProtocolService::new(state.store, policy, state.checkpoints);
+        match service
+            .recover(&request, now)
+            .await
+            .map_err(|error| map_service_error::<Store>(&error))?
+        {
+            ServiceBaseline::Artifact(page) => encode_response(StatusCode::OK, &page),
+            ServiceBaseline::Unavailable => Err(ApiError::BaselineUnavailable),
         }
     }
     .await;
@@ -380,6 +416,8 @@ enum ApiError {
     NotAcceptable,
     Malformed { context: &'static str },
     CheckpointExpired,
+    BaselineRequired,
+    BaselineUnavailable,
     Busy,
     Deadline,
     Unavailable,
@@ -399,6 +437,8 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::CheckpointExpired => StatusCode::GONE,
+            Self::BaselineRequired => StatusCode::CONFLICT,
+            Self::BaselineUnavailable => StatusCode::NOT_FOUND,
             Self::Busy | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Deadline => StatusCode::GATEWAY_TIMEOUT,
             Self::Clock | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -434,22 +474,25 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
+    use lgwks_bot::rt::sync::Notify;
     use logical_db_crdt::{Document, Object, Scalar};
     use logical_db_model::{
         AccountId, ChangeDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
-        Scope, SpaceId,
+        Scope, SnapshotArtifact, SnapshotBaseline, SnapshotRecord, SpaceId,
     };
     use logical_db_protocol::{
         ChangeEnvelope, PROTOCOL_VERSION, PullPage, PushOutcome, PushResponse, RejectionCode,
     };
-    use logical_db_service::{AcceptResult, ExecutionGrant, PageResult, StoredPage};
-    use tokio::sync::Notify;
+    use logical_db_service::{
+        AcceptResult, BaselinePageResult, BaselinePageSlice, ConsumedResult, ExecutionGrant,
+        PageResult, PruneRefusal, PruneResult, SealResult, StoredPage,
+    };
     use tower::ServiceExt;
 
     use super::*;
 
     use logical_db_model::ActionDigest;
-    use logical_db_protocol::{PageAction, write_action};
+    use logical_db_protocol::{PageAction, RecoveryAction, write_action};
 
     struct Allow;
     #[derive(Clone, Copy)]
@@ -798,6 +841,79 @@ mod tests {
         }
     }
 
+    /// Inert retention for doubles whose tests never reach recovery or pruning.
+    macro_rules! inert_retention {
+        ($store:ty) => {
+            impl RetentionStore for $store {
+                fn consumed_through(
+                    &self,
+                    _scope: Scope,
+                ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+                    ready(Ok(0))
+                }
+                fn snapshot_baseline(
+                    &self,
+                    _scope: Scope,
+                ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
+                    ready(Ok(None))
+                }
+                fn build_snapshot(
+                    &self,
+                    scope: Scope,
+                    through: u64,
+                ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
+                    ready(Ok(SnapshotArtifact::new(scope, through, Vec::new())
+                        .expect("an empty bounded artifact is valid")))
+                }
+                fn read_baseline_page(
+                    &self,
+                    _action: &RecoveryAction,
+                    _descriptor: &SnapshotBaseline,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+                    ready(Ok(BaselinePageResult::Page(BaselinePageSlice {
+                        documents: Vec::new(),
+                        more: false,
+                    })))
+                }
+                fn seal_snapshot(
+                    &self,
+                    _scope: Scope,
+                    _artifact: &SnapshotArtifact,
+                    _request: OperationDigest,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
+                    ready(Ok(SealResult::BeyondFrontier { frontier: 0 }))
+                }
+                fn mark_consumed(
+                    &self,
+                    _scope: Scope,
+                    _through: u64,
+                    _request: OperationDigest,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+                    ready(Ok(ConsumedResult::Unchanged {
+                        consumed_through: 0,
+                    }))
+                }
+                fn prune(
+                    &self,
+                    _scope: Scope,
+                    _up_to: u64,
+                    _min_live: Option<u64>,
+                    _request: OperationDigest,
+                    _grant: &impl ExecutionGrant,
+                ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
+                    ready(Ok(PruneResult::Refused(PruneRefusal::MissingBaseline)))
+                }
+            }
+        };
+    }
+
+    inert_retention!(Memory);
+    inert_retention!(Stalled);
+    inert_retention!(ConsumedInvocations);
+
     struct Stalled {
         entered: Arc<Notify>,
     }
@@ -890,8 +1006,19 @@ mod tests {
         decoded.outcomes.remove(0)
     }
 
-    #[tokio::test]
-    async fn fixed_action_rejects_wire_mutations_and_accepts_exact_retry() {
+    fn test_runtime() -> lgwks_bot::Runtime {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn fixed_action_rejects_wire_mutations_and_accepts_exact_retry() {
+        test_runtime().block_on(fixed_action_body());
+    }
+
+    async fn fixed_action_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let original = change(scope, ReplicaId::new());
         let action = ExactAction {
@@ -960,8 +1087,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn router_pushes_then_pulls_versioned_cbor_without_leaking_credentials() {
+    #[test]
+    fn router_pushes_then_pulls_versioned_cbor_without_leaking_credentials() {
+        test_runtime().block_on(router_pushes_then_pulls_body());
+    }
+
+    async fn router_pushes_then_pulls_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let change = change(scope, replica);
@@ -1012,8 +1143,12 @@ mod tests {
         assert_eq!(page.changes, vec![change]);
     }
 
-    #[tokio::test]
-    async fn ingress_rejects_ambiguous_auth_and_wrong_representations() {
+    #[test]
+    fn ingress_rejects_ambiguous_auth_and_wrong_representations() {
+        test_runtime().block_on(ingress_rejects_body());
+    }
+
+    async fn ingress_rejects_body() {
         let app = router(
             Memory::default(),
             Bearer,
@@ -1066,8 +1201,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn admission_bounds_complete_requests_and_enforces_deadline() {
+    #[test]
+    fn admission_bounds_complete_requests_and_enforces_deadline() {
+        test_runtime().block_on(admission_bounds_body());
+    }
+
+    async fn admission_bounds_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let push = PushRequest {
@@ -1086,7 +1225,7 @@ mod tests {
             1,
             Duration::from_millis(50),
         );
-        let first = tokio::spawn(
+        let first = lgwks_bot::rt::task::spawn(
             app.clone()
                 .oneshot(request("/v1/changes:push", encode(&push))),
         );
@@ -1103,8 +1242,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn default_composition_refuses_writes_and_sync_over_http() {
+    #[test]
+    fn default_composition_refuses_writes_and_sync_over_http() {
+        test_runtime().block_on(default_composition_body());
+    }
+
+    async fn default_composition_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let app = router(
@@ -1159,8 +1302,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
-    async fn consumed_invocation_surfaces_as_typed_rejection_over_http() {
+    #[test]
+    fn consumed_invocation_surfaces_as_typed_rejection_over_http() {
+        test_runtime().block_on(consumed_invocation_body());
+    }
+
+    async fn consumed_invocation_body() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let app = router(

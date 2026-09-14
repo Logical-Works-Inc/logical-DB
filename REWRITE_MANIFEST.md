@@ -69,8 +69,14 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   from caller intent/idempotency identity. The hosted FDB journey holds one
   action grant fixed while mutating every write field, proves rejection without
   frontier advance, and preserves exact-byte retry (issue #27).
-- [ ] Include explicit application-supplied projection semantic identity in
-  the durable schema digest and migration proof (issue #29).
+- [x] Include explicit application-supplied projection semantic identity in
+  the durable schema digest and migration proof (issue #29). `Projection`
+  requires a `ProjectionSemantics` (nonzero version or opaque digest) that is
+  hashed with its `IndexId` into the v2 schema digest; a changed semantics under
+  the same index and schema version returns migration-required, and
+  `Database::migrate_schema` rebuilds the rows atomically. Covered by the
+  `changed_projection_semantics_requires_migration_and_rebuilds_rows` facade
+  test.
 - [x] Native Windows CI passed data placement, file locking, concurrent open,
   Unicode, read-only paths, process termination, loopback HTTP, and all default
   workspace tests. Public TLS remains a deployment-host boundary, not an
@@ -80,16 +86,21 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Integrate independently verifiable, exact-request Braid confirmation
   evidence before enabling daemon write or synchronization authority. Pinned
   Braid's capsule flag alone is not treated as runtime evidence.
-- [ ] Close server recovery before pruning: expose paged HTTP baseline recovery
+- [x] Close server recovery before pruning: expose paged HTTP baseline recovery
   and install the recovered document state plus checkpoint atomically in the
   client. The v2 server baseline, retention floor, and transactional prune gate
-  are established by the current stack layer, but issue #28 remains open until
-  this client journey is proven.
+  are established, and the paged client journey is proven by
+  `a_baseline_larger_than_one_page_recovers_through_real_http` and the live
+  `fdb_recovery_composition` journey at 300 documents.
 - [x] Implement embedded document tombstones and versioned export/restore with
   retained facade/store tests for reopen, propagation, corrupt input, and
   resuming a restore prefix.
-- [ ] Complete direct process-kill-during-restore and external-consumer recovery
-  evidence; an in-process partial replay test is not a process-kill receipt.
+- [x] Complete direct process-kill-during-restore and external-consumer recovery
+  evidence. `fdb_process_kill_restore` spawns the external `recovery_consumer`
+  process, `SIGKILL`s it after a continued baseline page, proves the durable
+  replica committed no checkpoint, local change, or document, then reruns the
+  same process to a complete atomic install. An in-process partial replay test
+  is not a process-kill receipt.
 - [ ] Exercise multi-node FDB failover and point-in-time restore, public
   TLS/issuer/rotation, sustained load/backpressure, disk exhaustion, sleep/wake,
   and mobile sandbox lifecycle.

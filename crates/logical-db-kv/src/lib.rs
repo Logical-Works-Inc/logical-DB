@@ -127,8 +127,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use logical_db::{BatchEdit, Database, DatabaseError, MigrationReport, Projection};
-use logical_db::{EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar};
+pub use logical_db::{
+    BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
+};
+use logical_db::{
+    ChangeEvent, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar,
+};
 use logical_db_model::MAX_CHANGE_BYTES;
 pub use logical_db_model::{
     AccountId, DocumentId, DocumentRevision, IndexId, IndexValue, NamespaceCheckpoint,
@@ -140,6 +144,11 @@ use uuid::Uuid;
 
 /// Application schema version binding the cache projections to a scope.
 pub const KV_SCHEMA_VERSION: u32 = 1;
+/// Semantic version of [`kv_projections`]. It is separate from
+/// [`KV_SCHEMA_VERSION`] so a change to either projection function's output for
+/// any slot forces [`KvCache::migrate_schema`] instead of reopening a stale
+/// index. Bump it whenever the projection logic changes.
+pub const KV_PROJECTION_SEMANTICS: ProjectionSemantics = ProjectionSemantics::V1;
 /// Newest envelope layout version this cache writes and reads: `1` for
 /// inline values, `2` for tiered values carrying a sidecar reference.
 /// Inline values keep version `1` so readers that predate tiering keep
@@ -283,6 +292,12 @@ pub enum KvError {
     /// A namespace checkpoint map was malformed.
     #[error("namespace checkpoint map is malformed")]
     CorruptCheckpointMap,
+    /// The replica's scope was rewritten by a baseline install, whose recovered
+    /// documents carry no events. Maintenance that reclaims by the
+    /// event-derived document set fails closed instead of reclaiming bytes that
+    /// a recovered document still references.
+    #[error("replica scope was rewritten by a baseline install")]
+    ScopeRewritten,
     /// A namespace checkpoint map used a foreign layout version.
     #[error("namespace checkpoint map version {actual} is unsupported")]
     UnsupportedCheckpointMapVersion {
@@ -683,8 +698,13 @@ impl KvCache {
             }
             let complete = events.len() < MAX_PAGE_LIMIT;
             for event in &events {
-                observed.insert(event.document, event.sequence);
-                after = event.sequence;
+                if let ChangeEvent::Document {
+                    document, sequence, ..
+                } = event
+                {
+                    observed.insert(*document, *sequence);
+                }
+                after = event.sequence();
             }
             if complete {
                 break;
@@ -1630,8 +1650,14 @@ impl KvCache {
             }
             let complete = events.len() < MAX_PAGE_LIMIT;
             for event in &events {
-                documents.insert(event.document);
-                after = event.sequence;
+                let ChangeEvent::Document {
+                    document, sequence, ..
+                } = event
+                else {
+                    return Err(KvError::ScopeRewritten);
+                };
+                documents.insert(*document);
+                after = *sequence;
             }
             if complete {
                 break;
@@ -1665,7 +1691,7 @@ impl KvCache {
 #[must_use]
 pub fn kv_projections() -> Vec<Projection> {
     vec![
-        Projection::new(EXPIRY_INDEX, |reader| {
+        Projection::new(EXPIRY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -1677,7 +1703,7 @@ pub fn kv_projections() -> Vec<Projection> {
                 Some(_) => None,
             })
         }),
-        Projection::new(RECENCY_INDEX, |reader| {
+        Projection::new(RECENCY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -1848,36 +1874,18 @@ fn content_digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::with_capacity(64);
-    for byte in digest {
-        name.push(char::from(HEX[usize::from(byte >> 4)]));
-        name.push(char::from(HEX[usize::from(byte & 0x0F)]));
-    }
-    name
+    lgwks_std::hex::encode(digest)
 }
 
 fn hex_to_digest(name: &str) -> Option<[u8; 32]> {
-    if name.len() != 64 {
+    if name.len() != 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return None;
     }
-    let bytes = name.as_bytes();
-    let mut digest = [0_u8; 32];
-    for (index, slot) in digest.iter_mut().enumerate() {
-        let hi = hex_val(bytes[2 * index])?;
-        let lo = hex_val(bytes[2 * index + 1])?;
-        *slot = hi << 4 | lo;
-    }
-    Some(digest)
-}
-
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    lgwks_std::hex::decode(name).ok()?.try_into().ok()
 }
 
 fn is_blob_name(name: &str) -> bool {
@@ -3326,5 +3334,25 @@ mod tests {
             );
         }
         cleanup(&db_path);
+    }
+
+    #[test]
+    fn blob_names_are_canonical_lowercase_hex_and_reject_every_near_miss() {
+        let canonical = hex_digest(&[0xab; 32]);
+        assert_eq!(canonical.len(), 64);
+        assert_eq!(hex_to_digest(&canonical), Some([0xab; 32]));
+        assert!(is_blob_name(&canonical));
+        let short = canonical[..63].to_owned();
+        let long = format!("{canonical}0");
+        let mixed_case = canonical.replace('a', "A");
+        let invalid_digit = format!("z{}", &canonical[1..]);
+        assert_eq!(hex_to_digest(&short), None);
+        assert_eq!(hex_to_digest(&long), None);
+        assert_eq!(hex_to_digest(&mixed_case), None);
+        assert_eq!(hex_to_digest(&invalid_digit), None);
+        assert!(!is_blob_name(&short));
+        assert!(!is_blob_name(&long));
+        assert!(!is_blob_name(&mixed_case));
+        assert!(!is_blob_name(&invalid_digit));
     }
 }

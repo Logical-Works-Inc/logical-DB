@@ -14,16 +14,17 @@ use std::{
     time::Duration,
 };
 
-use futures::TryStreamExt;
-use logical_db_protocol::{ProtocolError, PullPage, PullRequest, PushRequest, PushResponse};
-use logical_db_sync::{PullResult, Transport};
+use lgwks_std::json::serde::{Serialize, de::DeserializeOwned};
+use logical_db_protocol::{
+    BaselinePage, BaselineRequest, ProtocolError, PullPage, PullRequest, PushRequest, PushResponse,
+};
+use logical_db_sync::{BaselineResult, PullResult, Transport};
 pub use reqwest::Url;
 use reqwest::{
     Client, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
-use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";
@@ -221,9 +222,35 @@ where
         if response.status() == StatusCode::GONE {
             return Ok(PullResult::CheckpointExpired);
         }
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(PullResult::BaselineRequired);
+        }
         let page = decode_response::<PullPage>(response).await?;
         page.validate(request.scope).map_err(HttpError::Protocol)?;
         Ok(PullResult::Page(page))
+    }
+
+    async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error> {
+        request.validate().map_err(HttpError::Protocol)?;
+        let body = encode(&request)?;
+        let authorization = self.credentials.authorization().await?;
+        let response = self
+            .client
+            .post(self.route("v1/recovery:baseline")?)
+            .header(AUTHORIZATION, authorization)
+            .header(CONTENT_TYPE, MEDIA_TYPE)
+            .header(ACCEPT, MEDIA_TYPE)
+            .body(body)
+            .send()
+            .await
+            .map_err(HttpError::Network)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(BaselineResult::Unavailable);
+        }
+        let page = decode_response::<BaselinePage>(response).await?;
+        page.validate_page(request.scope)
+            .map_err(HttpError::Protocol)?;
+        Ok(BaselineResult::Artifact(page))
     }
 }
 
@@ -239,6 +266,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, HttpError> {
 }
 
 async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, HttpError> {
+    let mut response = response;
     let status = response.status();
     if !status.is_success() {
         let retry_after = response
@@ -271,9 +299,8 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
         eprintln!("logical-db-http: decode_response: BodyTooLarge");
         return Err(HttpError::BodyTooLarge);
     }
-    let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = stream.try_next().await.map_err(HttpError::Network)? {
+    while let Some(chunk) = response.chunk().await.map_err(HttpError::Network)? {
         if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
             eprintln!("logical-db-http: decode_response: BodyTooLarge");
             return Err(HttpError::BodyTooLarge);
@@ -476,10 +503,19 @@ mod tests {
                 "/gone/v1/changes:pull",
                 post(|| async { (AxumStatus::GONE, Body::empty()) }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        lgwks_bot::rt::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{address}/").parse().unwrap()
+    }
+
+    fn test_runtime() -> lgwks_bot::Runtime {
+        lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()
+            .expect("test runtime")
     }
 
     #[test]
@@ -546,8 +582,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn response_decoder_enforces_status_media_and_exact_stream_bounds() {
+    #[test]
+    fn response_decoder_enforces_status_media_and_exact_stream_bounds() {
+        test_runtime().block_on(response_decoder_body());
+    }
+
+    async fn response_decoder_body() {
         let endpoint = endpoint().await;
         let client = Client::new();
         let response = client
@@ -621,8 +661,12 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn pull_maps_only_http_gone_to_checkpoint_expiry() {
+    #[test]
+    fn pull_maps_only_http_gone_to_checkpoint_expiry() {
+        test_runtime().block_on(pull_gone_body());
+    }
+
+    async fn pull_gone_body() {
         use logical_db_model::{AccountId, OperationDigest, ReplicaId, Scope, SpaceId};
 
         let mut transport =
@@ -642,5 +686,276 @@ mod tests {
             transport.pull(request).await,
             Ok(PullResult::CheckpointExpired)
         ));
+    }
+
+    /// Serves one hand-written HTTP/1.1 response on a loopback port so a test
+    /// controls the exact framing bytes rather than a framework's defaults.
+    fn spawn_raw_server<F>(responder: F) -> Url
+    where
+        F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw server");
+        let address = listener.local_addr().expect("raw server address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let declared: usize = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|line| {
+                    let lowered = line.to_ascii_lowercase();
+                    let (_, value) = lowered.split_once("content-length:")?;
+                    value.trim().parse().ok()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; declared];
+            let mut read = 0;
+            while read < declared {
+                match stream.read(&mut body[read..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(got) => read += got,
+                }
+            }
+            responder(&mut stream);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        format!("http://{address}/")
+            .parse()
+            .expect("raw server url")
+    }
+
+    fn write_bytes(stream: &mut std::net::TcpStream, bytes: &[u8]) {
+        use std::io::Write;
+        let _ = stream.write_all(bytes);
+        let _ = stream.flush();
+    }
+
+    fn chunked_head() -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ntransfer-encoding: chunked\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn chunk(stream: &mut std::net::TcpStream, data: &[u8]) {
+        write_bytes(stream, format!("{:x}\r\n", data.len()).as_bytes());
+        write_bytes(stream, data);
+        write_bytes(stream, b"\r\n");
+    }
+
+    /// A CBOR unsigned 42 is exactly `0x18 0x2a`.
+    const CBOR_FORTY_TWO: &[u8] = &[0x18, 0x2a];
+
+    fn raw_client() -> Client {
+        Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("raw client")
+    }
+
+    #[test]
+    fn a_chunked_response_without_a_content_length_is_decoded() {
+        let endpoint = spawn_raw_server(|stream| {
+            write_bytes(stream, &chunked_head());
+            chunk(stream, CBOR_FORTY_TWO);
+            write_bytes(stream, b"0\r\n\r\n");
+        });
+        let decoded = test_runtime().block_on(decode_forty_two(endpoint));
+        assert_eq!(decoded, 42);
+    }
+
+    async fn decode_forty_two(endpoint: Url) -> u8 {
+        let response = raw_client()
+            .get(endpoint)
+            .send()
+            .await
+            .expect("chunked request");
+        assert!(
+            response.headers().get(CONTENT_LENGTH).is_none(),
+            "the server must not declare a length"
+        );
+        decode_response::<u8>(response).await.expect("decode")
+    }
+
+    #[test]
+    fn a_chunked_body_crossing_the_ceiling_fails_closed_without_a_content_length() {
+        let endpoint = spawn_raw_server(|stream| {
+            write_bytes(stream, &chunked_head());
+            let filler = vec![0u8; 64 * 1024];
+            let mut sent = 0;
+            while sent <= MAX_HTTP_BODY_BYTES + 64 * 1024 {
+                chunk(stream, &filler);
+                sent += filler.len();
+            }
+            write_bytes(stream, b"0\r\n\r\n");
+        });
+        assert!(matches!(
+            test_runtime().block_on(ceiling_error(endpoint)),
+            Err(HttpError::BodyTooLarge)
+        ));
+    }
+
+    async fn ceiling_error(endpoint: Url) -> Result<u8, HttpError> {
+        let response = raw_client()
+            .get(endpoint)
+            .send()
+            .await
+            .expect("over-ceiling request");
+        decode_response::<u8>(response).await
+    }
+
+    #[test]
+    fn a_declared_length_above_the_ceiling_is_refused_before_the_body_is_read() {
+        let endpoint = spawn_raw_server(|stream| {
+            write_bytes(
+                stream,
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: {}\r\n\r\n",
+                    MAX_HTTP_BODY_BYTES + 1
+                )
+                .as_bytes(),
+            );
+            chunk(stream, CBOR_FORTY_TWO);
+        });
+        assert!(matches!(
+            test_runtime().block_on(ceiling_error(endpoint)),
+            Err(HttpError::BodyTooLarge)
+        ));
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_declared_length_is_an_error_never_a_hang() {
+        let endpoint = spawn_raw_server(|stream| {
+            write_bytes(
+                stream,
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: 5\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            write_bytes(stream, CBOR_FORTY_TWO);
+        });
+        let started = std::time::Instant::now();
+        let outcome = test_runtime().block_on(short_body(endpoint));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not stall"
+        );
+        assert!(outcome.is_err(), "a truncated body must not decode");
+    }
+
+    async fn short_body(endpoint: Url) -> Result<u8, HttpError> {
+        let response = raw_client()
+            .get(endpoint)
+            .send()
+            .await
+            .map_err(HttpError::Network)?;
+        decode_response::<u8>(response).await
+    }
+
+    #[test]
+    fn a_redirect_is_refused_and_its_target_is_never_contacted() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let followed = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&followed);
+        let target = spawn_raw_server(move |stream| {
+            marker.store(true, Ordering::SeqCst);
+            write_bytes(stream, &chunked_head());
+            chunk(stream, CBOR_FORTY_TWO);
+            write_bytes(stream, b"0\r\n\r\n");
+        });
+        let redirect = spawn_raw_server(move |stream| {
+            write_bytes(
+                stream,
+                format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}\r\ncontent-length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+        });
+        let error = test_runtime().block_on(pull_from(redirect));
+        assert!(
+            matches!(error, Err(HttpError::Status { code: 307, .. })),
+            "a redirect must surface as a status error, got {error:?}"
+        );
+        assert!(
+            !followed.load(Ordering::SeqCst),
+            "the transport followed a redirect it was told to refuse"
+        );
+    }
+
+    async fn pull_from(endpoint: Url) -> Result<PullResult, HttpError> {
+        use logical_db_model::{AccountId, OperationDigest, ReplicaId, Scope, SpaceId};
+        let mut transport =
+            HttpTransport::new(endpoint, StaticBearer::new("blackbox").expect("bearer"))
+                .expect("transport");
+        transport
+            .pull(PullRequest {
+                protocol: logical_db_protocol::PROTOCOL_VERSION,
+                scope: Scope::new(AccountId::new(), SpaceId::new()),
+                replica: ReplicaId::new(),
+                request: OperationDigest::new([2; 32]),
+                after: None,
+                max_changes: 1,
+                max_bytes: 1_024,
+            })
+            .await
+    }
+
+    #[test]
+    fn a_stalled_response_is_released_by_the_request_timeout() {
+        let endpoint = spawn_raw_server(|stream| {
+            write_bytes(stream, &chunked_head());
+            std::thread::sleep(Duration::from_secs(45));
+        });
+        let started = std::time::Instant::now();
+        let outcome = test_runtime().block_on(pull_from(endpoint));
+        let elapsed = started.elapsed();
+        assert!(outcome.is_err(), "a stalled response must not succeed");
+        assert!(
+            elapsed >= Duration::from_secs(25) && elapsed < Duration::from_secs(44),
+            "the client timeout must bound the stall, elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn cancelling_an_in_flight_request_leaves_the_transport_usable() {
+        let slow = spawn_raw_server(|stream| {
+            write_bytes(stream, &chunked_head());
+            chunk(stream, &[0x18]);
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        let fast = spawn_raw_server(|stream| {
+            write_bytes(stream, &chunked_head());
+            chunk(stream, CBOR_FORTY_TWO);
+            write_bytes(stream, b"0\r\n\r\n");
+        });
+        let runtime = test_runtime();
+        runtime.block_on(cancel_then_succeed(slow, fast));
+    }
+
+    async fn cancel_then_succeed(slow: Url, fast: Url) {
+        let pending = lgwks_bot::rt::task::spawn(pull_from(slow));
+        lgwks_bot::rt::task::yield_now().await;
+        pending.abort();
+        let decoded = decode_forty_two(fast).await;
+        assert_eq!(decoded, 42, "the transport must stay usable");
     }
 }

@@ -15,8 +15,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lgwks_std.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
-serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

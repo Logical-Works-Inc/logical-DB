@@ -124,9 +124,8 @@ fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    run().await
+fn main() -> Result<(), Box<dyn Error>> {
+    lgwks_bot::Runtime::new()?.block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -704,9 +703,10 @@ async fn verify_http_action_binding(
         CheckpointCodec::new([0x27; 32], 60_000)?,
         SystemClock,
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, application).await });
+    let server =
+        lgwks_bot::rt::task::spawn(async move { axum::serve(listener, application).await });
     let endpoint = format!("http://{address}/v1/changes:push");
     let client = reqwest::Client::new();
 
@@ -796,7 +796,7 @@ async fn push_over_http(
             .send()
             .await?;
         if response.status().is_server_error() {
-            tokio::task::yield_now().await;
+            lgwks_bot::rt::task::yield_now().await;
             continue;
         }
         if !response.status().is_success() {
@@ -1281,11 +1281,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn live_fdb_recovers_unknown_commit_and_preserves_all_axes() {
+    #[test]
+    fn live_fdb_recovers_unknown_commit_and_preserves_all_axes() {
         if std::env::var_os("LOGICAL_DB_FDB_CLUSTER_FILE").is_none() {
             return;
         }
-        run().await.expect("live FDB ambiguity proof");
+        lgwks_bot::Runtime::new()
+            .expect("test runtime")
+            .block_on(run())
+            .expect("live FDB ambiguity proof");
     }
 }

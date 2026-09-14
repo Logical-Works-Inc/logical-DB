@@ -284,6 +284,21 @@ impl Document {
         Ok(())
     }
 
+    /// Merges another verified document into this one, retaining both histories.
+    ///
+    /// The merge is a CRDT union: concurrent edits from either side survive and
+    /// converge to the same visible value on every replica. A recovered baseline
+    /// is merged with the replica's current state rather than replacing it, so an
+    /// unsent local edit is never dropped by recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError::Automerge`] when the merge fails.
+    pub fn merge(&mut self, other: &mut Self) -> Result<(), CrdtError> {
+        self.inner.merge(&mut other.inner)?;
+        Ok(())
+    }
+
     /// Reads one scalar or object from a map property.
     ///
     /// # Errors

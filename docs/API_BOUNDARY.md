@@ -13,7 +13,7 @@ Braid. Its durable identity axis is:
 ```text
 AccountId / SpaceId / DocumentId
 ReplicaId / OperationId / OperationDigest
-IndexId / IndexValue / PeerId
+IndexId / IndexValue / ProjectionSemantics / PeerId
 ```
 
 The embedded surface is deliberately small:
@@ -33,6 +33,12 @@ Database::export()
 Database::restore(payload)
 Database::restore_cursor()
 ```
+
+Each `Projection` supplies an explicit `ProjectionSemantics` that is bound
+into the durable schema digest alongside its `IndexId`. Changing a projection
+function's output requires changed semantics and an explicit
+`Database::migrate_schema`; the same index identity and schema version with new
+semantics fails closed with migration-required.
 
 `edit_fn` receives only the typed CRDT `Editor`; `read_fn` and projection
 functions receive only `Reader`. Storage handles, tuple keys, transaction

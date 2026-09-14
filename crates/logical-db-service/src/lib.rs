@@ -12,13 +12,14 @@ use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 use logical_db_model::OperationId;
 use logical_db_model::{
-    ActionDigest, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotRecord,
-    is_behind_retention,
+    ActionDigest, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
+    SnapshotDocument, SnapshotRecord, is_behind_retention,
 };
 use logical_db_protocol::{
-    ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, PageAction, ProtocolError, PullPage, PullRequest,
-    PushOutcome, PushRequest, PushResponse, RejectionCode, mark_consumed_action, prune_action,
-    seal_snapshot_action, write_action,
+    BaselineDocument, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION,
+    PageAction, ProtocolError, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
+    RecoveryAction, RejectionCode, mark_consumed_action, prune_action, seal_snapshot_action,
+    write_action,
 };
 use sha2::Sha256;
 use thiserror::Error;
@@ -466,6 +467,24 @@ pub enum ConsumedResult {
 
 /// Durable retention contract for peer-aware log collection.
 ///
+/// One ordered slice of a sealed baseline after an exclusive document cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BaselinePageSlice {
+    /// Strictly ascending documents after the requested cursor.
+    pub documents: Vec<SnapshotDocument>,
+    /// Whether further documents follow this slice for the same descriptor.
+    pub more: bool,
+}
+
+/// Durable outcome of one grant-bound recovery page read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaselinePageResult {
+    /// The read observed the justified frontier and returned a page slice.
+    Page(BaselinePageSlice),
+    /// The scope frontier moved after the invocation was justified.
+    StaleAuthority,
+}
+
 /// Reads report the versioned snapshot baseline, the retention floor, and the
 /// peer-consumption watermark. Writes are frontier-bound like page reads: a
 /// grant justified against a moved frontier reports stale authority instead of
@@ -492,6 +511,22 @@ pub trait RetentionStore: ServiceStore {
         scope: Scope,
         through: u64,
     ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send;
+
+    /// Reads one bounded ordered page of a sealed baseline for one cursor.
+    ///
+    /// The slice carries at most `MAX_BASELINE_PAGE_DOCUMENTS` documents,
+    /// strictly ascending after `action.after_document`. `more` reports that the
+    /// same descriptor has further documents. The store recomputes the
+    /// normalized action digest from the actual parameters and refuses a grant
+    /// issued for any other checkpoint or cursor; it validates each stored
+    /// document's own integrity, and the aggregate digest is the recovering
+    /// client's terminal check.
+    fn read_baseline_page(
+        &self,
+        action: &RecoveryAction,
+        descriptor: &SnapshotBaseline,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send;
 
     /// Durably records a versioned snapshot baseline for the scope.
     ///
@@ -561,6 +596,15 @@ where
         through: u64,
     ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
         (**self).build_snapshot(scope, through)
+    }
+
+    fn read_baseline_page(
+        &self,
+        action: &RecoveryAction,
+        descriptor: &SnapshotBaseline,
+        grant: &impl ExecutionGrant,
+    ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+        (**self).read_baseline_page(action, descriptor, grant)
     }
 
     fn seal_snapshot(
@@ -722,6 +766,25 @@ pub enum ServicePull {
     Page(PullPage),
     /// Valid authenticated checkpoint reached its expiry.
     CheckpointExpired,
+    /// The client cannot resume from the log prefix alone.
+    ///
+    /// The retained prefix below `floor` was collected into a state-bearing
+    /// baseline, so a fresh or expired replica must install that artifact
+    /// before any suffix pull. A position is not a recoverable snapshot.
+    BaselineRequired {
+        /// Durable retention floor the client must recover through.
+        floor: u64,
+    },
+}
+
+/// Response to one recovery request: the sealed artifact or its absence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceBaseline {
+    /// A sealed state-bearing artifact covers the retained prefix.
+    Artifact(Box<BaselinePage>),
+    /// No state-bearing baseline exists, so the durable log still covers every
+    /// position and a full pull from the floor is complete.
+    Unavailable,
 }
 
 /// Stateless service orchestration over a durable storage adapter.
@@ -811,30 +874,49 @@ where
 
     /// Reads one authorized page after an authenticated opaque checkpoint.
     ///
-    /// A checkpoint behind the durable retention floor takes the explicit
-    /// full-recovery transition instead of a partial prefix. A request without
-    /// a checkpoint resumes from the floor, which is the full-recovery read
-    /// path after collection.
+    /// A checkpoint behind the durable retention floor, an expired checkpoint
+    /// once collection has advanced the floor, and a fresh replica facing a
+    /// nonzero floor all take the explicit [`ServicePull::BaselineRequired`]
+    /// transition: the collected prefix exists only as a state-bearing
+    /// baseline, so no partial log prefix may be applied.
     ///
     /// # Errors
     ///
     /// Returns protocol, authority, checkpoint-authentication, backend, or
-    /// cross-scope corruption failures. Expiry is a typed non-error response.
+    /// cross-scope corruption failures. Expiry and required recovery are typed
+    /// non-error responses.
     pub async fn pull(
         &self,
         request: &PullRequest,
         now_unix_ms: u64,
     ) -> Result<ServicePull, ServiceError<Store::Error>> {
         request.validate().map_err(ServiceError::Protocol)?;
+        let floor = self
+            .store
+            .retention_floor(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
         let checkpoint_position = match &request.after {
             Some(token) => match self.checkpoints.open(request.scope, token, now_unix_ms) {
+                Ok(position) if is_behind_retention(position, floor) => {
+                    eprintln!("logical-db-service: pull: BaselineRequired");
+                    return Ok(ServicePull::BaselineRequired { floor });
+                }
                 Ok(position) => Some(position),
+                Err(CheckpointError::Expired) if floor > 0 => {
+                    eprintln!("logical-db-service: pull: BaselineRequired");
+                    return Ok(ServicePull::BaselineRequired { floor });
+                }
                 Err(CheckpointError::Expired) => return Ok(ServicePull::CheckpointExpired),
                 Err(error) => {
                     eprintln!("logical-db-service: pull checkpoint: {error}");
                     return Err(ServiceError::Checkpoint(error));
                 }
             },
+            None if floor > 0 => {
+                eprintln!("logical-db-service: pull: BaselineRequired");
+                return Ok(ServicePull::BaselineRequired { floor });
+            }
             None => None,
         };
         let frontier = self
@@ -842,15 +924,18 @@ where
             .frontier(request.scope)
             .await
             .map_err(ServiceError::Store)?;
-        let floor = self
-            .store
-            .retention_floor(request.scope)
-            .await
-            .map_err(ServiceError::Store)?;
-        if checkpoint_position.is_some_and(|position| is_behind_retention(position, floor)) {
-            return Ok(ServicePull::CheckpointExpired);
-        }
         let after = checkpoint_position.unwrap_or(0).max(floor);
+        self.page_after(request, after, frontier, now_unix_ms).await
+    }
+
+    /// Serves one authorized page and issues the replacement checkpoint.
+    async fn page_after(
+        &self,
+        request: &PullRequest,
+        after: u64,
+        frontier: u64,
+        now_unix_ms: u64,
+    ) -> Result<ServicePull, ServiceError<Store::Error>> {
         let action = PageAction {
             scope: request.scope,
             replica: request.replica,
@@ -966,6 +1051,107 @@ where
             .seal_snapshot(scope, &artifact, request, &grant)
             .await
             .map_err(ServiceError::Store)
+    }
+
+    /// Returns one bounded page of the sealed state-bearing baseline a
+    /// recovering client must install.
+    ///
+    /// The durable descriptor is read once per request and the ordered document
+    /// slice is read after `request.after_document`, so a baseline larger than
+    /// one page is delivered without materializing the whole artifact. The
+    /// client verifies the aggregate descriptor digest across the pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns protocol, authority, backend, or cross-scope corruption
+    /// failures. A scope with no sealed state-bearing baseline reports
+    /// [`ServiceBaseline::Unavailable`] instead of an empty artifact.
+    pub async fn recover(
+        &self,
+        request: &BaselineRequest,
+        now_unix_ms: u64,
+    ) -> Result<ServiceBaseline, ServiceError<Store::Error>> {
+        request.validate().map_err(ServiceError::Protocol)?;
+        let frontier = self
+            .store
+            .frontier(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let action = RecoveryAction {
+            scope: request.scope,
+            replica: request.replica,
+            intent: request.request,
+            after: request.after.clone(),
+            after_document: request.after_document,
+        };
+        let digest = action.digest();
+        let Some(grant) =
+            self.policy
+                .authorize(request.scope, Effect::Sync, digest, frontier, now_unix_ms)
+        else {
+            eprintln!("logical-db-service: recover: Forbidden");
+            return Err(ServiceError::Forbidden);
+        };
+        if grant.scope() != request.scope
+            || grant.effect() != Effect::Sync
+            || grant.action() != digest
+            || grant.frontier() != frontier
+        {
+            eprintln!("logical-db-service: recover: Forbidden");
+            return Err(ServiceError::Forbidden);
+        }
+        let sealed = self
+            .store
+            .snapshot_baseline(request.scope)
+            .await
+            .map_err(ServiceError::Store)?;
+        let Some(SnapshotRecord::State(descriptor)) = sealed else {
+            return Ok(ServiceBaseline::Unavailable);
+        };
+        let slice = match self
+            .store
+            .read_baseline_page(&action, &descriptor, &grant)
+            .await
+            .map_err(ServiceError::Store)?
+        {
+            BaselinePageResult::Page(slice) => slice,
+            BaselinePageResult::StaleAuthority => {
+                eprintln!("logical-db-service: recover: StaleAuthority");
+                return Err(ServiceError::StaleAuthority);
+            }
+        };
+        if slice.more && slice.documents.is_empty() {
+            eprintln!("logical-db-service: recover: CorruptStoreData");
+            return Err(ServiceError::CorruptStoreData);
+        }
+        let checkpoint = self
+            .checkpoints
+            .issue(request.scope, descriptor.position(), now_unix_ms)
+            .map_err(ServiceError::Checkpoint)?;
+        let next_document = if slice.more {
+            slice.documents.last().map(|document| document.document)
+        } else {
+            None
+        };
+        let page = BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: descriptor.encode().to_vec(),
+            documents: slice
+                .documents
+                .iter()
+                .map(|document| BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint,
+            more: slice.more,
+            next_document,
+        };
+        page.validate_page(request.scope)
+            .map_err(ServiceError::Protocol)?;
+        Ok(ServiceBaseline::Artifact(Box::new(page)))
     }
 
     /// Advances the peer-consumption watermark guarding collection.
@@ -1116,6 +1302,8 @@ mod tests {
 
     use super::*;
 
+    use logical_db_protocol::recover_action;
+
     struct Allow;
     struct Stale;
     struct Grant {
@@ -1179,6 +1367,41 @@ mod tests {
                 effect,
                 action,
                 frontier: frontier.checked_sub(1).unwrap_or(1),
+            })
+        }
+    }
+
+    /// Certifies exactly one captured invocation, like a host authority that
+    /// binds a grant to the action digest it justified.
+    struct ExactRecovery {
+        scope: Scope,
+        action: ActionDigest,
+        frontier: u64,
+    }
+
+    impl Authority for ExactRecovery {
+        type Grant = Grant;
+
+        fn authorize(
+            &self,
+            scope: Scope,
+            effect: Effect,
+            action: ActionDigest,
+            frontier: u64,
+            _now: u64,
+        ) -> Option<Self::Grant> {
+            if scope != self.scope
+                || effect != Effect::Sync
+                || action != self.action
+                || frontier != self.frontier
+            {
+                return None;
+            }
+            Some(Grant {
+                scope,
+                effect,
+                action,
+                frontier,
             })
         }
     }
@@ -1290,6 +1513,14 @@ mod tests {
             through: u64,
         ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
             std::future::ready(Ok(self.build_snapshot_result(scope, through)))
+        }
+        fn read_baseline_page(
+            &self,
+            action: &RecoveryAction,
+            descriptor: &SnapshotBaseline,
+            grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+            std::future::ready(Ok(self.read_baseline_page_result(action, descriptor, grant)))
         }
         fn seal_snapshot(
             &self,
@@ -1414,6 +1645,43 @@ mod tests {
                 .collect::<Vec<_>>();
             materialize_snapshot(scope, through, base.as_ref(), &changes)
                 .expect("memory store must build a bounded test artifact")
+        }
+        fn read_baseline_page_result(
+            &self,
+            action: &RecoveryAction,
+            descriptor: &SnapshotBaseline,
+            grant: &impl ExecutionGrant,
+        ) -> BaselinePageResult {
+            if self
+                .check_retention_grant(action.scope, action.digest(), grant)
+                .is_none()
+            {
+                return BaselinePageResult::StaleAuthority;
+            }
+            let Some(artifact) = self.retention_state(action.scope).baseline else {
+                return BaselinePageResult::Page(BaselinePageSlice {
+                    documents: Vec::new(),
+                    more: false,
+                });
+            };
+            assert!(
+                &artifact.baseline == descriptor,
+                "memory store baseline descriptor disagrees with its artifact"
+            );
+            let mut documents = artifact
+                .documents
+                .iter()
+                .filter(|document| {
+                    action
+                        .after_document
+                        .is_none_or(|cursor| document.document > cursor)
+                })
+                .take(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 1)
+                .cloned()
+                .collect::<Vec<_>>();
+            let more = documents.len() > logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS;
+            documents.truncate(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
+            BaselinePageResult::Page(BaselinePageSlice { documents, more })
         }
         fn seal_snapshot_result(
             &self,
@@ -1587,13 +1855,13 @@ mod tests {
             changes: vec![change(scope, replica, operation)],
         };
         assert!(matches!(
-            futures::executor::block_on(service.push(&request, 10))
+            lgwks_std::task::block_on(service.push(&request, 10))
                 .unwrap()
                 .outcomes[0],
             PushOutcome::Accepted { .. }
         ));
         assert!(matches!(
-            futures::executor::block_on(service.push(&request, 10))
+            lgwks_std::task::block_on(service.push(&request, 10))
                 .unwrap()
                 .outcomes[0],
             PushOutcome::Duplicate { .. }
@@ -1607,7 +1875,7 @@ mod tests {
             max_changes: 10,
             max_bytes: 1024,
         };
-        let ServicePull::Page(page) = futures::executor::block_on(service.pull(&pull, 10)).unwrap()
+        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10)).unwrap()
         else {
             panic!("page expected")
         };
@@ -1618,7 +1886,7 @@ mod tests {
             ..pull
         };
         assert!(matches!(
-            futures::executor::block_on(service.pull(&forged, 11)),
+            lgwks_std::task::block_on(service.pull(&forged, 11)),
             Err(ServiceError::Checkpoint(CheckpointError::InvalidMac))
         ));
     }
@@ -1641,7 +1909,7 @@ mod tests {
             max_changes: 10,
             max_bytes: 1024,
         };
-        let ServicePull::Page(page) = futures::executor::block_on(service.pull(&pull, 10)).unwrap()
+        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10)).unwrap()
         else {
             panic!("page expected")
         };
@@ -1650,7 +1918,7 @@ mod tests {
             ..pull
         };
         assert_eq!(
-            futures::executor::block_on(service.pull(&expired, 15)).unwrap(),
+            lgwks_std::task::block_on(service.pull(&expired, 15)).unwrap(),
             ServicePull::CheckpointExpired
         );
     }
@@ -1668,7 +1936,7 @@ mod tests {
         malformed.bytes = vec![1];
         let mut mismatched = change(scope, replica, OperationId::new());
         mismatched.digest = ChangeDigest::new([0; 32]);
-        let response = futures::executor::block_on(service.push(
+        let response = lgwks_std::task::block_on(service.push(
             &PushRequest {
                 protocol: PROTOCOL_VERSION,
                 replica,
@@ -1712,7 +1980,7 @@ mod tests {
             max_bytes: 1024,
         };
         assert!(matches!(
-            futures::executor::block_on(service.pull(&pull, 10)),
+            lgwks_std::task::block_on(service.pull(&pull, 10)),
             Err(ServiceError::StaleAuthority)
         ));
     }
@@ -1851,7 +2119,7 @@ mod tests {
             replica,
             changes,
         };
-        futures::executor::block_on(service.push(&request, 10)).unwrap()
+        lgwks_std::task::block_on(service.push(&request, 10)).unwrap()
     }
 
     fn pull_after<Store, Policy>(
@@ -1875,7 +2143,160 @@ mod tests {
             max_changes: 10,
             max_bytes: 1_048_576,
         };
-        futures::executor::block_on(service.pull(&request, now)).unwrap()
+        lgwks_std::task::block_on(service.pull(&request, now)).unwrap()
+    }
+
+    fn recover_at<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        replica: ReplicaId,
+        after: Option<Checkpoint>,
+        now: u64,
+    ) -> ServiceBaseline
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        let request = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([92; 32]),
+            after,
+            after_document: None,
+        };
+        lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+    }
+
+    fn recover_page_at<Store, Policy>(
+        service: &ProtocolService<Store, Policy>,
+        scope: Scope,
+        replica: ReplicaId,
+        after_document: Option<DocumentId>,
+        now: u64,
+    ) -> ServiceBaseline
+    where
+        Store: RetentionStore,
+        Store::Error: std::fmt::Debug,
+        Policy: Authority,
+    {
+        let request = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: OperationDigest::new([93; 32]),
+            after: None,
+            after_document,
+        };
+        lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+    }
+
+    #[test]
+    fn a_recovery_grant_for_one_cursor_cannot_authorize_another() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let intent = OperationDigest::new([92; 32]);
+        let cursor = DocumentId::new();
+        let authorized = recover_action(scope, replica, intent, None, None);
+        let captured = recover_action(scope, replica, intent, None, Some(&cursor));
+        assert_ne!(
+            authorized, captured,
+            "the exclusive cursor must change the recover action digest"
+        );
+
+        let service = ProtocolService::new(
+            Memory::default(),
+            ExactRecovery {
+                scope,
+                action: authorized,
+                frontier: 0,
+            },
+            CheckpointCodec::new([6; 32], 100).unwrap(),
+        );
+        let other = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: intent,
+            after: None,
+            after_document: Some(cursor),
+        };
+        assert!(matches!(
+            lgwks_std::task::block_on(service.recover(&other, 10)),
+            Err(ServiceError::Forbidden)
+        ));
+        let exact = BaselineRequest {
+            protocol: PROTOCOL_VERSION,
+            scope,
+            replica,
+            request: intent,
+            after: None,
+            after_document: None,
+        };
+        assert!(matches!(
+            lgwks_std::task::block_on(service.recover(&exact, 10)),
+            Ok(ServiceBaseline::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn recovery_pages_a_baseline_larger_than_one_page() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([6; 32], 100).unwrap(),
+        );
+        let total = logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        let changes = (0..total)
+            .map(|index| {
+                envelope_with(
+                    scope,
+                    replica,
+                    OperationId::new(),
+                    u8::try_from(index % 256).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for chunk in changes.chunks(logical_db_model::MAX_CHANGES_PER_PAGE) {
+            push_all(&service, replica, chunk.to_vec());
+        }
+        assert!(matches!(
+            seal_at(&service, scope, total as u64, 10),
+            SealResult::Sealed { .. }
+        ));
+
+        let ServiceBaseline::Artifact(first) = recover_page_at(&service, scope, replica, None, 11)
+        else {
+            panic!("sealed baseline must be available");
+        };
+        assert!(first.more);
+        assert_eq!(
+            first.documents.len(),
+            logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS
+        );
+        let cursor = first
+            .next_document
+            .expect("continued page carries a cursor");
+        let ServiceBaseline::Artifact(second) =
+            recover_page_at(&service, scope, replica, Some(cursor), 12)
+        else {
+            panic!("continued baseline page must be available");
+        };
+        assert!(!second.more);
+        assert_eq!(second.documents.len(), 44);
+        assert_eq!(second.descriptor, first.descriptor);
+        assert!(second.next_document.is_none());
+
+        let mut accumulator = logical_db_protocol::BaselineAccumulator::new(
+            scope,
+            first.validate_page(scope).unwrap(),
+        );
+        assert!(!accumulator.push(&first).unwrap());
+        assert!(accumulator.push(&second).unwrap());
+        assert_eq!(accumulator.finish().unwrap().documents.len(), total);
     }
 
     fn seal_at<Store, Policy>(
@@ -1889,7 +2310,7 @@ mod tests {
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        futures::executor::block_on(service.seal_snapshot(
+        lgwks_std::task::block_on(service.seal_snapshot(
             scope,
             position,
             OperationDigest::new([61; 32]),
@@ -1909,7 +2330,7 @@ mod tests {
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        futures::executor::block_on(service.mark_consumed(
+        lgwks_std::task::block_on(service.mark_consumed(
             scope,
             through,
             OperationDigest::new([62; 32]),
@@ -1930,7 +2351,7 @@ mod tests {
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        futures::executor::block_on(service.prune(
+        lgwks_std::task::block_on(service.prune(
             scope,
             up_to,
             min_live,
@@ -2067,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn behind_floor_checkpoint_expires_then_full_recovery_completes() {
+    fn behind_floor_checkpoint_requires_baseline_then_suffix_completes() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
@@ -2105,11 +2526,29 @@ mod tests {
             })
         );
         assert_eq!(
-            pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
-            ServicePull::CheckpointExpired
+            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15),
+            ServicePull::BaselineRequired { floor: 2 }
         );
-        let ServicePull::Page(recovered) = pull_after(&service, scope, replica, None, 16) else {
-            panic!("recovery page expected")
+        assert_eq!(
+            pull_after(&service, scope, replica, None, 15),
+            ServicePull::BaselineRequired { floor: 2 }
+        );
+        let ServiceBaseline::Artifact(baseline) =
+            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)
+        else {
+            panic!("state-bearing baseline expected")
+        };
+        let artifact = baseline.validate(scope).unwrap();
+        assert_eq!(artifact.baseline.position(), 2);
+        assert_eq!(artifact.documents.len(), 2);
+        let ServicePull::Page(recovered) = pull_after(
+            &service,
+            scope,
+            replica,
+            Some(baseline.checkpoint.clone()),
+            17,
+        ) else {
+            panic!("recovery suffix page expected")
         };
         assert_eq!(recovered.changes.len(), 2);
         assert_eq!(recovered.changes[0].bytes, tombstone_bytes);
@@ -2164,7 +2603,17 @@ mod tests {
                 ..
             }
         ));
-        let ServicePull::Page(page) = pull_after(&service, scope, replica, None, 13) else {
+        let ServiceBaseline::Artifact(baseline) = recover_at(&service, scope, replica, None, 13)
+        else {
+            panic!("state-bearing baseline expected")
+        };
+        let ServicePull::Page(page) = pull_after(
+            &service,
+            scope,
+            replica,
+            Some(baseline.checkpoint.clone()),
+            13,
+        ) else {
             panic!("page expected")
         };
         assert_eq!(page.changes.len(), 1);
@@ -2216,17 +2665,25 @@ mod tests {
             CheckpointCodec::new([25; 32], 10_000).unwrap(),
         );
         assert_eq!(
-            futures::executor::block_on(store.retention_floor(scope)).unwrap(),
+            lgwks_std::task::block_on(store.retention_floor(scope)).unwrap(),
             2
         );
         assert!(matches!(
-            futures::executor::block_on(store.snapshot_baseline(scope)).unwrap(),
+            lgwks_std::task::block_on(store.snapshot_baseline(scope)).unwrap(),
             Some(SnapshotRecord::State(ref baseline)) if baseline.position() == 2
         ));
         assert_eq!(
-            pull_after(&service, scope, replica, Some(stale_checkpoint), 15),
-            ServicePull::CheckpointExpired
+            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15),
+            ServicePull::BaselineRequired { floor: 2 }
         );
+        let ServiceBaseline::Artifact(baseline) =
+            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)
+        else {
+            panic!("state-bearing baseline must survive restart")
+        };
+        let artifact = baseline.validate(scope).unwrap();
+        assert_eq!(artifact.baseline.position(), 2);
+        assert_eq!(artifact.documents.len(), 2);
     }
 
     #[test]
@@ -2260,7 +2717,7 @@ mod tests {
             CheckpointCodec::new([26; 32], 10_000).unwrap(),
         );
         assert_eq!(
-            futures::executor::block_on(stale.seal_snapshot(
+            lgwks_std::task::block_on(stale.seal_snapshot(
                 scope,
                 0,
                 OperationDigest::new([61; 32]),
@@ -2270,7 +2727,7 @@ mod tests {
             SealResult::StaleAuthority
         );
         assert_eq!(
-            futures::executor::block_on(stale.mark_consumed(
+            lgwks_std::task::block_on(stale.mark_consumed(
                 scope,
                 0,
                 OperationDigest::new([62; 32]),
@@ -2280,7 +2737,7 @@ mod tests {
             ConsumedResult::StaleAuthority
         );
         assert_eq!(
-            futures::executor::block_on(stale.prune(
+            lgwks_std::task::block_on(stale.prune(
                 scope,
                 0,
                 None,
@@ -2296,7 +2753,7 @@ mod tests {
             CheckpointCodec::new([27; 32], 10_000).unwrap(),
         );
         assert!(matches!(
-            futures::executor::block_on(denied.prune(
+            lgwks_std::task::block_on(denied.prune(
                 scope,
                 0,
                 None,

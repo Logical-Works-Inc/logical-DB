@@ -72,7 +72,7 @@ allowed-dependency map must additionally declare the semantic edges
 |---|---|---|
 | Embedded app | `Database::open`, `open_default`, `open_with_schema`, `edit`, `read`, `query_index`, `changes_since`, `synchronize` | redb tables, key bytes, raw Automerge/FDB handles |
 | Structured state | `Reader::{get,get_index,conflicts,conflicts_at,keys,len,text}`, `Editor` map/list/text/counter methods | CRDT actor/op internals except opaque conflict IDs |
-| Projection schema | `Projection`, `IndexId`, `IndexValue`, nonzero schema version | reverse rows, ordered value encoding, rebuild mechanics |
+| Projection schema | `Projection`, `IndexId`, `ProjectionSemantics`, `IndexValue`, nonzero schema version | reverse rows, ordered value encoding, rebuild mechanics |
 | Thin client | `HttpTransport`, async `CredentialProvider`, `SyncLimits`, `SyncReport` | reqwest client, CBOR buffers, retry cursors |
 | HTTP service | `logical_db_server::router`, `Authenticator`, `Clock` | listener/TLS/process lifecycle, authorization headers |
 | Durable service | `ServiceStore::{frontier,accept,page}`, `RetentionStore::{build_snapshot,seal_snapshot,prune}`, `ExecutionGrant` | FDB database and transaction handles |
@@ -107,8 +107,11 @@ load snapshot + revision
 A wakeup may be dropped; `changes_since(cursor)` is the lossless recovery path.
 Remote pages materialize merged snapshots, indexes, newly observed events, and
 the replacement peer checkpoint in one transaction. A duplicate page appends no
-phantom events. Schema identity is bound before state is opened; drift returns a
-typed migration-required error instead of serving stale indexes.
+phantom events. Schema identity is bound before state is opened: the schema
+version and every `(IndexId, ProjectionSemantics)` pair are hashed into the
+durable digest, so drift returns a typed migration-required error instead of
+serving stale indexes, and changed projection semantics under the same index
+identity cannot silently reopen old rows.
 `Database::migrate_schema` records one exact target, scans snapshots in bounded
 document-ID order, rechecks each revision while replacing that document's index
 rows atomically, and advances its durable cursor in the same transaction. Normal

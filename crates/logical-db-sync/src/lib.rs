@@ -9,18 +9,25 @@
 use std::{error::Error, fmt, time::Duration};
 
 use logical_db_model::{
-    ChangeDigest, DocumentId, ModelError, NAMESPACE_CHECKPOINT_TTL_MS, NamespaceCheckpoint,
-    NamespaceCheckpoints, NamespacePolicy, NetworkCondition, OperationDigest, OperationId, PeerId,
-    ReplicaId, Scope, is_namespace_checkpoint_expired, validate_namespace,
+    ChangeDigest, DocumentId, MAX_BASELINE_BYTES, ModelError, NAMESPACE_CHECKPOINT_TTL_MS,
+    NamespaceCheckpoint, NamespaceCheckpoints, NamespacePolicy, NetworkCondition, OperationDigest,
+    OperationId, PeerId, ReplicaId, Scope, SnapshotArtifact, is_namespace_checkpoint_expired,
+    validate_namespace,
 };
 use logical_db_protocol::{
-    ChangeEnvelope, Checkpoint, PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest,
-    PushOutcome, PushRequest, PushResponse, RejectionCode,
+    BaselineAccumulator, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint,
+    PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
+    RejectionCode,
 };
 use sha2::{Digest, Sha256};
 
 /// Maximum pull pages processed by one foreground synchronization cycle.
 pub const MAX_PAGES_PER_CYCLE: usize = 32;
+
+/// Maximum baseline pages one recovery may request: the whole aggregate
+/// artifact at the smallest legal page (`MAX_BASELINE_DOCUMENTS` divided by
+/// `MAX_BASELINE_PAGE_DOCUMENTS`).
+pub const MAX_RECOVERY_PAGES: u16 = 256;
 
 /// One durable local change with its private acknowledgement position.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +101,21 @@ pub trait ReplicaPort {
         changes: &[InboundChange],
         checkpoint: &[u8],
     ) -> Result<(), Self::Error>;
+    /// Atomically installs a verified state-bearing baseline and its checkpoint.
+    ///
+    /// The artifact has already reproduced its sealed descriptor digest. A
+    /// replica must commit the document states and the replacement checkpoint
+    /// in one durable transition, leaving both unchanged on any failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the replica's validation, merge, or durable commit failure.
+    fn install_baseline(
+        &self,
+        peer: PeerId,
+        artifact: &SnapshotArtifact,
+        checkpoint: &[u8],
+    ) -> Result<(), Self::Error>;
 }
 
 /// Result of requesting one pull page.
@@ -103,6 +125,17 @@ pub enum PullResult {
     Page(PullPage),
     /// The service no longer recognizes the supplied checkpoint.
     CheckpointExpired,
+    /// The retained prefix was collected; the replica must install a baseline.
+    BaselineRequired,
+}
+
+/// Result of requesting the state-bearing recovery baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaselineResult {
+    /// A bounded state-bearing artifact and its replacement checkpoint.
+    Artifact(BaselinePage),
+    /// No baseline is sealed, so the durable log still covers every position.
+    Unavailable,
 }
 
 /// Network or in-process protocol transport.
@@ -123,6 +156,12 @@ pub trait Transport {
     ///
     /// Returns a transport-specific request or response failure.
     async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error>;
+    /// Downloads the state-bearing baseline a recovering replica must install.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-specific request or response failure.
+    async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error>;
 }
 
 /// Resource ceilings for one synchronization cycle.
@@ -134,6 +173,10 @@ pub struct SyncLimits {
     pub bytes_per_page: u32,
     /// Maximum pull pages before yielding to the host.
     pub pages_per_cycle: u8,
+    /// Maximum baseline pages one recovery may request before refusing.
+    pub recovery_pages: u16,
+    /// Maximum encoded baseline bytes one recovery may request before refusing.
+    pub recovery_bytes: u64,
 }
 
 impl Default for SyncLimits {
@@ -142,6 +185,8 @@ impl Default for SyncLimits {
             changes_per_page: 128,
             bytes_per_page: 4 * 1_048_576,
             pages_per_cycle: 16,
+            recovery_pages: MAX_RECOVERY_PAGES,
+            recovery_bytes: u64::from(MAX_RECOVERY_PAGES) * MAX_BASELINE_BYTES as u64,
         }
     }
 }
@@ -165,6 +210,14 @@ impl SyncLimits {
             eprintln!("logical-db-sync: pages per cycle exceeds the configured bound");
             return Err(ProtocolError::PageLimit);
         }
+        if self.recovery_pages == 0 || self.recovery_pages > MAX_RECOVERY_PAGES {
+            eprintln!("logical-db-sync: recovery pages exceeds the configured bound");
+            return Err(ProtocolError::PageLimit);
+        }
+        if self.recovery_bytes < MAX_BASELINE_BYTES as u64 {
+            eprintln!("logical-db-sync: recovery bytes cannot carry one legal page");
+            return Err(ProtocolError::PageLimit);
+        }
         Ok(self)
     }
 }
@@ -180,6 +233,8 @@ pub struct SyncReport {
     pub pages: usize,
     /// Whether an expired checkpoint forced a full pull.
     pub full_resync: bool,
+    /// Whether a state-bearing baseline was installed during this cycle.
+    pub recovered: bool,
     /// Whether unsent local changes or remote pages remain after this bounded cycle.
     pub more: bool,
 }
@@ -202,6 +257,8 @@ pub enum SyncError<ReplicaError, TransportError> {
     },
     /// Host requested cancellation between atomic operations.
     Cancelled,
+    /// Recovery exceeded its declared request or byte budget before completing.
+    RecoveryBudgetExhausted,
 }
 
 impl<R: fmt::Display, T: fmt::Display> fmt::Display for SyncError<R, T> {
@@ -219,6 +276,9 @@ impl<R: fmt::Display, T: fmt::Display> fmt::Display for SyncError<R, T> {
                 )
             }
             Self::Cancelled => formatter.write_str("synchronization was cancelled"),
+            Self::RecoveryBudgetExhausted => {
+                formatter.write_str("recovery exceeded its bounded request or byte budget")
+            }
         }
     }
 }
@@ -275,17 +335,24 @@ where
         .map_err(SyncError::Protocol)?;
     let mut restarted_after_expiry = false;
     while report.pages < usize::from(limits.pages_per_cycle) {
-        let Some(page) = pull_and_install(
-            replica,
-            peer,
-            transport,
-            limits,
-            &mut after,
-            &mut restarted_after_expiry,
-        )
-        .await?
+        let Some(page) = pull_and_install(replica, peer, transport, limits, &mut after).await?
         else {
-            report.full_resync = true;
+            if install_recovery(
+                replica,
+                peer,
+                transport,
+                &mut after,
+                &mut restarted_after_expiry,
+                limits,
+                &mut cancelled,
+                &mut report,
+            )
+            .await?
+            {
+                report.recovered = true;
+            } else {
+                report.full_resync = true;
+            }
             continue;
         };
         let inbound = page.changes.len();
@@ -413,7 +480,6 @@ async fn pull_and_install<R, T>(
     transport: &mut T,
     limits: SyncLimits,
     after: &mut Option<Checkpoint>,
-    restarted: &mut bool,
 ) -> Result<Option<PullPage>, SyncError<R::Error, T::Error>>
 where
     R: ReplicaPort,
@@ -434,15 +500,11 @@ where
         .map_err(SyncError::Transport)?;
     let page = match pulled {
         PullResult::Page(page) => page,
-        PullResult::CheckpointExpired if after.is_some() && !*restarted => {
-            *after = None;
-            *restarted = true;
-            return Ok(None);
-        }
-        PullResult::CheckpointExpired => {
-            eprintln!("logical-db-sync: checkpoint expired during synchronization");
+        PullResult::CheckpointExpired if after.is_none() => {
+            eprintln!("logical-db-sync: checkpoint expired without a durable checkpoint");
             return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
         }
+        PullResult::CheckpointExpired | PullResult::BaselineRequired => return Ok(None),
     };
     page.validate(replica.scope())
         .map_err(SyncError::Protocol)?;
@@ -461,6 +523,175 @@ where
     Ok(Some(page))
 }
 
+/// Installs the state-bearing baseline after the service collected the prefix.
+///
+/// Fetches one bounded page at a time, folds them into the descriptor identity,
+/// and installs the assembled document state plus its checkpoint in one durable
+/// replica transition. A page that repeats or skips a cursor, changes the
+/// descriptor, or reports no baseline mid-sequence is a loud protocol failure,
+/// never a partial install. `false` reports that no baseline is sealed for the
+/// scope, so the durable log still covers every position and the caller restarts
+/// from the floor.
+#[allow(clippy::too_many_arguments)]
+async fn install_recovery<R, T>(
+    replica: &R,
+    peer: PeerId,
+    transport: &mut T,
+    after: &mut Option<Checkpoint>,
+    restarted: &mut bool,
+    limits: SyncLimits,
+    cancelled: &mut impl FnMut() -> bool,
+    report: &mut SyncReport,
+) -> Result<bool, SyncError<R::Error, T::Error>>
+where
+    R: ReplicaPort,
+    T: Transport,
+{
+    if *restarted {
+        eprintln!("logical-db-sync: recovery requested twice in one cycle");
+        return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
+    }
+    *restarted = true;
+    if cancelled() {
+        eprintln!("logical-db-sync: recovery cancelled before the first page");
+        return Err(SyncError::Cancelled);
+    }
+    let BaselineResult::Artifact(page) =
+        request_baseline_page(transport, replica, after.as_ref(), None).await?
+    else {
+        *after = None;
+        return Ok(false);
+    };
+    let descriptor = page
+        .validate_page(replica.scope())
+        .map_err(SyncError::Protocol)?;
+    let declared = descriptor.document_count() as usize;
+    let mut accumulator = BaselineAccumulator::new(replica.scope(), descriptor);
+    let mut checkpoint = page.checkpoint.clone();
+    let mut fetched = 1usize;
+    let mut bytes = page_snapshot_bytes(&page);
+    let mut accumulated = page.documents.len();
+    if accumulated > declared || bytes > limits.recovery_bytes {
+        eprintln!("logical-db-sync: the first recovery page exceeds its declared bounds");
+        return Err(SyncError::RecoveryBudgetExhausted);
+    }
+    let mut complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
+    let mut cursor = page.next_document;
+    while !complete {
+        let Some(next) = cursor else {
+            eprintln!("logical-db-sync: a continued recovery carried no cursor");
+            return Err(SyncError::Protocol(ProtocolError::NonProgressPage));
+        };
+        if cancelled() {
+            eprintln!("logical-db-sync: recovery cancelled between baseline pages");
+            return Err(SyncError::Cancelled);
+        }
+        if fetched >= usize::from(limits.recovery_pages) {
+            eprintln!("logical-db-sync: recovery exceeded its page budget");
+            return Err(SyncError::RecoveryBudgetExhausted);
+        }
+        let BaselineResult::Artifact(page) =
+            request_baseline_page(transport, replica, after.as_ref(), Some(next)).await?
+        else {
+            eprintln!("logical-db-sync: a continued recovery reported no baseline");
+            return Err(SyncError::Protocol(ProtocolError::BaselineMismatch));
+        };
+        fetched += 1;
+        bytes = bytes
+            .checked_add(page_snapshot_bytes(&page))
+            .ok_or(SyncError::RecoveryBudgetExhausted)?;
+        accumulated = accumulated
+            .checked_add(page.documents.len())
+            .ok_or(SyncError::Protocol(ProtocolError::BaselineMismatch))?;
+        if accumulated > declared || bytes > limits.recovery_bytes {
+            eprintln!("logical-db-sync: recovery exceeded its declared bounds");
+            return Err(SyncError::RecoveryBudgetExhausted);
+        }
+        checkpoint = page.checkpoint.clone();
+        complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
+        cursor = page.next_document;
+    }
+    if cancelled() {
+        eprintln!("logical-db-sync: recovery cancelled before installing the baseline");
+        return Err(SyncError::Cancelled);
+    }
+    let artifact = accumulator.finish().map_err(SyncError::Protocol)?;
+    replica
+        .install_baseline(peer, &artifact, checkpoint.as_wire())
+        .map_err(SyncError::Replica)?;
+    *after = Some(checkpoint);
+    report.pages += fetched;
+    Ok(true)
+}
+
+/// Encoded snapshot bytes carried by one baseline page.
+fn page_snapshot_bytes(page: &BaselinePage) -> u64 {
+    page.documents
+        .iter()
+        .map(|document| document.snapshot.len() as u64)
+        .sum()
+}
+
+/// Requests exactly one bounded baseline page at one exclusive cursor.
+async fn request_baseline_page<R, T>(
+    transport: &mut T,
+    replica: &R,
+    after: Option<&Checkpoint>,
+    cursor: Option<DocumentId>,
+) -> Result<BaselineResult, SyncError<R::Error, T::Error>>
+where
+    R: ReplicaPort,
+    T: Transport,
+{
+    let request = BaselineRequest {
+        protocol: PROTOCOL_VERSION,
+        scope: replica.scope(),
+        replica: replica.replica(),
+        request: baseline_request_digest(replica.scope(), replica.replica(), after, cursor),
+        after: after.cloned(),
+        after_document: cursor,
+    };
+    request.validate().map_err(SyncError::Protocol)?;
+    fetch_baseline(transport, request)
+        .await
+        .map_err(SyncError::Transport)
+}
+
+async fn fetch_baseline<T: Transport>(
+    transport: &mut T,
+    request: BaselineRequest,
+) -> Result<BaselineResult, T::Error> {
+    transport.baseline(request).await
+}
+
+fn baseline_request_digest(
+    scope: Scope,
+    replica: ReplicaId,
+    after: Option<&Checkpoint>,
+    after_document: Option<DocumentId>,
+) -> OperationDigest {
+    let mut digest = Sha256::new();
+    digest.update(b"logical-db/baseline/v1");
+    digest.update(scope.account().as_uuid().as_bytes());
+    digest.update(scope.space().as_uuid().as_bytes());
+    digest.update(replica.as_uuid().as_bytes());
+    match after {
+        Some(checkpoint) => {
+            digest.update([1]);
+            digest.update(checkpoint.as_wire());
+        }
+        None => digest.update([0]),
+    }
+    match after_document {
+        Some(cursor) => {
+            digest.update([1]);
+            digest.update(cursor.as_uuid().as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    OperationDigest::new(digest.finalize().into())
+}
+
 struct NamespacePullContext<'a, F> {
     namespace: &'a str,
     is_mine: &'a F,
@@ -468,7 +699,7 @@ struct NamespacePullContext<'a, F> {
     now_unix_ms: u64,
     policy: NamespacePolicy,
     after: &'a mut Option<Checkpoint>,
-    restarted: &'a mut bool,
+    restarted_after_expiry: &'a mut bool,
 }
 
 async fn pull_namespace_page<R, T, F>(
@@ -503,16 +734,25 @@ where
         .map_err(NamespaceSyncError::Transport)?;
     let page = match pulled {
         PullResult::Page(page) => page,
-        PullResult::CheckpointExpired if context.after.is_some() && !*context.restarted => {
-            *context.after = None;
-            *context.restarted = true;
-            return Ok(None);
-        }
-        PullResult::CheckpointExpired => {
-            eprintln!("logical-db-sync: namespace checkpoint expired during pull");
+        PullResult::BaselineRequired => {
+            eprintln!("logical-db-sync: namespace recovery requires an unsupported baseline");
             return Err(NamespaceSyncError::Protocol(
                 ProtocolError::InvalidCheckpoint,
             ));
+        }
+        PullResult::CheckpointExpired => {
+            if *context.restarted_after_expiry {
+                eprintln!("logical-db-sync: namespace checkpoint expired twice in one cycle");
+                return Err(NamespaceSyncError::Protocol(
+                    ProtocolError::InvalidCheckpoint,
+                ));
+            }
+            *context.restarted_after_expiry = true;
+            eprintln!(
+                "logical-db-sync: namespace checkpoint expired; restarting from the floor once"
+            );
+            *context.after = None;
+            return Ok(None);
         }
     };
     page.validate(replica.scope())
@@ -726,7 +966,7 @@ where
     let start = namespace_start(replica, peer, namespace, now_unix_ms)?;
     let mut checkpoints = start.checkpoints;
     let mut after = start.after;
-    let mut restarted_after_expiry = start.restarted_after_expiry;
+    let mut restarted_after_expiry = false;
     if start.recovered {
         report.full_resync = true;
     }
@@ -738,7 +978,7 @@ where
             now_unix_ms,
             policy,
             after: &mut after,
-            restarted: &mut restarted_after_expiry,
+            restarted_after_expiry: &mut restarted_after_expiry,
         };
         let Some(page) = pull_namespace_page(replica, peer, transport, &mut context).await? else {
             report.full_resync = true;
@@ -873,7 +1113,6 @@ where
 struct NamespaceStart {
     checkpoints: NamespaceCheckpoints,
     after: Option<Checkpoint>,
-    restarted_after_expiry: bool,
     recovered: bool,
 }
 
@@ -894,12 +1133,10 @@ where
         Some(bytes) => NamespaceCheckpoints::decode(&bytes).map_err(NamespaceSyncError::Model)?,
     };
     let mut after = None;
-    let mut restarted_after_expiry = false;
     let mut recovered = false;
     if let Some(stored) = checkpoints.get(namespace) {
         if is_namespace_checkpoint_expired(stored, now_unix_ms) {
             recovered = true;
-            restarted_after_expiry = true;
         } else {
             after = Some(
                 Checkpoint::from_wire(stored.cursor().to_vec())
@@ -910,7 +1147,6 @@ where
     Ok(NamespaceStart {
         checkpoints,
         after,
-        restarted_after_expiry,
         recovered,
     })
 }
@@ -1636,7 +1872,7 @@ fn defer_transport<TransportError>(
 mod tests {
     use std::{convert::Infallible, future::Future};
 
-    use logical_db_model::{AccountId, SpaceId};
+    use logical_db_model::{AccountId, MAX_BASELINE_PAGE_DOCUMENTS, SpaceId};
     use logical_db_protocol::RejectionCode;
 
     use super::*;
@@ -1648,6 +1884,7 @@ mod tests {
         checkpoint: std::cell::RefCell<Option<Vec<u8>>>,
         acknowledged: std::cell::Cell<u64>,
         installed: std::cell::RefCell<Vec<InboundChange>>,
+        baselines: std::cell::RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
     }
 
     impl ReplicaPort for Replica {
@@ -1687,6 +1924,18 @@ mod tests {
             *self.checkpoint.borrow_mut() = Some(checkpoint.to_vec());
             Ok(())
         }
+        fn install_baseline(
+            &self,
+            _peer: PeerId,
+            artifact: &SnapshotArtifact,
+            checkpoint: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.baselines
+                .borrow_mut()
+                .push((artifact.baseline.encode().to_vec(), checkpoint.to_vec()));
+            *self.checkpoint.borrow_mut() = Some(checkpoint.to_vec());
+            Ok(())
+        }
     }
 
     struct Wire {
@@ -1707,6 +1956,12 @@ mod tests {
             _request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             std::future::ready(Ok(self.pulls.pop_front().unwrap()))
+        }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
         }
     }
 
@@ -1729,6 +1984,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(Some(vec![9])),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let new_checkpoint = Checkpoint::from_wire(vec![10]).unwrap();
         let mut wire = Wire {
@@ -1747,7 +2003,7 @@ mod tests {
             ]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -1765,6 +2021,7 @@ mod tests {
                 pulled: 0,
                 pages: 1,
                 full_resync: true,
+                recovered: false,
                 more: false
             }
         );
@@ -1790,6 +2047,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
             push: Some(PushResponse {
@@ -1802,7 +2060,7 @@ mod tests {
             pulls: std::collections::VecDeque::default(),
         };
         assert!(
-            matches!(futures::executor::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation)
+            matches!(lgwks_std::task::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation)
         );
         assert_eq!(replica.acknowledged.get(), 0);
     }
@@ -1829,6 +2087,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
             push: Some(PushResponse {
@@ -1838,7 +2097,7 @@ mod tests {
             pulls: std::collections::VecDeque::new(),
         };
         assert_eq!(
-            futures::executor::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))
+            lgwks_std::task::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))
                 .unwrap(),
             (1, true)
         );
@@ -1867,6 +2126,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
             push: Some(PushResponse {
@@ -1881,7 +2141,7 @@ mod tests {
             })]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -1905,6 +2165,7 @@ mod tests {
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
+            baselines: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1914,6 +2175,8 @@ mod tests {
             changes_per_page: logical_db_model::MAX_CHANGES_PER_PAGE.try_into().unwrap(),
             bytes_per_page: logical_db_model::MAX_PAGE_BYTES.try_into().unwrap(),
             pages_per_cycle: MAX_PAGES_PER_CYCLE.try_into().unwrap(),
+            recovery_pages: MAX_RECOVERY_PAGES,
+            recovery_bytes: u64::MAX,
         };
         assert_eq!(valid.validate(), Ok(valid));
         for invalid in [
@@ -1941,6 +2204,18 @@ mod tests {
                 pages_per_cycle: valid.pages_per_cycle + 1,
                 ..valid
             },
+            SyncLimits {
+                recovery_pages: 0,
+                ..valid
+            },
+            SyncLimits {
+                recovery_pages: valid.recovery_pages + 1,
+                ..valid
+            },
+            SyncLimits {
+                recovery_bytes: MAX_BASELINE_BYTES as u64 - 1,
+                ..valid
+            },
         ] {
             assert_eq!(invalid.validate(), Err(ProtocolError::PageLimit));
         }
@@ -1955,7 +2230,7 @@ mod tests {
             pulls: [PullResult::CheckpointExpired].into(),
         };
         assert!(matches!(
-            futures::executor::block_on(synchronize(
+            lgwks_std::task::block_on(synchronize(
                 &replica,
                 PeerId::new(),
                 &mut wire,
@@ -1965,6 +2240,348 @@ mod tests {
             Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint))
         ));
         assert!(replica.checkpoint.borrow().is_none());
+    }
+
+    struct RecoveryWire {
+        pulls: std::collections::VecDeque<PullResult>,
+        baseline: Option<BaselinePage>,
+    }
+
+    impl Transport for RecoveryWire {
+        type Error = Infallible;
+        fn push(
+            &mut self,
+            _request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
+            std::future::ready(Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: Vec::new(),
+            }))
+        }
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
+            std::future::ready(Ok(self.pulls.pop_front().unwrap()))
+        }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            let result = match self.baseline.take() {
+                Some(page) => BaselineResult::Artifact(page),
+                None => BaselineResult::Unavailable,
+            };
+            std::future::ready(Ok(result))
+        }
+    }
+
+    struct BudgetWire<'a> {
+        pages: std::collections::VecDeque<BaselinePage>,
+        requests: &'a std::cell::Cell<usize>,
+        cancel: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Transport for BudgetWire<'_> {
+        type Error = Infallible;
+
+        fn push(
+            &mut self,
+            _request: PushRequest,
+        ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
+            std::future::ready(Ok(PushResponse {
+                protocol: PROTOCOL_VERSION,
+                outcomes: Vec::new(),
+            }))
+        }
+
+        fn pull(
+            &mut self,
+            _request: PullRequest,
+        ) -> impl Future<Output = Result<PullResult, Self::Error>> {
+            std::future::ready(Ok(PullResult::BaselineRequired))
+        }
+
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            self.requests.set(self.requests.get() + 1);
+            let result = self
+                .pages
+                .pop_front()
+                .map_or(BaselineResult::Unavailable, BaselineResult::Artifact);
+            if self.requests.get() == 1 {
+                self.cancel.set(true);
+            }
+            std::future::ready(Ok(result))
+        }
+    }
+
+    fn paged_recovery_pages(scope: Scope) -> std::collections::VecDeque<BaselinePage> {
+        let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        let mut documents = (0..total)
+            .map(|_| logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        let artifact = SnapshotArtifact::new(scope, 7, documents.clone()).unwrap();
+        let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
+        let mut pages = std::collections::VecDeque::new();
+        pages.push_back(page_for(&artifact, first, true));
+        pages.push_back(page_for(&artifact, rest, false));
+        pages
+    }
+
+    #[test]
+    fn recovery_stops_between_pages_when_cancelled() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let pages = paged_recovery_pages(scope);
+        let requests = std::cell::Cell::new(0usize);
+        let cancel = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut wire = BudgetWire {
+            pages,
+            requests: &requests,
+            cancel: std::rc::Rc::clone(&cancel),
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || cancel.get(),
+        ));
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert_eq!(requests.get(), 1, "cancellation must stop the next fetch");
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "a cancelled recovery must install nothing"
+        );
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+    }
+
+    #[test]
+    fn recovery_refuses_to_exceed_its_page_budget_without_mutating_state() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let pages = paged_recovery_pages(scope);
+        let requests = std::cell::Cell::new(0usize);
+        let mut wire = BudgetWire {
+            pages,
+            requests: &requests,
+            cancel: std::rc::Rc::new(std::cell::Cell::new(false)),
+        };
+        let limits = SyncLimits {
+            recovery_pages: 1,
+            ..SyncLimits::default()
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            limits,
+            || false,
+        ));
+        assert!(matches!(result, Err(SyncError::RecoveryBudgetExhausted)));
+        assert_eq!(requests.get(), 1, "one page is the whole declared budget");
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "an exhausted recovery must install nothing"
+        );
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+    }
+
+    fn non_progressing_page(scope: Scope) -> BaselinePage {
+        let mut documents = (0..2)
+            .map(|_| logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        let artifact = SnapshotArtifact::new(scope, 5, documents.clone()).unwrap();
+        let mut page = page_for(&artifact, &documents, true);
+        // A continued page whose cursor points back inside the page body rather
+        // than strictly past it must be refused before the next fetch.
+        page.next_document = Some(documents[0].document);
+        page
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_a_page_cursor_does_not_advance() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let mut pages = std::collections::VecDeque::new();
+        pages.push_back(non_progressing_page(scope));
+        let requests = std::cell::Cell::new(0usize);
+        let mut wire = BudgetWire {
+            pages,
+            requests: &requests,
+            cancel: std::rc::Rc::new(std::cell::Cell::new(false)),
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || false,
+        ));
+        assert!(matches!(
+            result,
+            Err(SyncError::Protocol(ProtocolError::NonProgressPage))
+        ));
+        assert_eq!(
+            requests.get(),
+            1,
+            "a non-advancing cursor stops before a second fetch"
+        );
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "a non-advancing recovery must install nothing"
+        );
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+    }
+
+    fn recovery_page(scope: Scope, position: u64) -> BaselinePage {
+        let artifact = SnapshotArtifact::new(
+            scope,
+            position,
+            vec![logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![1, 2, 3],
+                tombstone: false,
+            }],
+        )
+        .unwrap();
+        BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: artifact.baseline.encode().to_vec(),
+            documents: artifact
+                .documents
+                .iter()
+                .map(|document| logical_db_protocol::BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
+            more: false,
+            next_document: None,
+        }
+    }
+
+    fn page_for(
+        artifact: &SnapshotArtifact,
+        slice: &[logical_db_model::SnapshotDocument],
+        more: bool,
+    ) -> BaselinePage {
+        BaselinePage {
+            protocol: PROTOCOL_VERSION,
+            descriptor: artifact.baseline.encode().to_vec(),
+            documents: slice
+                .iter()
+                .map(|document| logical_db_protocol::BaselineDocument {
+                    document: document.document,
+                    tombstone: document.tombstone,
+                    snapshot: document.snapshot.clone(),
+                })
+                .collect(),
+            checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
+            more,
+            next_document: if more {
+                slice.last().map(|document| document.document)
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn baseline_required_installs_state_before_the_suffix_commit() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let baseline = recovery_page(scope, 2);
+        let baseline_checkpoint = baseline.checkpoint.as_wire().to_vec();
+        let suffix_checkpoint = Checkpoint::from_wire(vec![10]).unwrap();
+        let mut wire = RecoveryWire {
+            pulls: [
+                PullResult::BaselineRequired,
+                PullResult::Page(PullPage {
+                    protocol: PROTOCOL_VERSION,
+                    changes: Vec::new(),
+                    checkpoint: suffix_checkpoint.clone(),
+                    more: false,
+                }),
+            ]
+            .into(),
+            baseline: Some(baseline),
+        };
+        let report = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || false,
+        ))
+        .unwrap();
+        assert!(report.recovered);
+        assert!(!report.full_resync);
+        assert_eq!(
+            report.pages, 2,
+            "the recovery page and the suffix page are both accounted"
+        );
+        let baselines = replica.baselines.borrow();
+        assert_eq!(baselines.len(), 1);
+        assert_eq!(baselines[0].1, baseline_checkpoint);
+        assert!(matches!(
+            logical_db_model::SnapshotBaseline::decode(&baselines[0].0),
+            Ok(logical_db_model::SnapshotRecord::State(baseline)) if baseline.position() == 2
+        ));
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(suffix_checkpoint.as_wire().to_vec())
+        );
+    }
+
+    #[test]
+    fn a_broken_paged_recovery_installs_nothing() {
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = empty_replica(scope);
+        *replica.checkpoint.borrow_mut() = Some(vec![9]);
+        let mut documents = (0..=logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS)
+            .map(|index| logical_db_model::SnapshotDocument {
+                document: DocumentId::new(),
+                snapshot: vec![u8::try_from(index % 251).unwrap() + 1],
+                tombstone: false,
+            })
+            .collect::<Vec<_>>();
+        documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
+        let artifact = SnapshotArtifact::new(scope, 3, documents.clone()).unwrap();
+        let (first, _rest) = documents.split_at(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
+        let mut wire = RecoveryWire {
+            pulls: [PullResult::BaselineRequired].into(),
+            baseline: Some(page_for(&artifact, first, true)),
+        };
+        let result = lgwks_std::task::block_on(synchronize(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            SyncLimits::default(),
+            || false,
+        ));
+        assert!(result.is_err());
+        assert!(replica.baselines.borrow().is_empty());
+        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
     }
 
     #[test]
@@ -1991,7 +2608,7 @@ mod tests {
             })]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -2028,7 +2645,7 @@ mod tests {
             })]
             .into(),
         };
-        let report = futures::executor::block_on(synchronize(
+        let report = lgwks_std::task::block_on(synchronize(
             &replica,
             PeerId::new(),
             &mut wire,
@@ -2152,6 +2769,14 @@ mod tests {
             *self.slot.borrow_mut() = Some(checkpoint.to_vec());
             Ok(())
         }
+        fn install_baseline(
+            &self,
+            _peer: PeerId,
+            _artifact: &SnapshotArtifact,
+            _checkpoint: &[u8],
+        ) -> Result<(), Self::Error> {
+            unreachable!("namespace synchronization fails closed before baseline installation")
+        }
     }
 
     struct LogChange {
@@ -2263,6 +2888,12 @@ mod tests {
                 more,
             })))
         }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
+        }
     }
 
     fn outbound(sequence: u64, document: DocumentId) -> OutboundChange {
@@ -2334,7 +2965,7 @@ mod tests {
             .iter()
             .find_map(|(document, namespace)| (*namespace == "quiet").then_some(*document))
             .unwrap();
-        let report = futures::executor::block_on(synchronize_namespace(
+        let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2362,7 +2993,7 @@ mod tests {
             PositionalLog::position_bytes(2)
         );
         assert!(map.get("chatty").is_none());
-        let rerun = futures::executor::block_on(synchronize_namespace(
+        let rerun = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2376,12 +3007,121 @@ mod tests {
     }
 
     #[test]
+    fn namespace_expiry_restarts_once_from_the_floor() {
+        let scope = log_scope();
+        let replica = NsReplica::fresh(scope, Vec::new());
+        let mut checkpoints = NamespaceCheckpoints::new();
+        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut restarted = false;
+        let is_mine = |_: DocumentId| true;
+        let mut wire =
+            ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
+        let mut context = NamespacePullContext {
+            namespace: "quiet",
+            is_mine: &is_mine,
+            checkpoints: &mut checkpoints,
+            now_unix_ms: 1_000,
+            policy: online_policy(16, 8),
+            after: &mut after,
+            restarted_after_expiry: &mut restarted,
+        };
+        let first = lgwks_std::task::block_on(pull_namespace_page(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            &mut context,
+        ))
+        .unwrap();
+        assert!(
+            first.is_none(),
+            "an ordinary expiry must restart instead of failing closed"
+        );
+        assert!(
+            *context.restarted_after_expiry,
+            "the bounded restart must be recorded"
+        );
+        assert!(
+            context.after.is_none(),
+            "the restart must pull from the floor"
+        );
+        let second = lgwks_std::task::block_on(pull_namespace_page(
+            &replica,
+            PeerId::new(),
+            &mut wire,
+            &mut context,
+        ))
+        .unwrap();
+        assert_eq!(second, Some((0, false)));
+    }
+
+    #[test]
+    fn namespace_repeated_expiry_and_baseline_required_fail_closed() {
+        let scope = log_scope();
+        let replica = NsReplica::fresh(scope, Vec::new());
+        let is_mine = |_: DocumentId| true;
+        let mut checkpoints = NamespaceCheckpoints::new();
+        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut restarted = true;
+        let mut expired = ScriptWire::with_pulls(vec![PullResult::CheckpointExpired]);
+        {
+            let mut context = NamespacePullContext {
+                namespace: "quiet",
+                is_mine: &is_mine,
+                checkpoints: &mut checkpoints,
+                now_unix_ms: 1_000,
+                policy: online_policy(16, 8),
+                after: &mut after,
+                restarted_after_expiry: &mut restarted,
+            };
+            assert!(matches!(
+                lgwks_std::task::block_on(pull_namespace_page(
+                    &replica,
+                    PeerId::new(),
+                    &mut expired,
+                    &mut context,
+                )),
+                Err(NamespaceSyncError::Protocol(
+                    ProtocolError::InvalidCheckpoint
+                ))
+            ));
+        }
+
+        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut restarted = false;
+        let mut baseline = ScriptWire::with_pulls(vec![PullResult::BaselineRequired]);
+        let mut context = NamespacePullContext {
+            namespace: "quiet",
+            is_mine: &is_mine,
+            checkpoints: &mut checkpoints,
+            now_unix_ms: 1_000,
+            policy: online_policy(16, 8),
+            after: &mut after,
+            restarted_after_expiry: &mut restarted,
+        };
+        assert!(matches!(
+            lgwks_std::task::block_on(pull_namespace_page(
+                &replica,
+                PeerId::new(),
+                &mut baseline,
+                &mut context,
+            )),
+            Err(NamespaceSyncError::Protocol(
+                ProtocolError::InvalidCheckpoint
+            ))
+        ));
+        assert!(
+            !*context.restarted_after_expiry,
+            "baseline-required must fail closed without spending the restart"
+        );
+    }
+
+    #[test]
     fn chatty_flood_never_blocks_quiet_convergence_or_upload() {
         let scope = log_scope();
         let (mut log, ownership) = log_with(scope, &["quiet"]);
         log.grow_per_pull = 20;
         let replica = NsReplica::fresh(scope, Vec::new());
-        let report = futures::executor::block_on(synchronize_namespace(
+        let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
@@ -2405,7 +3145,7 @@ mod tests {
         pending.push(quiet_change);
         let sender = NsReplica::fresh(scope, pending);
         let mut uplink = log_with(scope, &[]).0;
-        let send = futures::executor::block_on(send_namespace_now(
+        let send = lgwks_std::task::block_on(send_namespace_now(
             &sender,
             PeerId::new(),
             &mut uplink,
@@ -2435,7 +3175,7 @@ mod tests {
             .unwrap();
         replica.seed_map(&stale);
         let peer = PeerId::new();
-        let report = futures::executor::block_on(synchronize_namespace(
+        let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2456,7 +3196,7 @@ mod tests {
         expired_service.floor = u64::MAX;
         let fresh = NsReplica::fresh(scope, Vec::new());
         assert!(matches!(
-            futures::executor::block_on(synchronize_namespace(
+            lgwks_std::task::block_on(synchronize_namespace(
                 &fresh,
                 PeerId::new(),
                 &mut expired_service,
@@ -2477,7 +3217,7 @@ mod tests {
         let (mut log, ownership) = log_with(scope, &["quiet"; 6]);
         let replica = NsReplica::fresh(scope, Vec::new());
         let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
-        let deferred = futures::executor::block_on(synchronize_namespace(
+        let deferred = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
@@ -2494,7 +3234,7 @@ mod tests {
 
         let constrained =
             NamespacePolicy::new(2, 1_048_576, 8, NetworkCondition::Constrained).unwrap();
-        let partial = futures::executor::block_on(synchronize_namespace(
+        let partial = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
@@ -2516,7 +3256,7 @@ mod tests {
         let replica = NsReplica::fresh(scope, Vec::new());
         *replica.slot.borrow_mut() = Some(b"legacy-global-cursor".to_vec());
         assert!(matches!(
-            futures::executor::block_on(synchronize_namespace(
+            lgwks_std::task::block_on(synchronize_namespace(
                 &replica,
                 PeerId::new(),
                 &mut log,
@@ -2539,7 +3279,7 @@ mod tests {
         let (mut log, ownership) = log_with(scope, &["alpha", "beta", "alpha", "beta"]);
         let replica = NsReplica::fresh(scope, Vec::new());
         let peer = PeerId::new();
-        let alpha_report = futures::executor::block_on(synchronize_namespace(
+        let alpha_report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2552,7 +3292,7 @@ mod tests {
         assert_eq!(alpha_report.pages, 4);
         assert!(!alpha_report.more);
         assert!(replica.stored_map().get("beta").is_none());
-        let beta_report = futures::executor::block_on(synchronize_namespace(
+        let beta_report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2572,7 +3312,7 @@ mod tests {
             map.get("beta").unwrap().cursor(),
             PositionalLog::position_bytes(4)
         );
-        let quiet_rerun = futures::executor::block_on(synchronize_namespace(
+        let quiet_rerun = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
@@ -2595,7 +3335,7 @@ mod tests {
         let mut uplink = log_with(scope, &[]).0;
         uplink.reject_push = true;
         assert!(matches!(
-            futures::executor::block_on(send_namespace_now(
+            lgwks_std::task::block_on(send_namespace_now(
                 &replica,
                 PeerId::new(),
                 &mut uplink,
@@ -2657,6 +3397,12 @@ mod tests {
                 .pop_front()
                 .expect("orchestrator pulled past the scripted pages")))
         }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
+        }
     }
 
     fn scripted_page(
@@ -2709,6 +3455,7 @@ mod tests {
                 checkpoint: RefCell::new(None),
                 acknowledged: Cell::new(0),
                 installed: RefCell::new(Vec::new()),
+                baselines: RefCell::new(Vec::new()),
             },
             operations,
         )
@@ -2784,6 +3531,12 @@ mod tests {
                 more: false,
             })))
         }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
+        }
     }
 
     struct ServiceLog {
@@ -2857,6 +3610,12 @@ mod tests {
                 more,
             })))
         }
+        fn baseline(
+            &mut self,
+            _request: BaselineRequest,
+        ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
+            std::future::ready(Ok(BaselineResult::Unavailable))
+        }
     }
 
     #[test]
@@ -2909,7 +3668,7 @@ mod tests {
         let mut wire = ScriptWire::with_pulls(vec![scripted_empty_page(1), scripted_empty_page(2)]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.send_now(
+        let report = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits {
@@ -2950,7 +3709,7 @@ mod tests {
         ]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.fetch_now(
+        let report = lgwks_std::task::block_on(engine.fetch_now(
             &replica,
             &mut wire,
             SyncLimits {
@@ -2987,12 +3746,13 @@ mod tests {
             checkpoint: RefCell::new(Some(vec![9])),
             acknowledged: Cell::new(0),
             installed: RefCell::new(Vec::new()),
+            baselines: RefCell::new(Vec::new()),
         };
         let mut wire =
             ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.fetch_now(
+        let report = lgwks_std::task::block_on(engine.fetch_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3015,7 +3775,7 @@ mod tests {
         *fresh.checkpoint.borrow_mut() = Some(vec![9]);
         let mut retrying = orchestrator();
         assert!(matches!(
-            futures::executor::block_on(retrying.fetch_now(
+            lgwks_std::task::block_on(retrying.fetch_now(
                 &fresh,
                 &mut expired,
                 SyncLimits::default(),
@@ -3046,7 +3806,7 @@ mod tests {
             retry_after: &retry_after,
         };
         let mut engine = orchestrator();
-        let deferred = futures::executor::block_on(engine.send_now(
+        let deferred = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3062,7 +3822,7 @@ mod tests {
         assert_eq!(engine.state().not_ready_until_ms(), 50);
         assert!(wire.pushes.borrow().is_empty());
 
-        let gated = futures::executor::block_on(engine.send_now(
+        let gated = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3076,7 +3836,7 @@ mod tests {
         assert!(wire.pushes.borrow().is_empty());
         assert_eq!(wire.pulls_seen.get(), 0);
 
-        let recovered = futures::executor::block_on(engine.send_now(
+        let recovered = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             SyncLimits::default(),
@@ -3101,7 +3861,7 @@ mod tests {
         };
         let mut failing = orchestrator();
         assert!(matches!(
-            futures::executor::block_on(failing.send_now(
+            lgwks_std::task::block_on(failing.send_now(
                 &stuck,
                 &mut fatal,
                 SyncLimits::default(),
@@ -3133,7 +3893,7 @@ mod tests {
             changes_per_page: 1,
             ..SyncLimits::default()
         };
-        let partial = futures::executor::block_on(engine.send_now(
+        let partial = lgwks_std::task::block_on(engine.send_now(
             &replica,
             &mut wire,
             limits,
@@ -3148,7 +3908,7 @@ mod tests {
         let blob = engine.export_state();
         assert_eq!(OrchestratorState::decode(&blob).unwrap(), engine.state());
         let mut revived = SyncOrchestrator::restore(peer, policy, &blob).unwrap();
-        let resumed = futures::executor::block_on(revived.send_now(
+        let resumed = lgwks_std::task::block_on(revived.send_now(
             &replica,
             &mut wire,
             limits,
@@ -3159,7 +3919,7 @@ mod tests {
         .unwrap();
         assert_eq!(resumed.pushed, 1);
         assert!(resumed.more);
-        let finished = futures::executor::block_on(revived.send_now(
+        let finished = lgwks_std::task::block_on(revived.send_now(
             &replica,
             &mut wire,
             limits,
@@ -3191,7 +3951,7 @@ mod tests {
         let is_mine = |candidate| ownership.get(&candidate) == Some(&"quiet");
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
-        let report = futures::executor::block_on(engine.run_namespace(
+        let report = lgwks_std::task::block_on(engine.run_namespace(
             &replica,
             &mut log,
             &domain("quiet", online_policy(16, 8), 1_000),
@@ -3218,7 +3978,7 @@ mod tests {
 
         let pulls_before = log.pulls.get();
         let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
-        let parked = futures::executor::block_on(engine.run_namespace(
+        let parked = lgwks_std::task::block_on(engine.run_namespace(
             &replica,
             &mut log,
             &domain("quiet", offline, 2_000),
@@ -3250,6 +4010,7 @@ mod tests {
             checkpoint: RefCell::new(None),
             acknowledged: Cell::new(0),
             installed: RefCell::new(Vec::new()),
+            baselines: RefCell::new(Vec::new()),
         };
         let receiver = empty_replica(scope);
         let mut log = ServiceLog {
@@ -3262,7 +4023,7 @@ mod tests {
             ..SyncLimits::default()
         };
         let mut uplink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
-        let sent = futures::executor::block_on(uplink.send_now(
+        let sent = lgwks_std::task::block_on(uplink.send_now(
             &sender,
             &mut log,
             limits,
@@ -3275,7 +4036,7 @@ mod tests {
         assert!(!sent.more);
 
         let mut downlink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
-        let fetched = futures::executor::block_on(downlink.fetch_now(
+        let fetched = lgwks_std::task::block_on(downlink.fetch_now(
             &receiver,
             &mut log,
             limits,
@@ -3296,7 +4057,7 @@ mod tests {
         assert_eq!(installed_docs, vec![first_document, second_document]);
         assert_eq!(*log.pushes.borrow(), operations);
 
-        let quiet = futures::executor::block_on(downlink.send_now(
+        let quiet = lgwks_std::task::block_on(downlink.send_now(
             &receiver,
             &mut log,
             limits,
@@ -3308,7 +4069,7 @@ mod tests {
         assert_eq!(quiet.pushed, 0);
         assert_eq!(quiet.pulled, 0);
         assert!(!quiet.more);
-        let settled = futures::executor::block_on(uplink.fetch_now(
+        let settled = lgwks_std::task::block_on(uplink.fetch_now(
             &sender,
             &mut log,
             limits,

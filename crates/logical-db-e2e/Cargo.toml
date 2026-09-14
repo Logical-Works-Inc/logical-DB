@@ -11,14 +11,20 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+fdb = ["dep:logical-db-store-fdb", "logical-db-store-fdb/fdb"]
+
 [dependencies]
+lgwks_bot.workspace = true
 logical-db = { version = "0.1.0", path = "../logical-db", features = ["http", "semantics"] }
-tokio.workspace = true
+logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 ciborium.workspace = true
+lgwks_deps.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
@@ -27,5 +33,13 @@ logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 
-[lints]
-workspace = true
+# Mirrors the workspace lint set, but `unsafe_code` is `deny` rather than
+# `forbid` so the single FDB runtime boot FFI call can carry a scoped,
+# reviewed `#[allow(unsafe_code)]` exactly as `logical-db-daemon` does.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
