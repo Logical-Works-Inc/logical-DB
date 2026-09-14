@@ -21,10 +21,15 @@ pub const SNAPSHOT_BASELINE_LEGACY_BYTES: usize = 10;
 pub const MAX_BASELINE_PAGE_DOCUMENTS: usize = 256;
 /// Maximum documents in one complete sealed snapshot artifact.
 ///
-/// Aggregate payload is independently bounded by [`MAX_BASELINE_BYTES`]; this
-/// count bound keeps per-document identity and buffer overhead proportional to
-/// the payload bound instead of leaving it unbounded for tiny documents.
-pub const MAX_BASELINE_DOCUMENTS: usize = 65_536;
+/// Held at one page until the recovering client consumes continuation pages. A
+/// service that sealed a larger aggregate while a single-page client still
+/// demanded the whole artifact could prune a prefix that client can never
+/// install, so the ceiling stays here and is raised with the paging client.
+/// [`SnapshotArtifact::new`] and [`SnapshotBaseline::decode`] both consult this
+/// bound, so an oversized seal or descriptor is a fail-closed
+/// [`ModelError::SnapshotTooManyDocuments`]. Aggregate payload remains
+/// independently bounded by [`MAX_BASELINE_BYTES`].
+pub const MAX_BASELINE_DOCUMENTS: usize = MAX_BASELINE_PAGE_DOCUMENTS;
 /// Maximum aggregate snapshot payload bytes.
 pub const MAX_BASELINE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -707,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_accepts_a_baseline_larger_than_one_page() {
+    fn artifact_refuses_a_baseline_larger_than_one_page() {
         let scope = scope();
         let documents = (0..=MAX_BASELINE_PAGE_DOCUMENTS)
             .map(|index| SnapshotDocument {
@@ -716,10 +721,9 @@ mod tests {
                 tombstone: false,
             })
             .collect::<Vec<_>>();
-        let artifact = SnapshotArtifact::new(scope, 3, documents).unwrap();
         assert_eq!(
-            artifact.baseline.document_count() as usize,
-            MAX_BASELINE_PAGE_DOCUMENTS + 1
+            SnapshotArtifact::new(scope, 3, documents),
+            Err(ModelError::SnapshotTooManyDocuments)
         );
     }
 }

@@ -1551,11 +1551,11 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_folds_a_multi_page_baseline_and_refuses_gaps_and_shortfalls() {
+    fn accumulator_folds_pages_within_the_single_page_ceiling_and_refuses_overflow() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let documents = ordered_states(MAX_BASELINE_PAGE_DOCUMENTS + 44);
+        let documents = ordered_states(MAX_BASELINE_PAGE_DOCUMENTS);
         let artifact = SnapshotArtifact::new(scope, 11, documents.clone()).unwrap();
-        let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
+        let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS / 2);
         let first_page = paged_page(&artifact, first, true);
         let second_page = paged_page(&artifact, rest, false);
         let mut accumulator = BaselineAccumulator::new(scope, artifact.baseline.clone());
@@ -1570,5 +1570,19 @@ mod tests {
         let mut short = BaselineAccumulator::new(scope, artifact.baseline.clone());
         assert!(!short.push(&first_page).unwrap());
         assert_eq!(short.finish(), Err(ProtocolError::BaselineMismatch));
+
+        let overflow_documents = ordered_states(MAX_BASELINE_PAGE_DOCUMENTS + 1);
+        let (overflow_first, overflow_tail) =
+            overflow_documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
+        let mut overflow = BaselineAccumulator::new(scope, artifact.baseline.clone());
+        assert!(
+            !overflow
+                .push(&paged_page(&artifact, overflow_first, true))
+                .unwrap()
+        );
+        assert_eq!(
+            overflow.push(&paged_page(&artifact, overflow_tail, false)),
+            Err(ProtocolError::InvalidBaselineDocuments)
+        );
     }
 }

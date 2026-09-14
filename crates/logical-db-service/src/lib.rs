@@ -2241,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_pages_a_baseline_larger_than_one_page() {
+    fn recovery_serves_a_single_page_baseline_at_the_ceiling() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
@@ -2249,7 +2249,7 @@ mod tests {
             Allow,
             CheckpointCodec::new([6; 32], 100).unwrap(),
         );
-        let total = logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        let total = logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS;
         let changes = (0..total)
             .map(|index| {
                 envelope_with(
@@ -2268,35 +2268,17 @@ mod tests {
             SealResult::Sealed { .. }
         ));
 
-        let ServiceBaseline::Artifact(first) = recover_page_at(&service, scope, replica, None, 11)
+        let ServiceBaseline::Artifact(page) = recover_page_at(&service, scope, replica, None, 11)
         else {
             panic!("sealed baseline must be available");
         };
-        assert!(first.more);
+        assert!(!page.more);
+        assert_eq!(page.documents.len(), total);
+        assert!(page.next_document.is_none());
         assert_eq!(
-            first.documents.len(),
-            logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS
+            page.validate_page(scope).unwrap().document_count() as usize,
+            total
         );
-        let cursor = first
-            .next_document
-            .expect("continued page carries a cursor");
-        let ServiceBaseline::Artifact(second) =
-            recover_page_at(&service, scope, replica, Some(cursor), 12)
-        else {
-            panic!("continued baseline page must be available");
-        };
-        assert!(!second.more);
-        assert_eq!(second.documents.len(), 44);
-        assert_eq!(second.descriptor, first.descriptor);
-        assert!(second.next_document.is_none());
-
-        let mut accumulator = logical_db_protocol::BaselineAccumulator::new(
-            scope,
-            first.validate_page(scope).unwrap(),
-        );
-        assert!(!accumulator.push(&first).unwrap());
-        assert!(accumulator.push(&second).unwrap());
-        assert_eq!(accumulator.finish().unwrap().documents.len(), total);
     }
 
     fn seal_at<Store, Policy>(
