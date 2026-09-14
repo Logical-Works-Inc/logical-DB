@@ -124,7 +124,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         &documents,
     )?;
 
-    let status = spawn_consumer(
+    let mut rerun = spawn_consumer(
         &consumer_path,
         scope,
         consumer_replica,
@@ -132,8 +132,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         &endpoint,
         &ready,
         0,
-    )
-    .wait()?;
+    );
+    let status = rerun.wait()?;
     if !status.success() {
         eprintln!("fdb-process-kill-restore: the recovery rerun failed: {status:?}");
         return Err(io::Error::other("the recovery rerun did not succeed").into());
@@ -271,6 +271,33 @@ fn assert_recovered(
     Ok(())
 }
 
+/// Owns a spawned recovery consumer and terminates and reaps it on every path,
+/// so an early return or panic cannot leak a live child.
+struct ConsumerChild {
+    child: std::process::Child,
+}
+
+impl ConsumerChild {
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for ConsumerChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_consumer(
     path: &Path,
@@ -280,8 +307,8 @@ fn spawn_consumer(
     endpoint: &Url,
     ready: &Path,
     pause_ms: u64,
-) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_recovery_consumer"))
+) -> ConsumerChild {
+    let child = Command::new(env!("CARGO_BIN_EXE_recovery_consumer"))
         .arg(path)
         .arg(scope.account().to_string())
         .arg(scope.space().to_string())
@@ -292,10 +319,11 @@ fn spawn_consumer(
         .arg(ready)
         .arg(pause_ms.to_string())
         .spawn()
-        .expect("the recovery consumer must spawn")
+        .expect("the recovery consumer must spawn");
+    ConsumerChild { child }
 }
 
-fn await_ready(child: &mut std::process::Child, ready: &Path) -> Result<(), Box<dyn Error>> {
+fn await_ready(child: &mut ConsumerChild, ready: &Path) -> Result<(), Box<dyn Error>> {
     for _poll in 0..2_000 {
         if ready.exists() {
             return Ok(());
