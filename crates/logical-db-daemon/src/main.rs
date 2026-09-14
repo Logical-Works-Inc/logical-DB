@@ -261,13 +261,15 @@ mod tests {
     use logical_db_crdt::{Document, Object, Scalar};
     use logical_db_model::{
         ActionDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
+        SnapshotArtifact, SnapshotBaseline, SnapshotRecord,
     };
     use logical_db_protocol::{
         ChangeEnvelope, PROTOCOL_VERSION, PageAction, PullRequest, PushOutcome, PushRequest,
-        RejectionCode,
+        RecoveryAction, RejectionCode,
     };
     use logical_db_service::{
-        AcceptResult, Authority, CheckpointCodec, ExecutionGrant, PageResult, ProtocolService,
+        AcceptResult, Authority, BaselinePageResult, CheckpointCodec, ConsumedResult,
+        ExecutionGrant, PageResult, ProtocolService, PruneResult, RetentionStore, SealResult,
         ServiceError, ServiceStore,
     };
 
@@ -312,6 +314,84 @@ mod tests {
             _action: PageAction,
             _grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+    }
+
+    impl RetentionStore for RefusedStore {
+        fn consumed_through(
+            &self,
+            _scope: Scope,
+        ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn snapshot_baseline(
+            &self,
+            _scope: Scope,
+        ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn build_snapshot(
+            &self,
+            _scope: Scope,
+            _through: u64,
+        ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn read_baseline_page(
+            &self,
+            _action: &RecoveryAction,
+            _descriptor: &SnapshotBaseline,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn seal_snapshot(
+            &self,
+            _scope: Scope,
+            _artifact: &SnapshotArtifact,
+            _request: OperationDigest,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn mark_consumed(
+            &self,
+            _scope: Scope,
+            _through: u64,
+            _request: OperationDigest,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
+            std::future::poll_fn(|_| {
+                panic!("default composition refuses before the store is contacted")
+            })
+        }
+
+        fn prune(
+            &self,
+            _scope: Scope,
+            _up_to: u64,
+            _min_live: Option<u64>,
+            _request: OperationDigest,
+            _grant: &impl ExecutionGrant,
+        ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
             std::future::poll_fn(|_| {
                 panic!("default composition refuses before the store is contacted")
             })
