@@ -204,16 +204,21 @@ impl SnapshotArtifact {
             eprintln!("logical-db-model: SnapshotArtifact::new document count: {error}");
             ModelError::SnapshotTooLarge
         })?;
+        let admitted_bytes = documents.iter().try_fold(0usize, |total, document| {
+            total
+                .checked_add(document.snapshot.len())
+                .ok_or(ModelError::SnapshotTooLarge)
+        })?;
+        if admitted_bytes > MAX_BASELINE_BYTES {
+            let error = ModelError::SnapshotTooLarge;
+            eprintln!("logical-db-model: SnapshotArtifact::new aggregate admission: {error}");
+            return Err(error);
+        }
         let mut builder = SnapshotDigestBuilder::new(scope, position, u64::from(document_count));
         for document in &documents {
             builder.push(document)?;
         }
         let (digest, byte_len) = builder.finish()?;
-        if byte_len > MAX_BASELINE_BYTES {
-            let error = ModelError::SnapshotTooLarge;
-            eprintln!("logical-db-model: SnapshotArtifact::new aggregate bytes: {error}");
-            return Err(error);
-        }
         let byte_len = u32::try_from(byte_len).map_err(|error| {
             eprintln!("logical-db-model: SnapshotArtifact::new byte length: {error}");
             ModelError::SnapshotTooLarge
@@ -238,6 +243,11 @@ impl SnapshotArtifact {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HASHED_BODY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Incremental canonical digest over one ordered snapshot document sequence.
@@ -303,6 +313,8 @@ impl SnapshotDigestBuilder {
         self.previous = Some(document.document);
         frame(&mut self.digest, document.document.as_uuid().as_bytes());
         frame(&mut self.digest, &[u8::from(document.tombstone)]);
+        #[cfg(test)]
+        HASHED_BODY_BYTES.with(|bytes| bytes.set(bytes.get() + document.snapshot.len()));
         frame(&mut self.digest, &document.snapshot);
         Ok(())
     }
@@ -359,6 +371,30 @@ mod tests {
             snapshot: vec![1, 2, 3],
             tombstone: false,
         }
+    }
+    fn fixed_scope() -> Scope {
+        Scope::new(
+            AccountId::from_uuid(uuid::Uuid::from_bytes([0x11; 16])),
+            SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
+        )
+    }
+    fn fixed_doc(byte: u8, snapshot: Vec<u8>, tombstone: bool) -> SnapshotDocument {
+        SnapshotDocument {
+            document: DocumentId::from_uuid(uuid::Uuid::from_bytes([byte; 16])),
+            snapshot,
+            tombstone,
+        }
+    }
+    fn streamed_digest(
+        scope: Scope,
+        position: u64,
+        documents: &[SnapshotDocument],
+    ) -> BaselineDigest {
+        let mut builder = SnapshotDigestBuilder::new(scope, position, documents.len() as u64);
+        for document in documents {
+            builder.push(document).unwrap();
+        }
+        builder.finish().unwrap().0
     }
 
     #[test]
@@ -470,6 +506,183 @@ mod tests {
         }
         let (_, byte_len) = builder.finish().unwrap();
         assert_eq!(byte_len, MAX_BASELINE_DOCUMENTS + 1);
+    }
+
+    // The pre-existing `artifact_digest_has_a_portable_golden_encoding` case is
+    // the independent one-shot framing oracle. The vectors below were captured
+    // from the pre-change `SnapshotArtifact::new` implementation and frozen
+    // verbatim, so a shared framing bug cannot hide behind a test that compares
+    // two paths both built from `SnapshotDigestBuilder`.
+
+    #[test]
+    fn empty_stream_digest_has_a_portable_golden_encoding() {
+        let expected = [
+            130, 230, 239, 157, 28, 146, 21, 237, 58, 130, 114, 37, 199, 141, 221, 3, 67, 32, 213,
+            139, 84, 177, 203, 137, 131, 231, 122, 95, 237, 122, 239, 110,
+        ];
+        let artifact = SnapshotArtifact::new(fixed_scope(), 7, Vec::new()).unwrap();
+        assert_eq!(artifact.baseline.digest().into_bytes(), expected);
+        assert_eq!(artifact.baseline.byte_len(), 0);
+        assert_eq!(
+            streamed_digest(fixed_scope(), 7, &[]).into_bytes(),
+            expected
+        );
+    }
+
+    #[test]
+    fn tombstone_document_digest_has_a_portable_golden_encoding() {
+        let expected = [
+            5, 66, 153, 159, 247, 113, 46, 90, 156, 32, 147, 29, 186, 33, 186, 16, 110, 102, 164,
+            94, 143, 39, 240, 138, 131, 152, 248, 246, 240, 30, 33, 239,
+        ];
+        let documents = vec![fixed_doc(0x33, vec![1, 2, 3], true)];
+        let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone()).unwrap();
+        assert_eq!(artifact.baseline.digest().into_bytes(), expected);
+        assert_eq!(artifact.baseline.byte_len(), 3);
+        assert_eq!(
+            streamed_digest(fixed_scope(), 7, &documents).into_bytes(),
+            expected
+        );
+    }
+
+    #[test]
+    fn multi_document_stream_digest_has_a_portable_golden_encoding() {
+        let expected = [
+            54, 246, 36, 252, 204, 121, 238, 36, 81, 30, 162, 254, 219, 217, 50, 184, 253, 205,
+            145, 59, 5, 110, 244, 119, 114, 56, 3, 163, 157, 236, 92, 220,
+        ];
+        let documents = vec![
+            fixed_doc(0x33, vec![1, 2, 3], false),
+            fixed_doc(0x44, vec![4, 5, 6], true),
+            fixed_doc(0x55, vec![7, 8, 9], false),
+        ];
+        let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone()).unwrap();
+        assert_eq!(artifact.baseline.digest().into_bytes(), expected);
+        assert_eq!(artifact.baseline.byte_len(), 9);
+        assert_eq!(
+            streamed_digest(fixed_scope(), 7, &documents).into_bytes(),
+            expected
+        );
+    }
+
+    // Falsifiers: each hostile shape must either change the digest or be refused.
+
+    #[test]
+    fn streamed_digest_refuses_overlong_streams() {
+        let scope = scope();
+        let first = fixed_doc(0x33, vec![1], false);
+        let second = fixed_doc(0x44, vec![2], false);
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, 1);
+        builder.push(&first).unwrap();
+        builder.push(&second).unwrap();
+        assert_eq!(
+            builder.finish(),
+            Err(ModelError::SnapshotDescriptorMismatch)
+        );
+    }
+
+    #[test]
+    fn streamed_digest_refuses_zero_count_with_a_document() {
+        let scope = scope();
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, 0);
+        builder.push(&fixed_doc(0x33, vec![1], false)).unwrap();
+        assert_eq!(
+            builder.finish(),
+            Err(ModelError::SnapshotDescriptorMismatch)
+        );
+    }
+
+    #[test]
+    fn streamed_digest_refuses_empty_and_oversized_payloads() {
+        let scope = scope();
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, 2);
+        assert_eq!(
+            builder.push(&fixed_doc(0x33, Vec::new(), false)),
+            Err(ModelError::SnapshotDocumentInvalid)
+        );
+        assert_eq!(
+            builder.push(&fixed_doc(0x44, vec![0; MAX_BASELINE_BYTES + 1], false)),
+            Err(ModelError::SnapshotDocumentInvalid)
+        );
+        assert_eq!(
+            builder.finish(),
+            Err(ModelError::SnapshotDescriptorMismatch)
+        );
+    }
+
+    #[test]
+    fn streamed_digest_refuses_reverse_ordering_across_a_chunk_boundary() {
+        let scope = scope();
+        let higher = fixed_doc(0x55, vec![1], false);
+        let lower = fixed_doc(0x44, vec![2], false);
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, 2);
+        // The first chunk ends on the higher identity; the next chunk regresses.
+        builder.push(&higher).unwrap();
+        assert_eq!(
+            builder.push(&lower),
+            Err(ModelError::SnapshotDocumentsUnordered)
+        );
+    }
+
+    #[test]
+    fn streamed_digest_is_scope_position_and_tombstone_sensitive() {
+        let documents = [fixed_doc(0x33, vec![1, 2, 3], false)];
+        let base = streamed_digest(fixed_scope(), 7, &documents);
+        let other_scope = Scope::new(
+            AccountId::from_uuid(uuid::Uuid::from_bytes([0x12; 16])),
+            SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
+        );
+        assert_ne!(base, streamed_digest(other_scope, 7, &documents));
+        assert_ne!(base, streamed_digest(fixed_scope(), 8, &documents));
+        let tombstones = [fixed_doc(0x33, vec![1, 2, 3], true)];
+        assert_ne!(base, streamed_digest(fixed_scope(), 7, &tombstones));
+    }
+
+    #[test]
+    fn rejected_push_leaves_the_builder_usable_and_unchanged() {
+        let scope = scope();
+        let first = fixed_doc(0x33, vec![1], false);
+        let second = fixed_doc(0x44, vec![2], false);
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, 2);
+        builder.push(&first).unwrap();
+        assert_eq!(
+            builder.push(&first),
+            Err(ModelError::SnapshotDocumentsUnordered)
+        );
+        assert_eq!(
+            builder.push(&fixed_doc(0x44, Vec::new(), false)),
+            Err(ModelError::SnapshotDocumentInvalid)
+        );
+        // A rejected push is not folded: the next valid push still observes
+        // `first` as its predecessor and the builder finalizes the same stream
+        // a fresh builder would.
+        builder.push(&second).unwrap();
+        let mut fresh = SnapshotDigestBuilder::new(scope, 0, 2);
+        fresh.push(&first).unwrap();
+        fresh.push(&second).unwrap();
+        assert_eq!(builder.finish().unwrap(), fresh.finish().unwrap());
+    }
+
+    #[test]
+    fn caller_admits_aggregate_bytes_before_hashing_a_large_body() {
+        let scope = scope();
+        let start = HASHED_BODY_BYTES.with(std::cell::Cell::get);
+        SnapshotArtifact::new(scope, 0, vec![fixed_doc(0x33, vec![1, 2, 3], false)]).unwrap();
+        let after_small = HASHED_BODY_BYTES.with(std::cell::Cell::get);
+        assert_eq!(after_small, start + 3);
+        let documents = vec![
+            fixed_doc(0x33, vec![0xAB; MAX_BASELINE_BYTES], false),
+            fixed_doc(0x44, vec![0xCD; 1], false),
+        ];
+        assert_eq!(
+            SnapshotArtifact::new(scope, 0, documents),
+            Err(ModelError::SnapshotTooLarge)
+        );
+        assert_eq!(
+            HASHED_BODY_BYTES.with(std::cell::Cell::get),
+            after_small,
+            "aggregate admission must run before any document body is hashed"
+        );
     }
 
     #[test]
