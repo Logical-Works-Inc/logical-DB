@@ -64,3 +64,26 @@ pre-hardening head remain valid for the code they tested; every result above
 supersedes them for the current head. All runs executed on the Director's
 development machine; the ThinkPad Ryzen 3 acceptance floor remains unmeasured
 and no portability claim is made beyond the lanes listed here.
+
+## Follow-up: self-hosted runner execution (2026-09-15)
+
+The `logical-db-local` self-hosted runner executed the two new lanes on the
+PR head. Executed runs, all against the exact PR head `4e07c7e9`:
+
+| run | lanes | result |
+|---|---|---|
+| [34910156966](https://github.com/srinji-kaggss/logical-DB/actions/runs/34910156966) | selfhosted-quality, selfhosted-fdb-composition | **both success** (first execution; hosted lanes billing-blocked) |
+| [34910937956](https://github.com/srinji-kaggss/logical-DB/actions/runs/34910937956) | selfhosted-quality, selfhosted-fdb-composition | **both success** (workflow_dispatch) |
+| [34912714579](https://github.com/srinji-kaggss/logical-DB/actions/runs/34912714579) | selfhosted-quality, selfhosted-fdb-composition | **both success** (workflow_dispatch) |
+| [34914317662](https://github.com/srinji-kaggss/logical-DB/actions/runs/34914317662) | selfhosted-quality | failed once (runner connection drop mid-job, job cancelled), **success on rerun**; selfhosted-fdb-composition **success** |
+
+The one failure was a transient runner connection drop 30 seconds into the
+workspace-test step; the identical step passed on rerun and in both prior
+runs. Root cause of the drop is unresolved from retained evidence.
+
+Runner lifecycle (machine-side, not repository content): the runner is
+ephemeral and on-demand. It is registered fresh for each run, takes one job,
+deregisters itself, and exits; a launchd watcher starts it only when a queued
+job carries the self-hosted label and kills it after 30 minutes without job
+activity. Between runs there is no listener process, no registration, and no
+local state. Idle RAM cost of the logical-db runner: zero.
