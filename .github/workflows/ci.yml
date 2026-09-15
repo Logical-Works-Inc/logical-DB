@@ -183,3 +183,110 @@ jobs:
             --test fdb_recovery_composition -- --nocapture
           cargo test -p logical-db-e2e --features fdb --locked \
             --test fdb_process_kill_restore -- --nocapture
+
+  selfhosted-quality:
+    name: self-hosted macos arm64 / test-clippy
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: toolchain identity
+        shell: bash
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version --verbose
+      - name: compile all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: dependency register
+        run: cargo test -p logical-db-e2e --locked --test dependency_contract
+      - name: test runtime and restart journeys
+        run: cargo test --workspace --locked
+      - name: lint with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: check formatting
+        run: cargo fmt --all -- --check
+
+  selfhosted-fdb-composition:
+    name: self-hosted official FDB client / daemon feature
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: stage checksummed FoundationDB 7.3.77 arm64 client and server
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fdb_root="${RUNNER_TEMP}/foundationdb-7.3.77"
+          mkdir -p "${fdb_root}"
+          pkg_asset="FoundationDB-7.3.77_arm64.pkg"
+          curl --fail --location --retry 5 \
+            "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}" \
+            --output "${fdb_root}/${pkg_asset}"
+          curl --fail --location --retry 5 \
+            "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}.sha256" \
+            --output "${fdb_root}/${pkg_asset}.sha256"
+          (cd "${fdb_root}" && shasum -a 256 --check "${pkg_asset}.sha256")
+          pkgutil --expand-full "${fdb_root}/${pkg_asset}" "${fdb_root}/expanded"
+          libdir="${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/lib"
+          srvdir="${fdb_root}/expanded/FoundationDB-server.pkg/Payload/usr/local/libexec"
+          clidir="${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/bin"
+          chmod +x "${srvdir}/fdbserver" "${clidir}/fdbcli"
+          echo "FDB_LIBRARY_ROOT=${libdir}" >> "${GITHUB_ENV}"
+          echo "FDB_SERVER_BIN=${srvdir}/fdbserver" >> "${GITHUB_ENV}"
+          echo "FDB_CLI_BIN=${clidir}/fdbcli" >> "${GITHUB_ENV}"
+      - name: compile, lint, and test optional composition
+        shell: bash
+        run: |
+          export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
+          cargo check -p logical-db-store-fdb --features fdb --locked
+          cargo check -p logical-db-e2e --features fdb --all-targets --locked
+          cargo clippy -p logical-db-daemon --features fdb --all-targets --locked -- -D warnings
+          cargo clippy -p logical-db-e2e --features fdb --all-targets --locked -- -D warnings
+          cargo test -p logical-db-store-fdb --features fdb --locked
+          cargo test -p logical-db-daemon --features fdb --locked
+      - name: run retained FDB ambiguity journey
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
+          live_root="${RUNNER_TEMP}/logical-db-fdb-live"
+          mkdir -p "${live_root}/data" "${live_root}/logs"
+          cluster_file="${live_root}/fdb.cluster"
+          echo "logicaldb:ci@127.0.0.1:4650" > "${cluster_file}"
+          "${FDB_SERVER_BIN}" \
+            -p 127.0.0.1:4650 -C "${cluster_file}" \
+            -d "${live_root}/data" -L "${live_root}/logs" \
+            --memory 1GiB --cache-memory 256MiB --storage-memory 256MiB &
+          fdb_pid=$!
+          cleanup() {
+            kill "${fdb_pid}" 2>/dev/null || true
+            wait "${fdb_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _attempt in {1..40}; do
+            if "${FDB_CLI_BIN}" -C "${cluster_file}" \
+              --exec "configure new single memory"; then break; fi
+            sleep 1
+          done
+          for _attempt in {1..40}; do
+            status=$("${FDB_CLI_BIN}" -C "${cluster_file}" \
+              --exec "status minimal" 2>&1 || true)
+            if grep --fixed-strings --line-regexp --quiet \
+              "The database is available." <<< "${status}"; then
+              echo "${status}"
+              break
+            fi
+            if [[ "${_attempt}" == 40 ]]; then
+              echo "${status}"
+              exit 1
+            fi
+            sleep 1
+          done
+          export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
+          cargo run -p logical-db-daemon --bin fdb-ambiguity-journey \
+            --features fdb --locked
+          cargo test -p logical-db-e2e --features fdb --locked \
+            --test fdb_recovery_composition -- --nocapture
+          cargo test -p logical-db-e2e --features fdb --locked \
+            --test fdb_process_kill_restore -- --nocapture
