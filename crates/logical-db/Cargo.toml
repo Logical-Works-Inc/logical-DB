@@ -27,6 +27,7 @@ logical-db-store = { version = "0.1.0", path = "../logical-db-store" }
 logical-db-sync = { version = "0.1.0", path = "../logical-db-sync" }
 sha2.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 lgwks_std.workspace = true

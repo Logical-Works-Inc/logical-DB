@@ -59,6 +59,18 @@ pub use logical_db_cairn;
 #[cfg(feature = "semantics")]
 pub use logical_db_episode;
 
+/// One-import surface for the everyday embedded application API.
+pub mod prelude {
+    pub use crate::{
+        Database, DatabaseError, DuplicateReceipt, EditOutcome, EditReceipt, content_digest,
+    };
+    pub use logical_db_crdt::{Editor, Item, Object, ObjectKind, Reader, Scalar};
+    pub use logical_db_model::{
+        AccountId, ChangeDigest, DocumentId, IndexEntry, IndexId, IndexValue, OperationDigest,
+        OperationId, ReplicaId, Scope, SpaceId,
+    };
+}
+
 /// Types required only by hosts implementing a custom synchronization transport.
 pub mod transport {
     pub use logical_db_protocol::{
@@ -407,6 +419,124 @@ impl Database {
             },
             report,
         ))
+    }
+
+    /// Opens (or reopens) a local application database with library-managed
+    /// identity.
+    ///
+    /// The first call mints one [`Scope`] and one [`ReplicaId`], records them
+    /// in a `<path>.identity` sidecar flushed to storage before the embedded
+    /// store is created, and opens the database. Later calls read the sidecar
+    /// and reopen the same durable identity, so restarts keep one replica. The
+    /// sidecar is a fixed-format record: corruption is refused loudly instead
+    /// of re-identifying, and deleting the sidecar over an existing store
+    /// surfaces the store's own replica mismatch instead of minting a second
+    /// replica.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use logical_db::prelude::*;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let path = std::env::temp_dir().join("logical-db-quickstart.redb");
+    /// let database = Database::open_local(&path)?;
+    /// let document = DocumentId::new();
+    /// database.put_value(document, "greeting", Scalar::String("hello".into()))?;
+    /// assert_eq!(
+    ///     database.get_value(document, "greeting")?,
+    ///     Some(Scalar::String("hello".into()))
+    /// );
+    /// # drop(database);
+    /// # std::fs::remove_file(&path).ok();
+    /// # std::fs::remove_file(path.with_file_name(format!("{}.identity", path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default()))).ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns sidecar I/O failures and embedded store open failures.
+    pub fn open_local(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        use std::io::Write as _;
+        let path = path.as_ref();
+        let sidecar = identity_sidecar_path(path);
+        match std::fs::read(&sidecar) {
+            Ok(bytes) => {
+                let (scope, replica) = decode_identity_sidecar(&bytes)?;
+                Database::open(path, scope, replica)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let scope = Scope::new(AccountId::new(), SpaceId::new());
+                let replica = ReplicaId::new();
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&sidecar)
+                {
+                    Ok(mut sidecar_file) => {
+                        sidecar_file.write_all(&encode_identity_sidecar(scope, replica))?;
+                        sidecar_file.sync_all()?;
+                        drop(sidecar_file);
+                        Database::open(path, scope, replica)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let bytes = std::fs::read(&sidecar)?;
+                        let (scope, replica) = decode_identity_sidecar(&bytes)?;
+                        Database::open(path, scope, replica)
+                    }
+                    Err(error) => Err(DatabaseError::Io(error)),
+                }
+            }
+            Err(error) => Err(DatabaseError::Io(error)),
+        }
+    }
+
+    /// Puts one scalar at the document root under `key` as one new durable
+    /// operation.
+    ///
+    /// Each call carries a fresh operation identity, so there is no
+    /// request-level duplicate detection at this sugar layer; repeated puts of
+    /// equal content converge through the document CRDT. The request digest is
+    /// [`content_digest`] of the document, key, and value.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured document or storage failures from
+    /// [`Database::edit`].
+    pub fn put_value(
+        &self,
+        document: DocumentId,
+        key: &str,
+        value: Scalar,
+    ) -> Result<EditOutcome<()>, DatabaseError> {
+        let request = content_digest(document, key, &value);
+        self.edit(document, OperationId::new(), request, |editor| {
+            editor.put(&Object::root(), key, value)
+        })
+    }
+
+    /// Reads one scalar at the document root under `key`.
+    ///
+    /// Returns `None` for a never-created document, an absent key, or a
+    /// non-scalar value at the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured document or storage failures from
+    /// [`Database::read`].
+    pub fn get_value(
+        &self,
+        document: DocumentId,
+        key: &str,
+    ) -> Result<Option<Scalar>, DatabaseError> {
+        Ok(self
+            .read(document, |reader| reader.get(&Object::root(), key))?
+            .flatten()
+            .and_then(|item| match item {
+                Item::Scalar(value) => Some(value),
+                Item::Object { .. } => None,
+            }))
     }
 
     /// Returns the logical ownership scope fixed when this handle opened.
@@ -1833,6 +1963,111 @@ fn check_restore_coverage(
     Ok(documented)
 }
 
+const IDENTITY_SIDECAR_MAGIC: [u8; 4] = *b"LDBI";
+const IDENTITY_SIDECAR_VERSION: u8 = 1;
+const IDENTITY_SIDECAR_BYTES: usize = 53;
+
+/// Derives one operation request digest from canonical content bytes.
+///
+/// The digest is SHA-256 over the document identity, the property key, and a
+/// tagged scalar encoding, so equal content yields equal request identity and
+/// any content difference yields a different digest.
+#[must_use]
+pub fn content_digest(document: DocumentId, key: &str, value: &Scalar) -> OperationDigest {
+    OperationDigest::new(Sha256::digest(canonical_value_bytes(document, key, value)).into())
+}
+
+fn canonical_value_bytes(document: DocumentId, key: &str, value: &Scalar) -> Vec<u8> {
+    fn push_bounded_field(bytes: &mut Vec<u8>, field: &[u8]) {
+        let length = u32::try_from(field.len()).expect("field length is bounded by validation");
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(document.as_uuid().as_bytes());
+    push_bounded_field(&mut bytes, key.as_bytes());
+    match value {
+        Scalar::Null => bytes.push(0),
+        Scalar::Boolean(inner) => {
+            bytes.push(1);
+            bytes.push(u8::from(*inner));
+        }
+        Scalar::Integer(inner) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&inner.to_be_bytes());
+        }
+        Scalar::Unsigned(inner) => {
+            bytes.push(3);
+            bytes.extend_from_slice(&inner.to_be_bytes());
+        }
+        Scalar::Number(inner) => {
+            bytes.push(4);
+            bytes.extend_from_slice(&inner.to_bits().to_be_bytes());
+        }
+        Scalar::String(inner) => {
+            bytes.push(5);
+            push_bounded_field(&mut bytes, inner.as_bytes());
+        }
+        Scalar::Bytes(inner) => {
+            bytes.push(6);
+            push_bounded_field(&mut bytes, inner);
+        }
+        Scalar::Counter(inner) => {
+            bytes.push(7);
+            bytes.extend_from_slice(&inner.to_be_bytes());
+        }
+        Scalar::Timestamp(inner) => {
+            bytes.push(8);
+            bytes.extend_from_slice(&inner.to_be_bytes());
+        }
+        Scalar::Unknown {
+            type_code,
+            bytes: inner,
+        } => {
+            bytes.push(9);
+            bytes.push(*type_code);
+            push_bounded_field(&mut bytes, inner);
+        }
+    }
+    bytes
+}
+
+fn identity_sidecar_path(path: &Path) -> std::path::PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".identity");
+    std::path::PathBuf::from(sidecar)
+}
+
+fn encode_identity_sidecar(scope: Scope, replica: ReplicaId) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(IDENTITY_SIDECAR_BYTES);
+    bytes.extend_from_slice(&IDENTITY_SIDECAR_MAGIC);
+    bytes.push(IDENTITY_SIDECAR_VERSION);
+    bytes.extend_from_slice(scope.account().as_uuid().as_bytes());
+    bytes.extend_from_slice(scope.space().as_uuid().as_bytes());
+    bytes.extend_from_slice(replica.as_uuid().as_bytes());
+    bytes
+}
+
+fn decode_identity_sidecar(bytes: &[u8]) -> Result<(Scope, ReplicaId), DatabaseError> {
+    if bytes.len() != IDENTITY_SIDECAR_BYTES
+        || bytes[..4] != IDENTITY_SIDECAR_MAGIC
+        || bytes[4] != IDENTITY_SIDECAR_VERSION
+    {
+        eprintln!("logical-db: open_local: identity sidecar is corrupt");
+        return Err(DatabaseError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "logical-db identity sidecar is corrupt",
+        )));
+    }
+    let account = uuid::Uuid::from_slice(&bytes[5..21]).expect("sidecar slice length is checked");
+    let space = uuid::Uuid::from_slice(&bytes[21..37]).expect("sidecar slice length is checked");
+    let replica = uuid::Uuid::from_slice(&bytes[37..53]).expect("sidecar slice length is checked");
+    Ok((
+        Scope::new(AccountId::from_uuid(account), SpaceId::from_uuid(space)),
+        ReplicaId::from_uuid(replica),
+    ))
+}
+
 fn export_identity(payload: &[u8]) -> [u8; 32] {
     Sha256::digest(payload).into()
 }
@@ -1990,6 +2225,96 @@ mod tests {
         {
             std::future::ready(Ok(transport::BaselineResult::Unavailable))
         }
+    }
+
+    fn local_sidecar(path: &Path) -> std::path::PathBuf {
+        identity_sidecar_path(path)
+    }
+
+    #[test]
+    fn open_local_reopens_with_one_durable_identity_and_readable_values() {
+        let path = path();
+        let document = DocumentId::new();
+        let (first_scope, first_replica) = {
+            let database = Database::open_local(&path).unwrap();
+            database
+                .put_value(document, "greeting", Scalar::String("hello".into()))
+                .unwrap();
+            (database.scope(), database.replica())
+        };
+        let reopened = Database::open_local(&path).unwrap();
+        assert_eq!(reopened.scope(), first_scope);
+        assert_eq!(reopened.replica(), first_replica);
+        assert_eq!(
+            reopened.get_value(document, "greeting").unwrap(),
+            Some(Scalar::String("hello".into()))
+        );
+        drop(reopened);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(local_sidecar(&path)).unwrap();
+    }
+
+    #[test]
+    fn open_local_refuses_a_corrupt_identity_sidecar_instead_of_reidentifying() {
+        let path = path();
+        {
+            Database::open_local(&path).unwrap();
+        }
+        fs::write(local_sidecar(&path), b"garbage").unwrap();
+        let Err(error) = Database::open_local(&path) else {
+            panic!("a corrupt identity sidecar must refuse to open");
+        };
+        assert!(matches!(
+            error,
+            DatabaseError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData
+        ));
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(local_sidecar(&path)).unwrap();
+    }
+
+    #[test]
+    fn put_and_get_value_round_trip_overwrite_and_missing_documents() {
+        let path = path();
+        let database = Database::open_local(&path).unwrap();
+        let document = DocumentId::new();
+        database
+            .put_value(document, "count", Scalar::Unsigned(1))
+            .unwrap();
+        database
+            .put_value(document, "count", Scalar::Unsigned(2))
+            .unwrap();
+        assert_eq!(
+            database.get_value(document, "count").unwrap(),
+            Some(Scalar::Unsigned(2))
+        );
+        assert_eq!(
+            database.get_value(DocumentId::new(), "count").unwrap(),
+            None
+        );
+        assert_eq!(database.get_value(document, "missing").unwrap(), None);
+        drop(database);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(local_sidecar(&path)).unwrap();
+    }
+
+    #[test]
+    fn content_digest_is_deterministic_and_content_sensitive() {
+        let document = DocumentId::new();
+        let first = content_digest(document, "key", &Scalar::String("v".into()));
+        let again = content_digest(document, "key", &Scalar::String("v".into()));
+        assert_eq!(first, again);
+        assert_ne!(
+            first,
+            content_digest(document, "key", &Scalar::String("w".into()))
+        );
+        assert_ne!(
+            first,
+            content_digest(document, "other", &Scalar::String("v".into()))
+        );
+        assert_ne!(
+            first,
+            content_digest(DocumentId::new(), "key", &Scalar::String("v".into()))
+        );
     }
 
     #[test]
