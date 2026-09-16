@@ -53,24 +53,26 @@ asserted separately. Persistent acknowledgement/checkpoint invariance still
 needs execution through the existing sync/recovery composition lanes; these
 transport tests are not a substitute for that storage evidence.
 
-## Required execution before promotion
+## Execution record — 2026-09-16 local receipts
 
-No Rust build, rustfmt, clippy, test, mutation campaign, rewrite verifier, or FDB
-journey was run for this patch. This environment has no Rust toolchain and its
-shell cannot resolve GitHub. GOVERNANCE.md records account-billing-blocked
-hosted CI; this patch does not alter or bypass that gate. Keep the PR draft and
-#54 open until exact-head reproduction is recorded, including measured timings.
+Executed on the Director's development machine (`rustc 1.98.0 (88d9e12ae
+2026-08-18)`, `aarch64-apple-darwin`), working tree clean at
+`3a7aa84caf1c34788cc517e1887272314deec332` plus this docs-only commit; no
+Rust or lockfile bytes change after the receipts below.
 
-```sh
-cargo fmt --all -- --check
-cargo clippy --locked -p logical-db-http --all-targets -- -D warnings
-cargo test --locked -p logical-db-http tests::deadlines -- --nocapture
-cargo test --locked -p logical-db-http
-cargo test --locked -p logical-db-e2e
-python3 scripts/verify-rewrite.py
-```
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed (exit 0) |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed (exit 0) after one hardening commit: the `Late` fixture's `async fn` tripped `clippy::unused_async_trait_impl` under `-D warnings`; converted to `fn -> impl Future` + `std::future::ready` with identical poll-time semantics |
+| `cargo test --workspace --locked` | passed (exit 0, 44 suites, 0 failed) |
+| `cargo test --locked -p logical-db-http` | passed: 20/0 including all seven deadline tests |
+| `python3 scripts/verify-rewrite.py` | `PASS clean-room rewrite evidence gates` (exit 0) |
+| Mutation control (refresh deadline removed, reverted) | `pending_credentials_timeout_without_dispatch_on_every_route` and `late_ready_credentials_are_refused_before_dispatch` both FAILED (5/2); restored head: 7/0 |
+| Self-hosted CI reproduction on the exact head | executed in CI run for this branch; see PR checks |
+| Local FDB composition | not executed this session (no staged FDB binaries at hand); the self-hosted FDB lane covers the recovery journeys |
+| Measured timings | the shared-budget test asserts elapsed within its declared [500 ms, 1 s) tolerance and passes; no independent timing instrumentation was added |
 
-Also run the existing HTTP/FDB recovery composition on the provisioned FDB lane.
-Counterfactual checks should remove the refresh timeout, reset the deadline
-after refresh, omit body coverage, and omit the late-ready guard individually;
-each corresponding regression must fail. No counterfactual execution is claimed.
+Hosted Linux/macOS/Windows lanes remain billing-blocked on this account; that
+limitation is unchanged by this patch. The first local clippy rerun was wrongly
+reported clean because its output was filtered without capturing the exit
+code; the deterministic lint was caught and fixed on the next full run.
