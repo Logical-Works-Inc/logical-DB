@@ -294,11 +294,13 @@ fn expired_deadline_never_polls_the_next_stage() {
 fn late_ready_credentials_are_refused_before_dispatch() {
     struct Late;
     impl CredentialProvider for Late {
-        async fn authorization(&mut self) -> Result<HeaderValue, CredentialError> {
+        fn authorization(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<HeaderValue, CredentialError>> {
             // Deliberately violate the cooperative-provider contract to prove
             // the post-poll check rejects a late ready value, not to promise preemption.
             std::thread::sleep(Duration::from_millis(50));
-            Ok(HeaderValue::from_static("Bearer never-print-me"))
+            std::future::ready(Ok(HeaderValue::from_static("Bearer never-print-me")))
         }
     }
     test_runtime().block_on(async {
