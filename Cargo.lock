@@ -1198,6 +1198,7 @@ name = "lgwks_std"
 version = "0.6.1"
 source = "git+https://github.com/srinji-kaggss/logicalworks-crates?rev=88d2a75b8988c37e77118cdf69b80a7fde5c3fb2#88d2a75b8988c37e77118cdf69b80a7fde5c3fb2"
 dependencies = [
+ "blake3",
  "iri-string",
  "serde",
  "serde_json",

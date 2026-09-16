@@ -1969,12 +1969,18 @@ const IDENTITY_SIDECAR_BYTES: usize = 53;
 
 /// Derives one operation request digest from canonical content bytes.
 ///
-/// The digest is SHA-256 over the document identity, the property key, and a
-/// tagged scalar encoding, so equal content yields equal request identity and
-/// any content difference yields a different digest.
+/// The digest is BLAKE3 through the estate substrate `lgwks_std::hash` over
+/// the document identity, the property key, and a tagged scalar encoding, so
+/// equal content yields equal request identity and any content difference
+/// yields a different digest. This sugar starts at BLAKE3 rather than the
+/// workspace's legacy SHA-2 surfaces: new identity code follows the estate
+/// dependency doctrine, and legacy v1 digest surfaces stay versioned until
+/// their own migration.
 #[must_use]
 pub fn content_digest(document: DocumentId, key: &str, value: &Scalar) -> OperationDigest {
-    OperationDigest::new(Sha256::digest(canonical_value_bytes(document, key, value)).into())
+    OperationDigest::new(
+        *lgwks_std::hash::blake3(&canonical_value_bytes(document, key, value)).as_bytes(),
+    )
 }
 
 fn canonical_value_bytes(document: DocumentId, key: &str, value: &Scalar) -> Vec<u8> {
