@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use lgwks_bot::rt::time::{Instant, timeout_at};
 use lgwks_std::json::serde::{Serialize, de::DeserializeOwned};
 use logical_db_protocol::{
     BaselinePage, BaselineRequest, ProtocolError, PullPage, PullRequest, PushRequest, PushResponse,
@@ -29,10 +30,17 @@ use thiserror::Error;
 
 const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";
 const MAX_HTTP_BODY_BYTES: usize = 12_582_912;
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum server-directed retry delay accepted from an untrusted response.
 pub const MAX_RETRY_AFTER_SECONDS: u64 = 3_600;
 
 /// Refreshable credential boundary invoked before every request.
+///
+/// Refresh shares the transport's operation deadline. Providers must yield
+/// promptly, avoid blocking the executor, and keep refresh work owned by the
+/// returned future: dropping it must release that work and leave the provider
+/// reusable. Do not detach refresh tasks. Async timers cannot preempt a provider
+/// that blocks inside a poll or while constructing its future.
 pub trait CredentialProvider: Send {
     /// Produces a sensitive complete `Authorization` header value.
     ///
@@ -90,10 +98,17 @@ impl CredentialProvider for StaticBearer {
 }
 
 /// Reusable pooled thin-client transport.
+///
+/// Each push, pull, or baseline exchange has one 30-second deadline covering
+/// request encoding, credential refresh, HTTP headers, body consumption, and
+/// response validation. Dropping the operation cancels its owned local work;
+/// after dispatch, neither cancellation nor timeout implies remote rollback.
+/// Timer enforcement requires a running executor and cooperative providers.
 pub struct HttpTransport<Credentials> {
     client: Client,
     endpoint: Url,
     credentials: Credentials,
+    operation_timeout: Duration,
 }
 
 impl<Credentials> HttpTransport<Credentials>
@@ -143,6 +158,7 @@ where
             client,
             endpoint,
             credentials,
+            operation_timeout: OPERATION_TIMEOUT,
         })
     }
 
@@ -153,28 +169,55 @@ where
         })
     }
 
-    async fn send<Request, Reply>(
+    async fn send<Request, Reply, Decode, Decoded>(
         &mut self,
         route: &str,
         request: &Request,
+        decode: Decode,
     ) -> Result<Reply, HttpError>
     where
         Request: Serialize,
-        Reply: DeserializeOwned,
+        Decode: FnOnce(Response) -> Decoded,
+        Decoded: Future<Output = Result<Reply, HttpError>>,
     {
+        let deadline = Instant::now() + self.operation_timeout;
         let body = encode(request)?;
-        let authorization = self.credentials.authorization().await?;
-        let response = self
-            .client
-            .post(self.route(route)?)
-            .header(AUTHORIZATION, authorization)
-            .header(CONTENT_TYPE, MEDIA_TYPE)
-            .header(ACCEPT, MEDIA_TYPE)
-            .body(body)
-            .send()
-            .await
-            .map_err(HttpError::Network)?;
-        decode_response(response).await
+        let mut authorization = within_deadline(deadline, HttpError::CredentialTimeout, async {
+            self.credentials.authorization().await
+        })
+        .await??;
+        authorization.set_sensitive(true);
+        within_deadline(deadline, HttpError::OperationTimeout, async {
+            let response = self
+                .client
+                .post(self.route(route)?)
+                .header(AUTHORIZATION, authorization)
+                .header(CONTENT_TYPE, MEDIA_TYPE)
+                .header(ACCEPT, MEDIA_TYPE)
+                .body(body)
+                .send()
+                .await
+                .map_err(HttpError::Network)?;
+            decode(response).await
+        })
+        .await?
+    }
+}
+
+// A timer may poll a ready future before checking expiry. Refuse both an
+// already-expired stage and a value returned after the deadline, so a late
+// credential cannot dispatch a request and a late page cannot be installed.
+async fn within_deadline<T>(
+    deadline: Instant,
+    error: HttpError,
+    future: impl Future<Output = T>,
+) -> Result<T, HttpError> {
+    if Instant::now() >= deadline {
+        return Err(error);
+    }
+    match timeout_at(deadline, future).await {
+        Ok(value) if Instant::now() < deadline => Ok(value),
+        _ => Err(error),
     }
 }
 
@@ -200,57 +243,48 @@ where
 
     async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
         request.validate().map_err(HttpError::Protocol)?;
-        let response: PushResponse = self.send("v1/changes:push", &request).await?;
-        response.validate(&request).map_err(HttpError::Protocol)?;
-        Ok(response)
+        let expected = &request;
+        self.send("v1/changes:push", &request, move |response| async move {
+            let response: PushResponse = decode_response(response).await?;
+            response.validate(expected).map_err(HttpError::Protocol)?;
+            Ok(response)
+        })
+        .await
     }
 
     async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error> {
         request.validate().map_err(HttpError::Protocol)?;
-        let body = encode(&request)?;
-        let authorization = self.credentials.authorization().await?;
-        let response = self
-            .client
-            .post(self.route("v1/changes:pull")?)
-            .header(AUTHORIZATION, authorization)
-            .header(CONTENT_TYPE, MEDIA_TYPE)
-            .header(ACCEPT, MEDIA_TYPE)
-            .body(body)
-            .send()
-            .await
-            .map_err(HttpError::Network)?;
-        if response.status() == StatusCode::GONE {
-            return Ok(PullResult::CheckpointExpired);
-        }
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(PullResult::BaselineRequired);
-        }
-        let page = decode_response::<PullPage>(response).await?;
-        page.validate(request.scope).map_err(HttpError::Protocol)?;
-        Ok(PullResult::Page(page))
+        let scope = request.scope;
+        self.send("v1/changes:pull", &request, move |response| async move {
+            if response.status() == StatusCode::GONE {
+                return Ok(PullResult::CheckpointExpired);
+            }
+            if response.status() == StatusCode::CONFLICT {
+                return Ok(PullResult::BaselineRequired);
+            }
+            let page = decode_response::<PullPage>(response).await?;
+            page.validate(scope).map_err(HttpError::Protocol)?;
+            Ok(PullResult::Page(page))
+        })
+        .await
     }
 
     async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error> {
         request.validate().map_err(HttpError::Protocol)?;
-        let body = encode(&request)?;
-        let authorization = self.credentials.authorization().await?;
-        let response = self
-            .client
-            .post(self.route("v1/recovery:baseline")?)
-            .header(AUTHORIZATION, authorization)
-            .header(CONTENT_TYPE, MEDIA_TYPE)
-            .header(ACCEPT, MEDIA_TYPE)
-            .body(body)
-            .send()
-            .await
-            .map_err(HttpError::Network)?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(BaselineResult::Unavailable);
-        }
-        let page = decode_response::<BaselinePage>(response).await?;
-        page.validate_page(request.scope)
-            .map_err(HttpError::Protocol)?;
-        Ok(BaselineResult::Artifact(page))
+        let scope = request.scope;
+        self.send(
+            "v1/recovery:baseline",
+            &request,
+            move |response| async move {
+                if response.status() == StatusCode::NOT_FOUND {
+                    return Ok(BaselineResult::Unavailable);
+                }
+                let page = decode_response::<BaselinePage>(response).await?;
+                page.validate_page(scope).map_err(HttpError::Protocol)?;
+                Ok(BaselineResult::Artifact(page))
+            },
+        )
+        .await
     }
 }
 
@@ -359,6 +393,14 @@ pub enum HttpError {
     /// Credential refresh or encoding failed.
     #[error("HTTP credential failed: {0}")]
     Credential(#[from] CredentialError),
+    /// The shared operation deadline expired before credential acquisition
+    /// completed. No HTTP request was dispatched by this operation.
+    #[error("HTTP operation deadline expired during credential refresh")]
+    CredentialTimeout,
+    /// The shared deadline expired during the HTTP exchange or validation.
+    /// The request may have committed remotely; retry only the exact operation.
+    #[error("HTTP operation deadline expired; remote outcome may be unknown")]
+    OperationTimeout,
     /// Request or response body exceeded its hard ceiling.
     #[error("HTTP body exceeds the bounded protocol ceiling")]
     BodyTooLarge,
@@ -395,7 +437,7 @@ impl HttpError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Network(_) => true,
+            Self::Network(_) | Self::CredentialTimeout | Self::OperationTimeout => true,
             Self::Status { code, .. } => matches!(*code, 408 | 425 | 429 | 502 | 503 | 504),
             _ => false,
         }
@@ -420,6 +462,8 @@ mod tests {
         http::{Response as AxumResponse, StatusCode as AxumStatus},
         routing::{get, post},
     };
+
+    mod deadlines;
 
     async fn endpoint() -> Url {
         let mut exact = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
