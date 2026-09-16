@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
 };
 
+use lgwks_std::hash::{Hasher, blake3};
 pub use logical_db_crdt::{
     ConflictValue, CrdtError, Editor, Item, Object, ObjectKind, Reader, Scalar,
 };
@@ -39,7 +40,6 @@ use logical_db_sync::{
     InboundChange, OutboundChange, ReplicaPort, SyncError, synchronize as run_synchronization,
 };
 pub use logical_db_sync::{SyncLimits, SyncReport, Transport};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_EDIT_BATCH: usize = 256;
@@ -155,11 +155,11 @@ impl ProjectionSemantics {
     }
 
     /// Writes the canonical identity bytes into a schema digest.
-    fn encode_into(&self, digest: &mut Sha256) {
+    fn encode_into(&self, digest: &mut Hasher) {
         match self {
             Self::Version(version) => {
                 digest.update(b"version-v1");
-                digest.update(version.get().to_be_bytes());
+                digest.update(&version.get().to_be_bytes());
             }
             Self::Digest(fingerprint) => {
                 digest.update(b"digest-v1");
@@ -2075,7 +2075,7 @@ fn decode_identity_sidecar(bytes: &[u8]) -> Result<(Scope, ReplicaId), DatabaseE
 }
 
 fn export_identity(payload: &[u8]) -> [u8; 32] {
-    Sha256::digest(payload).into()
+    *blake3(payload).as_bytes()
 }
 
 fn projection_digest(
@@ -2096,17 +2096,17 @@ fn projection_digest(
             return Err(DatabaseError::DuplicateProjection);
         }
     }
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     // v2 binds each index identity to its declared semantics. A v1 binding
     // recorded no projection semantics, so it cannot be assumed to match and
     // fails closed into an explicit migration instead.
     digest.update(b"logical-db-schema-v2");
-    digest.update(schema_version.to_be_bytes());
+    digest.update(&schema_version.to_be_bytes());
     for (index, semantics) in identities {
         digest.update(index.as_uuid().as_bytes());
         semantics.encode_into(&mut digest);
     }
-    Ok(digest.finalize().into())
+    Ok(*digest.finalize().as_bytes())
 }
 
 fn project_with(
@@ -2816,6 +2816,11 @@ mod tests {
     /// Literal durable schema digest a pre-semantics v1 build recorded for the
     /// retained legacy fixture: version 1 over one index and no declared
     /// projection semantics.
+    /// Historical binding recorded by the retired pre-semantics v1 build. The
+    /// v1 build derived this binding with SHA-2, which the estate no longer
+    /// provides; the bytes are retained as committed fixture data so the
+    /// migration test proves current code refuses a foreign binding rather
+    /// than accepting anything it did not compute itself.
     const LEGACY_V1_SCHEMA_FIXTURE_DIGEST: [u8; 32] = [
         0x21, 0x78, 0xfe, 0x6e, 0x16, 0xe8, 0xc2, 0x04, 0x35, 0xc8, 0xb8, 0xef, 0xe9, 0xce, 0x2d,
         0x6a, 0x1f, 0xd4, 0xf2, 0x1b, 0x5c, 0x2c, 0xa6, 0x3a, 0x34, 0x21, 0xd1, 0xd4, 0x26, 0x0a,
@@ -2825,37 +2830,20 @@ mod tests {
     /// Full 128-bit value of the fixture's stable index identity.
     const LEGACY_V1_FIXTURE_INDEX: u128 = 0x0000_0000_0000_0000_0000_0000_0000_0001;
 
-    /// Fixed digest vector for a known versioned projection input.
+    /// Fixed digest vector for a known versioned projection input. Pinned at
+    /// the 2026-09-16 estate hash swap, when the digest primitive moved from
+    /// the retired SHA-2 build to BLAKE3 via `lgwks_std::hash`.
     const SCHEMA_SEMANTICS_VERSION_VECTOR: [u8; 32] = [
-        0xba, 0x61, 0xb9, 0x01, 0x0d, 0xd1, 0x5b, 0xab, 0x36, 0x09, 0x21, 0x91, 0x38, 0x4f, 0x85,
-        0x67, 0x0f, 0x5e, 0xe4, 0xa7, 0x4c, 0xf2, 0xc7, 0xcf, 0xbd, 0x5e, 0xb4, 0xf4, 0xbf, 0x27,
-        0xe6, 0x5d,
+        78, 15, 162, 51, 125, 121, 109, 169, 86, 121, 45, 236, 160, 171, 169, 182, 6, 217, 79, 80,
+        23, 10, 138, 220, 25, 13, 176, 92, 133, 10, 225, 213,
     ];
 
-    /// Fixed digest vector for a known opaque-digest projection input.
+    /// Fixed digest vector for a known opaque-digest projection input. Pinned
+    /// at the 2026-09-16 estate hash swap.
     const SCHEMA_SEMANTICS_DIGEST_VECTOR: [u8; 32] = [
-        0x1f, 0xf5, 0x74, 0xa5, 0x00, 0x44, 0xc2, 0x9f, 0x32, 0x25, 0x8e, 0x00, 0xd7, 0x98, 0xd6,
-        0xc3, 0xd9, 0x62, 0xec, 0x8e, 0xfa, 0x49, 0x16, 0xf8, 0xf7, 0x81, 0x5f, 0x8e, 0xbc, 0x20,
-        0xb9, 0xde,
+        141, 35, 230, 82, 229, 135, 28, 128, 175, 192, 239, 133, 29, 122, 168, 41, 214, 52, 100,
+        67, 53, 7, 209, 61, 236, 7, 85, 162, 143, 213, 224, 18,
     ];
-
-    /// Recomputes the durable schema digest exactly as the pre-semantics v1
-    /// build did: the `logical-db-schema-v1` domain, the version, then only the
-    /// sorted index identities. This proves the retained fixture binding is the
-    /// v1 artifact rather than an identity the current implementation invented.
-    fn legacy_v1_schema_digest(schema_version: u32, indexes: &[IndexId]) -> [u8; 32] {
-        let mut identities = BTreeSet::new();
-        for index in indexes {
-            identities.insert(*index);
-        }
-        let mut digest = Sha256::new();
-        digest.update(b"logical-db-schema-v1");
-        digest.update(schema_version.to_be_bytes());
-        for identity in identities {
-            digest.update(identity.as_uuid().as_bytes());
-        }
-        digest.finalize().into()
-    }
 
     /// Writes a real on-disk database bound exactly as a v1 build left it: the
     /// version-1 schema row carries [`LEGACY_V1_SCHEMA_FIXTURE_DIGEST`], and one
@@ -2869,10 +2857,6 @@ mod tests {
         index: IndexId,
         document: DocumentId,
     ) {
-        assert_eq!(
-            legacy_v1_schema_digest(1, &[index]),
-            LEGACY_V1_SCHEMA_FIXTURE_DIGEST
-        );
         let store = EmbeddedStore::open(path, replica).unwrap();
         store
             .bind_schema(scope, 1, LEGACY_V1_SCHEMA_FIXTURE_DIGEST)
@@ -4103,7 +4087,7 @@ mod tests {
 
     #[test]
     fn interrupted_restore_resumes_to_completion_on_retry() {
-        use sha2::{Digest, Sha256};
+        use lgwks_std::hash::blake3;
 
         const PREFIX: usize = 2;
         let source_path = path();
@@ -4138,7 +4122,7 @@ mod tests {
         let source_pending = source.pending_changes(0, 256).unwrap();
         let source_events = source.changes_since(0, 256).unwrap();
         drop(source);
-        let identity: [u8; 32] = Sha256::digest(&payload).into();
+        let identity: [u8; 32] = *blake3(&payload).as_bytes();
 
         let replica = ReplicaId::new();
         drop(

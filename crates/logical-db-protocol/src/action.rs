@@ -4,10 +4,10 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 
+use lgwks_std::hash::Hasher;
 use logical_db_model::{
     ActionDigest, DocumentId, OperationDigest, ReplicaId, Scope, SnapshotBaseline,
 };
-use sha2::{Digest, Sha256};
 
 use crate::{ChangeEnvelope, Checkpoint, PROTOCOL_VERSION};
 
@@ -40,7 +40,7 @@ impl PageAction {
         frame(&mut digest, &self.after.to_be_bytes());
         frame(&mut digest, &self.max_changes.to_be_bytes());
         frame(&mut digest, &self.max_bytes.to_be_bytes());
-        ActionDigest::new(digest.finalize().into())
+        ActionDigest::new(*digest.finalize().as_bytes())
     }
 }
 
@@ -89,7 +89,7 @@ pub fn write_action(change: &ChangeEnvelope) -> ActionDigest {
     frame(&mut digest, change.replica.as_uuid().as_bytes());
     frame(&mut digest, &change.digest.into_bytes());
     frame(&mut digest, &change.bytes);
-    ActionDigest::new(digest.finalize().into())
+    ActionDigest::new(*digest.finalize().as_bytes())
 }
 
 /// Binds a seal operation to the complete state-bearing artifact descriptor.
@@ -101,7 +101,7 @@ pub fn seal_snapshot_action(
 ) -> ActionDigest {
     let mut digest = action_hash(b"seal-snapshot", scope, intent);
     frame(&mut digest, &baseline.encode());
-    ActionDigest::new(digest.finalize().into())
+    ActionDigest::new(*digest.finalize().as_bytes())
 }
 
 /// Binds a recovery fetch to the scope, replica, intent, triggering checkpoint,
@@ -130,7 +130,7 @@ pub fn recover_action(
         }
         None => frame(&mut digest, &[0]),
     }
-    ActionDigest::new(digest.finalize().into())
+    ActionDigest::new(*digest.finalize().as_bytes())
 }
 
 /// Binds consumption acknowledgement to its exact upper position.
@@ -138,7 +138,7 @@ pub fn recover_action(
 pub fn mark_consumed_action(scope: Scope, intent: OperationDigest, through: u64) -> ActionDigest {
     let mut digest = action_hash(b"mark-consumed", scope, intent);
     frame(&mut digest, &through.to_be_bytes());
-    ActionDigest::new(digest.finalize().into())
+    ActionDigest::new(*digest.finalize().as_bytes())
 }
 
 /// Binds collection to its upper position and explicit optional live checkpoint.
@@ -155,11 +155,11 @@ pub fn prune_action(
     if let Some(position) = min_live {
         frame(&mut digest, &position.to_be_bytes());
     }
-    ActionDigest::new(digest.finalize().into())
+    ActionDigest::new(*digest.finalize().as_bytes())
 }
 
-fn action_hash(kind: &[u8], scope: Scope, intent: OperationDigest) -> Sha256 {
-    let mut digest = Sha256::new();
+fn action_hash(kind: &[u8], scope: Scope, intent: OperationDigest) -> Hasher {
+    let mut digest = Hasher::new();
     frame(&mut digest, b"logical-db-action-v1");
     frame(&mut digest, &PROTOCOL_VERSION.to_be_bytes());
     frame(&mut digest, kind);
@@ -169,8 +169,8 @@ fn action_hash(kind: &[u8], scope: Scope, intent: OperationDigest) -> Sha256 {
     digest
 }
 
-fn frame(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_be_bytes());
+fn frame(digest: &mut Hasher, bytes: &[u8]) {
+    digest.update(&(bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
 }
 
@@ -209,13 +209,14 @@ mod tests {
             digest: ChangeDigest::new([7; 32]),
             bytes: vec![0, 1, 255],
         };
-        // Independently calculated with Python hashlib over u64-BE length frames.
+        // Golden re-pinned at the 2026-09-16 estate hash swap: the digest
+        // primitive is BLAKE3 through `lgwks_std::hash`, framing unchanged.
         assert_eq!(
             write_action(&change).into_bytes(),
             [
-                0xa1, 0x37, 0x77, 0x17, 0x0a, 0xd0, 0xf1, 0x0a, 0x03, 0x25, 0xbe, 0x43, 0x6c, 0xfc,
-                0xbc, 0x7d, 0x67, 0xb7, 0x7c, 0x46, 0x54, 0xc7, 0x48, 0x02, 0xbe, 0x0e, 0x80, 0xf7,
-                0xd8, 0x1c, 0xd5, 0x4d,
+                0xbf, 0x4a, 0x28, 0x73, 0xe9, 0x91, 0x12, 0x87, 0xf4, 0xb6, 0x48, 0x36, 0xce, 0x3e,
+                0x84, 0xf2, 0x66, 0xd9, 0x68, 0x5b, 0x49, 0x74, 0xb8, 0x68, 0x29, 0xe4, 0x52, 0xef,
+                0xc7, 0x15, 0xa4, 0x87,
             ]
         );
     }

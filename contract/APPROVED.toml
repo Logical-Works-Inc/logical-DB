@@ -281,34 +281,6 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
-[[approved]]
-crate = "sha2"
-tier = "boundary"
-version = "=0.11.0"
-owner = "logical-db-model"
-capability = "crypto.sha256"
-source = "registry"
-allowed_consumers = "logical-db,logical-db-model,logical-db-protocol,logical-db-store-fdb,logical-db-kv,logical-db-episode,logical-db-cairn,logical-db-braid,logical-db-service,logical-db-sync,logical-db-daemon"
-allowed_kinds = "normal,dev"
-reason = "Checkpoint and identity digests are SHA-256 by protocol; the estate hash surface is BLAKE3 only."
-approved_by = "Director"
-approved_on = "2026-09-13"
-review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
-
-[[approved]]
-crate = "hmac"
-tier = "boundary"
-version = "=0.13.0"
-owner = "logical-db-service"
-capability = "crypto.hmac-sha256"
-source = "registry"
-allowed_consumers = "logical-db-service,logical-db-daemon"
-allowed_kinds = "normal"
-reason = "Constant-time HMAC-SHA256 bearer verification is a protocol requirement absent from std."
-approved_by = "Director"
-approved_on = "2026-09-13"
-review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
-
 # ── Async HTTP client and server ────────────────────────────────────────────
 # `lgwks_bot` owns the runtime, but the estate has no async HTTP client or
 # server. Both are frozen boundaries with the reason recorded: the estate's

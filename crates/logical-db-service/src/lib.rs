@@ -8,7 +8,6 @@
 
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
-use hmac::{Hmac, KeyInit, Mac};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 use logical_db_model::OperationId;
 use logical_db_model::{
@@ -21,7 +20,6 @@ use logical_db_protocol::{
     RecoveryAction, RejectionCode, mark_consumed_action, prune_action, seal_snapshot_action,
     write_action,
 };
-use sha2::Sha256;
 use thiserror::Error;
 
 const CHECKPOINT_MAGIC: &[u8; 4] = b"LCP\x01";
@@ -697,13 +695,13 @@ impl CheckpointCodec {
             eprintln!("logical-db-service: open: Malformed");
             return Err(CheckpointError::Malformed);
         }
-        let mut mac = self.mac();
-        mac.update(&bytes[..CHECKPOINT_BODY_BYTES]);
-        mac.verify_slice(&bytes[CHECKPOINT_BODY_BYTES..])
-            .map_err(|error| {
-                eprintln!("logical-db-service: CheckpointError::InvalidMac: {error}");
-                CheckpointError::InvalidMac
-            })?;
+        let expected = lgwks_std::hash::keyed(&self.key, &bytes[..CHECKPOINT_BODY_BYTES]);
+        let supplied = <[u8; 32]>::try_from(&bytes[CHECKPOINT_BODY_BYTES..])
+            .expect("token length is checked against CHECKPOINT_BYTES");
+        if !tags_equal(expected.as_bytes(), &supplied) {
+            eprintln!("logical-db-service: CheckpointError::InvalidMac");
+            return Err(CheckpointError::InvalidMac);
+        }
         if bytes[4..20] != *scope.account().as_uuid().as_bytes()
             || bytes[20..36] != *scope.space().as_uuid().as_bytes()
         {
@@ -720,14 +718,22 @@ impl CheckpointCodec {
     }
 
     fn tag(&self, body: &[u8]) -> [u8; 32] {
-        let mut mac = self.mac();
-        mac.update(body);
-        mac.finalize().into_bytes().into()
+        *lgwks_std::hash::keyed(&self.key, body).as_bytes()
     }
+}
 
-    fn mac(&self) -> Hmac<Sha256> {
-        <Hmac<Sha256> as KeyInit>::new_from_slice(&self.key).expect("HMAC accepts every key length")
+/// Compares two authentication tags in constant time.
+///
+/// The folded-xor walk exposes no timing dependence on where the bytes first
+/// differ, matching the constant-time equality the estate digest type
+/// provides internally.
+#[must_use]
+pub fn tags_equal(computed: &[u8; 32], expected: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for (left, right) in computed.iter().zip(expected.iter()) {
+        difference |= left ^ right;
     }
+    difference == 0
 }
 
 /// Opaque checkpoint validation failures.

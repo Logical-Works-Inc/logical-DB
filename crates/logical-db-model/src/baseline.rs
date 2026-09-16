@@ -7,7 +7,7 @@
 //! `evidence/SOURCES.md`.
 
 use crate::{DocumentId, ModelError, Scope};
-use sha2::{Digest, Sha256};
+use lgwks_std::hash::Hasher;
 
 /// Current state-bearing baseline descriptor version.
 pub const SNAPSHOT_BASELINE_VERSION: u16 = 2;
@@ -265,20 +265,30 @@ thread_local! {
 /// the same sequence assembled in memory. The builder owns ordering,
 /// per-document bounds, the running byte total, and the declared document count;
 /// a sequence that ends short, long, or out of order cannot finalize.
-#[derive(Debug)]
 pub struct SnapshotDigestBuilder {
-    digest: Sha256,
+    digest: Hasher,
     expected_count: u64,
     count: u64,
     byte_len: usize,
     previous: Option<DocumentId>,
 }
 
+impl std::fmt::Debug for SnapshotDigestBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotDigestBuilder")
+            .field("expected_count", &self.expected_count)
+            .field("count", &self.count)
+            .field("byte_len", &self.byte_len)
+            .field("previous", &self.previous)
+            .finish_non_exhaustive()
+    }
+}
 impl SnapshotDigestBuilder {
     /// Starts a builder for exactly `document_count` documents at `position`.
     #[must_use]
     pub fn new(scope: Scope, position: u64, document_count: u64) -> Self {
-        let mut digest = Sha256::new();
+        let mut digest = Hasher::new();
         frame(&mut digest, b"logical-db-baseline-v2");
         frame(&mut digest, scope.account().as_uuid().as_bytes());
         frame(&mut digest, scope.space().as_uuid().as_bytes());
@@ -338,12 +348,15 @@ impl SnapshotDigestBuilder {
             eprintln!("logical-db-model: SnapshotDigestBuilder count: {error}");
             return Err(error);
         }
-        Ok((BaselineDigest(self.digest.finalize().into()), self.byte_len))
+        Ok((
+            BaselineDigest(*self.digest.finalize().as_bytes()),
+            self.byte_len,
+        ))
     }
 }
 
-fn frame(digest: &mut Sha256, bytes: &[u8]) {
-    digest.update((bytes.len() as u64).to_be_bytes());
+fn frame(digest: &mut Hasher, bytes: &[u8]) {
+    digest.update(&(bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
 }
 
@@ -438,9 +451,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             artifact.baseline.digest().into_bytes(),
+            // Re-pinned at the 2026-09-16 estate hash swap to BLAKE3.
             [
-                56, 231, 44, 53, 72, 56, 165, 65, 220, 47, 175, 20, 242, 220, 94, 89, 108, 99, 248,
-                118, 214, 229, 194, 48, 144, 232, 24, 34, 204, 174, 36, 131,
+                41, 100, 14, 43, 176, 108, 83, 249, 216, 116, 41, 169, 65, 93, 202, 115, 211, 87,
+                68, 48, 174, 151, 216, 133, 232, 209, 78, 155, 134, 56, 147, 69,
             ]
         );
     }
@@ -525,8 +539,8 @@ mod tests {
     #[test]
     fn empty_stream_digest_has_a_portable_golden_encoding() {
         let expected = [
-            130, 230, 239, 157, 28, 146, 21, 237, 58, 130, 114, 37, 199, 141, 221, 3, 67, 32, 213,
-            139, 84, 177, 203, 137, 131, 231, 122, 95, 237, 122, 239, 110,
+            71, 43, 172, 140, 216, 191, 236, 239, 92, 7, 42, 181, 192, 141, 96, 131, 199, 34, 103,
+            0, 170, 35, 247, 111, 78, 137, 207, 157, 208, 248, 251, 238,
         ];
         let artifact = SnapshotArtifact::new(fixed_scope(), 7, Vec::new()).unwrap();
         assert_eq!(artifact.baseline.digest().into_bytes(), expected);
@@ -540,8 +554,8 @@ mod tests {
     #[test]
     fn tombstone_document_digest_has_a_portable_golden_encoding() {
         let expected = [
-            5, 66, 153, 159, 247, 113, 46, 90, 156, 32, 147, 29, 186, 33, 186, 16, 110, 102, 164,
-            94, 143, 39, 240, 138, 131, 152, 248, 246, 240, 30, 33, 239,
+            159, 212, 63, 55, 91, 223, 140, 196, 39, 31, 57, 185, 169, 62, 119, 131, 189, 52, 85,
+            205, 204, 65, 198, 102, 214, 37, 114, 65, 221, 104, 136, 22,
         ];
         let documents = vec![fixed_doc(0x33, vec![1, 2, 3], true)];
         let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone()).unwrap();
@@ -556,8 +570,8 @@ mod tests {
     #[test]
     fn multi_document_stream_digest_has_a_portable_golden_encoding() {
         let expected = [
-            54, 246, 36, 252, 204, 121, 238, 36, 81, 30, 162, 254, 219, 217, 50, 184, 253, 205,
-            145, 59, 5, 110, 244, 119, 114, 56, 3, 163, 157, 236, 92, 220,
+            16, 249, 242, 54, 53, 147, 16, 252, 104, 176, 157, 59, 236, 236, 174, 188, 61, 59, 175,
+            174, 237, 67, 11, 175, 237, 255, 98, 131, 185, 20, 251, 201,
         ];
         let documents = vec![
             fixed_doc(0x33, vec![1, 2, 3], false),

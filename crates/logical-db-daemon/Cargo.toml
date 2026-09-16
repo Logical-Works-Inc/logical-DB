@@ -29,7 +29,6 @@ axum.workspace = true
 ciborium.workspace = true
 foundationdb = { workspace = true, optional = true }
 foundationdb-tuple = { workspace = true, optional = true }
-hmac.workspace = true
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-braid = { version = "0.1.0", path = "../logical-db-braid" }
 logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
@@ -37,9 +36,9 @@ logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 lgwks_bot.workspace = true
+lgwks_std.workspace = true
 logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", features = ["fdb"], optional = true }
 reqwest.workspace = true
-sha2.workspace = true
 uuid.workspace = true
 
 [lints.rust]

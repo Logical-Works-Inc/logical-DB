@@ -22,7 +22,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true
-sha2.workspace = true
 
 [lints]
 workspace = true

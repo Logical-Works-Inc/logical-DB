@@ -406,12 +406,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmov"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
-
-[[package]]
 name = "combine"
 version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -484,15 +478,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctutils"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
-dependencies = [
- "cmov",
-]
-
-[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -501,7 +486,6 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
- "ctutils",
 ]
 
 [[package]]
@@ -812,15 +796,6 @@ checksum = "81df830f11babb0eee9a082e09135ef0a7d8791f3fe9b279bb9485bf7eaf23e0"
 dependencies = [
  "leb128",
  "thiserror",
-]
-
-[[package]]
-name = "hmac"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
-dependencies = [
- "digest",
 ]
 
 [[package]]
@@ -1247,7 +1222,6 @@ dependencies = [
  "logical-db-protocol",
  "logical-db-store",
  "logical-db-sync",
- "sha2",
  "thiserror",
  "uuid",
 ]
@@ -1264,9 +1238,9 @@ dependencies = [
  "braid-sdk",
  "braid-verify",
  "braid-vocab-cms",
+ "lgwks_std 0.6.1",
  "logical-db-model",
  "logical-db-service",
- "sha2",
  "thiserror",
 ]
 
@@ -1275,7 +1249,6 @@ name = "logical-db-cairn"
 version = "0.1.0"
 dependencies = [
  "lgwks_std 0.6.1",
- "sha2",
  "thiserror",
  "uuid",
 ]
@@ -1297,8 +1270,8 @@ dependencies = [
  "ciborium",
  "foundationdb",
  "foundationdb-tuple",
- "hmac",
  "lgwks_bot",
+ "lgwks_std 0.6.1",
  "logical-db-braid",
  "logical-db-crdt",
  "logical-db-model",
@@ -1307,7 +1280,6 @@ dependencies = [
  "logical-db-service",
  "logical-db-store-fdb",
  "reqwest",
- "sha2",
  "uuid",
 ]
 
@@ -1338,7 +1310,6 @@ dependencies = [
  "ciborium",
  "lgwks_std 0.6.1",
  "logical-db-cairn",
- "sha2",
  "thiserror",
  "uuid",
 ]
@@ -1366,7 +1337,6 @@ dependencies = [
  "lgwks_std 0.6.1",
  "logical-db",
  "logical-db-model",
- "sha2",
  "thiserror",
  "uuid",
 ]
@@ -1376,7 +1346,6 @@ name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
  "lgwks_std 0.6.1",
- "sha2",
  "thiserror",
  "uuid",
 ]
@@ -1396,7 +1365,6 @@ dependencies = [
  "lgwks_std 0.6.1",
  "logical-db-model",
  "serde_bytes",
- "sha2",
  "thiserror",
 ]
 
@@ -1420,12 +1388,10 @@ dependencies = [
 name = "logical-db-service"
 version = "0.1.0"
 dependencies = [
- "hmac",
  "lgwks_std 0.6.1",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
- "sha2",
  "thiserror",
 ]
 
@@ -1445,10 +1411,10 @@ version = "0.1.0"
 dependencies = [
  "foundationdb",
  "foundationdb-tuple",
+ "lgwks_std 0.6.1",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-service",
- "sha2",
  "thiserror",
  "uuid",
 ]
@@ -1460,7 +1426,6 @@ dependencies = [
  "lgwks_std 0.6.1",
  "logical-db-model",
  "logical-db-protocol",
- "sha2",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@
 
 use std::{error::Error, fmt, time::Duration};
 
+use lgwks_std::hash::Hasher;
 use logical_db_model::{
     ChangeDigest, DocumentId, MAX_BASELINE_BYTES, ModelError, NAMESPACE_CHECKPOINT_TTL_MS,
     NamespaceCheckpoint, NamespaceCheckpoints, NamespacePolicy, NetworkCondition, OperationDigest,
@@ -19,7 +20,6 @@ use logical_db_protocol::{
     PROTOCOL_VERSION, ProtocolError, PullPage, PullRequest, PushOutcome, PushRequest, PushResponse,
     RejectionCode,
 };
-use sha2::{Digest, Sha256};
 
 /// Maximum pull pages processed by one foreground synchronization cycle.
 pub const MAX_PAGES_PER_CYCLE: usize = 32;
@@ -450,21 +450,23 @@ fn pull_request_digest(
     after: Option<&Checkpoint>,
     limits: SyncLimits,
 ) -> OperationDigest {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     digest.update(b"logical-db/pull/v1");
     digest.update(scope.account().as_uuid().as_bytes());
     digest.update(scope.space().as_uuid().as_bytes());
     digest.update(replica.as_uuid().as_bytes());
     match after {
         Some(checkpoint) => {
-            digest.update([1]);
+            digest.update(&[1]);
             digest.update(checkpoint.as_wire());
         }
-        None => digest.update([0]),
+        None => {
+            digest.update(&[0]);
+        }
     }
-    digest.update(limits.changes_per_page.to_be_bytes());
-    digest.update(limits.bytes_per_page.to_be_bytes());
-    OperationDigest::new(digest.finalize().into())
+    digest.update(&limits.changes_per_page.to_be_bytes());
+    digest.update(&limits.bytes_per_page.to_be_bytes());
+    OperationDigest::new(*digest.finalize().as_bytes())
 }
 
 async fn fetch_page<T: Transport>(
@@ -670,26 +672,30 @@ fn baseline_request_digest(
     after: Option<&Checkpoint>,
     after_document: Option<DocumentId>,
 ) -> OperationDigest {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     digest.update(b"logical-db/baseline/v1");
     digest.update(scope.account().as_uuid().as_bytes());
     digest.update(scope.space().as_uuid().as_bytes());
     digest.update(replica.as_uuid().as_bytes());
     match after {
         Some(checkpoint) => {
-            digest.update([1]);
+            digest.update(&[1]);
             digest.update(checkpoint.as_wire());
         }
-        None => digest.update([0]),
+        None => {
+            digest.update(&[0]);
+        }
     }
     match after_document {
         Some(cursor) => {
-            digest.update([1]);
+            digest.update(&[1]);
             digest.update(cursor.as_uuid().as_bytes());
         }
-        None => digest.update([0]),
+        None => {
+            digest.update(&[0]);
+        }
     }
-    OperationDigest::new(digest.finalize().into())
+    OperationDigest::new(*digest.finalize().as_bytes())
 }
 
 struct NamespacePullContext<'a, F> {
@@ -1203,23 +1209,25 @@ fn namespace_pull_digest(
     after: Option<&Checkpoint>,
     policy: NamespacePolicy,
 ) -> OperationDigest {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     digest.update(b"logical-db/pull-ns/v1");
     digest.update(scope.account().as_uuid().as_bytes());
     digest.update(scope.space().as_uuid().as_bytes());
     digest.update(replica.as_uuid().as_bytes());
     digest.update(namespace.as_bytes());
-    digest.update([0]);
+    digest.update(&[0]);
     match after {
         Some(checkpoint) => {
-            digest.update([1]);
+            digest.update(&[1]);
             digest.update(checkpoint.as_wire());
         }
-        None => digest.update([0]),
+        None => {
+            digest.update(&[0]);
+        }
     }
-    digest.update(policy.changes_per_page().to_be_bytes());
-    digest.update(policy.bytes_per_page().to_be_bytes());
-    OperationDigest::new(digest.finalize().into())
+    digest.update(&policy.changes_per_page().to_be_bytes());
+    digest.update(&policy.bytes_per_page().to_be_bytes());
+    OperationDigest::new(*digest.finalize().as_bytes())
 }
 
 /// Drain and backoff budgets for one [`SyncOrchestrator`].

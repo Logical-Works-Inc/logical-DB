@@ -65,7 +65,7 @@ struct BaselineDocumentManifest {
 
 #[cfg(any(feature = "fdb", test))]
 fn encode_baseline_document(document: &SnapshotDocument) -> Result<[u8; 41], FdbDataError> {
-    use sha2::{Digest, Sha256};
+    use lgwks_std::hash::blake3;
 
     if document.snapshot.len() > MAX_BASELINE_BYTES {
         eprintln!("logical-db-store-fdb: baseline document exceeds byte budget");
@@ -78,7 +78,7 @@ fn encode_baseline_document(document: &SnapshotDocument) -> Result<[u8; 41], Fdb
     bytes[2] = u8::from(document.tombstone);
     bytes[3..7].copy_from_slice(&byte_len.to_be_bytes());
     bytes[7..9].copy_from_slice(&chunks.to_be_bytes());
-    bytes[9..].copy_from_slice(&Sha256::digest(&document.snapshot));
+    bytes[9..].copy_from_slice(blake3(&document.snapshot).as_bytes());
     Ok(bytes)
 }
 
@@ -295,7 +295,7 @@ fn validate_baseline_atlas(
     baseline: &SnapshotBaseline,
     atlas: &BaselineAtlas,
 ) -> Result<SnapshotArtifact, DataError> {
-    use sha2::{Digest, Sha256};
+    use lgwks_std::hash::blake3;
 
     let digest = baseline.digest().into_bytes();
     let mut documents = Vec::new();
@@ -316,9 +316,7 @@ fn validate_baseline_atlas(
             }
             snapshot.extend_from_slice(chunk);
         }
-        if snapshot.len() != manifest.byte_len
-            || Sha256::digest(&snapshot).as_slice() != manifest.digest
-        {
+        if snapshot.len() != manifest.byte_len || *blake3(&snapshot).as_bytes() != manifest.digest {
             eprintln!("logical-db-store-fdb: atlas snapshot digest is invalid");
             return Err(DataError::BaselineCorrupt);
         }
@@ -1522,7 +1520,7 @@ mod runtime {
         key: &[u8],
         manifest: BaselineDocumentManifest,
     ) -> Result<SnapshotDocument, FdbBindingError> {
-        use sha2::{Digest, Sha256};
+        use lgwks_std::hash::blake3;
 
         let (document_id,) = document_space
             .unpack::<(uuid::Uuid,)>(key)
@@ -1535,7 +1533,7 @@ mod runtime {
             manifest,
         )
         .await?;
-        if Sha256::digest(&snapshot).as_slice() != manifest.digest {
+        if *blake3(&snapshot).as_bytes() != manifest.digest {
             eprintln!("logical-db-store-fdb: baseline document digest mismatch");
             return Err(binding(DataError::BaselineCorrupt));
         }
