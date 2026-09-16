@@ -37,6 +37,35 @@ attempt 3, bounded page, isolated scope), `fdb_recovery_composition`, and
 Hosted CI remains the required reproduction environment until a self-hosted
 runner exists; these local receipts do not substitute for it.
 
+## 2026-09-16 delivered state and Director decisions
+
+- **PR #57 merged** as `f19867b`: the HTTP transport bounds credential
+  refresh and every exchange under one 30-second operation deadline
+  (`CredentialTimeout`/`OperationTimeout`). Self-hosted quality and FDB
+  lanes passed on the exact code head `c69631a` (run 35124718030),
+  including the 300-document `/v1/recovery:baseline` journey and the
+  process-kill restore consumer. Issue #54 stays open for independent
+  reproduction and measured-tolerance instrumentation.
+- **PRD ratified** — PR #58 merged as `b804838`:
+  `docs/PRD-UNIFIED-SUBSTRATE.md` is the product definition of record
+  (embedded v1, FDB as cloud relay only, Cairn+LEM unification, swarm
+  work packages WP0–WP8). The self-hosted FDB lane failed on the PR
+  head with no log (runner died before upload); the Rust bytes were
+  identical to `c69631a`, whose FDB lane passed — recorded as
+  infrastructural, not a source failure.
+- **SOT transfer authorized** — the Director authorized properly
+  bringing the Cairn and LEM code into this workspace (2026-09-16).
+  `docs/adr/0002-cairn-lem-authority-transfer.md` records the transfer;
+  the ADR-0001 migration proof is the open obligation (PRD WP2). Until
+  it lands, documentation says "migration in progress", never
+  "canonical".
+- **Issue consolidation** — #6, #8, #30, #32, #33, #34, #35 closed with
+  consolidation comments pointing at the PRD; #28, #25, #54 remain open
+  as real gates. Open issues are now exactly the acceptance list.
+- **CloudKit review recorded** — `docs/review-cloudkit.md`: relay-first
+  confirmed; CloudKit is a design reference plus at most a bounded
+  optional transport adapter for Apple-only consumer apps.
+
 The implemented architecture is described in `ARCHITECTURE.md`. It contains
 an embedded replica, an independently hosted FDB synchronization service,
 and optional Cairn/episode vocabulary through the facade. Episode v1 snapshots

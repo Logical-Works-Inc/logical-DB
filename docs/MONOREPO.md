@@ -86,9 +86,13 @@ Remain in the old repos as read-only reference; not re-implemented here:
 
 ## Next steps
 
+Tracked by the ratified product definition, `docs/PRD-UNIFIED-SUBSTRATE.md`
+(work packages WP0–WP8); the authority transfer is ADR-0002:
+
 - [x] FACADE-1: facade `semantics` feature re-export plus the `logical-db-e2e`
   episode-to-document journey.
-- [ ] LEM-2: episode operators wired to the service path.
-- [ ] INGEST-1: deterministic projection from episodes into indexed state.
-- [ ] ADAPTER-1: versioned, source-preserving LEM v0 translation and durable
-  ORIGIN handoff.
+- [ ] WP2: proper Cairn + LEM code migration (authoritative ports,
+  versioned BLAKE3-v0 ↔ SHA-256-v1 adapter, ADR-0001 migration proof) —
+  supersedes the old LEM-2 / INGEST-1 / ADAPTER-1 split.
+- [ ] WP6: episode → LocalWorld memory surface with inline citations and
+  the #34 comparative evaluation.

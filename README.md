@@ -116,21 +116,24 @@ redirects, credentials, timeouts, and page counts have hard ceilings.
 
 ## Status
 
-The clean-room rewrite verifier requires every surviving text file to name at
-least twenty ledger sources and proves all baseline blobs changed, greater than
-85% line churn, a one-way crate DAG, and no legacy `kernel` surface. The rewrite
-also has deterministic state-machine tests, crash-resumable schema migration,
-kill/restart journeys, mutation campaigns, and official FDB unknown-commit
-injection. The former facade-to-daemon journey is explicitly retired because
-its confirmation model was unsound. `REWRITE_MANIFEST.md` remains
-authoritative. Embedded tombstones and export/restore are implemented and have
-retained tests. Canonical action-byte authorization is implemented and exercised
-through the HTTP/service/FDB seam. The v2 state-bearing server baseline,
-retention floor, and transactional prune gate are established, but production
-completion still requires paged HTTP baseline recovery and atomic client
-installation, independent runtime Braid confirmation, projection semantic
-identity, multi-node FDB recovery, public TLS/issuer integration, sustained
-load, external LEM consumption, and direct process-kill restore evidence.
+The product definition of record is
+[docs/PRD-UNIFIED-SUBSTRATE.md](docs/PRD-UNIFIED-SUBSTRATE.md): one
+substrate unifying Logical-DB (durable state), Cairn (observations), and
+LEM (episodic memory) — an embeddable, local-first ontology substrate
+with dedupe-from-first-write, full reversibility, and citation-bearing
+agent memory. The 2026-09-16 companion review of Apple CloudKit lives in
+[docs/review-cloudkit.md](docs/review-cloudkit.md).
+
+Delivered and evidenced: the clean-room rewrite gates (verifier, one-way
+crate DAG, mutation campaigns, FDB unknown-commit injection), the
+recovery stack through pruning and process-kill restore (PRs #48–#53,
+live-cluster receipts in `evidence/`), the bounded HTTP transport
+deadline (PR #57), and self-hosted quality/FDB CI lanes (PR #56).
+Retired: the facade-to-daemon journey, whose confirmation model was
+unsound. Still gating production release: the recovery-acceptance
+checklist (#28), the checked access graph (#25), the Cairn+LEM migration
+proof (PRD WP2, ADR-0002), and the deployment/load journeys in
+`REWRITE_MANIFEST.md`, which remains the mechanical authority.
 
 See [GOVERNANCE.md](GOVERNANCE.md) for delivered evidence, open acceptance work,
 and the Director decisions needed to reconcile historical scope contracts.
