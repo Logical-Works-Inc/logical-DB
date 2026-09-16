@@ -272,14 +272,18 @@ where
     async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error> {
         request.validate().map_err(HttpError::Protocol)?;
         let scope = request.scope;
-        self.send("v1/recovery:baseline", &request, move |response| async move {
-            if response.status() == StatusCode::NOT_FOUND {
-                return Ok(BaselineResult::Unavailable);
-            }
-            let page = decode_response::<BaselinePage>(response).await?;
-            page.validate_page(scope).map_err(HttpError::Protocol)?;
-            Ok(BaselineResult::Artifact(page))
-        })
+        self.send(
+            "v1/recovery:baseline",
+            &request,
+            move |response| async move {
+                if response.status() == StatusCode::NOT_FOUND {
+                    return Ok(BaselineResult::Unavailable);
+                }
+                let page = decode_response::<BaselinePage>(response).await?;
+                page.validate_page(scope).map_err(HttpError::Protocol)?;
+                Ok(BaselineResult::Artifact(page))
+            },
+        )
         .await
     }
 }

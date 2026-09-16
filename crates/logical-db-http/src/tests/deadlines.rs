@@ -190,11 +190,9 @@ fn refresh_and_http_headers_or_body_share_one_budget() {
                     }
                     write_bytes(stream, b"0\r\n\r\n");
                 });
-                let mut transport = HttpTransport::new(
-                    endpoint,
-                    Refresh::new(Some(Duration::from_millis(300))),
-                )
-                .unwrap();
+                let mut transport =
+                    HttpTransport::new(endpoint, Refresh::new(Some(Duration::from_millis(300))))
+                        .unwrap();
                 transport.operation_timeout = Duration::from_millis(500);
                 let started = Instant::now();
                 let outcome = timeout(Duration::from_secs(2), invoke(&mut transport, operation))
@@ -245,7 +243,10 @@ fn credential_failures_and_timeout_retry_policy_stay_distinct() {
             credentials.fail = true;
             let mut transport = HttpTransport::new(endpoint, credentials).unwrap();
             let error = invoke(&mut transport, operation).await.unwrap_err();
-            assert!(matches!(error, HttpError::Credential(CredentialError::Refresh)));
+            assert!(matches!(
+                error,
+                HttpError::Credential(CredentialError::Refresh)
+            ));
             assert!(!error.is_retryable());
             assert!(!format!("{error:?} {error}").contains("never-print-me"));
             assert_undispatched(&listener);
@@ -281,11 +282,9 @@ fn static_and_refreshed_credentials_keep_all_routes_working() {
 #[test]
 fn expired_deadline_never_polls_the_next_stage() {
     test_runtime().block_on(async {
-        let outcome = within_deadline(
-            Instant::now(),
-            HttpError::OperationTimeout,
-            async { panic!("an expired stage must not start") },
-        )
+        let outcome = within_deadline(Instant::now(), HttpError::OperationTimeout, async {
+            panic!("an expired stage must not start")
+        })
         .await;
         assert!(matches!(outcome, Err(HttpError::OperationTimeout)));
     });
