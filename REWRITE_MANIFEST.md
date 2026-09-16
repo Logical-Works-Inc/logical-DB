@@ -64,7 +64,12 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 
 - [ ] Complete the explicit backend capability profiles and matched-trace
   evidence required by the recorded Director ruling in `GOVERNANCE.md`.
-- [ ] Resolve the remaining estate ownership decision before LEM handoff.
+- [x] Resolve the remaining estate ownership decision before LEM handoff.
+  Resolved 2026-09-16: the Director authorized the Cairn + LEM SOT
+  transfer, recorded in `docs/adr/0002-cairn-lem-authority-transfer.md`
+  and `docs/PRD-UNIFIED-SUBSTRATE.md` §5. The migration proof remains
+  open and is tracked as PRD WP2 — a resolved decision is not a landed
+  proof.
 - [x] Bind authority to a service-computed canonical action digest distinct
   from caller intent/idempotency identity. The hosted FDB journey holds one
   action grant fixed while mutating every write field, proves rejection without
