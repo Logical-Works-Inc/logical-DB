@@ -9,16 +9,13 @@ use std::{error::Error, io, net::SocketAddr};
 use axum::http::HeaderValue;
 use foundationdb::directory::{Directory, DirectoryLayer};
 use foundationdb_tuple::Subspace;
-use hmac::{Hmac, KeyInit, Mac};
+use lgwks_std::hash::keyed;
 use logical_db_braid::LocalBraidAuthority;
 use logical_db_model::{AccountId, Scope, SpaceId};
 use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
 use logical_db_service::CheckpointCodec;
 use logical_db_store_fdb::FdbServiceStore;
-use sha2::Sha256;
 use uuid::Uuid;
-
-type HmacSha256 = Hmac<Sha256>;
 
 struct BearerAuthenticator {
     key: [u8; 32],
@@ -31,7 +28,7 @@ impl BearerAuthenticator {
         validate_bearer_token(token)?;
         Ok(Self {
             key,
-            expected_tag: bearer_tag(key, token)?,
+            expected_tag: bearer_tag(key, token),
             scope,
         })
     }
@@ -50,16 +47,15 @@ impl Authenticator for BearerAuthenticator {
                 context: "bearer scheme",
             },
         )?;
-        let mut verifier = <HmacSha256 as KeyInit>::new_from_slice(&self.key).map_err(|error| {
-            eprintln!("logical-db-daemon: HMAC verifier initialization failed: {error}");
-            AuthenticationError::Forbidden
-        })?;
-        verifier.update(b"logical-db/standalone/bearer/v1\0");
-        verifier.update(token);
-        verifier.verify_slice(&self.expected_tag).map_err(|error| {
-            eprintln!("logical-db-daemon: bearer verification failed: {error}");
-            AuthenticationError::Unauthorized
-        })?;
+        let mut verifier_message =
+            Vec::with_capacity(b"logical-db/standalone/bearer/v1\0".len() + token.len());
+        verifier_message.extend_from_slice(b"logical-db/standalone/bearer/v1\0");
+        verifier_message.extend_from_slice(token);
+        let computed = keyed(&self.key, &verifier_message);
+        if !logical_db_service::tags_equal(computed.as_bytes(), &self.expected_tag) {
+            eprintln!("logical-db-daemon: bearer verification failed");
+            return Err(AuthenticationError::Unauthorized);
+        }
         let expires_at = now_unix_ms
             .checked_add(60_000)
             .ok_or(AuthenticationError::Forbidden)?;
@@ -67,12 +63,11 @@ impl Authenticator for BearerAuthenticator {
     }
 }
 
-fn bearer_tag(key: [u8; 32], token: &[u8]) -> Result<[u8; 32], io::Error> {
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&key)
-        .map_err(|error| io::Error::other(format!("HMAC initialization failed: {error}")))?;
-    mac.update(b"logical-db/standalone/bearer/v1\0");
-    mac.update(token);
-    Ok(mac.finalize().into_bytes().into())
+fn bearer_tag(key: [u8; 32], token: &[u8]) -> [u8; 32] {
+    let mut message = Vec::with_capacity(b"logical-db/standalone/bearer/v1\0".len() + token.len());
+    message.extend_from_slice(b"logical-db/standalone/bearer/v1\0");
+    message.extend_from_slice(token);
+    *keyed(&key, &message).as_bytes()
 }
 
 fn required(name: &'static str) -> Result<String, io::Error> {

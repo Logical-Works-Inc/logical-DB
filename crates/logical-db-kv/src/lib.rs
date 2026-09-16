@@ -15,8 +15,8 @@
 //! A cache key maps to exactly one [`DocumentId`]:
 //!
 //! ```text
-//! sha256("logical-db-kv/document/v1" || 0x00 || u64be(len(namespace))
-//!         || namespace || 0x00 || u64be(len(key)) || key)
+//! blake3("logical-db-kv/document/v1" || 0x00 || u64be(len(namespace))
+//!        || namespace || 0x00 || u64be(len(key)) || key)
 //! ```
 //!
 //! The first sixteen digest bytes become the UUID with the version nibble set
@@ -127,6 +127,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use lgwks_std::hash::Hasher;
 pub use logical_db::{
     BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
 };
@@ -138,7 +139,6 @@ pub use logical_db_model::{
     AccountId, DocumentId, DocumentRevision, IndexId, IndexValue, NamespaceCheckpoint,
     NamespaceCheckpoints, PeerId, ReplicaId, Scope, SpaceId,
 };
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -1553,7 +1553,7 @@ impl KvCache {
             return Ok(false);
         }
         let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
+        let mut hasher = Hasher::new();
         let mut buffer = vec![0_u8; BLOB_HASH_BUFFER_BYTES].into_boxed_slice();
         let mut remaining = size;
         while remaining > 0 {
@@ -1561,7 +1561,9 @@ impl KvCache {
                 .unwrap_or(BLOB_HASH_BUFFER_BYTES)
                 .min(buffer.len());
             match file.read_exact(&mut buffer[..width]) {
-                Ok(()) => hasher.update(&buffer[..width]),
+                Ok(()) => {
+                    hasher.update(&buffer[..width]);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                     return Ok(false);
                 }
@@ -1569,7 +1571,7 @@ impl KvCache {
             }
             remaining -= u64::try_from(width).unwrap_or(0);
         }
-        Ok(hasher.finalize().as_slice() == digest)
+        Ok(*hasher.finalize().as_bytes() == *digest)
     }
 
     fn install_blob(&self, source: &Path, digest: &[u8; 32], size: u64) -> Result<(), KvError> {
@@ -1868,9 +1870,9 @@ fn expiry_for(ttl: Option<Duration>, now: i64) -> i64 {
 }
 
 fn content_digest(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(bytes);
-    hasher.finalize().into()
+    *hasher.finalize().as_bytes()
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {
@@ -1924,12 +1926,12 @@ fn batch_sequence(started_at_ms: i64, index: usize) -> Result<u64, KvError> {
 }
 
 fn batch_member_operation(batch: OperationId, index: usize) -> OperationId {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/batch-member/v1");
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(batch.as_uuid().as_bytes());
-    hasher.update(u64::try_from(index).unwrap_or(u64::MAX).to_be_bytes());
-    let digest: [u8; 32] = hasher.finalize().into();
+    hasher.update(&u64::try_from(index).unwrap_or(u64::MAX).to_be_bytes());
+    let digest: [u8; 32] = *hasher.finalize().as_bytes();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x80;
@@ -1942,16 +1944,16 @@ fn batch_request_digest(
     entries: &[BatchPut],
     started_at_ms: i64,
 ) -> Result<OperationDigest, KvError> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/batch-request/v1");
     hasher.update(
-        u64::try_from(namespace.len())
+        &u64::try_from(namespace.len())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
     hasher.update(namespace.as_bytes());
     hasher.update(
-        u64::try_from(entries.len())
+        &u64::try_from(entries.len())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
@@ -1959,29 +1961,29 @@ fn batch_request_digest(
         let sequence = batch_sequence(started_at_ms, index)?;
         let expires_at_ms = expiry_for(entry.ttl, started_at_ms);
         hasher.update(
-            u64::try_from(entry.key.len())
+            &u64::try_from(entry.key.len())
                 .unwrap_or(u64::MAX)
                 .to_be_bytes(),
         );
         hasher.update(entry.key.as_bytes());
         hasher.update(
-            u64::try_from(entry.value.len())
+            &u64::try_from(entry.value.len())
                 .unwrap_or(u64::MAX)
                 .to_be_bytes(),
         );
         hasher.update(&entry.value);
-        hasher.update(expires_at_ms.to_be_bytes());
-        hasher.update(sequence.to_be_bytes());
+        hasher.update(&expires_at_ms.to_be_bytes());
+        hasher.update(&sequence.to_be_bytes());
     }
-    Ok(OperationDigest::new(hasher.finalize().into()))
+    Ok(OperationDigest::new(*hasher.finalize().as_bytes()))
 }
 
 fn bind_batch_request(request: OperationDigest, batch_digest: &OperationDigest) -> OperationDigest {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/batch-member-request/v1");
-    hasher.update(request.into_bytes());
-    hasher.update(batch_digest.into_bytes());
-    OperationDigest::new(hasher.finalize().into())
+    hasher.update(&request.into_bytes());
+    hasher.update(&batch_digest.into_bytes());
+    OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
 fn put_digest(
@@ -1992,18 +1994,18 @@ fn put_digest(
     expires_at_ms: i64,
     sequence: u64,
 ) -> OperationDigest {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/put/v1");
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(operation.as_uuid().as_bytes());
     hasher.update(namespace.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(key.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(value);
-    hasher.update(expires_at_ms.to_be_bytes());
-    hasher.update(sequence.to_be_bytes());
-    OperationDigest::new(hasher.finalize().into())
+    hasher.update(&expires_at_ms.to_be_bytes());
+    hasher.update(&sequence.to_be_bytes());
+    OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
 fn tiered_put_digest(
@@ -2015,44 +2017,44 @@ fn tiered_put_digest(
     expires_at_ms: i64,
     sequence: u64,
 ) -> OperationDigest {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/tiered-put/v1");
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(operation.as_uuid().as_bytes());
     hasher.update(namespace.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(key.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(digest);
-    hasher.update(size.to_be_bytes());
-    hasher.update(expires_at_ms.to_be_bytes());
-    hasher.update(sequence.to_be_bytes());
-    OperationDigest::new(hasher.finalize().into())
+    hasher.update(&size.to_be_bytes());
+    hasher.update(&expires_at_ms.to_be_bytes());
+    hasher.update(&sequence.to_be_bytes());
+    OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
 fn clear_digest(operation: &OperationId, namespace: &str, key: &str) -> OperationDigest {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/clear/v1");
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(operation.as_uuid().as_bytes());
     hasher.update(namespace.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(key.as_bytes());
-    OperationDigest::new(hasher.finalize().into())
+    OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
 fn document_for(namespace: &str, key: &str) -> DocumentId {
     let namespace_length = u64::try_from(namespace.len()).unwrap_or(u64::MAX);
     let key_length = u64::try_from(key.len()).unwrap_or(u64::MAX);
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/document/v1");
-    hasher.update([0]);
-    hasher.update(namespace_length.to_be_bytes());
+    hasher.update(&[0]);
+    hasher.update(&namespace_length.to_be_bytes());
     hasher.update(namespace.as_bytes());
-    hasher.update([0]);
-    hasher.update(key_length.to_be_bytes());
+    hasher.update(&[0]);
+    hasher.update(&key_length.to_be_bytes());
     hasher.update(key.as_bytes());
-    let digest: [u8; 32] = hasher.finalize().into();
+    let digest: [u8; 32] = *hasher.finalize().as_bytes();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x80;

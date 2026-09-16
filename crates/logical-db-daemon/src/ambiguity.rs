@@ -8,6 +8,7 @@ use std::{collections::HashSet, error::Error, io};
 
 use foundationdb::{Database, api::FdbApiBuilder, options::NetworkOption};
 use foundationdb_tuple::Subspace;
+use lgwks_std::hash::Hasher;
 use logical_db_crdt::{Document, EncodedChange, Object, Scalar};
 use logical_db_model::{
     AccountId, ActionDigest, BaselineDigest, DocumentId, Effect, MAX_PAGE_BYTES, OperationDigest,
@@ -26,7 +27,6 @@ use logical_db_service::{
     PruneReceipt, PruneRefusal, PruneResult, RetentionStore, SealResult, ServiceStore, StoredPage,
 };
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
-use sha2::{Digest, Sha256};
 
 const FULL_FDB_CHUNK_PROBE_BYTES: usize = 65_536;
 
@@ -103,24 +103,24 @@ impl ExecutionGrant for ForgedGrant {
 }
 
 fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u64) -> ForgedGrant {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     digest.update(b"logical-db/fdb-ambiguity-fixture/v1\0");
     digest.update(scope.account().as_uuid().as_bytes());
     digest.update(scope.space().as_uuid().as_bytes());
-    digest.update([match effect {
+    digest.update(&[match effect {
         Effect::Read => 1,
         Effect::Scan => 2,
         Effect::Write => 3,
         Effect::Sync => 4,
     }]);
-    digest.update(action.into_bytes());
-    digest.update(frontier.to_be_bytes());
+    digest.update(&action.into_bytes());
+    digest.update(&frontier.to_be_bytes());
     ForgedGrant {
         scope,
         effect,
         action,
         frontier,
-        invocation: digest.finalize().into(),
+        invocation: *digest.finalize().as_bytes(),
     }
 }
 
@@ -937,13 +937,13 @@ async fn append_continuation_record(
 }
 
 fn continuation_fixture_request(scope: Scope, frontier: u64, attempt: u16) -> OperationDigest {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     digest.update(b"logical-db/fdb-continuation-fixture/v1\0");
     digest.update(scope.account().as_uuid().as_bytes());
     digest.update(scope.space().as_uuid().as_bytes());
-    digest.update(frontier.to_be_bytes());
-    digest.update(attempt.to_be_bytes());
-    OperationDigest::new(digest.finalize().into())
+    digest.update(&frontier.to_be_bytes());
+    digest.update(&attempt.to_be_bytes());
+    OperationDigest::new(*digest.finalize().as_bytes())
 }
 
 async fn verify_recovered_write(

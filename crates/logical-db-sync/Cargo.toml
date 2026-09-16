@@ -13,10 +13,9 @@ repository.workspace = true
 [dependencies]
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
-sha2.workspace = true
+lgwks_std.workspace = true
 
 [dev-dependencies]
-lgwks_std.workspace = true
 
 [lints]
 workspace = true

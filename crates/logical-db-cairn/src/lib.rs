@@ -21,8 +21,8 @@
 
 #![forbid(unsafe_code)]
 
+use lgwks_std::hash::Hasher;
 use lgwks_std::json::serde::{self, Deserialize, Deserializer, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Maximum links accepted on one observation (per-observation bound; no model peer).
@@ -108,16 +108,16 @@ string_vocab!("Epistemic grade of a memory claim, weakest inference last.", Trus
     "Extrapolated beyond current evidence." Predicted => "predicted", "Composed from multiple weaker claims." Synthesized => "synthesized",
 );
 
-/// Shared digest framing: `sha256` over each part as `len(u64LE) + bytes`.
+/// Shared digest framing: `blake3` over each part as `len(u64LE) + bytes`.
 #[must_use]
 pub fn digest_frame(parts: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     for part in parts {
         let length = u64::try_from(part.len()).unwrap_or(u64::MAX);
-        hasher.update(length.to_le_bytes());
+        hasher.update(&length.to_le_bytes());
         hasher.update(part);
     }
-    hasher.finalize().into()
+    *hasher.finalize().as_bytes()
 }
 
 /// Content-derived observation identity; the zero digest is rejected.
@@ -592,12 +592,12 @@ mod tests {
         assert_eq!(reference.to_string(), "07".repeat(32));
         assert_eq!(reference.into_bytes(), [7u8; 32]);
         // digest_frame spells length-prefix (u64LE) + bytes per part.
-        let mut manual = Sha256::new();
+        let mut manual = Hasher::new();
         for part in [b"ab".as_slice(), b"c".as_slice()] {
-            manual.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+            manual.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
             manual.update(part);
         }
-        let want: [u8; 32] = manual.finalize().into();
+        let want: [u8; 32] = *manual.finalize().as_bytes();
         assert_eq!(digest_frame(&[b"ab", b"c"]), want);
         assert_ne!(digest_frame(&[b"ab", b"c"]), digest_frame(&[b"a", b"bc"]));
     }

@@ -20,7 +20,7 @@ braid-sdk = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.g
 braid-verify = { version = "0.1.0", git = "https://github.com/srinji-kaggss/Braid.git", rev = "4b1b3e93a6b930bac9533722a212a126cd8e3632" }
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
-sha2.workspace = true
+lgwks_std.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

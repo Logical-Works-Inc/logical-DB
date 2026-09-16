@@ -18,9 +18,9 @@ use braid_ir::{
 use braid_run::{JustificationProof, RunnableInvocation};
 use braid_sdk::Builder;
 use braid_verify::{Verdict, admit};
+use lgwks_std::hash::Hasher;
 use logical_db_model::{ActionDigest, Effect, Scope};
 use logical_db_service::{Authority, ExecutionGrant};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Braid capability prefix authorizing structured DB reads.
@@ -293,14 +293,14 @@ fn action_predicate(facts: &BTreeMap<String, Value>) -> Result<Predicate, BraidA
 }
 
 fn invocation_id(runnable: &RunnableInvocation) -> [u8; 32] {
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new();
     digest.update(b"logical-db/braid-invocation/v1\0");
-    digest.update(runnable.capsule_cid().0);
-    digest.update(runnable.registry_cid().0);
-    digest.update(runnable.authority_cid().0);
-    digest.update(runnable.justification().snapshot_cid().0);
-    digest.update(runnable.justification().predicate_cid().0);
-    digest.finalize().into()
+    digest.update(&runnable.capsule_cid().0);
+    digest.update(&runnable.registry_cid().0);
+    digest.update(&runnable.authority_cid().0);
+    digest.update(&runnable.justification().snapshot_cid().0);
+    digest.update(&runnable.justification().predicate_cid().0);
+    *digest.finalize().as_bytes()
 }
 
 fn effect_name(effect: Effect) -> &'static str {
