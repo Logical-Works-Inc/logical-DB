@@ -16,23 +16,38 @@
 #[path = "support/fdb_harness.rs"]
 mod fdb_harness;
 
-use std::{error::Error, fs, io};
+use std::{
+    error::Error,
+    fs, io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use fdb_harness::{FixtureAuthenticator, read_floor, read_frontier, seal_consume_and_prune};
 use logical_db::{
     AccountId, BatchEdit, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId,
     ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
     http::{HttpTransport, StaticBearer, Url},
-    transport::{BaselineRequest, BaselineResult, Transport},
+    transport::{BaselineRequest, BaselineResult, Checkpoint, PullRequest, PullResult, Transport},
 };
 use logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS;
-use logical_db_server::{SystemClock, router};
+use logical_db_server::{Clock, router};
 use logical_db_service::CheckpointCodec;
 use logical_db_store_fdb::{
     FdbServiceStore,
     foundationdb::{Database as FdbDatabase, api::FdbApiBuilder},
     foundationdb_tuple::Subspace,
 };
+
+struct RecoveryClock(Arc<AtomicU64>);
+
+impl Clock for RecoveryClock {
+    fn now_unix_ms(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::SeqCst))
+    }
+}
 
 #[test]
 fn fdb_recovery_composition() -> Result<(), Box<dyn Error>> {
@@ -53,11 +68,12 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     );
     let service_store = FdbServiceStore::new(http_database, root.clone())?;
     let prune_store = FdbServiceStore::new(prune_database, root)?;
+    let now = Arc::new(AtomicU64::new(1_000));
     let application = router(
         service_store,
         FixtureAuthenticator,
         CheckpointCodec::new([0x27; 32], 60_000)?,
-        SystemClock,
+        RecoveryClock(Arc::clone(&now)),
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -72,6 +88,16 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let first_path = std::env::temp_dir().join(format!("logical-db-fdb-recovery-first-{run}.redb"));
     let second_path =
         std::env::temp_dir().join(format!("logical-db-fdb-recovery-second-{run}.redb"));
+    let expired_path =
+        std::env::temp_dir().join(format!("logical-db-fdb-recovery-expired-{run}.redb"));
+    let expired_id = ReplicaId::new();
+    let expired = Database::open(&expired_path, scope, expired_id)?;
+    expired
+        .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+        .await?;
+    let old_checkpoint = expired
+        .checkpoint(peer)?
+        .expect("initial HTTP pull issues a checkpoint");
     let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
     let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
     // The first document of page two is deleted on the seeding replica, so its
@@ -120,6 +146,46 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 
     seal_consume_and_prune(&prune_store, scope, seeded_target).await?;
 
+    // Expire a real server-issued checkpoint without sleeping or changing the
+    // production codec. This client last pulled before the pruned log existed.
+    now.store(61_001, Ordering::SeqCst);
+    let pull = PullRequest {
+        protocol: logical_db_protocol::PROTOCOL_VERSION,
+        scope,
+        replica: expired_id,
+        request: OperationDigest::new([0x6e; 32]),
+        after: Some(Checkpoint::from_wire(old_checkpoint.clone())?),
+        max_changes: 1,
+        max_bytes: 1_048_576,
+    };
+    assert!(matches!(
+        transport.pull(pull.clone()).await?,
+        PullResult::BaselineRequired
+    ));
+    let recovered = expired
+        .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+        .await?;
+    assert!(
+        recovered.recovered,
+        "expired checkpoint must install the baseline"
+    );
+    let replacement = expired
+        .checkpoint(peer)?
+        .expect("recovery persists a checkpoint");
+    assert_ne!(replacement, old_checkpoint);
+    drop(expired);
+    let expired = Database::open(&expired_path, scope, expired_id)?;
+    assert_eq!(expired.checkpoint(peer)?, Some(replacement.clone()));
+    assert!(matches!(
+        transport
+            .pull(PullRequest {
+                after: Some(Checkpoint::from_wire(replacement)?),
+                ..pull
+            })
+            .await?,
+        PullResult::Page(_)
+    ));
+
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
@@ -132,8 +198,14 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         eprintln!("fdb-recovery-composition: boundary tombstone did not survive recovery");
         return Err(io::Error::other("recovered replica lost a boundary tombstone").into());
     }
+    assert!(expired.is_deleted(tombstoned)?);
     for (index, document) in documents.iter().enumerate() {
         let observed = second.read(*document, |reader| reader.get(&Object::root(), "state"))?;
+        assert_eq!(
+            expired.read(*document, |reader| reader.get(&Object::root(), "state"))?,
+            observed,
+            "expired and fresh replicas disagree at document {index}"
+        );
         if *document == tombstoned {
             if observed.is_some() {
                 eprintln!("fdb-recovery-composition: boundary tombstone resurrected");
@@ -178,7 +250,10 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         }
         pages += 1;
         for document in &page.documents {
-            seen.insert(document.document);
+            assert!(
+                seen.insert(document.document),
+                "baseline repeated a document"
+            );
         }
         let Some(next) = page.next_document else {
             break;
@@ -218,12 +293,14 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         "PASS fdb-http-recovery route=/v1/recovery:baseline recovered=true documents={total} frontier={frontier} floor={floor} store=real-fdb scope=isolated"
     );
 
-    drop((first, second));
+    println!("PASS fdb-http-expired-checkpoint recovered=true reopened=true replacement=usable");
+    drop((first, second, expired));
     server.abort();
     let _ = server.await;
     drop(prune_store);
     drop(network);
     let _ = fs::remove_file(&first_path);
     let _ = fs::remove_file(&second_path);
+    let _ = fs::remove_file(&expired_path);
     Ok(())
 }
