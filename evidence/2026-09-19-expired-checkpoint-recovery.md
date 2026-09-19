@@ -271,6 +271,17 @@ lanes now have a 12 GiB retained-cache limit checked before and after the full
 suite; an over-budget result remains a failure requiring maintenance. No
 retained evidence was deleted. This does not prove indefinite cache stability.
 
+Successive CI-only revisions otherwise duplicate the same 3.4 GiB Windows
+bundle. The VM planner now reuses matching artifacts through hard links only
+after checking their recorded and actual SHA-256 digests. Each source tree
+keeps its own directory and manifest; changed artifacts still consume their
+full new size. Artifact extraction skips existing files rather than mutating
+shared inodes, and runtime checksum verification still runs before execution.
+Two regressions cover shared blocks, repeated transfer, changed/corrupt bytes
+and destination symlinks. Nine inventory/transfer tests pass locally. The
+12 GiB artifact limit and 1 GiB free-space reserve are unchanged. This avoids
+duplicate storage for unchanged artifacts, not unbounded new-version retention.
+
 At published head `e5cd052`, native quality passed in 3m37s and native FDB
 passed in 27m32s. Windows failed at the recorded Rosetta error. The overall
 run was cancelled while Linux was queued; it is not a passing CI receipt.

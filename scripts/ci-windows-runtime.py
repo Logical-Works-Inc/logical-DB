@@ -86,16 +86,54 @@ def within_budget(used, growth, available):
     return used + growth <= 12 * 1024**3 and available >= growth + 1024**3
 
 
+def reuse_artifacts(root, manifest, base):
+    # Preserve each revision's complete immutable view without duplicating
+    # identical executable bytes. Transfer uses --skip-old-files afterwards.
+    transfer_growth(root, manifest["sizes"])
+    previous = root / ".ci-windows/tests.json"
+    if previous.exists() and json.loads(previous.read_text()) != manifest:
+        raise ValueError("retained revision has a different artifact manifest")
+    candidates = []
+    for directory in sorted(base.iterdir()):
+        if directory == root or directory.is_symlink() or not directory.is_dir():
+            continue
+        receipt = directory / ".ci-windows/tests.json"
+        if receipt.is_file():
+            candidates.append((directory, json.loads(receipt.read_text())["sha256"]))
+    reused = 0
+    for name, expected in manifest["sha256"].items():
+        target = root / name
+        if target.resolve() != target:
+            raise ValueError("artifact destination contains a symlink")
+        if target.exists():
+            if not target.is_file() or digest(target) != expected:
+                raise ValueError("retained artifact differs from incoming checksum")
+            continue
+        for directory, hashes in candidates:
+            source = directory / name
+            if hashes.get(name) != expected or source.resolve() != source:
+                continue
+            if source.is_file() and digest(source) == expected:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(source, target)
+                reused += manifest["sizes"][name]
+                break
+    return reused
+
+
 def plan_transfer():
     manifest = json.load(sys.stdin)
     if set(manifest["sizes"]) != set(manifest["sha256"]):
         raise ValueError("size inventory differs from checksummed artifacts")
     root = Path(sys.argv[2])
     base = Path("/var/lib/logical-db-ci")
+    if root.parent != base or len(root.name) != 40 or any(c not in "0123456789abcdef" for c in root.name):
+        raise ValueError("expected an owned source-tree directory")
+    reused = reuse_artifacts(root, manifest, base)
     used = int(subprocess.check_output(["du", "-sk", str(base)], text=True).split()[0]) * 1024
     growth = transfer_growth(root, manifest["sizes"]) + int(sys.argv[3]) * 1024 + 1024**2
     available = shutil.disk_usage(base).free
-    print(f"TRANSFER used_bytes={used} growth_bytes={growth} available_bytes={available}", flush=True)
+    print(f"TRANSFER reused_bytes={reused} used_bytes={used} growth_bytes={growth} available_bytes={available}", flush=True)
     if not within_budget(used, growth, available):
         raise SystemExit("Windows VM storage budget reached; recoverable maintenance required")
 
@@ -244,6 +282,39 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue(within_budget(11 * gib, gib, 2 * gib))
         self.assertFalse(within_budget(11 * gib, gib + 1, 3 * gib))
         self.assertFalse(within_budget(0, gib, 2 * gib - 1))
+
+    def test_unchanged_artifacts_share_blocks_without_replacing_old_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            old, new = base / "old", base / "new"
+            (old / ".ci-windows").mkdir(parents=True)
+            (old / "test.exe").write_bytes(b"compiled fixture")
+            manifest = {"sha256": {"test.exe": digest(old / "test.exe")},
+                        "sizes": {"test.exe": 16}}
+            (old / ".ci-windows/tests.json").write_text(json.dumps(manifest))
+            self.assertEqual(reuse_artifacts(new, manifest, base), 16)
+            self.assertTrue((old / "test.exe").samefile(new / "test.exe"))
+            self.assertEqual(reuse_artifacts(new, manifest, base), 0)
+            self.assertEqual(transfer_growth(new, manifest["sizes"]), 0)
+            changed = {"sha256": {"test.exe": "different"}, "sizes": {"test.exe": 16}}
+            self.assertEqual(reuse_artifacts(base / "changed", changed, base), 0)
+            self.assertFalse((base / "changed/test.exe").exists())
+            self.assertEqual((old / "test.exe").read_bytes(), b"compiled fixture")
+            with self.assertRaises(ValueError):
+                reuse_artifacts(new, changed, base)
+
+    def test_reuse_rejects_corruption_and_destination_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            old, new = base / "old", base / "new"
+            (old / ".ci-windows").mkdir(parents=True)
+            (old / "test.exe").write_bytes(b"corrupt")
+            manifest = {"sha256": {"test.exe": "not-the-file-hash"}, "sizes": {"test.exe": 7}}
+            (old / ".ci-windows/tests.json").write_text(json.dumps(manifest))
+            self.assertEqual(reuse_artifacts(new, manifest, base), 0)
+            new.symlink_to(old, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                reuse_artifacts(new, manifest, base)
 
 
 if __name__ == "__main__":

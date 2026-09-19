@@ -56,10 +56,10 @@ sudo mkdir -p /var/lib/logical-db-ci
 guest_root="/var/lib/logical-db-ci/$tree"
 limactl copy --backend=scp "$source_root/scripts/ci-windows-runtime.py" "$vm:/tmp/logical-db-ci-runtime.py"
 docker cp "$worker:/tmp/ci-windows-runtime/.ci-windows/tests.json" - | tar -xOf - | \
-  limactl shell "$vm" python3 /tmp/logical-db-ci-runtime.py plan "$guest_root" "$source_kib"
+  limactl shell "$vm" sudo python3 /tmp/logical-db-ci-runtime.py plan "$guest_root" "$source_kib"
 limactl shell "$vm" sudo mkdir -p "$guest_root"
 tar -C "$source_root" --exclude=./target -cf - . | limactl shell "$vm" sudo tar -xf - -C "$guest_root"
-docker cp "$worker:/tmp/ci-windows-runtime/." - | limactl shell "$vm" sudo tar -xf - -C "$guest_root"
+docker cp "$worker:/tmp/ci-windows-runtime/." - | limactl shell "$vm" sudo tar --skip-old-files -xf - -C "$guest_root"
 # Only the workspace pointer changes. Every revision's source/artifacts remain
 # recoverable; the VM has no host mounts, agent forwarding or host credentials.
 # shellcheck disable=SC2016
