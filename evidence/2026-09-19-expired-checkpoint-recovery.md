@@ -34,8 +34,9 @@ pull. Page enumeration rejects duplicate IDs immediately.
 
 The canonical owners remain `logical-db-service` (checkpoint validity),
 `logical-db-sync` (recovery), and the existing FDB adapter (durability).
-Only the composition test changes Rust behavior; no runtime, wire format,
-dependency, lockfile, or workflow changes. A wall-clock sleep was rejected
+The composition test and Windows preflight are test-only Rust; there are no
+product runtime, wire format, Rust dependency or lockfile changes. CI routing
+is corrected separately below. A wall-clock sleep was rejected
 because the existing Clock port permits deterministic expiry without waiting.
 A mock-only test cannot establish the requested HTTP/FDB composition.
 
@@ -89,6 +90,87 @@ the owned FDB server and released port 4679. The negative run's two residual
 fixture databases were moved to OS Trash and their original paths verified
 absent. No unrelated process or file was removed. Repeated memory/disk growth
 has not been instrumented; cleanup observation is a narrower claim.
+
+## Self-hosted CI correction
+
+The first PR run at `bbc28a6` passed both existing self-hosted lanes (macOS
+quality and live arm64 FDB), but 22 hosted jobs did not execute. Treating their
+billing annotation as an acceptable external blocker was the wrong decision:
+the Director requires self-hosted execution for every check, with emulation
+for the remaining platforms. This correction preserves that requirement.
+
+The workflow routes all jobs explicitly to `[self-hosted, macOS, ARM64]`.
+Native quality retains rewrite evidence, dependency-contract tests, complete
+workspace check/test/clippy, formatting and
+cargo-deny. Native arm64 FDB checks retain the same semantics; their environment
+exports are grouped to satisfy shell lint. Linux x86-64 runs workspace
+quality, all 15 original Linux isolated package builds, and the retained Linux
+FDB composition in the existing local Docker
+emulator. Windows-GNU runs compile, dependency-contract, workspace tests and
+clippy through Wine, not a GitHub-hosted Windows machine.
+
+`scripts/verify-ci.py` uses pinned PyYAML 6.0.3, not a text search, to reject
+hosted, unresolved, duplicate-key and opaque reusable-workflow routing. Its
+six regression methods pass locally. PyYAML is CI-only tooling; the Rust
+dependency register and lockfile are unchanged. Python's standard library
+does not parse YAML; a hand-written partial parser was rejected because it
+could miss scheduler-significant syntax. The existing dependency-contract
+gate remains mandatory; it does not claim to admit Python packages.
+
+`ci-emulated.sh` verifies the resident base-image digest, builds the pinned
+Rust 1.98.0 toolchain, and runs each guest with 4 CPUs, 6 GiB memory, 512 PIDs
+and a 50-minute execution deadline. The initial cross-rs 0.2.5 image failed
+a small Windows Rust runtime probe at link time: its import library lacked
+Rust 1.98's `GetHostNameW`. That image is rejected, not worked around in Rust.
+The replacement cross-rs image is pinned to
+`sha256:7dbfe2c497a798ee3798fecf4b262c0ea12d1d02a6331bdc05ce76c9ad90fd70`:
+GCC 13-posix and Wine 10.0. The Windows Rust smoke probe now passes random
+hash seeding, a loopback socket and thread join before the full suite builds;
+compiling it for the host instead correctly fails. Wine's initial headless
+setup diagnostics remain in the build log; no GUI capability is claimed.
+The first Windows all-target check passed in 10m19s, but its next shell command
+failed with exit 127 (`ets: command not found`): the agent had edited a script
+while Bash was reading its live bind mount. The Linux attempt was deliberately
+stopped (exit 143) to repair the shared harness. These are retained failures,
+not passing runtime evidence. Read-only guest mounts do not freeze host edits.
+
+The repaired driver archives the Git index into a recorded tree snapshot
+before execution. Its host body is parsed as one function before starting
+children. Guests mount that snapshot read-only, without `.git`, host credentials,
+or the Docker socket. The previous snapshot moves to OS Trash on replacement;
+no source history is irreversibly removed. Workers stop after each run and retain owned build/Wine caches for
+reuse; logs rotate at 2 x 10 MiB. Lane-specific target, registry and Git cache
+volumes allow the Actions checkout to reuse the local emulator's compilation
+without sharing host credentials or Linux/Windows build outputs. The Linux
+default and optional FDB lanes use the same fixed linker path, avoiding a
+second dependency build solely because RUSTFLAGS changed. An 8 GiB preflight cache check supplies
+backpressure, not a strict peak-storage guarantee. Changed worker images or
+mounts are refused pending recoverable maintenance rather than overwritten.
+Repeated cancellation, crash, disk-growth and image-upgrade lifecycle results
+remain unverified. These limits must not be reported as production acceptance.
+
+Measurable targets: zero jobs schedulable on a hosted runner; all original
+check families retained; actual guest test exits zero; expired checkpoint
+and process-kill FDB receipts remain present; no owned worker left running.
+At this receipt revision the routing regression passed; guest execution and
+new exact-head remote verification are pending. Wine is Windows-GNU
+compatibility evidence, not proof of native Windows kernel semantics.
+
+The frozen Linux run completed with exit 0: default workspace tests and
+clippy, optional FDB compilation/lint/tests, ambiguity journey, HTTP expired
+checkpoint recovery (10.18s) and process-kill restore (12.75s). Its snapshot
+predated the restored Linux package-isolation loop; that loop still requires
+exact-head verification. The Windows Wine 10 run exposed a separate harness
+prerequisite: eight dependency-contract tests failed because Windows
+`Command::new("cargo")` could not find a Windows executable. The gate was
+not skipped or mocked. The image now installs the matching Windows Rust
+toolchain and exposes its binaries through the Wine runner. Its fail-fast
+probe successfully spawned real Windows Cargo and rustc 1.98.0; the full
+suite is being rerun. Its dependency-contract rerun passed all ten tests in
+1.39s. Both failed images/workers and their logs are retained. Disabling the
+self-hosted membership guard in an in-memory copy of `verify-ci.py` caused
+the `[Linux, X64]` adversarial case to fail (`ValueError not raised`); the
+unmodified six-method suite passes. No source mutation was written to disk.
 
 ## Nine-axis acceptance retained
 

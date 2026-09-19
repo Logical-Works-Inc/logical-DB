@@ -1,0 +1,78 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. See ../../evidence/SOURCES.md.
+type: Contract
+title: Self-hosted CI without mutable-source test runs
+generated: {by: "agent:codex", at: "2026-09-19"}
+verified: {by: "agent:codex", method: "routing falsifiers, live source-edit counterexample, frozen-source hash comparison; complete guest runtime results pending"}
+status: verification-in-progress
+stale_after: "2026-10-19"
+sources:
+  - ../../scripts/ci-emulated.sh
+  - ../../scripts/ci-guest.sh
+  - ../../scripts/verify-ci.py
+  - ../../evidence/2026-09-19-expired-checkpoint-recovery.md
+id: self-hosted-ci
+actor: repository-maintainer-or-agent
+job: Verify a recorded revision using existing self-hosted compute, with visible failures and safe retry.
+prior_knowledge:
+  - All CI execution must remain self-hosted; hosted billing is not an accepted blocker.
+  - A local emulator command verifies the staged Git tree and rejects unstaged changes.
+  - Wine runs Windows-GNU binaries but does not establish native Windows MSVC semantics.
+start:
+  local_entry: bash scripts/ci-emulated.sh linux
+  other_target: bash scripts/ci-emulated.sh windows
+  remote_entry: Open or update a pull request; observe its exact-head Actions results in BrowserOS.
+  required_environment: Existing macOS ARM64 runner, Docker Linux x86-64 emulator, recorded resident base image.
+success:
+  visible_outcome: Every retained check family passes on the recorded source; all execution is self-hosted and owned workers are stopped.
+  release_boundary: Passing this journey does not establish whole-product production readiness or native Windows parity.
+states:
+  - name: refused-preflight
+    expectation: No test starts with unstaged source, a wrong image, an active worker, or incompatible retained configuration.
+  - name: source-frozen
+    expectation: SOURCE identifies the Git tree and snapshot path; later working-copy edits cannot alter guest scripts.
+  - name: running
+    expectation: EMULATOR identifies the worker, image and lane; compiler and test output remains visible.
+  - name: failed-or-cancelled
+    expectation: The exit remains nonzero, owned execution stops, and logs plus build caches remain recoverable.
+  - name: passed
+    expectation: Actual tests, not only compilation or scheduling, completed successfully.
+invariants:
+  - Every workflow job has literal self-hosted routing; opaque or hosted routing fails verification.
+  - Every guest source file belongs to the recorded Git-tree snapshot, unaffected by working-copy edits.
+  - A nonzero guest exit is returned by the public driver, never converted to success by container attachment.
+  - Linux and Windows use separate build caches; no host credentials or Docker socket enter the guest.
+  - The driver bounds CPU, memory, PIDs and execution time, and refuses oversized retained caches.
+  - Emulated Windows results remain distinguishable from native Windows results.
+trust_boundaries:
+  - The existing self-hosted runner executes trusted repository workflows; fork isolation is not proven here.
+  - Snapshots replaced by retry move to OS Trash; incompatible worker images are preserved for maintenance.
+  - Container caches and FDB fixture data are owned CI artifacts, not production data.
+recovery_contracts:
+  - Stage intended changes and rerun after an unstaged-source refusal.
+  - Correct the reported failing check, retain its original log, then rerun affected checks.
+  - Preserve or export a mismatched stopped worker before replacement; never silently overwrite it.
+  - A full cache requires explicit recoverable maintenance; the driver does not erase it to manufacture success.
+agent_contracts:
+  - SOURCE tree and EMULATOR worker/image/lane are stable text receipts; command exit is authoritative.
+  - A scheduled, running, compiled, failed or cancelled check is not a passing runtime result.
+  - Report physical hardware, native Windows, repeated cancellation and cumulative storage limits as unverified until measured.
+probes:
+  - id: reject-hosted-routing
+    action: Run python3 scripts/verify-ci.py against real YAML and hosted, matrix, duplicate-key and reusable-workflow falsifiers.
+    status: passed-local-six-regression-methods
+  - id: edit-during-run
+    action: Edit the working-copy guest script while both recorded-source guests are running, compare snapshot blobs with their tree, and finish the guest runs.
+    status: snapshot-isolation-passed-runtime-completion-pending
+  - id: propagate-guest-failure
+    action: Observe the original guest shell failure and the public driver exit.
+    status: observed-exit-127-no-false-success
+  - id: retry-with-cache
+    action: Restart from frozen source using the retained per-target compilation caches and run every check.
+    status: running
+  - id: cancellation-and-growth
+    action: Repeat public-driver cancellation and retry, measuring release latency and accumulated processes, ports and disk.
+    status: unverified
+  - id: remote-delivery
+    action: Verify the new exact-head terminal checks and open PR in BrowserOS, with no hosted jobs.
+    status: pending
