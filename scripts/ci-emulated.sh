@@ -38,8 +38,9 @@ echo "SOURCE tree=$source_tree snapshot=$source_root"
 expected=sha256:a66180f4e264b4a8038399ed4d1aa7e77fc23f242d3d9a43830fa0388d6e0c90
 actual=$(docker image inspect logical-db-act:local --format '{{.Id}}')
 [[ "$actual" == "$expected" ]] || { echo "runner image identity mismatch" >&2; exit 1; }
-docker build --pull=false --platform linux/amd64 -f "scripts/ci-${lane}.Dockerfile" -t "logical-db-ci-${lane}:local" .
-image_id=$(docker image inspect "logical-db-ci-${lane}:local" --format '{{.Id}}')
+image_tag="logical-db-ci-${lane}:${source_tree}"
+docker build --pull=false --platform linux/amd64 -f "scripts/ci-${lane}.Dockerfile" -t "$image_tag" .
+image_id=$(docker image inspect "$image_tag" --format '{{.Id}}')
 
 # One reusable, normally stopped worker per checkout/lane. The frozen source
 # mount excludes .git (checkout credentials), host caches and sockets.
@@ -88,6 +89,9 @@ echo "EMULATOR worker=$worker image=$image_id lane=$lane"
 docker start --attach "$worker"
 result=$(docker container inspect "$worker" --format '{{.State.ExitCode}}')
 [[ $(docker container inspect "$worker" --format '{{.State.Running}}') == false ]]
+if [[ "$result" == 0 && "$lane" == windows ]]; then
+  bash scripts/ci-windows-runtime.sh "$worker" "$source_tree" "$source_root"
+fi
 exit "$result"
 }
 main "$@"

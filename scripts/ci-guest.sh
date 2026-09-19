@@ -19,11 +19,24 @@ for path in /workspace/target /root/.cargo /root/.wine /tmp; do
   if [[ -d "$path" ]]; then cache_paths+=("$path"); fi
 done
 used_kib=$(du -sk "${cache_paths[@]}" | awk '{sum += $1} END {print sum+0}')
-[[ "$used_kib" -le 8388608 ]] || { echo "worker cache exceeds 8 GiB; maintenance required" >&2; exit 1; }
+cache_limit_kib=8388608
+# Windows retains the compiled target and an independently checksummed runtime
+# export. The measured target (4.843 GB) plus export/Wine state exceeds 8 GiB.
+if [[ "$lane" == windows ]]; then cache_limit_kib=12582912; fi
+echo "CACHE lane=$lane used_kib=$used_kib limit_kib=$cache_limit_kib"
+[[ "$used_kib" -le "$cache_limit_kib" ]] || { echo "worker cache budget reached; maintenance required" >&2; exit 1; }
 rustc --version --verbose
 cargo check --workspace --all-targets --locked
-cargo test -p logical-db-e2e --locked --test dependency_contract
-cargo test --workspace --locked
+if [[ "$lane" == windows ]]; then
+  # Cargo discovers every test executable; the system VM runs this inventory.
+  cargo test --workspace --locked --no-run --message-format=json > /tmp/ci-test-artifacts.jsonl
+  cargo metadata --locked --no-deps --format-version 1 > /tmp/ci-cargo-metadata.json
+  cargo test --workspace --doc --locked
+  python3 scripts/ci-windows-runtime.py export
+else
+  cargo test -p logical-db-e2e --locked --test dependency_contract
+  cargo test --workspace --locked
+fi
 cargo clippy --workspace --all-targets --locked -- -D warnings
 if [[ "$lane" == linux ]]; then
   # Preserve the original Linux package-isolation lane and report every

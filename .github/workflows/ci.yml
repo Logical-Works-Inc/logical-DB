@@ -39,7 +39,8 @@ jobs:
       - name: reject hosted runner routing
         run: |
           actionlint
-          shellcheck scripts/ci-emulated.sh scripts/ci-guest.sh scripts/ci-fdb-linux.sh scripts/ci-wine-runner.sh
+          shellcheck scripts/ci-emulated.sh scripts/ci-guest.sh scripts/ci-fdb-linux.sh scripts/ci-wine-runner.sh scripts/ci-windows-runtime.sh
+          python3 scripts/ci-windows-runtime.py test
           python3 -m venv "$RUNNER_TEMP/ci-policy"
           "$RUNNER_TEMP/ci-policy/bin/pip" install --disable-pip-version-check -r scripts/ci-requirements.txt
           "$RUNNER_TEMP/ci-policy/bin/python" scripts/verify-ci.py

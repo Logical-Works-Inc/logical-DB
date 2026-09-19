@@ -1,0 +1,16 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. See evidence/SOURCES.md.
+# Owned by logical-db CI. Stop after execution; retain disk for cached runtime.
+vmType: qemu
+plain: true
+arch: x86_64
+cpus: 4
+memory: 4GiB
+disk: 20GiB
+images:
+  - location: https://cloud-images.ubuntu.com/releases/resolute/release-20260720/ubuntu-26.04-server-cloudimg-amd64.img
+    arch: x86_64
+    digest: sha256:117816726abbdefc5ef3e38902e81a76f1c76c3610e709999d0885f9d5d9b477
+mounts: []
+containerd: {system: false, user: false}
+ssh: {forwardAgent: false, loadDotSSHPubKeys: false}

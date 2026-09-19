@@ -172,6 +172,81 @@ self-hosted membership guard in an in-memory copy of `verify-ci.py` caused
 the `[Linux, X64]` adversarial case to fail (`ValueError not raised`); the
 unmodified six-method suite passes. No source mutation was written to disk.
 
+Windows then reached the real E2E suite and Rosetta aborted with `invalid gdt
+selector index 5`. A one-thread rerun reproduced it. QEMU user-mode was not a
+passing substitute: Wine 10 re-executes its loader, and suppressing that
+re-exec instead produced a target segmentation fault. Native ARM QEMU also
+failed its smoke probe. These attempts are rejected, not enabled CI fallbacks.
+The isolated x86-64 QEMU system VM (4 CPUs, 4 GiB RAM, 12 GiB virtual disk,
+no host mounts) passed the same E2E executable: ten tests, zero failed or
+ignored, exit 0 in 42.61s. No shared Rosetta setting changed. This resolves
+the bounded emulator failure, not native Windows equivalence. The complete
+Cargo-discovered inventory remains under verification.
+The loader decision was checked against Wine 10's primary source:
+https://github.com/wine-mirror/wine/blob/wine-10.0/dlls/ntdll/unix/loader.c.
+
+The final Linux snapshot, including all fifteen restored isolation commands,
+completed with exit 0: 51 test-result groups, 354 passed test invocations
+(including deliberately repeated dependency/FDB checks), zero failed and
+zero ignored. HTTP expiry recovery took 24.00s; process-kill restore took
+17.60s. Its retained worker was verified stopped with exit 0. These are
+bounded correctness receipts, not matched performance measurements.
+
+The Windows compiler exports Cargo's JSON-discovered test inventory and
+package working directories, the matching Windows SDK binaries, runtime DLLs,
+and SHA-256 transfer checksums. Five regression methods reject incomplete or
+duplicate inventories, escaped paths and corrupted transfers. Disabling the
+checksum comparison in memory makes the tamper test fail. The runtime repeats
+the separate dependency-contract gate before all workspace executables; doc
+tests remain a mandatory compiler-container command. The QEMU guest has no
+host mounts or forwarded credentials and is stopped on either result. The
+first integrated export failed with exit 127 because Python was absent from
+the compiler image; Python is now an explicit image prerequisite.
+
+The first complete runtime attempt exposed another exporter omission:
+`crash_recovery` could not spawn `CARGO_BIN_EXE_crash_writer` (Windows error
+2, file not found). Cargo marks support binaries as non-test artifacts. The
+exporter now transfers every executable artifact while running only test
+harnesses; its new regression includes a non-test crash writer. No test was
+skipped or changed. The ten-test HTTP/recovery suite passed in that same run
+(38.63s). The run ended with three failed executables: crash and kill recovery
+both lacked support binaries, and the platform executable reported a Wine
+server connection reset before printing test results. The public driver
+returned exit 1 and the VM was verified stopped. Wine 10's primary manual
+documents a default three-second server persistence delay. The harness now
+requests 60 seconds between binaries, with VM shutdown still terminating the
+owned session; this addresses the inferred teardown race without retries or
+suppressed failures. Context7 had no matching Wine persistence documentation;
+the primary manual was read through BrowserOS:
+https://github.com/wine-mirror/wine/blob/wine-10.0/server/wineserver.man.in.
+Final corrected-inventory execution remains pending.
+
+Measured guest artifact storage was 2.7 GiB before adding support binaries,
+with 3.0 GiB free on the initial 12 GiB virtual disk. The owned VM declaration
+is increased to 20 GiB so retained failure evidence and the next complete
+bundle can coexist. Incoming artifact sizes are checked before transfer
+against a 12 GiB retained-artifact budget and 1 GiB remaining-space reserve.
+The budget admits the retained failed bundle, corrected local run and
+exact-head CI bundle; the first measured support binary alone is 185,061,254
+bytes. An 8 GiB budget would not safely cover those three complete receipts.
+This is bounded backpressure, not automated historical-artifact cleanup.
+The first corrected retry was refused by the compiler worker's original
+8 GiB preflight: Docker measured its Windows target volume at 4.843 GB and
+writable layer at 2,889,793,536 bytes, before other mounted caches and Wine
+state. Windows now has a 12 GiB preflight budget for both target and exported
+runtime bundle; Linux retains 8 GiB. The public log reports actual KiB usage
+and the limit. This sizes retained compilation evidence, not a test threshold.
+
+At published head `e5cd052`, native quality passed in 3m37s and native FDB
+passed in 27m32s. Windows failed at the recorded Rosetta error. The overall
+run was cancelled while Linux was queued; it is not a passing CI receipt.
+During that run the FDB log reported `TPSLimit=0` and `WorstFreeSpaceTLog=0`
+with approximately 26 GiB host space available. Disk-reserve throttling is
+the inference, not a measured threshold. Available space later rose above
+59 GiB and FDB completed. The Director subsequently confirmed completing
+the requested human-only Trash cleanup; a fresh `df -h` measured 60 GiB
+available. No agent emptied Trash or uploaded artifacts.
+
 ## Nine-axis acceptance retained
 
 | Axis | Required invariant | Evidence required |

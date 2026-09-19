@@ -3,7 +3,7 @@
 type: Contract
 title: Self-hosted CI without mutable-source test runs
 generated: {by: "agent:codex", at: "2026-09-19"}
-verified: {by: "agent:codex", method: "routing falsifiers, live source-edit counterexample, frozen-source hash comparison; complete guest runtime results pending"}
+verified: {by: "agent:codex", method: "routing falsifiers, frozen-source hashes, complete Linux run and ten-test full-system Windows probe; complete Windows inventory pending"}
 status: verification-in-progress
 stale_after: "2026-10-19"
 sources:
@@ -22,7 +22,7 @@ start:
   local_entry: bash scripts/ci-emulated.sh linux
   other_target: bash scripts/ci-emulated.sh windows
   remote_entry: Open or update a pull request; observe its exact-head Actions results in BrowserOS.
-  required_environment: Existing macOS ARM64 runner, Docker Linux x86-64 emulator, recorded resident base image.
+  required_environment: Existing macOS ARM64 runner, Docker Linux x86-64 emulator, recorded resident base image, Lima and QEMU for the isolated Windows-GNU runtime.
 success:
   visible_outcome: Every retained check family passes on the recorded source; all execution is self-hosted and owned workers are stopped.
   release_boundary: Passing this journey does not establish whole-product production readiness or native Windows parity.
@@ -63,13 +63,13 @@ probes:
     status: passed-local-six-regression-methods
   - id: edit-during-run
     action: Edit the working-copy guest script while both recorded-source guests are running, compare snapshot blobs with their tree, and finish the guest runs.
-    status: snapshot-isolation-passed-runtime-completion-pending
+    status: snapshot-isolation-and-linux-runtime-passed-windows-runtime-failed
   - id: propagate-guest-failure
     action: Observe the original guest shell failure and the public driver exit.
     status: observed-exit-127-no-false-success
   - id: retry-with-cache
     action: Restart from frozen source using the retained per-target compilation caches and run every check.
-    status: running
+    status: linux-all-checks-passed-windows-system-probe-passed-full-inventory-pending
   - id: cancellation-and-growth
     action: Repeat public-driver cancellation and retry, measuring release latency and accumulated processes, ports and disk.
     status: unverified
