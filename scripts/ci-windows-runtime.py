@@ -69,6 +69,37 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def transfer_growth(root, sizes):
+    growth = 0
+    for name, size in sizes.items():
+        if relative(ROOT / name) != name:
+            raise ValueError("artifact size path must be relative")
+        if not isinstance(size, int) or size < 0:
+            raise ValueError("invalid artifact size")
+        target = root / name
+        allocated = target.stat().st_blocks * 512 if target.is_file() else 0
+        growth += max(0, ((size + 4095) // 4096) * 4096 - allocated)
+    return growth
+
+
+def within_budget(used, growth, available):
+    return used + growth <= 12 * 1024**3 and available >= growth + 1024**3
+
+
+def plan_transfer():
+    manifest = json.load(sys.stdin)
+    if set(manifest["sizes"]) != set(manifest["sha256"]):
+        raise ValueError("size inventory differs from checksummed artifacts")
+    root = Path(sys.argv[2])
+    base = Path("/var/lib/logical-db-ci")
+    used = int(subprocess.check_output(["du", "-sk", str(base)], text=True).split()[0]) * 1024
+    growth = transfer_growth(root, manifest["sizes"]) + int(sys.argv[3]) * 1024 + 1024**2
+    available = shutil.disk_usage(base).free
+    print(f"TRANSFER used_bytes={used} growth_bytes={growth} available_bytes={available}", flush=True)
+    if not within_budget(used, growth, available):
+        raise SystemExit("Windows VM storage budget reached; recoverable maintenance required")
+
+
 def verify_transfer(root, manifest):
     tests = manifest["tests"]
     if not tests or sum(t["name"] == "dependency_contract" for t in tests) != 1:
@@ -112,6 +143,7 @@ def export():
     hashes = {str(p.relative_to(output)): digest(p) for p in output.rglob("*")
               if p.is_file() and p != control / "tests.json"}
     (control / "tests.json").write_text(json.dumps({"tests": tests, "sha256": hashes,
+        "sizes": {name: (output / name).stat().st_size for name in hashes},
         "artifact_bytes": sum((output / name).stat().st_size for name in hashes),
         "lock_sha256": digest(ROOT / "Cargo.lock")}, indent=2) + "\n")
     print(f"EXPORTED {len(tests)} Cargo-discovered Windows test executables and {len(artifacts) - len(tests)} support binaries")
@@ -195,6 +227,24 @@ class InventoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify_transfer(root, manifest)
 
+    def test_repeated_transfer_charges_growth_not_the_whole_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test.exe").write_bytes(b"compiled fixture")
+            allocated = (root / "test.exe").stat().st_blocks * 512
+            self.assertEqual(transfer_growth(root, {"test.exe": 16}), max(0, 4096 - allocated))
+            self.assertEqual(transfer_growth(root, {"new.exe": 4097}), 8192)
+            self.assertEqual(transfer_growth(root, {"test.exe": allocated + 4096}), 4096)
+            for sizes in ({"../escape": 1}, {"/workspace/test.exe": 1}, {"test.exe": -1}):
+                with self.assertRaises(ValueError):
+                    transfer_growth(root, sizes)
+
+    def test_budget_refuses_overflow_and_preserves_reserve(self):
+        gib = 1024**3
+        self.assertTrue(within_budget(11 * gib, gib, 2 * gib))
+        self.assertFalse(within_budget(11 * gib, gib + 1, 3 * gib))
+        self.assertFalse(within_budget(0, gib, 2 * gib - 1))
+
 
 if __name__ == "__main__":
     action = sys.argv[1]
@@ -202,8 +252,10 @@ if __name__ == "__main__":
         export()
     elif action == "run":
         sys.exit(run())
+    elif action == "plan":
+        plan_transfer()
     elif action == "test":
         result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(InventoryTests))
         sys.exit(not result.wasSuccessful())
     else:
-        raise SystemExit("expected export, run, or test")
+        raise SystemExit("expected export, run, plan, or test")

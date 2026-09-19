@@ -248,6 +248,12 @@ The budget admits the retained failed bundle, corrected local run and
 exact-head CI bundle; the first measured support binary alone is 185,061,254
 bytes. An 8 GiB budget would not safely cover those three complete receipts.
 This is bounded backpressure, not automated historical-artifact cleanup.
+Same-revision retries account for incoming per-file block growth against
+already allocated artifact blocks, rather than charging the entire retained
+bundle twice. Missing/new files are charged in full. Source bytes and metadata
+receive a conservative additional allowance. Two new regression methods cover
+repeat transfer, growing/new artifacts, path escapes, budget overflow and the
+free-space reserve. The limits remain 12 GiB plus a 1 GiB free-space reserve.
 The first corrected retry was refused by the compiler worker's original
 8 GiB preflight: Docker measured its Windows target volume at 4.843 GB and
 writable layer at 2,889,793,536 bytes, before other mounted caches and Wine

@@ -10,9 +10,7 @@ source_root=${3:?expected frozen source}
 [[ $(docker inspect "$worker" --format '{{.State.Running}}') == false ]]
 [[ $(docker inspect "$worker" --format '{{index .Config.Labels "logical-db.owner"}}') == ci ]]
 vm=logicaldb-windows-emulator
-artifact_kib=$(docker cp "$worker:/tmp/ci-windows-runtime/.ci-windows/tests.json" - | tar -xOf - | python3 -c 'import json,sys; n=json.load(sys.stdin)["artifact_bytes"]; assert isinstance(n,int) and n>0; print((n+1023)//1024)')
 source_kib=$(du -sk "$source_root" | cut -f1)
-incoming_kib=$((artifact_kib + source_kib + 1024))
 record=$(limactl list --json | python3 -c 'import json,sys
 for line in sys.stdin:
     value=json.loads(line)
@@ -54,12 +52,11 @@ fi
 [[ $(uname -m) == x86_64 && $(wine --version) == wine-10.* ]]
 /usr/lib/x86_64-linux-gnu/wine/wineserver --version
 sudo mkdir -p /var/lib/logical-db-ci
-used=$(sudo du -sk /var/lib/logical-db-ci | cut -f1)
-available=$(df -Pk / | awk "NR==2 {print \$4}")
-[[ $((used + $1)) -le 12582912 && "$available" -ge $(($1 + 1048576)) ]] || {
-  echo "Windows VM storage budget reached; recoverable maintenance required" >&2; exit 1;
-}' bash "$incoming_kib"
+'
 guest_root="/var/lib/logical-db-ci/$tree"
+limactl copy --backend=scp "$source_root/scripts/ci-windows-runtime.py" "$vm:/tmp/logical-db-ci-runtime.py"
+docker cp "$worker:/tmp/ci-windows-runtime/.ci-windows/tests.json" - | tar -xOf - | \
+  limactl shell "$vm" python3 /tmp/logical-db-ci-runtime.py plan "$guest_root" "$source_kib"
 limactl shell "$vm" sudo mkdir -p "$guest_root"
 tar -C "$source_root" --exclude=./target -cf - . | limactl shell "$vm" sudo tar -xf - -C "$guest_root"
 docker cp "$worker:/tmp/ci-windows-runtime/." - | limactl shell "$vm" sudo tar -xf - -C "$guest_root"
