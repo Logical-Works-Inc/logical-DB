@@ -3,7 +3,7 @@
 type: Contract
 title: Self-hosted CI without mutable-source test runs
 generated: {by: "agent:codex", at: "2026-09-19"}
-verified: {by: "agent:codex", method: "routing falsifiers, frozen-source hashes, complete Linux run and ten-test full-system Windows probe; complete Windows inventory pending"}
+verified: {by: "agent:codex", method: "routing falsifiers, frozen-source hashes, complete Linux run and corrected Windows inventory329passed; exact-head remote driver pending"}
 status: verification-in-progress
 stale_after: "2026-10-19"
 sources:
@@ -69,7 +69,7 @@ probes:
     status: observed-exit-127-no-false-success
   - id: retry-with-cache
     action: Restart from frozen source using the retained per-target compilation caches and run every check.
-    status: linux-all-checks-passed-windows-system-probe-passed-full-inventory-pending
+    status: linux-all-checks-passed-windows-corrected-runtime329passed-public-driver-pending
   - id: cancellation-and-growth
     action: Repeat public-driver cancellation and retry, measuring release latency and accumulated processes, ports and disk.
     status: unverified

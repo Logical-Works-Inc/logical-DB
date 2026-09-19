@@ -125,7 +125,8 @@ def run():
                WINEPATH=f"{control / 'sdk'};{control / 'dlls'}")
     # Wine's default three-second server teardown can race the next harness.
     # Keep this owned session alive between binaries; the VM trap ends it.
-    subprocess.run(["wineserver", "--persistent=60"], check=True, env=env, timeout=30)
+    subprocess.run(["/usr/lib/x86_64-linux-gnu/wine/wineserver", "--persistent=60"],
+                   check=True, env=env, timeout=30)
     subprocess.run(["wine", "--version"], check=True, env=env)
     subprocess.run(["wine", str(control / "smoke.exe")], check=True, env=env, timeout=180)
     tests = manifest["tests"]

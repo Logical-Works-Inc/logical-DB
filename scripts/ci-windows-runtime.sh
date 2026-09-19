@@ -52,6 +52,7 @@ if ! command -v wine >/dev/null; then
   sudo timeout 600 apt-get install -y --no-install-recommends wine=10.0~repack-12ubuntu1
 fi
 [[ $(uname -m) == x86_64 && $(wine --version) == wine-10.* ]]
+/usr/lib/x86_64-linux-gnu/wine/wineserver --version
 sudo mkdir -p /var/lib/logical-db-ci
 used=$(sudo du -sk /var/lib/logical-db-ci | cut -f1)
 available=$(df -Pk / | awk "NR==2 {print \$4}")

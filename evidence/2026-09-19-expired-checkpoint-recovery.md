@@ -219,7 +219,25 @@ owned session; this addresses the inferred teardown race without retries or
 suppressed failures. Context7 had no matching Wine persistence documentation;
 the primary manual was read through BrowserOS:
 https://github.com/wine-mirror/wine/blob/wine-10.0/server/wineserver.man.in.
-Final corrected-inventory execution remains pending.
+The corrected-inventory result is recorded below; complete remote-driver
+verification remains pending at this receipt revision.
+
+The corrected compiler run at `296e5f4` exported 28 test executables and four
+support binaries (3,649,821,329 bytes). Runtime setup then failed with
+`FileNotFoundError: wineserver`: the package does not put that name on PATH.
+`dpkg-query` identified `/usr/lib/x86_64-linux-gnu/wine/wineserver`; its own
+version/help output confirmed Wine 10.0 and `--persistent[=n]`. The harness
+now uses that installed path and checks it before transfer. Its corrected
+Python runner passed against the same verified bundle without recompiling
+unchanged Rust: 29 harness executions, 329 passed invocations (including the
+separate repeated dependency gate), zero failed and zero ignored, exit 0.
+Both process-exit and forced-termination recovery assertions passed by name,
+as did the platform executable. Runner SHA-256:
+`47efc5910e5b7dd6f3b511800c76b9d8efdb52d7215a791c33bea9c02e96ad6b`.
+The guest source and support binary were readable/executable but not writable
+by the test user. The cleanup wrapper stopped the VM successfully. The final
+remote run must still execute the complete public driver, not substitute
+this bounded diagnostic invocation. Its exact-head result belongs to PR #65.
 
 Measured guest artifact storage was 2.7 GiB before adding support binaries,
 with 3.0 GiB free on the initial 12 GiB virtual disk. The owned VM declaration
