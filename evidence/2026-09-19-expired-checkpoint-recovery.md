@@ -267,6 +267,18 @@ available. No agent emptied Trash or uploaded artifacts.
 
 ## Nine-axis acceptance retained
 
+Delivery-state correction: the later live BrowserOS settings inspection found
+classic rule `82656536` applying to `main`, with seven required status names,
+strict freshness, conversation resolution, linear history and administrator
+enforcement enabled. This differs from the earlier unprotected observation;
+the cause of that difference is unknown. No protection setting was changed.
+The workflow retains the seven legacy status names as real self-hosted jobs:
+evidence, three OS check names, formatting, dependency policy and FDB. The
+`*-latest` strings are check identifiers only, never runner selectors. A new
+regression validates the exact required-context set from the parsed workflow.
+The delivery endpoint is now protected-branch merge and synchronization after
+required checks pass, not merely an open PR. The nine axes remain unchanged.
+
 | Axis | Required invariant | Evidence required |
 |---|---|---|
 | Frontier | The selected design beats credible current alternatives on the actual problem without sacrificing correctness. | Dated primary research, named alternatives and matched capability/cost measurements. Familiarity or small size cannot establish superiority. |

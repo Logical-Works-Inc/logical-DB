@@ -22,18 +22,14 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  selfhosted-quality:
-    name: self-hosted macos arm64 / test-clippy-policy
+  selfhosted-evidence:
+    name: clean-room evidence
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-      - name: toolchain identity
-        run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          rustc --version --verbose
       - name: verify rewrite evidence
         run: python3 scripts/verify-rewrite.py
       - name: reject hosted runner routing
@@ -44,6 +40,20 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/ci-policy"
           "$RUNNER_TEMP/ci-policy/bin/pip" install --disable-pip-version-check -r scripts/ci-requirements.txt
           "$RUNNER_TEMP/ci-policy/bin/python" scripts/verify-ci.py
+
+  # Legacy check names satisfy the existing main-branch protection rule.
+  # They are status identifiers, not runner selectors: every job is self-hosted.
+  selfhosted-quality:
+    name: macos-latest / test-clippy
+    needs: selfhosted-evidence
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: toolchain identity
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version --verbose
       - name: compile all targets
         run: cargo check --workspace --all-targets --locked
       - name: dependency register
@@ -52,31 +62,52 @@ jobs:
         run: cargo test --workspace --locked
       - name: lint with warnings denied
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  selfhosted-format:
+    name: rustfmt
+    needs: selfhosted-evidence
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: rustfmt
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           cargo fmt --all -- --check
           rustfmt --check scripts/ci-windows-smoke.rs
+
+  selfhosted-policy:
+    name: advisory, license, and source policy
+    needs: selfhosted-evidence
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: install pinned policy checker
-        run: cargo install --locked cargo-deny --version 0.20.2
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" install --locked cargo-deny --version 0.20.2
       - name: enforce dependency policy
         run: cargo deny check
 
   emulated-quality:
-    name: self-hosted emulator / ${{ matrix.guest }}
+    name: ${{ matrix.check-name }} / test-clippy
     needs: selfhosted-quality
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        guest: [linux, windows]
+        include:
+          - {guest: linux, check-name: ubuntu-latest}
+          - {guest: windows, check-name: windows-latest}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Linux x86-64 or Windows-GNU Wine runtime
         run: bash scripts/ci-emulated.sh "${{ matrix.guest }}"
 
   selfhosted-fdb-composition:
-    name: self-hosted official FDB client / daemon feature
+    name: official FDB client / daemon feature
     needs: selfhosted-quality
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30

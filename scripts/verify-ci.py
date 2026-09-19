@@ -76,6 +76,23 @@ class RoutingRegression(unittest.TestCase):
             with self.subTest(document=document), self.assertRaises(ValueError):
                 verify(document)
 
+    def test_required_check_names_remain_available(self):
+        root = Path(__file__).resolve().parents[1]
+        document = yaml.load((root / ".github/workflows/ci.yml").read_text(), Loader=UniqueLoader)
+        names = set()
+        for job in document["jobs"].values():
+            if job["name"] == "${{ matrix.check-name }} / test-clippy":
+                names.update(f"{row['check-name']} / test-clippy"
+                             for row in job["strategy"]["matrix"]["include"])
+            else:
+                names.add(job["name"])
+        self.assertEqual(names, {
+            "clean-room evidence", "ubuntu-latest / test-clippy",
+            "macos-latest / test-clippy", "windows-latest / test-clippy",
+            "rustfmt", "advisory, license, and source policy",
+            "official FDB client / daemon feature",
+        })
+
 
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(RoutingRegression)
