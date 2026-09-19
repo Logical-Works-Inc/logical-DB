@@ -109,6 +109,19 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Exercise multi-node FDB failover and point-in-time restore, public
   TLS/issuer/rotation, sustained load/backpressure, disk exhaustion, sleep/wake,
   and mobile sandbox lifecycle.
+- [ ] Enforce the four-domain Cloud/Cairn/LEM/Forge dependency and authority
+  map: `docs/architecture/DOMAIN-BOUNDARIES.md`,
+  `docs/architecture/DEPENDENCY-RULES.md`, and `contract/domains/*.toml` must
+  be parsed by the existing contract tooling; each forbidden cross-domain import
+  needs a falsification fixture. This is a structure gate, not proof that the
+  target crates or services exist.
+- [ ] Complete ADR-0003’s sovereign Cloud Plane program: partition routing,
+  server-authorized replication views, residency/key/portable-exit contracts,
+  regional delivery/backpressure, multi-region DR, and all nine measured axes.
+  The current scope-wide FDB frontier and local receipts do not satisfy this.
+- [ ] Complete ADR-0004’s Forge action boundary: capability-bound operation,
+  idempotent receipt candidates, and the legal Cairn→LEM→LocalWorld→Forge→Cairn
+  black-box loop. Neither Cairn nor LEM may obtain ambient effect authority.
 - [x] Independent hostile review returned `MERGE` after the live FDB mutation
   campaign killed both initially surviving transaction mutations.
 - [x] A second independent hostile review covered the complete hardening delta

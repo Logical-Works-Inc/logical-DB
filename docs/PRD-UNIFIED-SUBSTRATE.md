@@ -14,13 +14,19 @@
 
 ## 1. Product thesis
 
-One substrate, three planes, one identity model. Cairn (observation
-vocabulary), Logical-Event-Memory (episodic memory), and Logical-DB
-(durable typed state) are **one product**: an embeddable, local-first
-ontology substrate that takes messy enterprise data, deduplicates it from
-the first write, keeps every mutation reversible, and exposes a
-citation-bearing memory and ML-training-ready graph — without the
-developer configuring any of it.
+One product, four independently developed domains, one identity model. The
+Cloud Plane supplies sovereign durable data and regional delivery; Cairn supplies
+observation/evidence and ontology; Logical-Event-Memory (LEM/ORIGIN) supplies
+canonical episodic memory; Forge supplies explicit receipt-producing operations.
+Together they are an embeddable ontology substrate that takes messy enterprise
+data, deduplicates it from the first write, keeps every mutation reversible, and
+exposes citation-bearing memory and an ML-training-ready graph without forcing a
+foreign data-custody dependency. Local execution reduces retained remote data,
+transfer, and cloud compute; it is not the only product surface.
+
+The sovereign hyperscale claim is a target gated by ADR-0003’s nine-axis
+measurements, not a present-tense scale claim. The domain contracts are in
+`docs/PRODUCT-MAP.md` and `docs/architecture/DOMAIN-BOUNDARIES.md`.
 
 Positioning: **Supabase's developer ergonomics × Palantir Foundry's
 ontology**, delivered embedded and AI-native. Palantir proved the ontology
@@ -58,20 +64,33 @@ SOTA semantics are the *default*, and opting out is the explicit act.
 | AI agent builder | "AI agent memories just work" | Episodes with inline citations to source spans + temporal validity; LocalWorld memory beats cosine-RAG baseline on ratified eval (issue #34) |
 | ML team | Training-ready graph | PyG/OGB-compatible export with datasheets and leakage-safe split manifests; ER completeness as precondition for entity-disjoint splits |
 
-## 3. Architecture: three planes, two surfaces
+## 3. Architecture: four domains, shared contracts
 
 ```text
-applications / agents (MCP + generated SDKs)
+applications / agents / product adapters
    |
-   | ONTOLOGY SURFACE  (typed objects, links, actions; schema-as-code)
+   | published, versioned contracts only
    |
-logical-db embedded core (ships today: CRDT state, indexes, KV,
-   |    change feed, bounded sync, FDB relay + recovery)
-   |
-   |-- MEMORY PLANE    (Cairn vocabulary -> episodes -> LocalWorld)
-   |-- IDENTITY PLANE  (entity resolution as derived projection)
-   |-- ML PLANE        (export: PyG/OGB/Arrow + datasheets + splits)
+   +-- Cloud Plane — durable data, regional relay/delivery/recovery,
+   |                  local replicas, tenant isolation
+   +-- Cairn — source evidence, ontology registry, candidate episodes,
+   |            reproducible operational views
+   +-- LEM / ORIGIN — canonical episodes, clocks, provenance, contradiction,
+   |                   consolidation, bounded LocalWorld
+   `-- Forge — capability-bound operations over LocalWorld; receipt candidates
+
+legal loop: Cairn candidate -> LEM append -> LocalWorld -> Forge receipt
+            -> Cairn candidate
 ```
+
+Cloud is below the other domains as infrastructure, never semantic or action
+authority. Cairn is evidence/ontology rather than canonical memory. LEM is the
+canonical semantic domain rather than an executor. Forge is the only operations
+domain and re-enters the evidence path through receipts. The current embedded
+CRDT, index, KV, bounded sync, FDB relay, and recovery implementation is Cloud
+Plane baseline; ADR-0003 defines the still-unimplemented sovereign hyperscale
+target. `docs/architecture/DOMAIN-BOUNDARIES.md` and
+`docs/architecture/DEPENDENCY-RULES.md` are normative for workstream ownership.
 
 ### 3.1 Ontology surface (new; the Palantir lesson, embedded)
 

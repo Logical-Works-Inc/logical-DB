@@ -14,6 +14,7 @@ import re
 import stat
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 BASELINE = "7cffbc07b6f312854986ae306b583ef891623b2d"
@@ -273,6 +274,44 @@ def dependency_failures() -> list[str]:
     return failures
 
 
+def domain_contract_failures() -> list[str]:
+    """Validate the four proposed domain manifests without claiming runtime enforcement."""
+    required = {"cloud", "cairn", "lem", "forge"}
+    directory = ROOT / "contract" / "domains"
+    if not directory.is_dir():
+        return ["missing contract/domains directory"]
+    manifests = sorted(directory.glob("*.toml"))
+    found: set[str] = set()
+    failures: list[str] = []
+    for path in manifests:
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            failures.append(f"invalid domain manifest {path.relative_to(ROOT)}: {error}")
+            continue
+        domain = parsed.get("domain")
+        if not isinstance(domain, str):
+            failures.append(f"domain manifest lacks string domain: {path.relative_to(ROOT)}")
+            continue
+        if domain in found:
+            failures.append(f"duplicate domain manifest declaration: {domain}")
+        found.add(domain)
+        for key in ("owner", "status", "release_lane"):
+            if not isinstance(parsed.get(key), str) or not parsed[key]:
+                failures.append(f"domain {domain} lacks nonempty {key}")
+        for key in ("may_depend_on", "forbidden_domains", "evidence", "blocked_claims"):
+            values = parsed.get(key)
+            if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+                failures.append(f"domain {domain} lacks nonempty string list {key}")
+    missing = sorted(required - found)
+    unexpected = sorted(found - required)
+    if missing:
+        failures.append(f"missing domain manifests: {' '.join(missing)}")
+    if unexpected:
+        failures.append(f"unexpected domain manifests: {' '.join(unexpected)}")
+    return failures
+
+
 def churn() -> tuple[float, float, list[str]]:
     """Measure changed baseline blob count and changed baseline byte coverage."""
     entries = baseline_entries()
@@ -301,6 +340,7 @@ def main() -> int:
         return 1
     citations = citation_failures(files, allowed_sources)
     dependencies = dependency_failures()
+    domains = domain_contract_failures()
     entries = baseline_entries()
     count_percent, byte_percent, unchanged = churn()
     line_percent = line_churn(entries)
@@ -313,15 +353,18 @@ def main() -> int:
     print(f"unchanged_baseline_blobs={len(unchanged)}")
     print(f"citation_failures={len(citations)}")
     print(f"dependency_failures={len(dependencies)}")
+    print(f"domain_contract_failures={len(domains)}")
 
     for failure in citations:
         print(f"FAIL citation: {failure}")
     for failure in dependencies:
         print(f"FAIL dependency: {failure}")
+    for failure in domains:
+        print(f"FAIL domain contract: {failure}")
     for path in unchanged:
         print(f"FAIL unchanged: {path}")
 
-    if citations or dependencies or unchanged:
+    if citations or dependencies or domains or unchanged:
         return 1
     if (
         count_percent < MINIMUM_HASH_CHURN
