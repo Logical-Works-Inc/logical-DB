@@ -258,8 +258,18 @@ The first corrected retry was refused by the compiler worker's original
 8 GiB preflight: Docker measured its Windows target volume at 4.843 GB and
 writable layer at 2,889,793,536 bytes, before other mounted caches and Wine
 state. Windows now has a 12 GiB preflight budget for both target and exported
-runtime bundle; Linux retains 8 GiB. The public log reports actual KiB usage
+runtime bundle. The public log reports actual KiB usage
 and the limit. This sizes retained compilation evidence, not a test threshold.
+
+Exact-head run `35460378880` subsequently passed the complete Windows public
+driver (29 runtime harness invocations, zero failures, including VM shutdown).
+Linux refused its original 8 GiB preflight at 10,133,124 KiB. A read-only,
+network-disabled audit of the stopped worker's mounts measured 9.3 GiB of
+targets (8.8 GiB in debug/deps, no incremental cache) and 444 MiB of Cargo
+caches. Linux builds both ordinary and separately linked FDB profiles. Both
+lanes now have a 12 GiB retained-cache limit checked before and after the full
+suite; an over-budget result remains a failure requiring maintenance. No
+retained evidence was deleted. This does not prove indefinite cache stability.
 
 At published head `e5cd052`, native quality passed in 3m37s and native FDB
 passed in 27m32s. Windows failed at the recorded Rosetta error. The overall

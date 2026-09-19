@@ -14,17 +14,19 @@ case "$lane" in
   *) echo "unsupported emulator lane: $lane" >&2; exit 2 ;;
 esac
 # Backpressure on retained caches, never erase state to manufacture cleanliness.
+check_cache_budget() {
 cache_paths=()
 for path in /workspace/target /root/.cargo /root/.wine /tmp; do
   if [[ -d "$path" ]]; then cache_paths+=("$path"); fi
 done
 used_kib=$(du -sk "${cache_paths[@]}" | awk '{sum += $1} END {print sum+0}')
-cache_limit_kib=8388608
-# Windows retains the compiled target and an independently checksummed runtime
-# export. The measured target (4.843 GB) plus export/Wine state exceeds 8 GiB.
-if [[ "$lane" == windows ]]; then cache_limit_kib=12582912; fi
+# Linux's measured ordinary/FDB-linked targets plus Cargo caches total 9.66 GiB.
+# Windows retains both its compiled target and checksummed runtime export.
+cache_limit_kib=12582912
 echo "CACHE lane=$lane used_kib=$used_kib limit_kib=$cache_limit_kib"
 [[ "$used_kib" -le "$cache_limit_kib" ]] || { echo "worker cache budget reached; maintenance required" >&2; exit 1; }
+}
+check_cache_budget
 rustc --version --verbose
 cargo check --workspace --all-targets --locked
 if [[ "$lane" == windows ]]; then
@@ -48,3 +50,4 @@ if [[ "$lane" == linux ]]; then
   if [[ "$failed" != 0 ]]; then exit "$failed"; fi
   bash scripts/ci-fdb-linux.sh
 fi
+check_cache_budget
