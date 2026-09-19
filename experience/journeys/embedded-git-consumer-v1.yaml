@@ -1,0 +1,49 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32 S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in ../../evidence/SOURCES.md.
+
+id: embedded-git-consumer-v1
+actor: Rust application developer with no access to Logical-DB internals
+job: Add the documented source dependency, persist one scoped value, reopen the replica, and read the same value.
+prior_knowledge:
+  - Knows Rust and Cargo but not Logical-DB's internal crate graph or storage format.
+  - Can choose durable account, space, replica, document, and operation identities for the application.
+  - Does not assume a daemon, network, FoundationDB, or Braid is available.
+start:
+  installation: Fresh Cargo project and fresh CARGO_HOME.
+  dependency: Revision-pinned logical-db Git source at ae5025692937edec114a865b6114e643f279b0a9.
+  state: No database file exists.
+success:
+  visible_outcome: The public facade compiles; one edit survives close and reopen; the program reports its pass result.
+  preserved_state: A single redb file contains the completed scoped local transition.
+states:
+  - name: dependency-resolving
+    expectation: Cargo resolves the named public facade and its source-pinned internal dependency graph.
+  - name: local-editing
+    expectation: The application can open a local replica and commit one structured value without a service dependency.
+  - name: reopened
+    expectation: The same scope and replica expose the committed value after the first handle is closed.
+  - name: unsupported-registry
+    expectation: A crates.io package attempt is explicitly refused until the workspace release order exists.
+invariants:
+  - The embedded journey imports only logical_db public types.
+  - A returned edit is durable across reopen for the same scope and replica.
+  - The documented revision is immutable; a branch name is not substituted as a release claim.
+  - Registry unavailability is visible before an application can mistake it for a usable installation.
+trust_boundaries:
+  - The Git revision identifies the source reviewed by this journey but does not prove a release, service authority, or hosted CI result.
+  - Account, space, replica, document, and operation identities remain application-owned durable inputs.
+recovery_contracts:
+  - Reopening after a successful edit exposes the prior complete state.
+  - A registry-install failure names the missing package rather than selecting an unreviewed fallback.
+agent_contracts:
+  - A black-box consumer returns exit 0 only after the reopened public value matches the committed value.
+  - The journey has no internal-crate import or test-only transport dependency.
+probes:
+  - id: fresh-git-source-edit-reopen
+    action: Create a fresh Cargo project with the README dependency, compile it with an isolated CARGO_HOME, edit through Database, close, reopen, and read the same value.
+    expected: Cargo and the program exit 0; the program prints PASS git-source public-facade embedded-edit-reopen.
+  - id: registry-package-boundary
+    action: Run cargo package -p logical-db --locked at the repository head.
+    expected: Cargo refuses because unpublished logical-db workspace crates are absent from crates.io; the README does not present that route as supported.
+  - id: exact-retry-and-crash-recovery
+    action: Run the repository's retained public-facade restart and exact-operation journeys.
+    expected: Completed transitions persist, exact retries do not duplicate work, and corruption or interrupted work fails closed as documented by the separate recovery experiments.
