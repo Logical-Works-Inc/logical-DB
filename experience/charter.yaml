@@ -1,0 +1,30 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32 S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in ../evidence/SOURCES.md.
+
+id: logical-db-v3
+scope: Public embedded Rust facade first; thin-client and standalone service remain separately gated surfaces.
+actors:
+  - Rust application developer embedding one account-and-space-scoped local replica.
+  - Service operator preparing the separately gated FoundationDB relay.
+primary_job: Add one reproducible public dependency, create durable local state, and recover it after reopening without knowing Logical-DB internals.
+entry_contract:
+  supported_installation: Revision-pinned Git dependency documented in README.md.
+  unsupported_installation: Crates.io remains unsupported until the ordered workspace release exists.
+  required_prior_knowledge:
+    - Rust and Cargo.
+    - A stable application-chosen identity policy for account, space, replica, and schema.
+  not_required:
+    - A daemon, network connection, FoundationDB, Braid, or internal Logical-DB crates for embedded local CRUD.
+critical_invariants:
+  - A successful public edit is immediately durable and readable after reopening the same scoped replica.
+  - The public facade is sufficient for the embedded journey; internal crate imports are unnecessary.
+  - An unsupported registry install fails explicitly rather than silently selecting a different dependency graph.
+  - A production service claim requires its own authority, recovery, deployment, and load evidence.
+observability:
+  measured:
+    - One fresh macOS arm64 Git-source consumer at ae5025692937edec114a865b6114e643f279b0a9 compiled, edited, reopened, and read the public facade successfully in this session.
+  unverified:
+    - Human onboarding time, repeatable p50/p95 install time, constrained-hardware startup, and all service/load outcomes.
+recovery_contract:
+  - Exact operation retries and crash/restart semantics remain the Database API contract; the embedded journey records reopening as its black-box recovery probe.
+  - Crates.io publication is a release-process dependency, not a runtime retry path.
+release_boundary: This charter does not promote the facade, daemon, or relay to production complete; REWRITE_MANIFEST.md remains the mechanical release authority.

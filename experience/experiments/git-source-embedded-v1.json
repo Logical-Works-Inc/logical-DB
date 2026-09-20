@@ -1,0 +1,59 @@
+{
+  "Evidence": "S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32 S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43",
+  "id": "git-source-embedded-v1",
+  "citations": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "S20", "S21", "S22", "S23", "S24", "S25", "S26", "S27", "S28", "S29", "S30", "S31", "S32", "S33", "S34", "S35", "S36", "S37", "S38", "S39", "S40", "S41", "S42", "S43"],
+  "actor": "Rust application developer using only the public facade from a fresh Cargo package",
+  "job": "install the documented Git source, persist one scoped value, and verify that it survives reopening",
+  "artifact": "logical-db Git source at ae5025692937edec114a865b6114e643f279b0a9 and the README installation contract",
+  "environment": {
+    "os": "macOS arm64",
+    "consumer": "fresh Cargo project with isolated CARGO_HOME and CARGO_TARGET_DIR",
+    "runtime": "no daemon, network service, FoundationDB, or Braid dependency after Cargo resolution"
+  },
+  "initial_state": {
+    "consumer": "absent before the experiment",
+    "database": "absent",
+    "source": "revision-pinned Git dependency",
+    "scope": "fresh account and space identities"
+  },
+  "expectation": "the documented public facade is sufficient to compile, commit one local value, reopen the same scoped replica, and read that value",
+  "perturbation": "close the first Database handle before reopening; separately attempt the registry package route that is not yet published",
+  "actions": [
+    "create a fresh Cargo package importing only logical_db public types",
+    "resolve the Git dependency at ae5025692937edec114a865b6114e643f279b0a9 with an isolated CARGO_HOME",
+    "open Database, commit one structured value, drop the handle, reopen, and compare the public read result",
+    "run cargo package -p logical-db --locked to test the registry package boundary"
+  ],
+  "observations": [
+    "the Git-source consumer resolved 77 packages, compiled, and printed PASS git-source public-facade embedded-edit-reopen with exit 0",
+    "the reopened public read matched the committed scoped value",
+    "cargo package -p logical-db --locked exited 101 because logical-db-cairn was not found in crates.io"
+  ],
+  "external_state_diff": [
+    "the isolated consumer created a Cargo lockfile, build cache, and one redb state file",
+    "the repository working tree was unchanged before the documented-experience edit",
+    "the registry package route created no release artifact"
+  ],
+  "invariant": "the supported embedded installation route is explicit, immutable, facade-only, and proves one durable reopen; unavailable registry publication is an explicit boundary",
+  "verdict": "proven-within-bounds",
+  "failure_classes": [
+    "registry packaging cannot resolve the unpublished logical-db-cairn dependency",
+    "the pre-change README had no supported installation contract"
+  ],
+  "follow_up_experiments": [
+    "repeat the Git-source consumer on every declared target",
+    "execute an ordered workspace publication and a crates.io consumer only after release authority is supplied",
+    "run the separately gated service recovery, authority, and load journeys"
+  ],
+  "evidence": [
+    "README.md",
+    "experience/charter.yaml",
+    "experience/journeys/embedded-git-consumer-v1.yaml",
+    "crates/logical-db/src/lib.rs"
+  ],
+  "limitations": [
+    "one macOS arm64 observation, not a human study or latency distribution",
+    "the Git source pin is not a crates.io release",
+    "this embedded-only journey does not establish Braid authority, service recovery, tenant isolation, portability, scale, or performance acceptance"
+  ]
+}
