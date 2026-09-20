@@ -29,6 +29,7 @@ use logical_db_service::{
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
 
 const FULL_FDB_CHUNK_PROBE_BYTES: usize = 65_536;
+const MAX_VERIFIED_PAGES: usize = 1_024;
 
 #[derive(Clone, Copy)]
 struct ForgedGrant {
@@ -1040,7 +1041,7 @@ async fn verify_page(
     let mut recovered_change_count = 0_usize;
     let mut continuation_change_count = 0_usize;
     let mut operations = HashSet::new();
-    loop {
+    while pages < MAX_VERIFIED_PAGES {
         let action = page_action(scope, change.replica, after, count, bytes);
         let grant = fixture_grant(scope, Effect::Sync, action.digest(), observed);
         let page = read_page_with_retry(store, action, &grant).await?;
@@ -1080,6 +1081,9 @@ async fn verify_page(
         if !page.more {
             break;
         }
+    }
+    if pages == MAX_VERIFIED_PAGES && after != observed {
+        return Err(io::Error::other("ordered FDB page verification exceeded its bound").into());
     }
     if pages < 2
         || !first_page_had_more

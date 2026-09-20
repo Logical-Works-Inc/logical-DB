@@ -5,6 +5,7 @@
 /target/
 /.codegraph/
 /keel-core/
+/graphify-out/
 mutants.out*
 /.idea/
 /.vscode/

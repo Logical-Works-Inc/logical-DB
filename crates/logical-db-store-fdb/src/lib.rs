@@ -5,6 +5,7 @@
 //! S33 S34 S35 S36 S42 S43. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 #[cfg(test)]
 use foundationdb_tuple::Subspace;
@@ -1255,7 +1256,7 @@ mod runtime {
         // until the range is exhausted or the change budget is exceeded.
         let mut manifests = Vec::new();
         let mut next_sequence = position.saturating_add(1);
-        loop {
+        while manifests.len() <= MAX_BASELINE_CHANGES {
             let begin = spaces.log.pack(&(next_sequence,));
             let remaining = MAX_BASELINE_CHANGES
                 .saturating_add(1)
@@ -1287,6 +1288,10 @@ mod runtime {
             };
             let (sequence,) = spaces.log.unpack::<(u64,)>(last).map_err(binding_invalid)?;
             next_sequence = sequence.saturating_add(1);
+        }
+        if manifests.len() > MAX_BASELINE_CHANGES {
+            eprintln!("logical-db-store-fdb: baseline replay exhausted its bounded scan");
+            return Err(binding(DataError::BaselineResourceLimit));
         }
         let mut changes = Vec::with_capacity(manifests.len());
         for (key, value) in manifests {
@@ -1371,7 +1376,7 @@ mod runtime {
         let mut manifests = Vec::new();
         let mut cursor = space_begin;
         let mut exclusive = false;
-        loop {
+        while manifests.len() <= expected_count {
             let remaining = expected_count
                 .saturating_add(1)
                 .saturating_sub(manifests.len());
@@ -1410,6 +1415,10 @@ mod runtime {
             };
             cursor = last;
             exclusive = true;
+        }
+        if manifests.len() > expected_count {
+            eprintln!("logical-db-store-fdb: baseline manifest scan exceeded its descriptor bound");
+            return Err(binding(DataError::BaselineCorrupt));
         }
         if manifests.len() != expected_count {
             eprintln!("logical-db-store-fdb: baseline manifest count is inconsistent");
