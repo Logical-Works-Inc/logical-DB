@@ -8,30 +8,39 @@ use logical_db::{
     AccountId, Database, DocumentId, Object, OperationDigest, OperationId, ReplicaId, Scalar,
     Scope, SpaceId,
 };
+use std::error::Error;
 use uuid::Uuid;
 
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("kill_writer: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    assert_eq!(arguments.len(), 5);
+    let [path, account, space, replica, ready] = arguments.as_slice() else {
+        return Err("expected path, account, space, replica, and ready-file arguments".into());
+    };
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&arguments[1]).unwrap()),
-        SpaceId::from_uuid(Uuid::parse_str(&arguments[2]).unwrap()),
+        AccountId::from_uuid(Uuid::parse_str(account)?),
+        SpaceId::from_uuid(Uuid::parse_str(space)?),
     );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(&arguments[3]).unwrap());
-    let database = Database::open(&arguments[0], scope, replica).unwrap();
+    let replica = ReplicaId::from_uuid(Uuid::parse_str(replica)?);
+    let database = Database::open(path, scope, replica)?;
     for sequence in 1_u64..=u64::MAX {
         let mut digest = [0; 32];
         digest[..8].copy_from_slice(&sequence.to_be_bytes());
-        database
-            .edit(
-                DocumentId::new(),
-                OperationId::new(),
-                OperationDigest::new(digest),
-                |editor| editor.put(&Object::root(), "sequence", Scalar::Unsigned(sequence)),
-            )
-            .unwrap();
+        database.edit(
+            DocumentId::new(),
+            OperationId::new(),
+            OperationDigest::new(digest),
+            |editor| editor.put(&Object::root(), "sequence", Scalar::Unsigned(sequence)),
+        )?;
         if sequence == 1 {
-            std::fs::write(&arguments[4], b"ready").unwrap();
+            std::fs::write(ready, b"ready")?;
         }
     }
+    Ok(())
 }

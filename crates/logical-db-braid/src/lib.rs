@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::collections::BTreeMap;
 
 use braid_capability::Capability;
 use braid_flow_ir::{FactRef, Predicate, ValueExpr};
@@ -71,6 +71,7 @@ impl ActionBinding {
 /// Constructs the exact Braid capability for one DB action.
 #[must_use]
 pub fn capability_for(scope: Scope, effect: Effect, action: ActionDigest) -> Capability {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let prefix = match effect {
         Effect::Read => READ_CAPABILITY,
         Effect::Scan => SCAN_CAPABILITY,
@@ -79,7 +80,8 @@ pub fn capability_for(scope: Scope, effect: Effect, action: ActionDigest) -> Cap
     };
     let mut action_hex = String::with_capacity(64);
     for byte in action.into_bytes() {
-        write!(&mut action_hex, "{byte:02x}").expect("writing to String is infallible");
+        action_hex.push(HEX[usize::from(byte >> 4)] as char);
+        action_hex.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     Capability::new(format!(
         "{prefix}.{}.{}.{action_hex}",

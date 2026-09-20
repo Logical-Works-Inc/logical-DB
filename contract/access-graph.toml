@@ -1,0 +1,88 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+# S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in
+# `evidence/SOURCES.md`.
+
+# Checked execution-access contract for issue #25.
+# This registry describes ownership and causal access; it is not a storage authority.
+version = 1
+
+[[resource]]
+name = "replica.state"
+owner = "logical-db-store"
+durability = "durable"
+
+[[resource]]
+name = "replica.outbox"
+owner = "logical-db-store"
+durability = "durable"
+
+[[resource]]
+name = "sync.checkpoint"
+owner = "logical-db-sync"
+durability = "durable"
+
+[[resource]]
+name = "sync.session"
+owner = "logical-db-sync"
+durability = "ephemeral"
+
+[[resource]]
+name = "schema.generation"
+owner = "logical-db-store"
+durability = "durable"
+
+[[resource]]
+name = "migration.state"
+owner = "logical-db-store"
+durability = "durable"
+
+[[resource]]
+name = "service.retention"
+owner = "logical-db-service"
+durability = "durable"
+
+[[resource]]
+name = "service.request"
+owner = "logical-db-service"
+durability = "ephemeral"
+
+[[system]]
+name = "store.commit"
+owner = "logical-db-store"
+reads = ["replica.state", "replica.outbox"]
+writes = ["replica.state", "replica.outbox"]
+receipt = "operation"
+continuation = "bounded batch"
+
+[[system]]
+name = "store.migrate"
+owner = "logical-db-store"
+reads = ["replica.state", "schema.generation"]
+writes = ["migration.state", "schema.generation"]
+receipt = "migration"
+continuation = "revision-checked page"
+
+[[system]]
+name = "sync.push-pull"
+owner = "logical-db-sync"
+reads = ["replica.outbox", "sync.checkpoint", "sync.session"]
+writes = ["sync.checkpoint", "sync.session"]
+receipt = "sync report"
+continuation = "bounded page and cycle"
+
+[[system]]
+name = "service.admit"
+owner = "logical-db-service"
+reads = ["service.retention", "service.request"]
+writes = ["service.request"]
+receipt = "protocol response"
+continuation = "deadline"
+
+[[system]]
+name = "service.retention-recovery"
+owner = "logical-db-service"
+reads = ["service.retention", "service.request"]
+writes = ["service.retention"]
+receipt = "prune receipt"
+continuation = "bounded baseline page"
