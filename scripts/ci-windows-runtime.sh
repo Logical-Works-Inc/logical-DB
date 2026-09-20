@@ -10,6 +10,7 @@ source_root=${3:?expected frozen source}
 [[ $(docker inspect "$worker" --format '{{.State.Running}}') == false ]]
 [[ $(docker inspect "$worker" --format '{{index .Config.Labels "logical-db.owner"}}') == ci ]]
 vm=logicaldb-windows-emulator
+wine_prefix=/var/lib/logical-db-ci/wine-prefix
 source_kib=$(du -sk "$source_root" | cut -f1)
 record=$(limactl list --json | python3 -c 'import json,sys
 for line in sys.stdin:
@@ -52,7 +53,9 @@ fi
 [[ $(uname -m) == x86_64 && $(wine --version) == wine-10.* ]]
 /usr/lib/x86_64-linux-gnu/wine/wineserver --version
 sudo mkdir -p /var/lib/logical-db-ci
-'
+sudo install -d -o srinji.guest -g srinji.guest -m 700 "$1"
+sudo chown -R srinji.guest:srinji.guest "$1"
+' bash "$wine_prefix"
 guest_root="/var/lib/logical-db-ci/$tree"
 limactl copy --backend=scp "$source_root/scripts/ci-windows-runtime.py" "$vm:/tmp/logical-db-ci-runtime.py"
 docker cp "$worker:/tmp/ci-windows-runtime/.ci-windows/tests.json" - | tar -xOf - | \
@@ -69,6 +72,7 @@ chown -hR root:root "$1"
 chmod -R a+rX,a-w "$1"
 ln -sfn "$1" /workspace' bash "$guest_root"
 echo "SYSTEM-EMULATOR vm=$vm source=$tree"
-limactl shell "$vm" timeout --signal=TERM --kill-after=2s 1800 python3 /workspace/scripts/ci-windows-runtime.py run
+limactl shell "$vm" env WINEPREFIX="$wine_prefix" \
+  timeout --signal=TERM --kill-after=2s 1800 python3 /workspace/scripts/ci-windows-runtime.py run
 }
 main "$@"
