@@ -1397,7 +1397,7 @@ impl EmbeddedStore {
         self.install_remote_page_inner(scope, peer, documents, changes, checkpoint, true)
     }
 
-    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines, reason = "see surrounding context")]
     fn install_remote_page_inner(
         &self,
         scope: Scope,
