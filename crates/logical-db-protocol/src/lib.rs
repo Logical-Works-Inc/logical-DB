@@ -66,6 +66,7 @@ impl Checkpoint {
 /// One immutable, retryable document change.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct ChangeEnvelope {
     /// Logical ownership scope.
     pub scope: Scope,
@@ -106,6 +107,7 @@ impl ChangeEnvelope {
 /// Bounded client-to-service change upload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct PushRequest {
     /// Exact protocol version encoded by the client.
     pub protocol: u16,
@@ -142,6 +144,7 @@ impl PushRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PushOutcome {
     /// The service durably accepted the change.
     Accepted {
@@ -166,6 +169,7 @@ pub enum PushOutcome {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RejectionCode {
     /// Change bytes did not match the supplied digest.
     DigestMismatch,
@@ -184,6 +188,7 @@ pub enum RejectionCode {
 /// Service response to one bounded push page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct PushResponse {
     /// Exact protocol version encoded by the service.
     pub protocol: u16,
@@ -223,6 +228,7 @@ impl PushResponse {
 /// Request for changes after an opaque durable checkpoint.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct PullRequest {
     /// Exact protocol version encoded by the client.
     pub protocol: u16,
@@ -264,6 +270,7 @@ impl PullRequest {
 /// One bounded service-to-client page.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct PullPage {
     /// Exact protocol version encoded by the service.
     pub protocol: u16,
@@ -310,6 +317,7 @@ impl PullPage {
 /// instead of applying a partial prefix.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct BaselineRequest {
     /// Exact protocol version encoded by the client.
     pub protocol: u16,
@@ -339,6 +347,7 @@ impl BaselineRequest {
 /// One document state inside a recovery baseline.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct BaselineDocument {
     /// Stable document identity.
     pub document: DocumentId,
@@ -363,6 +372,7 @@ pub struct BaselineDocument {
 /// a truncated, reordered, or substituted artifact never mutates local state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct BaselinePage {
     /// Exact protocol version encoded by the service.
     pub protocol: u16,
@@ -617,6 +627,7 @@ impl BaselineAccumulator {
 
 /// Stable transport-neutral protocol failures.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ProtocolError {
     /// Sender and receiver do not implement the same protocol.
     #[error("{context}: unsupported protocol version {actual}")]

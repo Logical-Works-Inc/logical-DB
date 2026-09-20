@@ -110,6 +110,7 @@ impl<'a> LocalChange<'a> {
 
 /// Atomic local transition from one document state to the next.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct LocalCommit<'a> {
     /// Immutable change and its logical routing metadata.
     pub change: LocalChange<'a>,
@@ -129,6 +130,7 @@ pub struct LocalCommit<'a> {
 
 /// Latest complete snapshot and its optimistic concurrency marker.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct StoredSnapshot {
     /// Complete verified Automerge snapshot bytes.
     pub bytes: Vec<u8>,
@@ -138,6 +140,7 @@ pub struct StoredSnapshot {
 
 /// One immutable remote change to install with a materialized snapshot.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct RemoteChange<'a> {
     /// Document receiving the change.
     pub document: DocumentId,
@@ -149,6 +152,7 @@ pub struct RemoteChange<'a> {
 
 /// One remotely merged document transition inside an atomic pull page.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct RemoteDocument<'a> {
     /// Changed document.
     pub document: DocumentId,
@@ -167,6 +171,7 @@ pub struct RemoteDocument<'a> {
 
 /// One stable secondary-index result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct IndexHit {
     /// Matching document ordered by its portable identifier.
     pub document: DocumentId,
@@ -180,6 +185,7 @@ pub struct IndexHit {
 /// subscription cursor taken before it can never silently observe a replaced
 /// scope as though nothing happened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ChangeEvent {
     /// A document's materialized representation changed.
     Document {
@@ -233,6 +239,7 @@ impl ChangeEvent {
 
 /// One immutable document input for a resumable materialized-index migration.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct MigrationDocument {
     /// Document ordered by its portable identifier.
     pub document: DocumentId,
@@ -244,6 +251,7 @@ pub struct MigrationDocument {
 
 /// One bounded migration page and the cursor it was read from.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct MigrationPage {
     /// Durable cursor that must still identify the migration when applied.
     pub after: Option<DocumentId>,
@@ -253,6 +261,7 @@ pub struct MigrationPage {
 
 /// Replacement materialized rows for one migration document.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct MigrationIndexes<'a> {
     /// Document whose complete index set is replaced.
     pub document: DocumentId,
@@ -264,6 +273,7 @@ pub struct MigrationIndexes<'a> {
 
 /// One ordered commit replayed by a versioned logical export.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ExportEntry {
     /// Document changed by the replayed commit.
     pub document: DocumentId,
@@ -279,6 +289,7 @@ pub struct ExportEntry {
 
 /// One document snapshot carried by a versioned logical export.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ExportDocument {
     /// Document ordered by its portable identifier.
     pub document: DocumentId,
@@ -290,6 +301,7 @@ pub struct ExportDocument {
 
 /// One bounded document page of a resumable logical export scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ExportScanPage {
     /// Durable cursor the page was read from.
     pub after: Option<DocumentId>,
@@ -299,6 +311,7 @@ pub struct ExportScanPage {
 
 /// Durable cursor of an interrupted versioned restore.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct RestoreCursor {
     /// Identity of the export payload the cursor belongs to.
     pub payload: [u8; 32],
@@ -308,6 +321,7 @@ pub struct RestoreCursor {
 
 /// Durable result of a local commit or exact retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CommitOutcome {
     /// A new outbox sequence was committed.
     Applied {
@@ -323,6 +337,7 @@ pub enum CommitOutcome {
 
 /// One durable unsent change reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct OutboxEntry {
     /// Monotonic sequence within the logical scope.
     pub sequence: u64,
@@ -336,6 +351,7 @@ pub struct OutboxEntry {
 
 /// Durable exact-request binding for a previously committed operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CommittedOperation {
     /// Document changed by the request.
     pub document: DocumentId,
@@ -1629,6 +1645,7 @@ impl EmbeddedStore {
 
 /// Stable embedded storage failures.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StoreError {
     /// Opening or creating the database failed.
     #[error("database open failed: {0}")]

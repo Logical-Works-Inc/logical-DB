@@ -111,6 +111,7 @@ impl fmt::Display for EpisodeId {
 /// One of the seven episode clocks; time is first-class and multi-clock.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub enum ClockKind {
     /// When ORIGIN encountered the episode.
     Observed,
@@ -131,6 +132,7 @@ pub enum ClockKind {
 /// Seven-clock episode timestamp in milliseconds since the epoch.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct EpisodeTime {
     /// When ORIGIN encountered the episode.
     pub observed: i64,
@@ -151,6 +153,7 @@ pub struct EpisodeTime {
 /// How an episode is known.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub enum Epistemic {
     /// Directly observed evidence.
     Explicit,
@@ -165,6 +168,7 @@ pub enum Epistemic {
 /// One evidence link: the episode plus the role it played.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct Evidence {
     /// Upstream episode this link rests on.
     pub episode: EpisodeId,
@@ -174,6 +178,7 @@ pub struct Evidence {
 
 /// Sealed error surface for the episode log.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EpisodeError {
     /// Zero digest passed to `EpisodeId::new`.
     #[error("episode identity cannot be zero")]
@@ -394,6 +399,7 @@ where
 
 /// One immutable episode; identity is derived from content at construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Episode {
     /// Content-derived identity over every immutable field below.
     pub id: EpisodeId,
@@ -557,6 +563,7 @@ impl<'de> Deserialize<'de> for Episode {
 /// rendered state cannot invent lineage. Guards mirror LEM `lib.rs:115-200`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct LocalWorldRecord {
     /// Local replay checkpoint, not cross-instance identity.
     pub source_sequence: u64,

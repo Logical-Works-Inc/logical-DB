@@ -16,6 +16,7 @@ use crate::{ChangeEnvelope, Checkpoint, PROTOCOL_VERSION};
 /// The store receives these actual parameters and independently recomputes
 /// their digest; a caller cannot substitute limits or position behind a grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct PageAction {
     /// Account and application whose data will be returned.
     pub scope: Scope,
@@ -50,6 +51,7 @@ impl PageAction {
 /// their action digest, so a caller cannot preserve the intent while
 /// substituting the checkpoint or the exclusive document cursor behind a grant.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct RecoveryAction {
     /// Scope whose recovery baseline is read.
     pub scope: Scope,

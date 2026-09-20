@@ -37,6 +37,7 @@ impl Object {
 
 /// Application scalar accepted by the stable document editor.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Scalar {
     /// Explicit null.
     Null,
@@ -67,6 +68,7 @@ pub enum Scalar {
 
 /// Convergent structured container kind owned by the Logical-DB API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ObjectKind {
     /// String-keyed object.
     Map,
@@ -136,6 +138,7 @@ impl From<ScalarValue> for Scalar {
 
 /// One immutable Automerge change ready for durable storage or transport.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct EncodedChange {
     /// Native Automerge change identity.
     pub digest: ChangeDigest,
@@ -372,6 +375,7 @@ impl Default for Document {
 
 /// Value observed through the stable document boundary.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Item {
     /// Scalar materialized value.
     Scalar(Scalar),
@@ -386,6 +390,7 @@ pub enum Item {
 
 /// One causally distinct value retained for a conflicting property or index.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ConflictValue {
     /// Scalar or nested object authored by one causal operation.
     pub value: Item,
@@ -687,6 +692,7 @@ impl Editor<'_> {
 
 /// Stable failures from the CRDT adapter.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CrdtError {
     /// Automerge rejected malformed state or an invalid operation.
     #[error("CRDT operation failed: {0}")]
