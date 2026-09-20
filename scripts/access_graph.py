@@ -62,8 +62,14 @@ def load(path: Path = GRAPH_PATH) -> dict:
         if not isinstance(name, str) or not name or name in system_names:
             raise AccessGraphError(f"{location}.name must be unique and non-empty")
         system_names.add(name)
+        if not isinstance(system.get("owner"), str) or not system["owner"]:
+            raise AccessGraphError(f"{location}.owner is required")
         reads = _strings(system, "reads", location)
         writes = _strings(system, "writes", location)
+        if len(set(reads)) != len(reads):
+            raise AccessGraphError(f"{location}.reads must not contain duplicate resources")
+        if len(set(writes)) != len(writes):
+            raise AccessGraphError(f"{location}.writes must not contain duplicate resources")
         for resource in reads + writes:
             if resource not in resource_names:
                 raise AccessGraphError(f"{location} references unknown resource {resource!r}")

@@ -133,6 +133,17 @@ def plan_transfer():
     used = int(subprocess.check_output(["du", "-sk", str(base)], text=True).split()[0]) * 1024
     growth = transfer_growth(root, manifest["sizes"]) + int(sys.argv[3]) * 1024 + 1024**2
     available = shutil.disk_usage(base).free
+    if not within_budget(used, growth, available):
+        candidates = []
+        for directory in sorted(base.iterdir()):
+            if directory == root or directory.is_symlink() or not directory.is_dir() or directory.name == "wine-prefix":
+                continue
+            candidates.append(directory)
+        while not within_budget(used, growth, available) and len(candidates) > 1:
+            oldest = candidates.pop(0)
+            shutil.rmtree(oldest, ignore_errors=True)
+            used = int(subprocess.check_output(["du", "-sk", str(base)], text=True).split()[0]) * 1024
+            available = shutil.disk_usage(base).free
     print(f"TRANSFER reused_bytes={reused} used_bytes={used} growth_bytes={growth} available_bytes={available}", flush=True)
     if not within_budget(used, growth, available):
         raise SystemExit("Windows VM storage budget reached; recoverable maintenance required")
@@ -191,10 +202,20 @@ def run():
     control = ROOT / ".ci-windows"
     manifest = json.loads((control / "tests.json").read_text())
     verify_transfer(ROOT, manifest)
-    env = dict(os.environ, WINEDEBUG="-fixme", RUST_BACKTRACE="1", RUST_TEST_THREADS="4",
+    prefix_str = os.environ.get("WINEPREFIX")
+    if not prefix_str:
+        raise RuntimeError("missing owned Wine prefix: WINEPREFIX is not set")
+    prefix = Path(prefix_str)
+    if not prefix.is_dir():
+        raise RuntimeError(f"missing owned Wine prefix directory: {prefix}")
+    env = dict(os.environ, WINEDEBUG="-fixme", WINEDLLOVERRIDES="mscoree,mshtml=",
+               RUST_BACKTRACE="1", RUST_TEST_THREADS="4",
                WINEPATH=f"{control / 'sdk'};{control / 'dlls'}")
+    # Initialize the VM-owned prefix before starting the retained server. The
+    # guest home is not a durable CI resource and must not supply this state.
+    subprocess.run(["wineboot", "--init"], check=True, env=env, timeout=120)
     # Wine's default three-second server teardown can race the next harness.
-    # Keep this owned session alive between binaries; the VM trap ends it.
+    # Keep this VM-owned session alive between binaries; the VM trap ends it.
     subprocess.run(["/usr/lib/x86_64-linux-gnu/wine/wineserver", "--persistent=60"],
                    check=True, env=env, timeout=30)
     subprocess.run(["wine", "--version"], check=True, env=env)

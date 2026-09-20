@@ -1985,14 +1985,10 @@ pub fn content_digest(document: DocumentId, key: &str, value: &Scalar) -> Operat
 }
 
 fn canonical_value_bytes(document: DocumentId, key: &str, value: &Scalar) -> Vec<u8> {
-    #[allow(clippy::manual_unwrap_or, clippy::single_match_else)]
     fn push_bounded_field(bytes: &mut Vec<u8>, field: &[u8]) {
-        let length = match u32::try_from(field.len()) {
-            Ok(length) => length,
-            Err(_) => u32::MAX,
-        };
+        let length = u32::try_from(field.len()).unwrap_or(u32::MAX);
         bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.extend_from_slice(field);
+        bytes.extend_from_slice(&field[..field.len().min(length as usize)]);
     }
     let mut bytes = Vec::new();
     bytes.extend_from_slice(document.as_uuid().as_bytes());

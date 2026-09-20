@@ -1360,21 +1360,14 @@ mod runtime {
             .transpose()
     }
 
-    async fn load_artifact(
+    async fn scan_baseline_manifests(
         transaction: &foundationdb::RetryableTransaction,
-        scope: Scope,
-        baseline: &logical_db_model::SnapshotBaseline,
-        spaces: &BaselineSpaces,
-    ) -> Result<SnapshotArtifact, FdbBindingError> {
-        let digest = baseline.digest().into_bytes();
-        let document_space = spaces.document.subspace(&(digest.as_slice(),));
-        let (space_begin, space_end) = document_space.range();
-        // The client may truncate a range read before the row budget is reached,
-        // so continue from the last document until the range is exhausted. The
-        // descriptor still bounds the total count and aggregate bytes.
-        let expected_count = baseline.document_count() as usize;
+        space_begin: &[u8],
+        space_end: &[u8],
+        expected_count: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FdbBindingError> {
         let mut manifests = Vec::new();
-        let mut cursor = space_begin;
+        let mut cursor = space_begin.to_vec();
         let mut exclusive = false;
         while manifests.len() <= expected_count {
             let remaining = expected_count
@@ -1387,7 +1380,7 @@ mod runtime {
             };
             let options = RangeOption {
                 begin,
-                end: KeySelector::first_greater_or_equal(space_end.as_slice()),
+                end: KeySelector::first_greater_or_equal(space_end),
                 limit: Some(remaining.max(1)),
                 target_bytes: MAX_BASELINE_BYTES,
                 ..RangeOption::default()
@@ -1424,9 +1417,19 @@ mod runtime {
             eprintln!("logical-db-store-fdb: baseline manifest count is inconsistent");
             return Err(binding(DataError::BaselineCorrupt));
         }
+        Ok(manifests)
+    }
+
+    async fn load_baseline_documents(
+        transaction: &foundationdb::RetryableTransaction,
+        document_space: &foundationdb_tuple::Subspace,
+        spaces: &BaselineSpaces,
+        digest: [u8; 32],
+        expected_bytes: usize,
+        manifests: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<SnapshotDocument>, FdbBindingError> {
         let mut documents = Vec::with_capacity(manifests.len());
         let mut aggregate_bytes = 0_usize;
-        let expected_bytes = usize::try_from(baseline.byte_len()).map_err(binding_invalid)?;
         for (key, value) in manifests {
             let manifest = decode_baseline_document(&value).map_err(binding)?;
             let Some(next_total) = aggregate_bytes
@@ -1436,15 +1439,9 @@ mod runtime {
                 eprintln!("logical-db-store-fdb: baseline byte total exceeds its descriptor");
                 return Err(binding(DataError::BaselineCorrupt));
             };
-            let document = load_artifact_document(
-                transaction,
-                &document_space,
-                spaces,
-                digest,
-                &key,
-                manifest,
-            )
-            .await?;
+            let document =
+                load_artifact_document(transaction, document_space, spaces, digest, &key, manifest)
+                    .await?;
             aggregate_bytes = next_total;
             documents.push(document);
         }
@@ -1452,6 +1449,14 @@ mod runtime {
             eprintln!("logical-db-store-fdb: baseline byte total is inconsistent");
             return Err(binding(DataError::BaselineCorrupt));
         }
+        Ok(documents)
+    }
+
+    fn verify_baseline_artifact(
+        scope: Scope,
+        baseline: &logical_db_model::SnapshotBaseline,
+        documents: Vec<SnapshotDocument>,
+    ) -> Result<SnapshotArtifact, FdbBindingError> {
         let artifact = SnapshotArtifact::new(scope, baseline.position(), documents)
             .map_err(binding_baseline)?;
         if &artifact.baseline != baseline {
@@ -1468,6 +1473,39 @@ mod runtime {
             return Err(binding(DataError::BaselineCorrupt));
         }
         Ok(artifact)
+    }
+
+    async fn load_artifact(
+        transaction: &foundationdb::RetryableTransaction,
+        scope: Scope,
+        baseline: &logical_db_model::SnapshotBaseline,
+        spaces: &BaselineSpaces,
+    ) -> Result<SnapshotArtifact, FdbBindingError> {
+        let digest = baseline.digest().into_bytes();
+        let document_space = spaces.document.subspace(&(digest.as_slice(),));
+        let (space_begin, space_end) = document_space.range();
+        let expected_count = baseline.document_count() as usize;
+        let expected_bytes = usize::try_from(baseline.byte_len()).map_err(binding_invalid)?;
+
+        let manifests = scan_baseline_manifests(
+            transaction,
+            space_begin.as_slice(),
+            space_end.as_slice(),
+            expected_count,
+        )
+        .await?;
+
+        let documents = load_baseline_documents(
+            transaction,
+            &document_space,
+            spaces,
+            digest,
+            expected_bytes,
+            manifests,
+        )
+        .await?;
+
+        verify_baseline_artifact(scope, baseline, documents)
     }
 
     async fn read_baseline_page_transaction(

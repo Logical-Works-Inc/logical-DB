@@ -38,6 +38,31 @@ class AccessGraphContract(unittest.TestCase):
             with self.assertRaisesRegex(access_graph.AccessGraphError, "multiple writers"):
                 access_graph.load(path)
 
+    def test_missing_system_owner_is_refused(self):
+        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "access-graph.toml"
+            path.write_text(source.replace('owner = "logical-db-store"', '# owner omitted', 1), encoding="utf-8")
+            with self.assertRaisesRegex(access_graph.AccessGraphError, "owner is required"):
+                access_graph.load(path)
+
+    def test_duplicate_writes_is_refused(self):
+        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "access-graph.toml"
+            path.write_text(source.replace('writes = ["replica.state", "replica.outbox"]',
+                                            'writes = ["replica.state", "replica.state"]', 1), encoding="utf-8")
+            with self.assertRaisesRegex(access_graph.AccessGraphError, "duplicate resources"):
+                access_graph.load(path)
+
+    def test_unwritten_resource_is_refused(self):
+        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "access-graph.toml"
+            path.write_text(source + '\n[[resource]]\nname="orphan.resource"\nowner="x"\ndurability="ephemeral"\n', encoding="utf-8")
+            with self.assertRaisesRegex(access_graph.AccessGraphError, "resources without a declared writer"):
+                access_graph.load(path)
+
 
 if __name__ == "__main__":
     unittest.main()
