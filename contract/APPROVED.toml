@@ -256,7 +256,7 @@ review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 [[approved]]
 crate = "uuid"
 tier = "boundary"
-version = "=1.26.0"
+version = "=1.26.1"
 owner = "logical-db-model"
 capability = "identity.uuid-v7"
 source = "registry"
@@ -304,7 +304,7 @@ review = "https://github.com/srinji-kaggss/logicalworks-crates/blob/main/docs/de
 [[approved]]
 crate = "reqwest"
 tier = "boundary"
-version = "=0.13.4"
+version = "=0.13.5"
 owner = "logical-db-http"
 capability = "net.async-http-client"
 source = "registry"
