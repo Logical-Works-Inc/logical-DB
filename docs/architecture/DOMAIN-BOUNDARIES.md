@@ -123,3 +123,14 @@ Every new domain component declares in `contract/domains/<domain>.toml`:
 
 `docs/architecture/DEPENDENCY-RULES.md` is the mechanical import policy. Issue
 #25’s checked access graph is the execution-time proof complement to this map.
+
+The machine-readable half is `contract/domains/<domain>.toml` plus
+`contract/domains/GRAPH.toml`: each record declares its owned `crates`, its
+`public_contracts`, its `may_depend_on` owners, and its `forbidden_domains`.
+`scripts/domain_contract.py` enforces that map against `cargo metadata` and
+compares the committed `evidence/domain-graph.md` receipt; the clean-room
+evidence lane runs it. A product domain may import only another domain's
+published contracts, while the declared composition layers (facade, adapter,
+e2e) may import implementation crates. This proves the declared import graph
+only; it does not prove the target services exist or that a runtime authority
+path is legal.

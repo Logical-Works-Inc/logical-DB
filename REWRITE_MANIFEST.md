@@ -109,12 +109,14 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [ ] Exercise multi-node FDB failover and point-in-time restore, public
   TLS/issuer/rotation, sustained load/backpressure, disk exhaustion, sleep/wake,
   and mobile sandbox lifecycle.
-- [ ] Enforce the four-domain Cloud/Cairn/LEM/Forge dependency and authority
+- [x] Enforce the four-domain Cloud/Cairn/LEM/Forge dependency and authority
   map: `docs/architecture/DOMAIN-BOUNDARIES.md`,
-  `docs/architecture/DEPENDENCY-RULES.md`, and `contract/domains/*.toml` must
-  be parsed by the existing contract tooling; each forbidden cross-domain import
-  needs a falsification fixture. This is a structure gate, not proof that the
-  target crates or services exist.
+  `docs/architecture/DEPENDENCY-RULES.md`, and `contract/domains/*.toml` are
+  parsed by `scripts/domain_contract.py` and enforced against `cargo metadata`
+  in the clean-room evidence lane; each domain has a deliberate forbidden-edge
+  falsifier in `scripts/test-domain-contract.py`; the committed
+  `evidence/domain-graph.md` receipt is regenerated and compared on every run.
+  This is a structure gate, not proof that the target crates or services exist.
 - [ ] Complete ADR-0003’s sovereign Cloud Plane program: partition routing,
   server-authorized replication views, residency/key/portable-exit contracts,
   regional delivery/backpressure, multi-region DR, and all nine measured axes.

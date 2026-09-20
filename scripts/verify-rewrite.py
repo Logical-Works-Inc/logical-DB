@@ -17,6 +17,9 @@ import sys
 import tomllib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import domain_contract  # noqa: E402
+
 BASELINE = "7cffbc07b6f312854986ae306b583ef891623b2d"
 MINIMUM_CITATIONS = 20
 MINIMUM_HASH_CHURN = 85.0
@@ -175,7 +178,10 @@ def citation_failures(files: list[Path], allowed: set[str]) -> list[str]:
         if relative == Path("evidence/SOURCES.md"):
             valid = found & allowed
         else:
-            header = payload[:CITATION_HEADER_BYTES].decode("utf-8", "strict")
+            # The 4096-byte ceiling is a byte bound, so a multibyte character
+            # can straddle it. Decode the prefix leniently rather than crashing
+            # on a boundary split; the header check is unaffected.
+            header = payload[:CITATION_HEADER_BYTES].decode("utf-8", "ignore")
             if "Evidence" not in header:
                 failures.append(f"missing explicit evidence header: {relative}")
             valid = set(SOURCE_PATTERN.findall(header)) & allowed
@@ -275,12 +281,19 @@ def dependency_failures() -> list[str]:
 
 
 def domain_contract_failures() -> list[str]:
-    """Validate the four proposed domain manifests without claiming runtime enforcement."""
+    """Validate the four domain manifests and enforce the allowed-edge graph.
+
+    The shape checks keep the descriptive records complete; the delegated
+    `domain_contract` checks prove the live `cargo metadata` graph obeys the
+    declared ownership and allowed edges, and that the committed
+    `evidence/domain-graph.md` receipt still matches. This is a structure gate,
+    not proof that the target crates or services exist.
+    """
     required = {"cloud", "cairn", "lem", "forge"}
     directory = ROOT / "contract" / "domains"
     if not directory.is_dir():
         return ["missing contract/domains directory"]
-    manifests = sorted(directory.glob("*.toml"))
+    manifests = sorted(path for path in directory.glob("*.toml") if path.name != "GRAPH.toml")
     found: set[str] = set()
     failures: list[str] = []
     for path in manifests:
@@ -299,16 +312,23 @@ def domain_contract_failures() -> list[str]:
         for key in ("owner", "status", "release_lane"):
             if not isinstance(parsed.get(key), str) or not parsed[key]:
                 failures.append(f"domain {domain} lacks nonempty {key}")
-        for key in ("may_depend_on", "forbidden_domains", "evidence", "blocked_claims"):
+        for key in ("crates", "may_depend_on", "forbidden_domains", "evidence", "blocked_claims"):
             values = parsed.get(key)
-            if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
-                failures.append(f"domain {domain} lacks nonempty string list {key}")
+            if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                failures.append(f"domain {domain} lacks string list {key}")
     missing = sorted(required - found)
     unexpected = sorted(found - required)
     if missing:
         failures.append(f"missing domain manifests: {' '.join(missing)}")
     if unexpected:
         failures.append(f"unexpected domain manifests: {' '.join(unexpected)}")
+    try:
+        edge_failures, document = domain_contract.enforce(ROOT)
+    except domain_contract.ContractError as error:
+        failures.append(f"domain contract is unreadable: {error}")
+        return failures
+    failures.extend(edge_failures)
+    failures.extend(domain_contract.receipt_failures(document, ROOT))
     return failures
 
 

@@ -91,6 +91,29 @@ through the public transport and the position-1 prune/fresh-replica
 counterexample verified item-by-item, plus reproduction on a runnable hosted or
 self-hosted lane. No hosted full-recovery evidence is claimed.
 
+## 2026-09-19 domain boundary enforcement (issue #73)
+
+- **Issue #73 implemented** on branch `feat/domain-boundary-enforcement`,
+  stacked on the docs commit `85f2bb2` (PR #65) that defined the four product
+  domains. `contract/domains/*.toml` now declare owned `crates`,
+  `public_contracts`, `may_depend_on`, and `forbidden_domains`;
+  `contract/domains/GRAPH.toml` adds the kernel/facade/adapter/e2e layers, the
+  composition-layer exemption, and the predecessor twin denylist.
+- **Enforcement** — `scripts/domain_contract.py` parses those records, reads
+  the live graph from `cargo metadata`, and refuses an undeclared owner, a
+  double-owned crate, a disallowed cross-domain edge, a product domain importing
+  another domain's implementation crate, and a predecessor twin. The clean-room
+  evidence lane runs it and compares the committed `evidence/domain-graph.md`
+  receipt (8 owners, 36 edges at this revision).
+- **Falsifier** — `scripts/test-domain-contract.py` injects one forbidden edge
+  per domain (Cloud→Cairn, Cairn→Cloud implementation, LEM→Cloud
+  implementation, Forge→Cloud) plus undeclared, double-owned, and twin crates,
+  and asserts the real checker refuses each; 8/8 pass locally.
+- **Scope limit** — this is a structure gate over the declared import graph. It
+  is not proof that the target Cairn/LEM/Forge crates or services exist, not the
+  external-consumer fixture (PRD WP2), and not issue #25's execution-time
+  transition graph. Those remain open.
+
 ## Recorded product decision
 
 The Director already resolved the backend split in
