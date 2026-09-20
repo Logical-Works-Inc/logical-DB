@@ -53,8 +53,8 @@ fi
 [[ $(uname -m) == x86_64 && $(wine --version) == wine-10.* ]]
 /usr/lib/x86_64-linux-gnu/wine/wineserver --version
 sudo mkdir -p /var/lib/logical-db-ci
-sudo install -d -o srinji.guest -g srinji.guest -m 700 "$1"
-sudo chown -R srinji.guest:srinji.guest "$1"
+sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 700 "$1"
+sudo chown -R "$(id -un):$(id -gn)" "$1"
 ' bash "$wine_prefix"
 guest_root="/var/lib/logical-db-ci/$tree"
 limactl copy --backend=scp "$source_root/scripts/ci-windows-runtime.py" "$vm:/tmp/logical-db-ci-runtime.py"
