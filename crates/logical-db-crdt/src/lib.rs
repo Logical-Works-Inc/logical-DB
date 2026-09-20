@@ -936,7 +936,7 @@ mod tests {
             .validate(),
             Err(CrdtError::InvalidChangeSize(0))
         ));
-        let mut forged = change.clone();
+        let mut forged = change;
         forged.digest = ChangeDigest::new([99; 32]);
         assert!(matches!(forged.validate(), Err(CrdtError::DigestMismatch)));
         let malformed = EncodedChange {

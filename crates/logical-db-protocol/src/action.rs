@@ -225,7 +225,7 @@ mod tests {
     fn write_identity_changes_for_every_authorized_field() {
         let original = change();
         let expected = write_action(&original);
-        assert_eq!(expected, write_action(&original.clone()));
+        assert_eq!(expected, write_action(&original));
         let mut variants = vec![original.clone(); 8];
         variants[0].scope = Scope::new(AccountId::new(), original.scope.space());
         variants[1].scope = Scope::new(original.scope.account(), SpaceId::new());
