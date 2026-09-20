@@ -5,9 +5,12 @@
 /target/
 /.codegraph/
 /keel-core/
+/graphify-out/
 mutants.out*
 /.idea/
 /.vscode/
+__pycache__/
+*.pyc
 *.redb
 *.redb.tmp
 *.pdb

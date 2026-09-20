@@ -11,6 +11,7 @@
 //! minimal embedded footprint.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1985,9 +1986,9 @@ pub fn content_digest(document: DocumentId, key: &str, value: &Scalar) -> Operat
 
 fn canonical_value_bytes(document: DocumentId, key: &str, value: &Scalar) -> Vec<u8> {
     fn push_bounded_field(bytes: &mut Vec<u8>, field: &[u8]) {
-        let length = u32::try_from(field.len()).expect("field length is bounded by validation");
+        let length = u32::try_from(field.len()).unwrap_or(u32::MAX);
         bytes.extend_from_slice(&length.to_be_bytes());
-        bytes.extend_from_slice(field);
+        bytes.extend_from_slice(&field[..field.len().min(length as usize)]);
     }
     let mut bytes = Vec::new();
     bytes.extend_from_slice(document.as_uuid().as_bytes());
@@ -2065,9 +2066,18 @@ fn decode_identity_sidecar(bytes: &[u8]) -> Result<(Scope, ReplicaId), DatabaseE
             "logical-db identity sidecar is corrupt",
         )));
     }
-    let account = uuid::Uuid::from_slice(&bytes[5..21]).expect("sidecar slice length is checked");
-    let space = uuid::Uuid::from_slice(&bytes[21..37]).expect("sidecar slice length is checked");
-    let replica = uuid::Uuid::from_slice(&bytes[37..53]).expect("sidecar slice length is checked");
+    let decode_uuid = |range: std::ops::Range<usize>| {
+        uuid::Uuid::from_slice(&bytes[range]).map_err(|error| {
+            eprintln!("logical-db: open_local: identity sidecar UUID is corrupt: {error}");
+            DatabaseError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "logical-db identity sidecar UUID is corrupt",
+            ))
+        })
+    };
+    let account = decode_uuid(5..21)?;
+    let space = decode_uuid(21..37)?;
+    let replica = decode_uuid(37..53)?;
     Ok((
         Scope::new(AccountId::from_uuid(account), SpaceId::from_uuid(space)),
         ReplicaId::from_uuid(replica),

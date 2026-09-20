@@ -6,10 +6,17 @@
 domain = "cairn"
 owner = "Cairn"
 status = "migration in progress"
-public_contracts = ["logical-db-cairn-core", "logical-db-cairn-sdk"]
+# Owned workspace crates. `logical-db-cairn` is the bounded compatibility port
+# until the core/sdk contracts land.
+crates = ["logical-db-cairn"]
+# Importable by another domain: the current compatibility port plus the future
+# published contracts. A future crate is not importable until it exists.
+public_contracts = ["logical-db-cairn", "logical-db-cairn-core", "logical-db-cairn-sdk"]
 current_compatibility_surface = ["logical-db-cairn"]
-may_depend_on = ["kernel", "cloud-public-ports"]
-forbidden_domains = ["cloud-implementation", "lem-implementation", "forge"]
+# Canonical owner labels. Cairn may consume published Cloud contracts but never
+# a Cloud implementation crate; the checker enforces that distinction.
+may_depend_on = ["kernel", "cloud"]
+forbidden_domains = ["lem", "forge"]
 durable_state_owner = "source systems; Cloud Plane only through published ports"
 release_lane = "cairn"
 evidence = ["source-coordinate fidelity", "candidate identity", "closed registry", "rebuildable view"]

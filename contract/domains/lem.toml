@@ -6,10 +6,17 @@
 domain = "lem"
 owner = "LEM / ORIGIN"
 status = "migration in progress"
-public_contracts = ["logical-db-lem-core", "logical-db-lem-projection", "logical-db-lem-adapter"]
+# Owned workspace crates. `logical-db-episode` is the bounded compatibility port
+# until the core/projection/adapter contracts land.
+crates = ["logical-db-episode"]
+# Importable by another domain: the current compatibility port plus the future
+# published contracts. A future crate is not importable until it exists.
+public_contracts = ["logical-db-episode", "logical-db-lem-core", "logical-db-lem-projection", "logical-db-lem-adapter"]
 current_compatibility_surface = ["logical-db-episode"]
-may_depend_on = ["kernel", "cloud-public-ports", "cairn-candidate-contract"]
-forbidden_domains = ["cloud-implementation", "cairn-ingest", "cairn-views", "forge-runtime"]
+# Canonical owner labels. LEM may consume published Cloud and Cairn contracts
+# but never their implementation crates; the checker enforces that distinction.
+may_depend_on = ["kernel", "cloud", "cairn"]
+forbidden_domains = ["forge"]
 durable_state_owner = "LEM / ORIGIN"
 release_lane = "lem"
 evidence = ["versioned identity adapter", "append-only episodes", "clocks", "provenance", "contradiction", "LocalWorld"]

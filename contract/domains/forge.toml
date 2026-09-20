@@ -6,10 +6,15 @@
 domain = "forge"
 owner = "Forge"
 status = "planned"
+# No workspace crate exists yet. `logical-db-forge-contract` is the first
+# planned crate; until it lands, Forge owns nothing and can import nothing.
+crates = []
 public_contracts = ["logical-db-forge-contract"]
 future_implementation = ["logical-db-forge-runtime"]
-may_depend_on = ["kernel", "lem-localworld-contract", "capability-contract"]
-forbidden_domains = ["cloud-implementation", "cairn-implementation", "lem-implementation"]
+# Canonical owner labels. Forge may consume the published LEM LocalWorld
+# contract but never a Cloud, Cairn, or LEM implementation crate.
+may_depend_on = ["kernel", "lem"]
+forbidden_domains = ["cloud", "cairn"]
 durable_state_owner = "none; receipts are candidate evidence"
 release_lane = "forge"
 evidence = ["capability scope", "idempotency", "receipt replay", "cancellation", "recovery"]

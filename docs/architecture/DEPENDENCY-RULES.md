@@ -5,8 +5,15 @@
 > S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
 > `../../evidence/SOURCES.md`.
 
-> Status: proposed. This policy is enforced incrementally by the existing
-> dependency-contract/evidence verifier; it does not authorize new dependencies.
+> Status: enforced for the declared import graph. `scripts/domain_contract.py`
+> parses `contract/domains/*.toml` and `contract/domains/GRAPH.toml`, reads the
+> live graph from `cargo metadata`, and refuses an undeclared owner, a
+> double-owned crate, a disallowed cross-domain edge, a product domain importing
+> another domain's implementation crate, and a predecessor twin. The clean-room
+> evidence lane runs it and compares the committed `evidence/domain-graph.md`
+> receipt; `scripts/test-domain-contract.py` injects a forbidden edge per domain
+> and proves the gate refuses it. This does not authorize new dependencies, and
+> it does not prove the target crates or services exist.
 
 ## One-way domain graph
 
@@ -55,15 +62,25 @@ handles: cross-domain use is contract-only.
 
 ## Enforcement
 
-1. Extend the existing dependency contract’s allowed-edge map with domain labels.
-2. Add an architecture test for each prohibited edge; it must fail against a
-   deliberately injected forbidden dependency.
-3. Generate the domain graph from Cargo metadata and compare it with
-   `contract/domains/*.toml`.
-4. Require a public-fixture consumer for every boundary crate and reject an
-   unpublished/private crate in that fixture.
-5. Make Issue #25’s transition graph show that canonical promotion and action
-   receipts take only the paths in `DOMAIN-BOUNDARIES.md`.
+1. [x] Extend the existing dependency contract’s allowed-edge map with domain
+   labels. `contract/domains/*.toml` and `contract/domains/GRAPH.toml` declare
+   `crates`, `public_contracts`, `may_depend_on`, and `forbidden_domains`; the
+   composition layers are declared in `[composition]`.
+2. [x] Add an architecture test for each prohibited edge; it must fail against a
+   deliberately injected forbidden dependency. `scripts/test-domain-contract.py`
+   injects one forbidden edge per domain (Cloud→Cairn, Cairn→Cloud
+   implementation, LEM→Cloud implementation, Forge→Cloud) plus undeclared,
+   double-owned, and twin crates, and asserts the real checker refuses each.
+3. [x] Generate the domain graph from Cargo metadata and compare it with
+   `contract/domains/*.toml`. `scripts/domain_contract.py --emit` writes
+   `evidence/domain-graph.md`; the verifier fails when the committed receipt no
+   longer matches the live graph.
+4. [ ] Require a public-fixture consumer for every boundary crate and reject an
+   unpublished/private crate in that fixture. This is the external-consumer
+   proof tracked by PRD WP2 and is not satisfied by the in-workspace e2e crate.
+5. [ ] Make Issue #25’s transition graph show that canonical promotion and action
+   receipts take only the paths in `DOMAIN-BOUNDARIES.md`. Issue #25 remains the
+   execution-time authority; this gate proves only the declared import graph.
 
 A clean compile is not proof of a legal authority path. A green domain lane is
 not proof of the cross-plane loop; only the cross-plane journey may establish

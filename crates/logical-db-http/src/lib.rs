@@ -5,6 +5,7 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{
     fmt,
@@ -551,7 +552,10 @@ mod tests {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        lgwks_bot::rt::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Keep the server task owned by this test; dropping the handle at test
+        // end aborts the loop instead of leaving a runtime task detached.
+        let _server =
+            lgwks_bot::rt::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{address}/").parse().unwrap()
     }
 

@@ -5,6 +5,7 @@
 //! `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{error::Error, fmt, time::Duration};
 
@@ -1630,7 +1631,7 @@ impl SyncOrchestrator {
             report.deferred = true;
             return Ok(report);
         }
-        loop {
+        for _cycle in 0..self.policy.max_cycles() {
             if cancelled() {
                 eprintln!("logical-db-sync: orchestrator run cancelled between cycles");
                 return Err(SyncError::Cancelled);
@@ -1664,6 +1665,8 @@ impl SyncOrchestrator {
                 }
             }
         }
+        report.more = true;
+        Ok(report)
     }
 
     /// Sends enqueued changes now, for backup-now immediacy after local edits.
@@ -1802,7 +1805,7 @@ impl SyncOrchestrator {
             }
         };
         report.send = send;
-        loop {
+        for _cycle in 0..self.policy.max_cycles() {
             if cancelled() {
                 eprintln!("logical-db-sync: namespace run cancelled between cycles");
                 return Err(NamespaceSyncError::Cancelled);
@@ -1844,6 +1847,8 @@ impl SyncOrchestrator {
                 }
             }
         }
+        report.more = true;
+        Ok(report)
     }
 }
 
@@ -3742,6 +3747,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(installed, documents);
         assert_eq!(*replica.checkpoint.borrow(), Some(vec![3]));
+    }
+
+    #[test]
+    fn orchestrator_cycle_budget_stops_without_claiming_completion() {
+        let scope = log_scope();
+        let replica = empty_replica(scope);
+        let documents = [DocumentId::new(), DocumentId::new(), DocumentId::new()];
+        let mut wire = ScriptWire::with_pulls(vec![
+            scripted_page(scope, 1, true, &documents[0..1]),
+            scripted_page(scope, 2, true, &documents[1..2]),
+            scripted_page(scope, 3, false, &documents[2..3]),
+        ]);
+        let policy =
+            OrchestratorPolicy::new(2, 1_000, 60_000).expect("nonzero test policy is valid");
+        let mut engine = SyncOrchestrator::new(PeerId::new(), policy);
+
+        let report = lgwks_std::task::block_on(engine.fetch_now(
+            &replica,
+            &mut wire,
+            SyncLimits {
+                pages_per_cycle: 1,
+                ..SyncLimits::default()
+            },
+            1_000,
+            &RetrySignal::never(),
+            || false,
+        ))
+        .expect("bounded orchestration succeeds");
+
+        assert_eq!(report.cycles, 2);
+        assert_eq!(report.pages, 2);
+        assert!(report.more);
+        assert_eq!(replica.installed.borrow().len(), 2);
     }
 
     #[test]

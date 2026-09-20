@@ -696,8 +696,9 @@ impl CheckpointCodec {
             return Err(CheckpointError::Malformed);
         }
         let expected = lgwks_std::hash::keyed(&self.key, &bytes[..CHECKPOINT_BODY_BYTES]);
-        let supplied = <[u8; 32]>::try_from(&bytes[CHECKPOINT_BODY_BYTES..])
-            .expect("token length is checked against CHECKPOINT_BYTES");
+        let Ok(supplied) = <[u8; 32]>::try_from(&bytes[CHECKPOINT_BODY_BYTES..]) else {
+            return Err(CheckpointError::Malformed);
+        };
         if !tags_equal(expected.as_bytes(), &supplied) {
             eprintln!("logical-db-service: CheckpointError::InvalidMac");
             return Err(CheckpointError::InvalidMac);

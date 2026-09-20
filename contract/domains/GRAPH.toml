@@ -1,0 +1,61 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+# S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in
+# evidence/SOURCES.md.
+#
+# Machine-readable ownership and allowed-edge policy for the non-domain layers
+# and the global no-twin rule. The four product domains declare their own
+# records in `cloud.toml`, `cairn.toml`, `lem.toml`, and `forge.toml`; this
+# file adds the kernel, facade, adapter, and end-to-end harness layers that are
+# not product domains. `scripts/domain_contract.py` merges both and enforces
+# the result against `cargo metadata`.
+#
+# Authority: `docs/architecture/DEPENDENCY-RULES.md` and
+# `docs/architecture/DOMAIN-BOUNDARIES.md`. This file is the mechanical
+# encoding, not a second authority: a change here is a reviewable contract
+# change, and the committed `evidence/domain-graph.md` receipt must be
+# regenerated with it.
+
+# The shared lower layer. Every kernel crate is a public contract, so any
+# domain may import it.
+[layers.kernel]
+crates = ["logical-db-model", "logical-db-protocol", "logical-db-platform"]
+public_contracts = ["logical-db-model", "logical-db-protocol", "logical-db-platform"]
+may_depend_on = []
+
+# The application facade composes published domain boundary crates behind
+# explicit features. It is a composition layer, so it may import implementation
+# crates of its allowed domains while the target boundary crates are staged.
+[layers.facade]
+crates = ["logical-db"]
+public_contracts = ["logical-db"]
+may_depend_on = ["kernel", "cloud", "cairn", "lem"]
+
+# Product adapters sit above the facade.
+[layers.adapter]
+crates = ["logical-db-kv"]
+public_contracts = ["logical-db-kv"]
+may_depend_on = ["kernel", "facade"]
+
+# The cross-domain journey harness. It is a test composition layer and may
+# import any allowed domain's crates; it is never a production dependency.
+[layers.e2e]
+crates = ["logical-db-e2e"]
+public_contracts = []
+may_depend_on = ["kernel", "cloud", "cairn", "lem", "facade", "adapter"]
+
+# Composition layers may import implementation crates from an allowed domain.
+# Product domains may import only the dependency domain's public contracts.
+[composition]
+domains = ["facade", "adapter", "e2e"]
+
+# Names that must never reappear as a workspace crate. The list covers both
+# frozen predecessor crates (`smb`, `wm-core`, ...) and a parallel owner of a
+# responsibility that already has one canonical crate (`origin`, `ontology`).
+# A twin is a second owner of an existing responsibility; the match is exact, a
+# `-<token>` suffix, or a `-<token>-` infix. CRDT and store twins are caught by
+# the ownership rule instead: every workspace crate must be declared exactly
+# once, so a second CRDT or store crate is an undeclared crate or a reviewable
+# receipt diff, never a silent addition.
+[twin_denylist]
+crates = ["smb", "wm-core", "wm-index", "wm-cli", "wm-eval", "fjallfactstore", "origin", "ontology"]

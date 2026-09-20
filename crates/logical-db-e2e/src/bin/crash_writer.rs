@@ -10,31 +10,39 @@ use logical_db::{
     AccountId, Database, DocumentId, Object, OperationDigest, OperationId, ReplicaId, Scalar,
     Scope, SpaceId,
 };
+use std::error::Error;
 use uuid::Uuid;
 
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("crash_writer: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    assert_eq!(arguments.len(), 5);
+    let [path, account, space, replica, document] = arguments.as_slice() else {
+        return Err("expected path, account, space, replica, and document arguments".into());
+    };
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&arguments[1]).unwrap()),
-        SpaceId::from_uuid(Uuid::parse_str(&arguments[2]).unwrap()),
+        AccountId::from_uuid(Uuid::parse_str(account)?),
+        SpaceId::from_uuid(Uuid::parse_str(space)?),
     );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(&arguments[3]).unwrap());
-    let document = DocumentId::from_uuid(Uuid::parse_str(&arguments[4]).unwrap());
-    let database = Database::open(&arguments[0], scope, replica).unwrap();
-    database
-        .edit(
-            document,
-            OperationId::new(),
-            OperationDigest::new([71; 32]),
-            |editor| {
-                editor.put(
-                    &Object::root(),
-                    "status",
-                    Scalar::String("committed-before-exit".into()),
-                )
-            },
-        )
-        .unwrap();
+    let replica = ReplicaId::from_uuid(Uuid::parse_str(replica)?);
+    let document = DocumentId::from_uuid(Uuid::parse_str(document)?);
+    let database = Database::open(path, scope, replica)?;
+    database.edit(
+        document,
+        OperationId::new(),
+        OperationDigest::new([71; 32]),
+        |editor| {
+            editor.put(
+                &Object::root(),
+                "status",
+                Scalar::String("committed-before-exit".into()),
+            )
+        },
+    )?;
     std::process::exit(71);
 }
