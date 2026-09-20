@@ -32,12 +32,18 @@ pub const MAX_VALUE_BYTES: usize = 65_536;
 /// Maximum UTF-8 bytes accepted in one memory claim (per-claim bound; no model peer).
 pub const MAX_CLAIM_BYTES: usize = 8_192;
 
+/// Declares one closed string vocabulary with canonical `snake_case` names.
+///
+/// Generates a `#[non_exhaustive]` enum whose variants carry their own doc, a
+/// canonical `as_str`, and a fail-closed `parse` that returns the caller-named
+/// `$err` variant for an unknown name.
 macro_rules! string_vocab {
     ($doc:literal, $name:ident, $err:ident, $($vdoc:literal $variant:ident => $str:literal),* $(,)?) => {
         #[doc = $doc]
         #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
         #[serde(rename_all = "snake_case")]
+        #[non_exhaustive]
         pub enum $name {
             $(
                 #[doc = $vdoc]
@@ -145,7 +151,6 @@ impl EpisodeRef {
     #[must_use = "the zero-digest rejection must be handled"]
     pub fn new(bytes: [u8; 32]) -> Result<Self, CairnError> {
         if bytes == [0; 32] {
-            eprintln!("logical-db-cairn: rejected zero episode reference");
             return Err(CairnError::ZeroId);
         }
         Ok(Self(bytes))
@@ -169,8 +174,12 @@ impl std::fmt::Display for EpisodeRef {
 }
 
 /// Directed, confidence-weighted edge between two observations.
+///
+/// `#[non_exhaustive]` so a new edge field is a compatible addition for
+/// downstream crates rather than a breaking change.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct TokenLink {
     /// Relation this edge asserts.
     pub relation: LinkRelation,
@@ -188,14 +197,9 @@ impl TokenLink {
     /// Returns [`CairnError::ZeroId`] or [`CairnError::InvalidConfidence`].
     pub fn validate(&self) -> Result<(), CairnError> {
         if self.target.into_bytes() == [0u8; 32] {
-            eprintln!("logical-db-cairn: rejected zero token-link target");
             return Err(CairnError::ZeroId);
         }
         if !(0.0..=1.0).contains(&self.confidence) {
-            eprintln!(
-                "logical-db-cairn: rejected token-link confidence {}",
-                self.confidence
-            );
             return Err(CairnError::InvalidConfidence(self.confidence));
         }
         Ok(())
@@ -203,8 +207,12 @@ impl TokenLink {
 }
 
 /// One validated semantic observation.
+///
+/// `#[non_exhaustive]` so a new observation field is a compatible addition for
+/// downstream crates rather than a breaking change.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct Observation {
     /// Observation identifier; must be non-zero.
     pub id: EpisodeRef,
@@ -230,35 +238,21 @@ impl Observation {
     /// Returns the [`CairnError`] matching the first bound violated.
     pub fn validate(&self) -> Result<(), CairnError> {
         if self.id.into_bytes() == [0u8; 32] {
-            eprintln!("logical-db-cairn: rejected observation with zero id");
             return Err(CairnError::ZeroId);
         }
         if !(0.0..=1.0).contains(&self.uncertainty) {
-            eprintln!(
-                "logical-db-cairn: rejected observation uncertainty {}",
-                self.uncertainty
-            );
             return Err(CairnError::InvalidConfidence(self.uncertainty));
         }
         if self.value.is_empty() {
-            eprintln!("logical-db-cairn: rejected empty observation value");
             return Err(CairnError::EmptyValue);
         }
         if self.value.len() > MAX_VALUE_BYTES {
-            eprintln!(
-                "logical-db-cairn: rejected observation value length {}",
-                self.value.len()
-            );
             return Err(CairnError::ValueTooLarge {
                 actual: self.value.len(),
                 maximum: MAX_VALUE_BYTES,
             });
         }
         if self.links.len() > MAX_LINKS {
-            eprintln!(
-                "logical-db-cairn: rejected observation link count {}",
-                self.links.len()
-            );
             return Err(CairnError::TooManyLinks {
                 actual: self.links.len(),
                 maximum: MAX_LINKS,
@@ -286,8 +280,11 @@ impl Observation {
         ])
     }
 
+    /// Frames every outgoing edge into the digest stream.
+    ///
+    /// Each edge contributes a fixed 32-byte digest, so the reserve is exact.
     fn link_digest(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.links.len() * 68);
+        let mut bytes = Vec::with_capacity(self.links.len().saturating_mul(32));
         for link in &self.links {
             let confidence = link.confidence.to_bits().to_le_bytes();
             let digest = digest_frame(&[
@@ -313,8 +310,12 @@ pub const fn authority_weight(tier: u8) -> f64 {
 }
 
 /// Trust-graded claim held in memory.
+///
+/// `#[non_exhaustive]` so a new claim field is a compatible addition for
+/// downstream crates rather than a breaking change.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct MemoryClaim {
     /// Claim text; non-empty UTF-8 bounded to [`MAX_CLAIM_BYTES`].
     pub claim: String,
@@ -332,24 +333,15 @@ impl MemoryClaim {
     /// Returns the [`CairnError`] matching the first bound violated.
     pub fn validate(&self) -> Result<(), CairnError> {
         if self.claim.is_empty() {
-            eprintln!("logical-db-cairn: rejected empty memory claim");
             return Err(CairnError::EmptyValue);
         }
         if self.claim.len() > MAX_CLAIM_BYTES {
-            eprintln!(
-                "logical-db-cairn: rejected memory claim length {}",
-                self.claim.len()
-            );
             return Err(CairnError::ValueTooLarge {
                 actual: self.claim.len(),
                 maximum: MAX_CLAIM_BYTES,
             });
         }
         if !(0.0..=1.0).contains(&self.confidence) {
-            eprintln!(
-                "logical-db-cairn: rejected memory confidence {}",
-                self.confidence
-            );
             return Err(CairnError::InvalidConfidence(self.confidence));
         }
         Ok(())
@@ -357,8 +349,12 @@ impl MemoryClaim {
 }
 
 /// Steering verdict for a proposed action.
+///
+/// `#[non_exhaustive]` so a new verdict field is a compatible addition for
+/// downstream crates rather than a breaking change.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct SteeringDecision {
     /// Whether the action may proceed.
     pub allow: bool,
@@ -407,7 +403,11 @@ impl SteeringDecision {
 }
 
 /// Errors for Cairn semantic validation and steering.
+///
+/// `#[non_exhaustive]` so a new refusal is a compatible addition rather than a
+/// breaking change to downstream exhaustive matches.
 #[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
 pub enum CairnError {
     /// Unknown token kind name.
     #[error("invalid token kind {value:?} at {context}")]
@@ -487,7 +487,9 @@ mod tests {
 
     fn observation() -> Observation {
         Observation {
-            id: EpisodeRef::new([7u8; 32]).expect("non-zero fixture id"),
+            // Constructed through the private field: the test module is inside
+            // this crate, so no fallible `new` call is needed for a literal.
+            id: EpisodeRef([7u8; 32]),
             kind: TokenKind::Evidence,
             modality: Modality::Text,
             uncertainty: 0.1,
@@ -500,7 +502,7 @@ mod tests {
     fn link(seed: u8, confidence: f32) -> TokenLink {
         TokenLink {
             relation: LinkRelation::Supports,
-            target: EpisodeRef::new([seed; 32]).expect("non-zero fixture target"),
+            target: EpisodeRef([seed; 32]),
             confidence,
         }
     }
@@ -535,38 +537,99 @@ mod tests {
 
     #[test]
     fn vocab_parse_roundtrip() {
-        use LinkRelation as L;
-        use Modality as M;
-        use TokenKind as K;
-        use {Actionability as A, TrustLevel as T};
-        roundtrip(&[K::Entity, K::Event, K::State], K::as_str, K::parse);
-        roundtrip(&[K::Relation, K::Affordance], K::as_str, K::parse);
-        roundtrip(&[K::Evidence, K::Permission], K::as_str, K::parse);
-        roundtrip(&[K::ActionResult, K::ViabilitySignal], K::as_str, K::parse);
-        roundtrip(&[K::MemoryEpisode, K::Contradiction], K::as_str, K::parse);
-        roundtrip(&[K::Uncertainty], K::as_str, K::parse);
-        roundtrip(&[L::Before, L::After, L::CausedBy], L::as_str, L::parse);
-        roundtrip(&[L::Supports, L::Contradicts], L::as_str, L::parse);
-        roundtrip(&[L::SameEntityAs, L::DependsOn], L::as_str, L::parse);
-        roundtrip(&[L::Enables, L::Blocks], L::as_str, L::parse);
-        roundtrip(&[M::Text, M::Code, M::Ui], M::as_str, M::parse);
-        roundtrip(&[M::Vision, M::Video, M::Audio], M::as_str, M::parse);
-        roundtrip(&[M::System, M::Memory, M::Tool], M::as_str, M::parse);
-        roundtrip(&[M::Workflow], M::as_str, M::parse);
-        roundtrip(&[A::None, A::Inspect, A::Ask], A::as_str, A::parse);
-        roundtrip(&[A::Repair, A::Execute, A::Block], A::as_str, A::parse);
-        roundtrip(&[T::Observed, T::Inferred], T::as_str, T::parse);
-        roundtrip(&[T::Predicted, T::Synthesized], T::as_str, T::parse);
-        let bogus = K::parse("bogus");
+        roundtrip(
+            &[TokenKind::Entity, TokenKind::Event, TokenKind::State],
+            TokenKind::as_str,
+            TokenKind::parse,
+        );
+        roundtrip(
+            &[TokenKind::Relation, TokenKind::Affordance],
+            TokenKind::as_str,
+            TokenKind::parse,
+        );
+        roundtrip(
+            &[TokenKind::Evidence, TokenKind::Permission],
+            TokenKind::as_str,
+            TokenKind::parse,
+        );
+        roundtrip(
+            &[TokenKind::ActionResult, TokenKind::ViabilitySignal],
+            TokenKind::as_str,
+            TokenKind::parse,
+        );
+        roundtrip(
+            &[TokenKind::MemoryEpisode, TokenKind::Contradiction],
+            TokenKind::as_str,
+            TokenKind::parse,
+        );
+        roundtrip(&[TokenKind::Uncertainty], TokenKind::as_str, TokenKind::parse);
+        roundtrip(
+            &[LinkRelation::Before, LinkRelation::After, LinkRelation::CausedBy],
+            LinkRelation::as_str,
+            LinkRelation::parse,
+        );
+        roundtrip(
+            &[LinkRelation::Supports, LinkRelation::Contradicts],
+            LinkRelation::as_str,
+            LinkRelation::parse,
+        );
+        roundtrip(
+            &[LinkRelation::SameEntityAs, LinkRelation::DependsOn],
+            LinkRelation::as_str,
+            LinkRelation::parse,
+        );
+        roundtrip(
+            &[LinkRelation::Enables, LinkRelation::Blocks],
+            LinkRelation::as_str,
+            LinkRelation::parse,
+        );
+        roundtrip(
+            &[Modality::Text, Modality::Code, Modality::Ui],
+            Modality::as_str,
+            Modality::parse,
+        );
+        roundtrip(
+            &[Modality::Vision, Modality::Video, Modality::Audio],
+            Modality::as_str,
+            Modality::parse,
+        );
+        roundtrip(
+            &[Modality::System, Modality::Memory, Modality::Tool],
+            Modality::as_str,
+            Modality::parse,
+        );
+        roundtrip(&[Modality::Workflow], Modality::as_str, Modality::parse);
+        roundtrip(
+            &[Actionability::None, Actionability::Inspect, Actionability::Ask],
+            Actionability::as_str,
+            Actionability::parse,
+        );
+        roundtrip(
+            &[Actionability::Repair, Actionability::Execute, Actionability::Block],
+            Actionability::as_str,
+            Actionability::parse,
+        );
+        roundtrip(
+            &[TrustLevel::Observed, TrustLevel::Inferred],
+            TrustLevel::as_str,
+            TrustLevel::parse,
+        );
+        roundtrip(
+            &[TrustLevel::Predicted, TrustLevel::Synthesized],
+            TrustLevel::as_str,
+            TrustLevel::parse,
+        );
         assert_eq!(
-            bogus,
+            TokenKind::parse("bogus"),
             Err(CairnError::InvalidKind {
                 value: "bogus".into(),
                 context: "TokenKind::parse",
             })
         );
-        let frobs = L::parse("frobs");
-        assert!(matches!(frobs, Err(CairnError::InvalidRelation { .. })));
+        assert!(matches!(
+            LinkRelation::parse("frobs"),
+            Err(CairnError::InvalidRelation { .. })
+        ));
     }
 
     #[test]
@@ -588,7 +651,7 @@ mod tests {
 
     #[test]
     fn episode_ref_display_and_framing() {
-        let reference = EpisodeRef::new([7u8; 32]).expect("non-zero fixture id");
+        let reference = EpisodeRef([7u8; 32]);
         assert_eq!(reference.to_string(), "07".repeat(32));
         assert_eq!(reference.into_bytes(), [7u8; 32]);
         // digest_frame spells length-prefix (u64LE) + bytes per part.
@@ -696,7 +759,7 @@ mod tests {
         id[..16].copy_from_slice(&bytes);
         id[16..].copy_from_slice(&bytes);
         obs.value = b"sensor reading".to_vec();
-        obs.id = EpisodeRef::new(id).expect("uuid-derived fixture id is non-zero");
+        obs.id = EpisodeRef(id);
         assert!(obs.validate().is_ok());
     }
 }

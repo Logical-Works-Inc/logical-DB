@@ -8,6 +8,10 @@
 
 use super::{MAX_NAME_BYTES, ModelError, NamespaceCheckpoint, validate_namespace};
 
+/// Borrows exactly `count` bytes at `cursor`, advancing `cursor` past them.
+///
+/// Fails closed with [`ModelError::InvalidNamespaceCheckpointEncoding`] when
+/// the range would run past the end of `bytes` or overflow the cursor.
 pub(super) fn take<'bytes>(
     bytes: &'bytes [u8],
     cursor: &mut usize,
@@ -17,65 +21,56 @@ pub(super) fn take<'bytes>(
         .checked_add(count)
         .ok_or(ModelError::InvalidNamespaceCheckpointEncoding)?;
     if end > bytes.len() {
-        eprintln!("logical-db-model: take: InvalidNamespaceCheckpointEncoding");
         return Err(ModelError::InvalidNamespaceCheckpointEncoding);
     }
     let slice = &bytes[*cursor..end];
     *cursor = end;
     Ok(slice)
 }
+
+/// Reads a big-endian `u16` at `cursor`, advancing past it.
 pub(super) fn take_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, ModelError> {
     let raw = take(bytes, cursor, 2)?;
-    raw.try_into().map(u16::from_be_bytes).map_err(|error| {
-        eprintln!("logical-db-model: ModelError::InvalidNamespaceCheckpointEncoding: {error}");
-        ModelError::InvalidNamespaceCheckpointEncoding
-    })
+    raw.try_into()
+        .map(u16::from_be_bytes)
+        .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)
 }
+
+/// Reads a big-endian `u32` length at `cursor`, returning it as `usize`.
 pub(super) fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<usize, ModelError> {
     let raw = take(bytes, cursor, 4)?;
-    let value: u32 = raw.try_into().map(u32::from_be_bytes).map_err(|error| {
-        eprintln!("logical-db-model: ModelError::InvalidNamespaceCheckpointEncoding: {error}");
-        ModelError::InvalidNamespaceCheckpointEncoding
-    })?;
-    usize::try_from(value).map_err(|error| {
-        eprintln!("logical-db-model: ModelError::InvalidNamespaceCheckpointEncoding: {error}");
-        ModelError::InvalidNamespaceCheckpointEncoding
-    })
+    let value: u32 = raw
+        .try_into()
+        .map(u32::from_be_bytes)
+        .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)?;
+    usize::try_from(value).map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)
 }
+
+/// Reads a length-prefixed, bounded UTF-8 namespace name at `cursor`.
 pub(super) fn take_namespace<'bytes>(
     bytes: &'bytes [u8],
     cursor: &mut usize,
 ) -> Result<&'bytes str, ModelError> {
     let name_len = take_u32(bytes, cursor)?;
     if name_len == 0 || name_len > MAX_NAME_BYTES {
-        eprintln!(
-            "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
-        );
         return Err(ModelError::InvalidNamespaceCheckpointEncoding);
     }
     let name_bytes = take(bytes, cursor, name_len)?;
-    let namespace = core::str::from_utf8(name_bytes).map_err(|error| {
-        eprintln!("logical-db-model: ModelError::InvalidNamespaceCheckpointEncoding: {error}");
-        ModelError::InvalidNamespaceCheckpointEncoding
-    })?;
+    let namespace = core::str::from_utf8(name_bytes)
+        .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)?;
     if validate_namespace(namespace).is_err() {
-        eprintln!(
-            "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
-        );
         return Err(ModelError::InvalidNamespaceCheckpointEncoding);
     }
     Ok(namespace)
 }
 
+/// Reads a length-prefixed checkpoint record at `cursor`.
 pub(super) fn take_checkpoint(
     bytes: &[u8],
     cursor: &mut usize,
 ) -> Result<NamespaceCheckpoint, ModelError> {
     let checkpoint_len = take_u32(bytes, cursor)?;
     if checkpoint_len == 0 {
-        eprintln!(
-            "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
-        );
         return Err(ModelError::InvalidNamespaceCheckpointEncoding);
     }
     let checkpoint_bytes = take(bytes, cursor, checkpoint_len)?;

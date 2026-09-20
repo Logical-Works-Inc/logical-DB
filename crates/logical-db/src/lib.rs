@@ -26,8 +26,10 @@ pub use logical_db_crdt::{
 };
 use logical_db_crdt::{Document, EncodedChange};
 pub use logical_db_model::{
-    AccountId, ActionDigest, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId,
+    AccountId, ActionDigest, BackendClass, CAPABILITY_PROFILE_BYTES, CAPABILITY_PROFILE_VERSION,
+    Capability, CapabilityProfile, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId,
     IndexValue, OperationDigest, OperationId, PeerId, ReplicaId, Scope, SnapshotArtifact, SpaceId,
+    common_guarantees,
 };
 pub use logical_db_platform::PlatformError;
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
@@ -67,8 +69,9 @@ pub mod prelude {
     };
     pub use logical_db_crdt::{Editor, Item, Object, ObjectKind, Reader, Scalar};
     pub use logical_db_model::{
-        AccountId, ChangeDigest, DocumentId, IndexEntry, IndexId, IndexValue, OperationDigest,
-        OperationId, ReplicaId, Scope, SpaceId,
+        AccountId, BackendClass, Capability, CapabilityProfile, ChangeDigest, DocumentId,
+        IndexEntry, IndexId, IndexValue, OperationDigest, OperationId, ReplicaId, Scope, SpaceId,
+        common_guarantees,
     };
 }
 
@@ -87,6 +90,7 @@ pub struct Database {
     scope: Scope,
     replica: ReplicaId,
     projections: Vec<Projection>,
+    profile: CapabilityProfile,
 }
 
 type MaterializedRemoteDocument = (
@@ -362,6 +366,7 @@ impl Database {
             scope,
             replica,
             projections,
+            profile: CapabilityProfile::embedded_local(),
         })
     }
 
@@ -417,6 +422,7 @@ impl Database {
                 scope,
                 replica,
                 projections,
+                profile: CapabilityProfile::embedded_local(),
             },
             report,
         ))
@@ -550,6 +556,35 @@ impl Database {
     #[must_use]
     pub const fn replica(&self) -> ReplicaId {
         self.replica
+    }
+
+    /// Returns the backend capability profile this replica is bound to.
+    ///
+    /// An embedded replica always reports
+    /// [`CapabilityProfile::embedded_local`]. Consumers must rely only on
+    /// guarantees this profile advertises, or call
+    /// [`Database::require_guarantees`] to fail closed on a stronger request.
+    #[must_use]
+    pub const fn capability_profile(&self) -> CapabilityProfile {
+        self.profile
+    }
+
+    /// Requires every listed backend guarantee from this replica, failing
+    /// closed with the exact unmet set instead of silently degrading.
+    ///
+    /// This is the embedded half of the recorded backend split: a caller that
+    /// needs distributed serializable transactions or replicated availability
+    /// cannot be quietly served by a local redb replica, and the refusal names
+    /// each guarantee it did not obtain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::Model`] wrapping
+    /// [`logical_db_model::ModelError::UnsupportedGuarantees`] listing every
+    /// required guarantee the bound profile does not provide.
+    pub fn require_guarantees(&self, required: &[Capability]) -> Result<(), DatabaseError> {
+        self.profile.require(required)?;
+        Ok(())
     }
 
     /// Applies one structured CRDT transaction and atomically saves its
@@ -1867,6 +1902,13 @@ pub enum DatabaseError {
     /// unchanged. Classified as [`DatabaseErrorKind::Other`].
     #[error("recovery baseline artifact is malformed or mismatched")]
     InvalidBaseline,
+    /// A required backend guarantee is not provided by this replica's profile.
+    ///
+    /// The refusal happens before any durable work, so a caller needing a
+    /// stronger class is never silently served by the local replica.
+    /// Classified as [`DatabaseErrorKind::Other`].
+    #[error("backend capability refused: {0}")]
+    Model(#[from] logical_db_model::ModelError),
 }
 
 impl DatabaseError {
@@ -2187,6 +2229,80 @@ mod tests {
 
     fn path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("logical-db-facade-{}.redb", uuid::Uuid::now_v7()))
+    }
+
+    #[test]
+    fn embedded_replica_publishes_its_profile_and_refuses_stronger_guarantees() {
+        let path = path();
+        let database = Database::open(
+            &path,
+            Scope::new(AccountId::new(), SpaceId::new()),
+            ReplicaId::new(),
+        )
+        .expect("open");
+        assert_eq!(
+            database.capability_profile(),
+            CapabilityProfile::embedded_local()
+        );
+        assert_eq!(
+            database.capability_profile().class(),
+            BackendClass::EmbeddedLocal
+        );
+        assert_eq!(
+            database.capability_profile().encode(),
+            [0, u8::try_from(CAPABILITY_PROFILE_VERSION).unwrap(), 0]
+        );
+
+        // A local replica satisfies every guarantee it advertises.
+        assert!(
+            database
+                .require_guarantees(&[
+                    Capability::DurableLocalCommit,
+                    Capability::CausalConvergence,
+                    Capability::ExportRestore,
+                ])
+                .is_ok()
+        );
+
+        // A distributed requirement fails closed and names every unmet guarantee.
+        let refusal = database
+            .require_guarantees(&[
+                Capability::DurableLocalCommit,
+                Capability::DistributedSerializableTransactions,
+                Capability::ReplicatedAvailability,
+            ])
+            .expect_err("local replica must not claim distributed guarantees");
+        assert_eq!(refusal.kind(), DatabaseErrorKind::Other);
+        match refusal {
+            DatabaseError::Model(logical_db_model::ModelError::UnsupportedGuarantees {
+                class,
+                missing,
+            }) => {
+                assert_eq!(class, BackendClass::EmbeddedLocal);
+                assert_eq!(
+                    missing,
+                    vec![
+                        Capability::DistributedSerializableTransactions,
+                        Capability::ReplicatedAvailability,
+                    ]
+                );
+            }
+            other => panic!("unexpected refusal: {other:?}"),
+        }
+
+        drop(database);
+        fs::remove_file(&path).expect("remove");
+    }
+
+    #[test]
+    fn common_subset_between_embedded_and_distributed_is_empty() {
+        assert_eq!(
+            common_guarantees(
+                &CapabilityProfile::embedded_local(),
+                &CapabilityProfile::distributed_transactional()
+            ),
+            Vec::new()
+        );
     }
 
     fn remote_page(changes: &[PendingChange]) -> Vec<RemoteChange> {

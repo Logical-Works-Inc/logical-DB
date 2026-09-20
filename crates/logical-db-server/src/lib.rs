@@ -404,7 +404,9 @@ where
             StoreFailureClass::Transient => ApiError::Unavailable,
             StoreFailureClass::Permanent => ApiError::Internal,
         },
-        ServiceError::CrossScopeStoreData | ServiceError::CorruptStoreData => ApiError::Internal,
+        ServiceError::CrossScopeStoreData
+        | ServiceError::CorruptStoreData
+        | ServiceError::Model(_) => ApiError::Internal,
     }
 }
 

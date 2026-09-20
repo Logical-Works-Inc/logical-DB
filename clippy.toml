@@ -1,4 +1,9 @@
 # [lgwks anti-pattern contract]
+# Test code is held to the same contract as production code. There are no
+# `allow-*-in-tests` relaxations here on purpose: `unwrap_used`, `expect_used`,
+# `panic`, `arithmetic_side_effects`, `as_conversions`, `min_ident_chars`, and
+# `redundant_clone` bind test modules exactly as they bind the shipped surface,
+# so a test cannot encode a habit the production path is forbidden to have.
 disallowed-methods = [
   { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded memory growth; use a bounded channel" },
   { path = "std::sync::mpsc::channel", reason = "std::mpsc has no bounded form and no async receiver" },

@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, future::Future, sync::Arc};
 use logical_db_crdt::{CrdtError, Document, EncodedChange};
 use logical_db_model::OperationId;
 use logical_db_model::{
-    ActionDigest, Effect, OperationDigest, Scope, SnapshotArtifact, SnapshotBaseline,
-    SnapshotDocument, SnapshotRecord, is_behind_retention,
+    ActionDigest, Capability, CapabilityProfile, Effect, OperationDigest, Scope, SnapshotArtifact,
+    SnapshotBaseline, SnapshotDocument, SnapshotRecord, is_behind_retention,
 };
 use logical_db_protocol::{
     BaselineDocument, BaselinePage, BaselineRequest, ChangeEnvelope, Checkpoint, PROTOCOL_VERSION,
@@ -799,6 +799,7 @@ pub struct ProtocolService<Store, Policy> {
     store: Store,
     policy: Policy,
     checkpoints: CheckpointCodec,
+    profile: CapabilityProfile,
 }
 
 impl<Store, Policy> ProtocolService<Store, Policy>
@@ -807,13 +808,40 @@ where
     Policy: Authority,
 {
     /// Constructs a service from explicit durable, authority, and token ports.
+    ///
+    /// The constructed service publishes the
+    /// [`CapabilityProfile::distributed_transactional`] class: it holds
+    /// distributed transaction authority over a FoundationDB-backed store,
+    /// which is exactly the class that carries serializable transactions,
+    /// replicated availability, watches/versionstamps, and cluster recovery.
     #[must_use]
     pub const fn new(store: Store, policy: Policy, checkpoints: CheckpointCodec) -> Self {
         Self {
             store,
             policy,
             checkpoints,
+            profile: CapabilityProfile::distributed_transactional(),
         }
+    }
+
+    /// Returns the backend capability profile this service is bound to.
+    #[must_use]
+    pub const fn capability_profile(&self) -> CapabilityProfile {
+        self.profile
+    }
+
+    /// Requires every listed backend guarantee, failing closed on the unmet set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Model`] wrapping
+    /// [`logical_db_model::ModelError::UnsupportedGuarantees`] listing every
+    /// required guarantee the bound profile does not provide.
+    pub fn require_guarantees(
+        &self,
+        required: &[Capability],
+    ) -> Result<(), ServiceError<Store::Error>> {
+        self.profile.require(required).map_err(ServiceError::Model)
     }
 
     /// Validates and idempotently accepts a bounded upload page.
@@ -1291,6 +1319,9 @@ pub enum ServiceError<StoreError> {
     /// Durable bytes failed CRDT-native decoding or digest verification.
     #[error("service storage returned corrupt change material")]
     CorruptStoreData,
+    /// A required backend guarantee is not provided by this service profile.
+    #[error("service capability refused: {0}")]
+    Model(logical_db_model::ModelError),
 }
 
 fn decode_u64(bytes: &[u8]) -> Result<u64, CheckpointError> {
@@ -1844,6 +1875,46 @@ mod tests {
                 code: RejectionCode::InvocationConsumed
             }
         );
+    }
+
+    #[test]
+    fn service_publishes_distributed_profile_and_refuses_embedded_only_guarantees() {
+        let service = ProtocolService::new(
+            Memory::default(),
+            Allow,
+            CheckpointCodec::new([7; 32], 100).unwrap(),
+        );
+        assert_eq!(
+            service.capability_profile(),
+            CapabilityProfile::distributed_transactional()
+        );
+        assert!(
+            service
+                .require_guarantees(&[
+                    Capability::DistributedSerializableTransactions,
+                    Capability::ClusterRecovery,
+                ])
+                .is_ok()
+        );
+        let refusal = service
+            .require_guarantees(&[
+                Capability::DistributedSerializableTransactions,
+                Capability::ExportRestore,
+            ])
+            .expect_err("distributed class must not claim embedded-only guarantees");
+        match refusal {
+            ServiceError::Model(logical_db_model::ModelError::UnsupportedGuarantees {
+                class,
+                missing,
+            }) => {
+                assert_eq!(
+                    class,
+                    logical_db_model::BackendClass::DistributedTransactional
+                );
+                assert_eq!(missing, vec![Capability::ExportRestore]);
+            }
+            other => panic!("unexpected refusal: {other:?}"),
+        }
     }
 
     #[test]

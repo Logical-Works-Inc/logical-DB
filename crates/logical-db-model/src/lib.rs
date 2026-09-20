@@ -7,11 +7,16 @@
 #![forbid(unsafe_code)]
 
 mod baseline;
+mod capability;
 pub use baseline::{
     BaselineDigest, MAX_BASELINE_BYTES, MAX_BASELINE_DOCUMENTS, MAX_BASELINE_PAGE_DOCUMENTS,
     SNAPSHOT_BASELINE_BYTES, SNAPSHOT_BASELINE_LEGACY_BYTES, SNAPSHOT_BASELINE_LEGACY_VERSION,
     SNAPSHOT_BASELINE_VERSION, SnapshotArtifact, SnapshotBaseline, SnapshotDigestBuilder,
     SnapshotDocument, SnapshotRecord,
+};
+pub use capability::{
+    BackendClass, CAPABILITY_PROFILE_BYTES, CAPABILITY_PROFILE_VERSION, Capability,
+    CapabilityProfile, common_guarantees,
 };
 
 use std::{collections::BTreeMap, fmt};
@@ -34,6 +39,11 @@ pub const MAX_PAGE_BYTES: usize = 8_388_608;
 /// Maximum encoded state for one materialized document snapshot.
 pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 
+/// Declares a UUID-backed newtype identifier with the shared model surface.
+///
+/// Each invocation emits the transparent newtype, its `now_v7` constructor,
+/// UUID accessors, `Default`, and `Display`, so every logical identity is a
+/// distinct type rather than a bare `Uuid`.
 macro_rules! entity_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
@@ -100,6 +110,7 @@ entity_id!(PeerId, "Identifies one synchronization service or peer.");
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexValue {
     /// Boolean ordering is `false`, then `true`.
     Boolean(bool),
@@ -118,11 +129,23 @@ pub enum IndexValue {
 /// One materialized secondary-index value for a document.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
+#[non_exhaustive]
 pub struct IndexEntry {
     /// Stable schema identity of the projection.
     pub index: IndexId,
     /// Current projected value. Absence is represented by no entry.
     pub value: IndexValue,
+}
+
+impl IndexEntry {
+    /// Builds one index projection from its schema identity and value.
+    ///
+    /// This is the constructor `#[non_exhaustive]` requires: callers outside
+    /// this crate cannot use a struct expression, so they compose through here.
+    #[must_use]
+    pub const fn new(index: IndexId, value: IndexValue) -> Self {
+        Self { index, value }
+    }
 }
 
 /// Monotonic optimistic-concurrency marker for one materialized document.
@@ -280,6 +303,7 @@ const NAMESPACE_MAP_MAGIC: [u8; 6] = *b"LDBNS1";
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum NetworkCondition {
     /// Run the full page budget every cycle.
     #[default]
@@ -298,9 +322,13 @@ pub enum NetworkCondition {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct NamespacePolicy {
+    /// Maximum changes requested in each pull page.
     changes_per_page: u16,
+    /// Maximum encoded change bytes requested in each pull page.
     bytes_per_page: u32,
+    /// Maximum pull pages before the driver yields to the host.
     pages_per_cycle: u8,
+    /// Network condition gating this sync domain.
     network: NetworkCondition,
 }
 
@@ -319,11 +347,10 @@ impl NamespacePolicy {
         if changes_per_page == 0
             || usize::from(changes_per_page) > MAX_CHANGES_PER_PAGE
             || bytes_per_page == 0
-            || bytes_per_page as usize > MAX_PAGE_BYTES
+            || usize::try_from(bytes_per_page).unwrap_or(usize::MAX) > MAX_PAGE_BYTES
             || pages_per_cycle == 0
             || pages_per_cycle > MAX_NAMESPACE_PAGES_PER_CYCLE
         {
-            eprintln!("logical-db-model: new: PageTooLarge");
             return Err(ModelError::PageTooLarge);
         }
         Ok(Self {
@@ -378,7 +405,6 @@ impl Default for NamespacePolicy {
 /// name.
 pub fn validate_namespace(namespace: &str) -> Result<(), ModelError> {
     if namespace.is_empty() || namespace.len() > MAX_NAME_BYTES {
-        eprintln!("logical-db-model: validate_namespace: InvalidIdentifierLength");
         return Err(ModelError::InvalidIdentifierLength {
             kind: "namespace",
             context: "validate_namespace",
@@ -398,8 +424,11 @@ pub fn validate_namespace(namespace: &str) -> Result<(), ModelError> {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct NamespaceCheckpoint {
+    /// Checkpoint layout version carried on the wire.
     version: u16,
+    /// Exclusive local freshness horizon in milliseconds since the Unix epoch.
     expires_at_unix_ms: u64,
+    /// Opaque service cursor bytes for this namespace alone.
     cursor: Vec<u8>,
 }
 
@@ -413,7 +442,6 @@ impl NamespaceCheckpoint {
     /// reserved zero expiry.
     pub fn new(cursor: Vec<u8>, expires_at_unix_ms: u64) -> Result<Self, ModelError> {
         if cursor.is_empty() || cursor.len() > MAX_NAMESPACE_CURSOR_BYTES {
-            eprintln!("logical-db-model: new: InvalidIdentifierLength");
             return Err(ModelError::InvalidIdentifierLength {
                 kind: "namespace cursor",
                 context: "NamespaceCheckpoint::new",
@@ -422,7 +450,6 @@ impl NamespaceCheckpoint {
             });
         }
         if expires_at_unix_ms == 0 {
-            eprintln!("logical-db-model: new: InvalidAuthorityExpiry");
             return Err(ModelError::InvalidAuthorityExpiry);
         }
         Ok(Self {
@@ -453,7 +480,7 @@ impl NamespaceCheckpoint {
     /// Encodes the checkpoint as version plus expiry plus cursor.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(14 + self.cursor.len());
+        let mut output = Vec::with_capacity(14_usize.saturating_add(self.cursor.len()));
         output.extend_from_slice(&self.version.to_be_bytes());
         output.extend_from_slice(&self.expires_at_unix_ms.to_be_bytes());
         let cursor_len = u32::try_from(self.cursor.len()).unwrap_or(u32::MAX);
@@ -471,32 +498,25 @@ impl NamespaceCheckpoint {
     /// foreign version.
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
         if bytes.len() < 14 {
-            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         let version = u16::from_be_bytes([bytes[0], bytes[1]]);
         if version != NAMESPACE_CHECKPOINT_VERSION {
-            eprintln!("logical-db-model: decode: UnsupportedNamespaceCheckpointVersion");
             return Err(ModelError::UnsupportedNamespaceCheckpointVersion { actual: version });
         }
         let expires_at_unix_ms = u64::from_be_bytes([
             bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
         ]);
         if expires_at_unix_ms == 0 {
-            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         let cursor_len = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
-        let cursor_len = usize::try_from(cursor_len).map_err(|error| {
-            eprintln!("logical-db-model: ModelError::InvalidNamespaceCheckpointEncoding: {error}");
-            ModelError::InvalidNamespaceCheckpointEncoding
-        })?;
+        let cursor_len = usize::try_from(cursor_len)
+            .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)?;
         if cursor_len == 0 || cursor_len > MAX_NAMESPACE_CURSOR_BYTES {
-            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
-        if bytes.len() != 14 + cursor_len {
-            eprintln!("logical-db-model: decode: InvalidNamespaceCheckpointEncoding");
+        if bytes.len() != 14_usize.saturating_add(cursor_len) {
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         Ok(Self {
@@ -529,6 +549,7 @@ pub const fn is_namespace_checkpoint_expired(
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct NamespaceCheckpoints {
+    /// Per-namespace checkpoints in canonical name order.
     entries: BTreeMap<String, NamespaceCheckpoint>,
 }
 
@@ -608,7 +629,6 @@ impl NamespaceCheckpoints {
             output.extend_from_slice(&encoded);
         }
         if output.len() > MAX_NAMESPACE_MAP_BYTES {
-            eprintln!("logical-db-model: encode: NamespaceCheckpointMapTooLarge");
             return Err(ModelError::NamespaceCheckpointMapTooLarge {
                 actual: output.len(),
                 maximum: MAX_NAMESPACE_MAP_BYTES,
@@ -627,16 +647,10 @@ impl NamespaceCheckpoints {
     pub fn decode(bytes: &[u8]) -> Result<Self, ModelError> {
         let mut cursor = 0_usize;
         if take(bytes, &mut cursor, NAMESPACE_MAP_MAGIC.len())? != NAMESPACE_MAP_MAGIC {
-            eprintln!(
-                "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
-            );
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         let version = take_u16(bytes, &mut cursor)?;
         if version != NAMESPACE_CHECKPOINT_MAP_VERSION {
-            eprintln!(
-                "logical-db-model: NamespaceCheckpoints::decode: UnsupportedNamespaceCheckpointVersion"
-            );
             return Err(ModelError::UnsupportedNamespaceCheckpointVersion { actual: version });
         }
         let count = take_u32(bytes, &mut cursor)?;
@@ -645,16 +659,10 @@ impl NamespaceCheckpoints {
             let namespace = take_namespace(bytes, &mut cursor)?;
             let checkpoint = take_checkpoint(bytes, &mut cursor)?;
             if entries.insert(namespace.to_owned(), checkpoint).is_some() {
-                eprintln!(
-                    "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
-                );
                 return Err(ModelError::InvalidNamespaceCheckpointEncoding);
             }
         }
         if cursor != bytes.len() {
-            eprintln!(
-                "logical-db-model: NamespaceCheckpoints::decode: InvalidNamespaceCheckpointEncoding"
-            );
             return Err(ModelError::InvalidNamespaceCheckpointEncoding);
         }
         Ok(Self { entries })
@@ -665,7 +673,9 @@ impl NamespaceCheckpoints {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct Scope {
+    /// Owning account identity.
     account: AccountId,
+    /// Application space within the account.
     space: SpaceId,
 }
 
@@ -693,6 +703,7 @@ impl Scope {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Effect {
     /// Read materialized document state.
     Read,
@@ -711,10 +722,15 @@ pub enum Effect {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct AuthorityDecision {
+    /// Scope the decision authorizes.
     scope: Scope,
+    /// Effect the decision authorizes.
     effect: Effect,
+    /// Canonical digest of the requested logical mutation.
     operation: OperationDigest,
+    /// Exclusive expiry in milliseconds since the Unix epoch.
     expires_at_unix_ms: u64,
+    /// Audit identity assigned by the authority adapter.
     decision_id: String,
 }
 
@@ -735,7 +751,6 @@ impl AuthorityDecision {
     ) -> Result<Self, ModelError> {
         let decision_id = decision_id.into();
         if decision_id.is_empty() || decision_id.len() > MAX_NAME_BYTES {
-            eprintln!("logical-db-model: new: InvalidIdentifierLength");
             return Err(ModelError::InvalidIdentifierLength {
                 kind: "authority decision",
                 context: "AuthorityDecision::new",
@@ -744,7 +759,6 @@ impl AuthorityDecision {
             });
         }
         if expires_at_unix_ms == 0 {
-            eprintln!("logical-db-model: new: InvalidAuthorityExpiry");
             return Err(ModelError::InvalidAuthorityExpiry);
         }
         Ok(Self {
@@ -780,6 +794,7 @@ impl AuthorityDecision {
 
 /// Stable model and validation failures.
 #[derive(Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ModelError {
     /// A caller-controlled identifier violated its encoded bound.
     #[error("{context}: {kind} length {actual} is outside the maximum {maximum}")]
@@ -851,6 +866,35 @@ pub enum ModelError {
         /// Accepted encoded byte count.
         maximum: usize,
     },
+    /// A capability profile could not satisfy a required guarantee.
+    #[error(
+        "backend class {class} does not provide {} required guarantees",
+        .missing.len()
+    )]
+    UnsupportedGuarantees {
+        /// Declared backend class that failed the request.
+        class: BackendClass,
+        /// Every required guarantee the class does not provide, in request order.
+        missing: Vec<Capability>,
+    },
+    /// A capability profile identity violated its fixed versioned encoding.
+    #[error("capability profile length {actual} is not {CAPABILITY_PROFILE_BYTES}")]
+    InvalidCapabilityProfileEncoding {
+        /// Observed encoded byte count.
+        actual: usize,
+    },
+    /// A capability profile identity used a foreign layout version.
+    #[error("capability profile version {actual} is unsupported")]
+    UnsupportedCapabilityProfileVersion {
+        /// Observed profile layout version.
+        actual: u16,
+    },
+    /// A capability profile identity named an unknown backend class.
+    #[error("backend class discriminant {actual} is unsupported")]
+    UnsupportedBackendClass {
+        /// Observed class discriminant.
+        actual: u8,
+    },
 }
 
 #[cfg(test)]
@@ -864,19 +908,19 @@ mod tests {
     }
 
     #[test]
-    fn authority_is_exactly_scope_bound() {
+    fn authority_is_exactly_scope_bound() -> Result<(), Box<dyn std::error::Error>> {
         let account = AccountId::new();
         let first = Scope::new(account, SpaceId::new());
         let second = Scope::new(account, SpaceId::new());
         let operation = OperationDigest::new([7; 32]);
-        let decision =
-            AuthorityDecision::new(first, Effect::Read, operation, 100, "local-policy").unwrap();
+        let decision = AuthorityDecision::new(first, Effect::Read, operation, 100, "local-policy")?;
         assert!(decision.permits(first, Effect::Read, operation, 99));
         assert!(!decision.permits(first, Effect::Write, operation, 99));
         assert!(!decision.permits(second, Effect::Read, operation, 99));
         assert!(!decision.permits(first, Effect::Read, OperationDigest::new([8; 32]), 99));
         assert!(!decision.permits(first, Effect::Read, operation, 100));
         assert_eq!(decision.decision_id(), "local-policy");
+        Ok(())
     }
 
     #[test]
@@ -893,7 +937,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_baseline_codec_is_versioned_and_fail_closed() {
+    fn snapshot_baseline_codec_is_versioned_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
         let account = AccountId::new();
         let space = SpaceId::new();
         let scope = Scope::new(account, space);
@@ -905,8 +950,7 @@ mod tests {
                 snapshot: vec![1, 2],
                 tombstone: false,
             }],
-        )
-        .unwrap();
+        )?;
         let baseline = artifact.baseline.clone();
         assert_eq!(baseline.version(), SNAPSHOT_BASELINE_VERSION);
         assert_eq!(baseline.position(), 41);
@@ -923,20 +967,23 @@ mod tests {
             Err(ModelError::UnsupportedSnapshotVersion { actual: 0 })
         );
         let mut too_many = artifact.baseline.encode();
-        too_many[42..46]
-            .copy_from_slice(&(u32::try_from(MAX_BASELINE_DOCUMENTS).unwrap() + 1).to_be_bytes());
+        too_many[42..46].copy_from_slice(
+            &(u32::try_from(MAX_BASELINE_DOCUMENTS).unwrap_or(u32::MAX) + 1).to_be_bytes(),
+        );
         assert_eq!(
             SnapshotBaseline::decode(&too_many),
             Err(ModelError::SnapshotTooManyDocuments)
         );
         let mut too_large = artifact.baseline.encode();
-        too_large[46..50]
-            .copy_from_slice(&(u32::try_from(MAX_BASELINE_BYTES).unwrap() + 1).to_be_bytes());
+        too_large[46..50].copy_from_slice(
+            &(u32::try_from(MAX_BASELINE_BYTES).unwrap_or(u32::MAX) + 1).to_be_bytes(),
+        );
         assert_eq!(
             SnapshotBaseline::decode(&too_large),
             Err(ModelError::SnapshotTooLarge)
         );
         assert!(artifact.validate(scope).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -950,8 +997,9 @@ mod tests {
     }
 
     #[test]
-    fn namespace_checkpoint_codec_round_trips_and_fails_closed() {
-        let checkpoint = NamespaceCheckpoint::new(vec![9, 8, 7], 1_000).unwrap();
+    fn namespace_checkpoint_codec_round_trips_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint = NamespaceCheckpoint::new(vec![9, 8, 7], 1_000)?;
         assert_eq!(checkpoint.version(), NAMESPACE_CHECKPOINT_VERSION);
         assert_eq!(checkpoint.expires_at_unix_ms(), 1_000);
         assert_eq!(checkpoint.cursor(), &[9, 8, 7]);
@@ -973,7 +1021,7 @@ mod tests {
                 actual: NAMESPACE_CHECKPOINT_VERSION + 1,
             })
         );
-        let mut trailing = encoded.clone();
+        let mut trailing = encoded;
         trailing.push(0);
         assert_eq!(
             NamespaceCheckpoint::decode(&trailing),
@@ -994,20 +1042,21 @@ mod tests {
             NamespaceCheckpoint::new(vec![1], 0),
             Err(ModelError::InvalidAuthorityExpiry)
         );
+        Ok(())
     }
 
     #[test]
-    fn namespace_checkpoint_expiry_is_exclusive() {
-        let checkpoint = NamespaceCheckpoint::new(vec![1], 100).unwrap();
+    fn namespace_checkpoint_expiry_is_exclusive() -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint = NamespaceCheckpoint::new(vec![1], 100)?;
         assert!(!is_namespace_checkpoint_expired(&checkpoint, 99));
         assert!(is_namespace_checkpoint_expired(&checkpoint, 100));
         assert!(is_namespace_checkpoint_expired(&checkpoint, 101));
+        Ok(())
     }
 
     #[test]
-    fn namespace_policy_validation_mirrors_page_bounds() {
-        let policy =
-            NamespacePolicy::new(128, 4 * 1_048_576, 16, NetworkCondition::Online).unwrap();
+    fn namespace_policy_validation_mirrors_page_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        let policy = NamespacePolicy::new(128, 4 * 1_048_576, 16, NetworkCondition::Online)?;
         assert_eq!(policy.changes_per_page(), 128);
         assert_eq!(policy.bytes_per_page(), 4 * 1_048_576);
         assert_eq!(policy.pages_per_cycle(), 16);
@@ -1016,7 +1065,7 @@ mod tests {
         for invalid in [
             NamespacePolicy::new(0, 1_024, 1, NetworkCondition::Online),
             NamespacePolicy::new(
-                u16::try_from(MAX_CHANGES_PER_PAGE + 1).unwrap(),
+                u16::try_from(MAX_CHANGES_PER_PAGE).unwrap_or(u16::MAX) + 1,
                 1_024,
                 1,
                 NetworkCondition::Online,
@@ -1024,7 +1073,7 @@ mod tests {
             NamespacePolicy::new(1, 0, 1, NetworkCondition::Online),
             NamespacePolicy::new(
                 1,
-                u32::try_from(MAX_PAGE_BYTES + 1).unwrap(),
+                u32::try_from(MAX_PAGE_BYTES).unwrap_or(u32::MAX) + 1,
                 1,
                 NetworkCondition::Online,
             ),
@@ -1038,10 +1087,12 @@ mod tests {
         ] {
             assert_eq!(invalid, Err(ModelError::PageTooLarge));
         }
+        Ok(())
     }
 
     #[test]
-    fn namespace_map_partitions_checkpoints_within_one_binding() {
+    fn namespace_map_partitions_checkpoints_within_one_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             validate_namespace(""),
             Err(ModelError::InvalidIdentifierLength {
@@ -1053,34 +1104,38 @@ mod tests {
         let mut map = NamespaceCheckpoints::new();
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
-        map.insert("hot", NamespaceCheckpoint::new(vec![1], 100).unwrap())
-            .unwrap();
-        map.insert("cold", NamespaceCheckpoint::new(vec![2], 200).unwrap())
-            .unwrap();
+        map.insert("hot", NamespaceCheckpoint::new(vec![1], 100)?)?;
+        map.insert("cold", NamespaceCheckpoint::new(vec![2], 200)?)?;
         assert_eq!(map.len(), 2);
         assert_eq!(map.namespaces(), vec!["cold".to_owned(), "hot".to_owned()]);
-        let encoded = map.encode().unwrap();
+        let encoded = map.encode()?;
         assert!(!encoded.is_empty());
         assert!(encoded.len() <= MAX_NAMESPACE_MAP_BYTES);
-        let decoded = NamespaceCheckpoints::decode(&encoded).unwrap();
-        assert_eq!(decoded.get("hot").unwrap().cursor(), &[1]);
-        assert_eq!(decoded.get("cold").unwrap().cursor(), &[2]);
-        let mut advanced = decoded.clone();
-        advanced
-            .insert("hot", NamespaceCheckpoint::new(vec![3], 300).unwrap())
-            .unwrap();
-        assert_eq!(advanced.get("hot").unwrap().cursor(), &[3]);
-        assert_eq!(advanced.get("cold").unwrap().cursor(), &[2]);
+        let decoded = NamespaceCheckpoints::decode(&encoded)?;
+        assert_eq!(
+            decoded.get("hot").map(NamespaceCheckpoint::cursor),
+            Some(&[1][..])
+        );
+        assert_eq!(
+            decoded.get("cold").map(NamespaceCheckpoint::cursor),
+            Some(&[2][..])
+        );
+        let mut advanced = decoded;
+        advanced.insert("hot", NamespaceCheckpoint::new(vec![3], 300)?)?;
+        assert_eq!(
+            advanced.get("hot").map(NamespaceCheckpoint::cursor),
+            Some(&[3][..])
+        );
+        assert_eq!(
+            advanced.get("cold").map(NamespaceCheckpoint::cursor),
+            Some(&[2][..])
+        );
         assert!(advanced.remove("cold"));
         assert!(!advanced.remove("cold"));
         assert!(advanced.get("cold").is_none());
-        let empty_bytes = NamespaceCheckpoints::new().encode().unwrap();
+        let empty_bytes = NamespaceCheckpoints::new().encode()?;
         assert!(!empty_bytes.is_empty());
-        assert!(
-            NamespaceCheckpoints::decode(&empty_bytes)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(NamespaceCheckpoints::decode(&empty_bytes)?.is_empty());
         assert_eq!(
             NamespaceCheckpoints::decode(b"legacy-global-cursor"),
             Err(ModelError::InvalidNamespaceCheckpointEncoding)
@@ -1089,23 +1144,22 @@ mod tests {
             NamespaceCheckpoints::decode(&[]),
             Err(ModelError::InvalidNamespaceCheckpointEncoding)
         );
+        let probe = NamespaceCheckpoint::new(vec![1], 1)?;
         assert!(matches!(
-            map.insert("", NamespaceCheckpoint::new(vec![1], 1).unwrap()),
+            map.insert("", probe),
             Err(ModelError::InvalidIdentifierLength { .. })
         ));
         let mut oversized = NamespaceCheckpoints::new();
         for name in ["first", "second"] {
-            oversized
-                .insert(
-                    name,
-                    NamespaceCheckpoint::new(vec![7; MAX_NAMESPACE_CURSOR_BYTES], u64::MAX)
-                        .unwrap(),
-                )
-                .unwrap();
+            oversized.insert(
+                name,
+                NamespaceCheckpoint::new(vec![7; MAX_NAMESPACE_CURSOR_BYTES], u64::MAX)?,
+            )?;
         }
         assert!(matches!(
             oversized.encode(),
             Err(ModelError::NamespaceCheckpointMapTooLarge { .. })
         ));
+        Ok(())
     }
 }

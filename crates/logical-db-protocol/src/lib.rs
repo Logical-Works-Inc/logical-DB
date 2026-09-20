@@ -419,11 +419,12 @@ impl BaselinePage {
         let descriptor = match SnapshotBaseline::decode(&self.descriptor) {
             Ok(SnapshotRecord::State(baseline)) => baseline,
             Ok(SnapshotRecord::LegacyPosition(_)) => {
-                eprintln!("logical-db-protocol: BaselinePage::validate_page: LegacyBaseline");
                 return Err(ProtocolError::InvalidBaselineDescriptor);
             }
-            Err(error) => {
-                eprintln!("logical-db-protocol: BaselinePage::validate_page descriptor: {error}");
+            // `SnapshotRecord` is `#[non_exhaustive]`, so a future record form
+            // must be refused as a foreign descriptor rather than matched.
+            Ok(_) => return Err(ProtocolError::InvalidBaselineDescriptor),
+            Err(_error) => {
                 return Err(ProtocolError::InvalidBaselineDescriptor);
             }
         };
@@ -433,11 +434,11 @@ impl BaselinePage {
             u64::from(descriptor.document_count()),
         );
         for document in &self.documents {
-            let state = SnapshotDocument {
-                document: document.document,
-                snapshot: document.snapshot.clone(),
-                tombstone: document.tombstone,
-            };
+            let state = SnapshotDocument::new(
+                document.document,
+                document.snapshot.clone(),
+                document.tombstone,
+            );
             builder.push(&state).map_err(|error| {
                 eprintln!("logical-db-protocol: BaselinePage::validate_page documents: {error}");
                 ProtocolError::InvalidBaselineDocuments
@@ -477,10 +478,12 @@ impl BaselinePage {
         let documents = self
             .documents
             .iter()
-            .map(|document| SnapshotDocument {
-                document: document.document,
-                snapshot: document.snapshot.clone(),
-                tombstone: document.tombstone,
+            .map(|document| {
+                SnapshotDocument::new(
+                    document.document,
+                    document.snapshot.clone(),
+                    document.tombstone,
+                )
             })
             .collect::<Vec<_>>();
         let artifact = SnapshotArtifact::new(expected_scope, descriptor.position(), documents)
@@ -574,11 +577,11 @@ impl BaselineAccumulator {
                     ProtocolError::InvalidBaselineDocuments
                 })?;
             self.last = Some(document.document);
-            self.documents.push(SnapshotDocument {
-                document: document.document,
-                snapshot: document.snapshot.clone(),
-                tombstone: document.tombstone,
-            });
+            self.documents.push(SnapshotDocument::new(
+                document.document,
+                document.snapshot.clone(),
+                document.tombstone,
+            ));
         }
         self.complete = !page.more;
         Ok(self.complete)
@@ -1337,10 +1340,8 @@ mod tests {
     fn ordered_documents(snapshots: &[(Vec<u8>, bool)]) -> Vec<SnapshotDocument> {
         let mut documents = snapshots
             .iter()
-            .map(|(snapshot, tombstone)| SnapshotDocument {
-                document: DocumentId::new(),
-                snapshot: snapshot.clone(),
-                tombstone: *tombstone,
+            .map(|(snapshot, tombstone)| {
+                SnapshotDocument::new(DocumentId::new(), snapshot.clone(), *tombstone)
             })
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
@@ -1514,10 +1515,12 @@ mod tests {
 
     fn ordered_states(count: usize) -> Vec<SnapshotDocument> {
         let mut documents = (0..count)
-            .map(|index| SnapshotDocument {
-                document: DocumentId::new(),
-                snapshot: vec![u8::try_from(index % 251).unwrap() + 1],
-                tombstone: false,
+            .map(|index| {
+                SnapshotDocument::new(
+                    DocumentId::new(),
+                    vec![u8::try_from(index % 251).unwrap() + 1],
+                    false,
+                )
             })
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
@@ -1567,7 +1570,7 @@ mod tests {
         assert!(!gap.push(&first_page).unwrap());
         assert_eq!(gap.push(&first_page), Err(ProtocolError::BaselineMismatch));
 
-        let mut short = BaselineAccumulator::new(scope, artifact.baseline.clone());
+        let mut short = BaselineAccumulator::new(scope, artifact.baseline);
         assert!(!short.push(&first_page).unwrap());
         assert_eq!(short.finish(), Err(ProtocolError::BaselineMismatch));
     }

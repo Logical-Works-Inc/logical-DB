@@ -22,27 +22,17 @@ logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", op
 uuid.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 ciborium.workspace = true
 lgwks_deps.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
-logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
-logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
-logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
-logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 
-# Mirrors the workspace lint set, but `unsafe_code` is `deny` rather than
-# `forbid` so the single FDB runtime boot FFI call can carry a scoped,
-# reviewed `#[allow(unsafe_code)]` exactly as `logical-db-daemon` does.
-[lints.rust]
-missing_docs = "warn"
-unsafe_code = "deny"
-
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
-
+# Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
+# network-boot FFI call, so it is one of the two crates that do not carry a
+# root `#![forbid(unsafe_code)]`; it relies on the workspace `unsafe_code =
+# "deny"` plus a scoped, documented attribute at the boot site. Cargo forbids
+# combining this inherit line with a member-local override, so the exception
+# lives here as an attribute, not as a duplicated lint table.
 [lints]
 workspace = true

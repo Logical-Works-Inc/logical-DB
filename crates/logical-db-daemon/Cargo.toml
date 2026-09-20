@@ -41,13 +41,11 @@ logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", fe
 reqwest.workspace = true
 uuid.workspace = true
 
-[lints.rust]
-missing_docs = "warn"
-unsafe_code = "deny"
-
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
-
+# Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
+# network-boot FFI call, so it is one of the two crates that do not carry a
+# root `#![forbid(unsafe_code)]`; it relies on the workspace `unsafe_code =
+# "deny"` plus a scoped, documented attribute at the boot site. Cargo forbids
+# combining this inherit line with a member-local override, so the exception
+# lives here as an attribute, not as a duplicated lint table.
 [lints]
 workspace = true

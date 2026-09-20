@@ -4,6 +4,7 @@
 
 /target/
 /.codegraph/
+/.keel/
 /keel-core/
 /graphify-out/
 mutants.out*
@@ -15,3 +16,6 @@ __pycache__/
 *.redb.tmp
 *.pdb
 .DS_Store
+
+# graphify AST cache: derived build artifact, never source
+graphify-out/cache/

@@ -69,6 +69,17 @@ lgwks_deps = { version = "0.1.5", git = "https://github.com/srinji-kaggss/logica
 [workspace.lints.rust]
 improper_ctypes = "forbid"
 improper_ctypes_definitions = "forbid"
+# `deny`, not `forbid`, and deliberately the only non-`forbid` entry here.
+#
+# Cargo rejects a member that both inherits the table (`[lints] workspace =
+# true`) and overrides one entry, so the exception cannot be declared per member.
+# Instead, every crate that must never permit `unsafe` states it at its own root
+# as `#![forbid(unsafe_code)]` — which is stronger than this table and cannot be
+# lowered by any `#[expect]` or `#[allow]` (E0453). Only `logical-db-daemon` and
+# `logical-db-e2e` omit that root attribute, because each owns one reviewed
+# FoundationDB network-boot FFI call that has to carry a scoped, documented
+# attribute; `deny` is what lets that scoped exception exist. This is rustc's own
+# pattern: `forbid` on the safe surface, one reasoned exception at the FFI leaf.
 unsafe_code = "forbid"
 unused_must_use = "forbid"
 

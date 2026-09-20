@@ -51,10 +51,15 @@ impl BaselineDigest {
 /// Fixed descriptor for one state-bearing snapshot artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotBaseline {
+    /// Descriptor layout version carried on the wire.
     version: u16,
+    /// Log position the described artifact covers.
     position: u64,
+    /// Canonical digest of the covered artifact.
     digest: BaselineDigest,
+    /// Number of documents in the described artifact.
     document_count: u32,
+    /// Aggregate snapshot payload byte length.
     byte_len: u32,
 }
 
@@ -123,24 +128,18 @@ impl SnapshotBaseline {
         if bytes.len() == SNAPSHOT_BASELINE_LEGACY_BYTES {
             let version = u16::from_be_bytes([bytes[0], bytes[1]]);
             if version != SNAPSHOT_BASELINE_LEGACY_VERSION {
-                let error = ModelError::UnsupportedSnapshotVersion { actual: version };
-                eprintln!("logical-db-model: SnapshotBaseline::decode legacy version: {error}");
-                return Err(error);
+                return Err(ModelError::UnsupportedSnapshotVersion { actual: version });
             }
             let mut position = [0; 8];
             position.copy_from_slice(&bytes[2..10]);
             return Ok(SnapshotRecord::LegacyPosition(u64::from_be_bytes(position)));
         }
         if bytes.len() != SNAPSHOT_BASELINE_BYTES {
-            let error = ModelError::InvalidSnapshotEncoding;
-            eprintln!("logical-db-model: SnapshotBaseline::decode length: {error}");
-            return Err(error);
+            return Err(ModelError::InvalidSnapshotEncoding);
         }
         let version = u16::from_be_bytes([bytes[0], bytes[1]]);
         if version != SNAPSHOT_BASELINE_VERSION {
-            let error = ModelError::UnsupportedSnapshotVersion { actual: version };
-            eprintln!("logical-db-model: SnapshotBaseline::decode version: {error}");
-            return Err(error);
+            return Err(ModelError::UnsupportedSnapshotVersion { actual: version });
         }
         let baseline = Self {
             version,
@@ -149,15 +148,11 @@ impl SnapshotBaseline {
             document_count: decode_u32(&bytes[42..46]),
             byte_len: decode_u32(&bytes[46..50]),
         };
-        if baseline.document_count as usize > MAX_BASELINE_DOCUMENTS {
-            let error = ModelError::SnapshotTooManyDocuments;
-            eprintln!("logical-db-model: SnapshotBaseline::decode document count: {error}");
-            return Err(error);
+        if usize::try_from(baseline.document_count).unwrap_or(usize::MAX) > MAX_BASELINE_DOCUMENTS {
+            return Err(ModelError::SnapshotTooManyDocuments);
         }
-        if baseline.byte_len as usize > MAX_BASELINE_BYTES {
-            let error = ModelError::SnapshotTooLarge;
-            eprintln!("logical-db-model: SnapshotBaseline::decode byte length: {error}");
-            return Err(error);
+        if usize::try_from(baseline.byte_len).unwrap_or(usize::MAX) > MAX_BASELINE_BYTES {
+            return Err(ModelError::SnapshotTooLarge);
         }
         Ok(SnapshotRecord::State(baseline))
     }
@@ -165,6 +160,7 @@ impl SnapshotBaseline {
 
 /// Result of decoding a versioned snapshot descriptor.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SnapshotRecord {
     /// Legacy position-only descriptor; it cannot satisfy state recovery.
     LegacyPosition(u64),
@@ -174,6 +170,7 @@ pub enum SnapshotRecord {
 
 /// One bounded document state included in a snapshot artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SnapshotDocument {
     /// Stable document identity.
     pub document: DocumentId,
@@ -183,8 +180,24 @@ pub struct SnapshotDocument {
     pub tombstone: bool,
 }
 
+impl SnapshotDocument {
+    /// Builds one document entry from its identity, canonical bytes, and flag.
+    ///
+    /// This is the constructor `#[non_exhaustive]` requires: callers outside
+    /// this crate cannot use a struct expression, so they compose through here.
+    #[must_use]
+    pub const fn new(document: DocumentId, snapshot: Vec<u8>, tombstone: bool) -> Self {
+        Self {
+            document,
+            snapshot,
+            tombstone,
+        }
+    }
+}
+
 /// A descriptor and its ordered, bounded document states.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SnapshotArtifact {
     /// Descriptor computed from the artifact documents.
     pub baseline: SnapshotBaseline,
@@ -204,33 +217,24 @@ impl SnapshotArtifact {
         documents: Vec<SnapshotDocument>,
     ) -> Result<Self, ModelError> {
         if documents.len() > MAX_BASELINE_DOCUMENTS {
-            let error = ModelError::SnapshotTooManyDocuments;
-            eprintln!("logical-db-model: SnapshotArtifact::new count: {error}");
-            return Err(error);
+            return Err(ModelError::SnapshotTooManyDocuments);
         }
-        let document_count = u32::try_from(documents.len()).map_err(|error| {
-            eprintln!("logical-db-model: SnapshotArtifact::new document count: {error}");
-            ModelError::SnapshotTooLarge
-        })?;
+        let document_count =
+            u32::try_from(documents.len()).map_err(|_error| ModelError::SnapshotTooLarge)?;
         let admitted_bytes = documents.iter().try_fold(0usize, |total, document| {
             total
                 .checked_add(document.snapshot.len())
                 .ok_or(ModelError::SnapshotTooLarge)
         })?;
         if admitted_bytes > MAX_BASELINE_BYTES {
-            let error = ModelError::SnapshotTooLarge;
-            eprintln!("logical-db-model: SnapshotArtifact::new aggregate admission: {error}");
-            return Err(error);
+            return Err(ModelError::SnapshotTooLarge);
         }
         let mut builder = SnapshotDigestBuilder::new(scope, position, u64::from(document_count));
         for document in &documents {
             builder.push(document)?;
         }
         let (digest, byte_len) = builder.finish()?;
-        let byte_len = u32::try_from(byte_len).map_err(|error| {
-            eprintln!("logical-db-model: SnapshotArtifact::new byte length: {error}");
-            ModelError::SnapshotTooLarge
-        })?;
+        let byte_len = u32::try_from(byte_len).map_err(|_error| ModelError::SnapshotTooLarge)?;
         Ok(Self {
             baseline: SnapshotBaseline::new(position, digest, document_count, byte_len),
             documents,
@@ -245,9 +249,7 @@ impl SnapshotArtifact {
     pub fn validate(&self, scope: Scope) -> Result<(), ModelError> {
         let expected = Self::new(scope, self.baseline.position, self.documents.clone())?;
         if expected.baseline != self.baseline {
-            let error = ModelError::SnapshotDescriptorMismatch;
-            eprintln!("logical-db-model: SnapshotArtifact::validate descriptor: {error}");
-            return Err(error);
+            return Err(ModelError::SnapshotDescriptorMismatch);
         }
         Ok(())
     }
@@ -266,10 +268,15 @@ thread_local! {
 /// per-document bounds, the running byte total, and the declared document count;
 /// a sequence that ends short, long, or out of order cannot finalize.
 pub struct SnapshotDigestBuilder {
+    /// Running canonical digest over the folded sequence.
     digest: Hasher,
+    /// Document count the finished stream must match.
     expected_count: u64,
+    /// Documents folded so far.
     count: u64,
+    /// Aggregate body bytes folded so far.
     byte_len: usize,
+    /// Identity of the previously folded document, for ordering.
     previous: Option<DocumentId>,
 }
 
@@ -314,14 +321,10 @@ impl SnapshotDigestBuilder {
             .previous
             .is_some_and(|previous| previous >= document.document)
         {
-            let error = ModelError::SnapshotDocumentsUnordered;
-            eprintln!("logical-db-model: SnapshotDigestBuilder ordering: {error}");
-            return Err(error);
+            return Err(ModelError::SnapshotDocumentsUnordered);
         }
         if document.snapshot.is_empty() || document.snapshot.len() > MAX_BASELINE_BYTES {
-            let error = ModelError::SnapshotDocumentInvalid;
-            eprintln!("logical-db-model: SnapshotDigestBuilder payload: {error}");
-            return Err(error);
+            return Err(ModelError::SnapshotDocumentInvalid);
         }
         self.byte_len = self
             .byte_len
@@ -332,7 +335,8 @@ impl SnapshotDigestBuilder {
         frame(&mut self.digest, document.document.as_uuid().as_bytes());
         frame(&mut self.digest, &[u8::from(document.tombstone)]);
         #[cfg(test)]
-        HASHED_BODY_BYTES.with(|bytes| bytes.set(bytes.get() + document.snapshot.len()));
+        HASHED_BODY_BYTES
+            .with(|bytes| bytes.set(bytes.get().saturating_add(document.snapshot.len())));
         frame(&mut self.digest, &document.snapshot);
         Ok(())
     }
@@ -344,9 +348,7 @@ impl SnapshotDigestBuilder {
     /// Returns a typed model error when the folded count differs from the declared count.
     pub fn finish(self) -> Result<(BaselineDigest, usize), ModelError> {
         if self.count != self.expected_count {
-            let error = ModelError::SnapshotDescriptorMismatch;
-            eprintln!("logical-db-model: SnapshotDigestBuilder count: {error}");
-            return Err(error);
+            return Err(ModelError::SnapshotDescriptorMismatch);
         }
         Ok((
             BaselineDigest(*self.digest.finalize().as_bytes()),
@@ -355,23 +357,27 @@ impl SnapshotDigestBuilder {
     }
 }
 
+/// Frames a length prefix and body into the running canonical digest.
 fn frame(digest: &mut Hasher, bytes: &[u8]) {
-    digest.update(&(bytes.len() as u64).to_be_bytes());
+    digest.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
     digest.update(bytes);
 }
 
+/// Decodes a big-endian `u64` from exactly eight bytes.
 fn decode_u64(bytes: &[u8]) -> u64 {
     let mut value = [0; 8];
     value.copy_from_slice(bytes);
     u64::from_be_bytes(value)
 }
 
+/// Decodes a big-endian `u32` from exactly four bytes.
 fn decode_u32(bytes: &[u8]) -> u32 {
     let mut value = [0; 4];
     value.copy_from_slice(bytes);
     u32::from_be_bytes(value)
 }
 
+/// Copies exactly thirty-two digest bytes into a fixed array.
 fn decode_array(bytes: &[u8]) -> [u8; 32] {
     let mut value = [0; 32];
     value.copy_from_slice(bytes);
@@ -383,9 +389,11 @@ mod tests {
     use super::*;
     use crate::{AccountId, SpaceId};
 
+    /// A fresh random-identifier scope for tests that only need one.
     fn scope() -> Scope {
         Scope::new(AccountId::new(), SpaceId::new())
     }
+    /// A small three-byte non-tombstone document for generic cases.
     fn doc() -> SnapshotDocument {
         SnapshotDocument {
             document: DocumentId::new(),
@@ -393,12 +401,14 @@ mod tests {
             tombstone: false,
         }
     }
+    /// A scope with fixed bytes, so digests are reproducible across runs.
     fn fixed_scope() -> Scope {
         Scope::new(
             AccountId::from_uuid(uuid::Uuid::from_bytes([0x11; 16])),
             SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
         )
     }
+    /// A document with a fixed identity so its digest is stable across runs.
     fn fixed_doc(byte: u8, snapshot: Vec<u8>, tombstone: bool) -> SnapshotDocument {
         SnapshotDocument {
             document: DocumentId::from_uuid(uuid::Uuid::from_bytes([byte; 16])),
@@ -406,35 +416,42 @@ mod tests {
             tombstone,
         }
     }
+    /// Folds a known-good sequence through the builder and returns its digest.
+    ///
+    /// Every rejection is propagated with `?`, so a test that feeds a valid
+    /// sequence fails loudly if the builder ever refuses one.
     fn streamed_digest(
         scope: Scope,
         position: u64,
         documents: &[SnapshotDocument],
-    ) -> BaselineDigest {
-        let mut builder = SnapshotDigestBuilder::new(scope, position, documents.len() as u64);
+    ) -> Result<BaselineDigest, Box<dyn std::error::Error>> {
+        let count = u64::try_from(documents.len()).unwrap_or(u64::MAX);
+        let mut builder = SnapshotDigestBuilder::new(scope, position, count);
         for document in documents {
-            builder.push(document).unwrap();
+            builder.push(document)?;
         }
-        builder.finish().unwrap().0
+        Ok(builder.finish()?.0)
     }
 
     #[test]
-    fn artifact_digest_is_reproducible_and_descriptor_validates() {
+    fn artifact_digest_is_reproducible_and_descriptor_validates()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = scope();
-        let first = SnapshotArtifact::new(scope, 7, vec![doc()]).unwrap();
-        let second = SnapshotArtifact::new(scope, 7, first.documents.clone()).unwrap();
+        let first = SnapshotArtifact::new(scope, 7, vec![doc()])?;
+        let second = SnapshotArtifact::new(scope, 7, first.documents.clone())?;
         assert_eq!(first.baseline.digest(), second.baseline.digest());
         assert!(first.validate(scope).is_ok());
-        let mut altered = first.clone();
+        let mut altered = first;
         altered.baseline = SnapshotBaseline::new(7, BaselineDigest::new([0; 32]), 1, 3);
         assert_eq!(
             altered.validate(scope),
             Err(ModelError::SnapshotDescriptorMismatch)
         );
+        Ok(())
     }
 
     #[test]
-    fn artifact_digest_has_a_portable_golden_encoding() {
+    fn artifact_digest_has_a_portable_golden_encoding() -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(
             AccountId::from_uuid(uuid::Uuid::from_bytes([0x11; 16])),
             SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
@@ -447,8 +464,7 @@ mod tests {
                 snapshot: vec![1, 2, 3],
                 tombstone: false,
             }],
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             artifact.baseline.digest().into_bytes(),
             // Re-pinned at the 2026-09-16 estate hash swap to BLAKE3.
@@ -457,6 +473,7 @@ mod tests {
                 68, 48, 174, 151, 216, 133, 232, 209, 78, 155, 134, 56, 147, 69,
             ]
         );
+        Ok(())
     }
 
     #[test]
@@ -493,7 +510,8 @@ mod tests {
     }
 
     #[test]
-    fn streamed_documents_reproduce_the_in_memory_digest() {
+    fn streamed_documents_reproduce_the_in_memory_digest() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = scope();
         let documents = (0..200_u128)
             .map(|index| SnapshotDocument {
@@ -502,32 +520,34 @@ mod tests {
                 tombstone: index % 2 == 0,
             })
             .collect::<Vec<_>>();
-        let artifact = SnapshotArtifact::new(scope, 9, documents.clone()).unwrap();
-        let mut builder = SnapshotDigestBuilder::new(scope, 9, documents.len() as u64);
+        let artifact = SnapshotArtifact::new(scope, 9, documents.clone())?;
+        let count = u64::try_from(documents.len()).unwrap_or(u64::MAX);
+        let mut builder = SnapshotDigestBuilder::new(scope, 9, count);
         for document in &documents {
-            builder.push(document).unwrap();
+            builder.push(document)?;
         }
-        let (digest, byte_len) = builder.finish().unwrap();
+        let (digest, byte_len) = builder.finish()?;
         assert_eq!(digest, artifact.baseline.digest());
-        assert_eq!(byte_len, 200 * 3);
+        assert_eq!(byte_len, 600);
+        Ok(())
     }
 
     #[test]
-    fn streamed_digest_folds_past_the_single_artifact_cap() {
+    fn streamed_digest_folds_past_the_single_artifact_cap() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = scope();
-        let declared = u64::try_from(MAX_BASELINE_DOCUMENTS + 1).unwrap();
-        let mut builder = SnapshotDigestBuilder::new(scope, 0, declared);
+        let declared = u64::try_from(MAX_BASELINE_DOCUMENTS)?;
+        let mut builder = SnapshotDigestBuilder::new(scope, 0, declared.saturating_add(1));
         for index in 0..=MAX_BASELINE_DOCUMENTS {
-            builder
-                .push(&SnapshotDocument {
-                    document: DocumentId::from_uuid(uuid::Uuid::from_u128(index as u128)),
-                    snapshot: vec![7],
-                    tombstone: false,
-                })
-                .unwrap();
+            builder.push(&SnapshotDocument {
+                document: DocumentId::from_uuid(uuid::Uuid::from_u128(u128::try_from(index)?)),
+                snapshot: vec![7],
+                tombstone: false,
+            })?;
         }
-        let (_, byte_len) = builder.finish().unwrap();
-        assert_eq!(byte_len, MAX_BASELINE_DOCUMENTS + 1);
+        let (_, byte_len) = builder.finish()?;
+        assert_eq!(byte_len, MAX_BASELINE_DOCUMENTS.saturating_add(1));
+        Ok(())
     }
 
     // The pre-existing `artifact_digest_has_a_portable_golden_encoding` case is
@@ -537,38 +557,43 @@ mod tests {
     // two paths both built from `SnapshotDigestBuilder`.
 
     #[test]
-    fn empty_stream_digest_has_a_portable_golden_encoding() {
+    fn empty_stream_digest_has_a_portable_golden_encoding() -> Result<(), Box<dyn std::error::Error>>
+    {
         let expected = [
             71, 43, 172, 140, 216, 191, 236, 239, 92, 7, 42, 181, 192, 141, 96, 131, 199, 34, 103,
             0, 170, 35, 247, 111, 78, 137, 207, 157, 208, 248, 251, 238,
         ];
-        let artifact = SnapshotArtifact::new(fixed_scope(), 7, Vec::new()).unwrap();
+        let artifact = SnapshotArtifact::new(fixed_scope(), 7, Vec::new())?;
         assert_eq!(artifact.baseline.digest().into_bytes(), expected);
         assert_eq!(artifact.baseline.byte_len(), 0);
         assert_eq!(
-            streamed_digest(fixed_scope(), 7, &[]).into_bytes(),
+            streamed_digest(fixed_scope(), 7, &[])?.into_bytes(),
             expected
         );
+        Ok(())
     }
 
     #[test]
-    fn tombstone_document_digest_has_a_portable_golden_encoding() {
+    fn tombstone_document_digest_has_a_portable_golden_encoding()
+    -> Result<(), Box<dyn std::error::Error>> {
         let expected = [
             159, 212, 63, 55, 91, 223, 140, 196, 39, 31, 57, 185, 169, 62, 119, 131, 189, 52, 85,
             205, 204, 65, 198, 102, 214, 37, 114, 65, 221, 104, 136, 22,
         ];
         let documents = vec![fixed_doc(0x33, vec![1, 2, 3], true)];
-        let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone()).unwrap();
+        let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone())?;
         assert_eq!(artifact.baseline.digest().into_bytes(), expected);
         assert_eq!(artifact.baseline.byte_len(), 3);
         assert_eq!(
-            streamed_digest(fixed_scope(), 7, &documents).into_bytes(),
+            streamed_digest(fixed_scope(), 7, &documents)?.into_bytes(),
             expected
         );
+        Ok(())
     }
 
     #[test]
-    fn multi_document_stream_digest_has_a_portable_golden_encoding() {
+    fn multi_document_stream_digest_has_a_portable_golden_encoding()
+    -> Result<(), Box<dyn std::error::Error>> {
         let expected = [
             16, 249, 242, 54, 53, 147, 16, 252, 104, 176, 157, 59, 236, 236, 174, 188, 61, 59, 175,
             174, 237, 67, 11, 175, 237, 255, 98, 131, 185, 20, 251, 201,
@@ -578,40 +603,44 @@ mod tests {
             fixed_doc(0x44, vec![4, 5, 6], true),
             fixed_doc(0x55, vec![7, 8, 9], false),
         ];
-        let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone()).unwrap();
+        let artifact = SnapshotArtifact::new(fixed_scope(), 7, documents.clone())?;
         assert_eq!(artifact.baseline.digest().into_bytes(), expected);
         assert_eq!(artifact.baseline.byte_len(), 9);
         assert_eq!(
-            streamed_digest(fixed_scope(), 7, &documents).into_bytes(),
+            streamed_digest(fixed_scope(), 7, &documents)?.into_bytes(),
             expected
         );
+        Ok(())
     }
 
     // Falsifiers: each hostile shape must either change the digest or be refused.
 
     #[test]
-    fn streamed_digest_refuses_overlong_streams() {
+    fn streamed_digest_refuses_overlong_streams() -> Result<(), Box<dyn std::error::Error>> {
         let scope = scope();
         let first = fixed_doc(0x33, vec![1], false);
         let second = fixed_doc(0x44, vec![2], false);
         let mut builder = SnapshotDigestBuilder::new(scope, 0, 1);
-        builder.push(&first).unwrap();
-        builder.push(&second).unwrap();
+        builder.push(&first)?;
+        builder.push(&second)?;
         assert_eq!(
             builder.finish(),
             Err(ModelError::SnapshotDescriptorMismatch)
         );
+        Ok(())
     }
 
     #[test]
-    fn streamed_digest_refuses_zero_count_with_a_document() {
+    fn streamed_digest_refuses_zero_count_with_a_document() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = scope();
         let mut builder = SnapshotDigestBuilder::new(scope, 0, 0);
-        builder.push(&fixed_doc(0x33, vec![1], false)).unwrap();
+        builder.push(&fixed_doc(0x33, vec![1], false))?;
         assert_eq!(
             builder.finish(),
             Err(ModelError::SnapshotDescriptorMismatch)
         );
+        Ok(())
     }
 
     #[test]
@@ -623,7 +652,11 @@ mod tests {
             Err(ModelError::SnapshotDocumentInvalid)
         );
         assert_eq!(
-            builder.push(&fixed_doc(0x44, vec![0; MAX_BASELINE_BYTES + 1], false)),
+            builder.push(&fixed_doc(
+                0x44,
+                vec![0; MAX_BASELINE_BYTES.saturating_add(1)],
+                false
+            )),
             Err(ModelError::SnapshotDocumentInvalid)
         );
         assert_eq!(
@@ -633,40 +666,45 @@ mod tests {
     }
 
     #[test]
-    fn streamed_digest_refuses_reverse_ordering_across_a_chunk_boundary() {
+    fn streamed_digest_refuses_reverse_ordering_across_a_chunk_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = scope();
         let higher = fixed_doc(0x55, vec![1], false);
         let lower = fixed_doc(0x44, vec![2], false);
         let mut builder = SnapshotDigestBuilder::new(scope, 0, 2);
         // The first chunk ends on the higher identity; the next chunk regresses.
-        builder.push(&higher).unwrap();
+        builder.push(&higher)?;
         assert_eq!(
             builder.push(&lower),
             Err(ModelError::SnapshotDocumentsUnordered)
         );
+        Ok(())
     }
 
     #[test]
-    fn streamed_digest_is_scope_position_and_tombstone_sensitive() {
+    fn streamed_digest_is_scope_position_and_tombstone_sensitive()
+    -> Result<(), Box<dyn std::error::Error>> {
         let documents = [fixed_doc(0x33, vec![1, 2, 3], false)];
-        let base = streamed_digest(fixed_scope(), 7, &documents);
+        let base = streamed_digest(fixed_scope(), 7, &documents)?;
         let other_scope = Scope::new(
             AccountId::from_uuid(uuid::Uuid::from_bytes([0x12; 16])),
             SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
         );
-        assert_ne!(base, streamed_digest(other_scope, 7, &documents));
-        assert_ne!(base, streamed_digest(fixed_scope(), 8, &documents));
+        assert_ne!(base, streamed_digest(other_scope, 7, &documents)?);
+        assert_ne!(base, streamed_digest(fixed_scope(), 8, &documents)?);
         let tombstones = [fixed_doc(0x33, vec![1, 2, 3], true)];
-        assert_ne!(base, streamed_digest(fixed_scope(), 7, &tombstones));
+        assert_ne!(base, streamed_digest(fixed_scope(), 7, &tombstones)?);
+        Ok(())
     }
 
     #[test]
-    fn rejected_push_leaves_the_builder_usable_and_unchanged() {
+    fn rejected_push_leaves_the_builder_usable_and_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = scope();
         let first = fixed_doc(0x33, vec![1], false);
         let second = fixed_doc(0x44, vec![2], false);
         let mut builder = SnapshotDigestBuilder::new(scope, 0, 2);
-        builder.push(&first).unwrap();
+        builder.push(&first)?;
         assert_eq!(
             builder.push(&first),
             Err(ModelError::SnapshotDocumentsUnordered)
@@ -678,20 +716,22 @@ mod tests {
         // A rejected push is not folded: the next valid push still observes
         // `first` as its predecessor and the builder finalizes the same stream
         // a fresh builder would.
-        builder.push(&second).unwrap();
+        builder.push(&second)?;
         let mut fresh = SnapshotDigestBuilder::new(scope, 0, 2);
-        fresh.push(&first).unwrap();
-        fresh.push(&second).unwrap();
-        assert_eq!(builder.finish().unwrap(), fresh.finish().unwrap());
+        fresh.push(&first)?;
+        fresh.push(&second)?;
+        assert_eq!(builder.finish()?, fresh.finish()?);
+        Ok(())
     }
 
     #[test]
-    fn caller_admits_aggregate_bytes_before_hashing_a_large_body() {
+    fn caller_admits_aggregate_bytes_before_hashing_a_large_body()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = scope();
         let start = HASHED_BODY_BYTES.with(std::cell::Cell::get);
-        SnapshotArtifact::new(scope, 0, vec![fixed_doc(0x33, vec![1, 2, 3], false)]).unwrap();
+        SnapshotArtifact::new(scope, 0, vec![fixed_doc(0x33, vec![1, 2, 3], false)])?;
         let after_small = HASHED_BODY_BYTES.with(std::cell::Cell::get);
-        assert_eq!(after_small, start + 3);
+        assert_eq!(after_small, start.saturating_add(3));
         let documents = vec![
             fixed_doc(0x33, vec![0xAB; MAX_BASELINE_BYTES], false),
             fixed_doc(0x44, vec![0xCD; 1], false),
@@ -705,37 +745,45 @@ mod tests {
             after_small,
             "aggregate admission must run before any document body is hashed"
         );
+        Ok(())
     }
 
     #[test]
-    fn streamed_digest_refuses_short_streams_and_disorder() {
+    fn streamed_digest_refuses_short_streams_and_disorder() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = scope();
         let first = doc();
         let mut short = SnapshotDigestBuilder::new(scope, 0, 2);
-        short.push(&first).unwrap();
+        short.push(&first)?;
         assert_eq!(short.finish(), Err(ModelError::SnapshotDescriptorMismatch));
         let mut disordered = SnapshotDigestBuilder::new(scope, 0, 2);
-        disordered.push(&first).unwrap();
+        disordered.push(&first)?;
         assert_eq!(
             disordered.push(&first),
             Err(ModelError::SnapshotDocumentsUnordered)
         );
+        Ok(())
     }
 
     #[test]
-    fn artifact_accepts_a_baseline_larger_than_one_page() {
+    fn artifact_accepts_a_baseline_larger_than_one_page() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = scope();
-        let documents = (0..=MAX_BASELINE_PAGE_DOCUMENTS)
-            .map(|index| SnapshotDocument {
-                document: DocumentId::from_uuid(uuid::Uuid::from_u128(index as u128)),
-                snapshot: vec![7],
-                tombstone: false,
+        let declared = u64::try_from(MAX_BASELINE_PAGE_DOCUMENTS)?;
+        let documents = (0..=declared)
+            .map(|index| {
+                Ok(SnapshotDocument {
+                    document: DocumentId::from_uuid(uuid::Uuid::from_u128(u128::from(index))),
+                    snapshot: vec![7],
+                    tombstone: false,
+                })
             })
-            .collect::<Vec<_>>();
-        let artifact = SnapshotArtifact::new(scope, 3, documents).unwrap();
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let artifact = SnapshotArtifact::new(scope, 3, documents)?;
         assert_eq!(
-            artifact.baseline.document_count() as usize,
-            MAX_BASELINE_PAGE_DOCUMENTS + 1
+            usize::try_from(artifact.baseline.document_count())?,
+            MAX_BASELINE_PAGE_DOCUMENTS.saturating_add(1)
         );
+        Ok(())
     }
 }

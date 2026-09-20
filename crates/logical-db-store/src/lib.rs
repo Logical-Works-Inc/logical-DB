@@ -1381,7 +1381,7 @@ impl EmbeddedStore {
         self.install_remote_page_inner(scope, peer, documents, changes, checkpoint, true)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn install_remote_page_inner(
         &self,
         scope: Scope,
@@ -2343,11 +2343,12 @@ fn encode_index_value(value: &IndexValue) -> Result<Vec<u8>, StoreError> {
             encoded.push(6);
             encoded.extend_from_slice(&((*value).cast_unsigned() ^ (1_u64 << 63)).to_be_bytes());
         }
+        // `IndexValue` is `#[non_exhaustive]`, so a future projected form must
+        // be refused as an unsupported encoding rather than silently skipped.
+        _ => return Err(StoreError::InvalidIndexes),
     }
     if !is_at_most(encoded.len(), MAX_INDEX_VALUE_BYTES) {
-        let error = StoreError::InvalidIndexes;
-        eprintln!("logical-db-store: {error:?}");
-        return Err(error);
+        return Err(StoreError::InvalidIndexes);
     }
     Ok(encoded)
 }
@@ -2928,10 +2929,7 @@ mod tests {
         index: IndexId,
         page: &MigrationPage,
     ) {
-        let indexes = [IndexEntry {
-            index,
-            value: IndexValue::Text("new".into()),
-        }];
+        let indexes = [IndexEntry::new(index, IndexValue::Text("new".into()))];
         let updates = page
             .documents
             .iter()
@@ -2965,10 +2963,7 @@ mod tests {
                     ),
                     expected_revision: None,
                     snapshot: b"snapshot",
-                    indexes: &[IndexEntry {
-                        index,
-                        value: IndexValue::Text("old".into()),
-                    }],
+                    indexes: &[IndexEntry::new(index, IndexValue::Text("old".into()))],
                     tombstone: false,
                 })
                 .unwrap();
@@ -3685,10 +3680,7 @@ mod tests {
                 change: local,
                 expected_revision: None,
                 snapshot: b"snapshot",
-                indexes: &[IndexEntry {
-                    index,
-                    value: value.clone(),
-                }],
+                indexes: &[IndexEntry::new(index, value.clone())],
                 tombstone: false,
             })
             .unwrap();
@@ -3739,10 +3731,7 @@ mod tests {
                     change: change(scope, document, OperationId::new(), byte, byte),
                     expected_revision: None,
                     snapshot: b"indexed",
-                    indexes: &[IndexEntry {
-                        index,
-                        value: IndexValue::Text("note".into()),
-                    }],
+                    indexes: &[IndexEntry::new(index, IndexValue::Text("note".into()))],
                     tombstone: false,
                 })
                 .unwrap();
@@ -3778,10 +3767,7 @@ mod tests {
                 change: change(scope, first_document, OperationId::new(), 3, 3),
                 expected_revision: Some(DocumentRevision::new(1)),
                 snapshot: b"reindexed",
-                indexes: &[IndexEntry {
-                    index,
-                    value: IndexValue::Text("task".into()),
-                }],
+                indexes: &[IndexEntry::new(index, IndexValue::Text("task".into()))],
                 tombstone: false,
             })
             .unwrap();
@@ -3829,24 +3815,15 @@ mod tests {
 
         let index = IndexId::new();
         let duplicate = [
-            IndexEntry {
-                index,
-                value: IndexValue::Boolean(false),
-            },
-            IndexEntry {
-                index,
-                value: IndexValue::Boolean(true),
-            },
+            IndexEntry::new(index, IndexValue::Boolean(false)),
+            IndexEntry::new(index, IndexValue::Boolean(true)),
         ];
         assert!(matches!(
             validate_indexes(&duplicate),
             Err(StoreError::InvalidIndexes)
         ));
         let excessive = (0..=MAX_INDEXES_PER_DOCUMENT)
-            .map(|_| IndexEntry {
-                index: IndexId::new(),
-                value: IndexValue::Boolean(true),
-            })
+            .map(|_| IndexEntry::new(IndexId::new(), IndexValue::Boolean(true)))
             .collect::<Vec<_>>();
         assert!(matches!(
             validate_indexes(&excessive),
@@ -3863,10 +3840,7 @@ mod tests {
             MAX_INDEX_VALUE_BYTES
         );
         let maximum = (0..MAX_INDEXES_PER_DOCUMENT)
-            .map(|_| IndexEntry {
-                index: IndexId::new(),
-                value: IndexValue::Boolean(true),
-            })
+            .map(|_| IndexEntry::new(IndexId::new(), IndexValue::Boolean(true)))
             .collect::<Vec<_>>();
         assert!(validate_indexes(&maximum).is_ok());
     }
@@ -3909,10 +3883,7 @@ mod tests {
         let document = DocumentId::new();
         let index = IndexId::new();
         let digest = ChangeDigest::new([8; 32]);
-        let indexes = [IndexEntry {
-            index,
-            value: IndexValue::Text("remote".into()),
-        }];
+        let indexes = [IndexEntry::new(index, IndexValue::Text("remote".into()))];
         let changes = [RemoteChange {
             document,
             digest,
@@ -4472,7 +4443,7 @@ mod tests {
             decode_export(&bytes[..bytes.len() - 1]),
             Err(StoreError::InvalidExport)
         ));
-        let mut trailing = bytes.clone();
+        let mut trailing = bytes;
         trailing.push(0);
         assert!(matches!(
             decode_export(&trailing),
