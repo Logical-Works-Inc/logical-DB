@@ -211,13 +211,16 @@ def run():
     env = dict(os.environ, WINEDEBUG="-fixme", WINEDLLOVERRIDES="mscoree,mshtml=",
                RUST_BACKTRACE="1", RUST_TEST_THREADS="4",
                WINEPATH=f"{control / 'sdk'};{control / 'dlls'}")
-    # Initialize the VM-owned prefix before starting the retained server. The
-    # guest home is not a durable CI resource and must not supply this state.
-    subprocess.run(["wineboot", "--init"], check=True, env=env, timeout=120)
-    # Wine's default three-second server teardown can race the next harness.
-    # Keep this VM-owned session alive between binaries; the VM trap ends it.
-    subprocess.run(["/usr/lib/x86_64-linux-gnu/wine/wineserver", "--persistent=60"],
-                   check=True, env=env, timeout=30)
+    wineserver_bin = "/usr/lib/x86_64-linux-gnu/wine/wineserver"
+    wineserver_cmd = wineserver_bin if Path(wineserver_bin).is_file() else "wineserver"
+    # Ensure persistent server is running before executing binaries.
+    # wineserver -k0 checks if the daemon is alive.
+    is_running = subprocess.run([wineserver_cmd, "-k0"], env=env).returncode == 0
+    if not is_running:
+        subprocess.run([wineserver_cmd, "--persistent=60"], check=True, env=env, timeout=30)
+    # Initialize prefix only if not yet initialized.
+    if not (prefix / "system.reg").is_file():
+        subprocess.run(["wineboot", "--init"], check=True, env=env, timeout=180)
     subprocess.run(["wine", "--version"], check=True, env=env)
     subprocess.run(["wine", str(control / "smoke.exe")], check=True, env=env, timeout=180)
     tests = manifest["tests"]

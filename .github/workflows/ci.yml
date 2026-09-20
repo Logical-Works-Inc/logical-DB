@@ -39,9 +39,11 @@ jobs:
           actionlint
           shellcheck scripts/ci-emulated.sh scripts/ci-guest.sh scripts/ci-fdb-linux.sh scripts/ci-wine-runner.sh scripts/ci-windows-runtime.sh
           python3 scripts/ci-windows-runtime.py test
-          python3 -m venv "$RUNNER_TEMP/ci-policy"
-          "$RUNNER_TEMP/ci-policy/bin/pip" install --disable-pip-version-check -r scripts/ci-requirements.txt
-          "$RUNNER_TEMP/ci-policy/bin/python" scripts/verify-ci.py
+          python3 scripts/verify-ci.py || {
+            python3 -m venv "$RUNNER_TEMP/ci-policy"
+            "$RUNNER_TEMP/ci-policy/bin/pip" install --disable-pip-version-check -r scripts/ci-requirements.txt
+            "$RUNNER_TEMP/ci-policy/bin/python" scripts/verify-ci.py
+          }
 
   # Legacy check names satisfy the existing main-branch protection rule.
   # They are status identifiers, not runner selectors: every job is self-hosted.
@@ -88,13 +90,15 @@ jobs:
       - name: install pinned policy checker
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/cargo" install --locked cargo-deny --version 0.20.2
+          if ! command -v cargo-deny >/dev/null || [[ "$("$HOME/.cargo/bin/cargo-deny" --version 2>/dev/null)" != *"0.20.2"* ]]; then
+            "$HOME/.cargo/bin/cargo" install --locked cargo-deny --version 0.20.2
+          fi
       - name: enforce dependency policy
         run: cargo deny check
 
   emulated-quality:
     name: ${{ matrix.check-name }} / test-clippy
-    needs: selfhosted-quality
+    needs: selfhosted-evidence
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     strategy:
@@ -110,7 +114,7 @@ jobs:
 
   selfhosted-fdb-composition:
     name: official FDB client / daemon feature
-    needs: selfhosted-quality
+    needs: selfhosted-evidence
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
@@ -120,21 +124,28 @@ jobs:
         run: |
           set -euo pipefail
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          fdb_root="${RUNNER_TEMP}/foundationdb-7.3.77"
-          mkdir -p "${fdb_root}"
-          pkg_asset="FoundationDB-7.3.77_arm64.pkg"
-          curl --fail --location --retry 5 \
-            "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}" \
-            --output "${fdb_root}/${pkg_asset}"
-          curl --fail --location --retry 5 \
-            "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}.sha256" \
-            --output "${fdb_root}/${pkg_asset}.sha256"
-          (cd "${fdb_root}" && shasum -a 256 --check "${pkg_asset}.sha256")
-          pkgutil --expand-full "${fdb_root}/${pkg_asset}" "${fdb_root}/expanded"
-          libdir="${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/lib"
-          srvdir="${fdb_root}/expanded/FoundationDB-server.pkg/Payload/usr/local/libexec"
-          clidir="${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/bin"
-          chmod +x "${srvdir}/fdbserver" "${clidir}/fdbcli"
+          fdb_cache="${HOME}/.cache/foundationdb-7.3.77-arm64"
+          libdir="${fdb_cache}/lib"
+          srvdir="${fdb_cache}/libexec"
+          clidir="${fdb_cache}/bin"
+          if [[ ! -x "${srvdir}/fdbserver" || ! -x "${clidir}/fdbcli" || ! -f "${libdir}/libfdb_c.dylib" ]]; then
+            fdb_root="${RUNNER_TEMP}/foundationdb-7.3.77"
+            mkdir -p "${fdb_root}"
+            pkg_asset="FoundationDB-7.3.77_arm64.pkg"
+            curl --fail --location --retry 5 \
+              "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}" \
+              --output "${fdb_root}/${pkg_asset}"
+            curl --fail --location --retry 5 \
+              "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}.sha256" \
+              --output "${fdb_root}/${pkg_asset}.sha256"
+            (cd "${fdb_root}" && shasum -a 256 --check "${pkg_asset}.sha256")
+            pkgutil --expand-full "${fdb_root}/${pkg_asset}" "${fdb_root}/expanded"
+            mkdir -p "${libdir}" "${srvdir}" "${clidir}"
+            cp -R "${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/lib/"* "${libdir}/"
+            cp -R "${fdb_root}/expanded/FoundationDB-server.pkg/Payload/usr/local/libexec/"* "${srvdir}/"
+            cp -R "${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/bin/"* "${clidir}/"
+            chmod +x "${srvdir}/fdbserver" "${clidir}/fdbcli"
+          fi
           {
             echo "FDB_LIBRARY_ROOT=${libdir}"
             echo "FDB_SERVER_BIN=${srvdir}/fdbserver"
