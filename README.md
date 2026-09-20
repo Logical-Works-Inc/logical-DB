@@ -20,6 +20,26 @@ self-hostable distributed service contract. Read the [product map](docs/PRODUCT-
 [Cloud acceptance ADR](docs/adr/0003-sovereign-hyperscale-data-plane.md) before
 choosing a workstream.
 
+## Install the supported embedded surface
+
+The current supported distribution is a revision-pinned Git dependency. Pinning
+the reviewed revision makes the source and its internal crate family
+reproducible; do not replace `rev` with a moving branch name in a durable
+application build.
+
+```toml
+[dependencies]
+logical-db = { git = "https://github.com/srinji-kaggss/logical-DB", rev = "ae5025692937edec114a865b6114e643f279b0a9", package = "logical-db" }
+```
+
+This is the embedded local-replica surface exercised by
+[`experience/journeys/embedded-git-consumer-v1.yaml`](experience/journeys/embedded-git-consumer-v1.yaml).
+It needs no daemon, network connection, FoundationDB, or Braid at runtime.
+Crates.io installation is not supported yet: the facade depends on unpublished
+workspace crates, and an ordered release is a separate production gate rather
+than a fallback the installer can guess. The quickstart below starts with the
+same public facade.
+
 ## What applications embed
 
 The `logical-db` facade exposes typed account/space/document identities,

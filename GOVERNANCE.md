@@ -16,14 +16,19 @@ all seven jobs completed successfully on that merge commit. This post-merge
 receipt is separate from the reviewed-head receipt above.
 
 PRs [#48](https://github.com/srinji-kaggss/logical-DB/pull/48) through
-[#53](https://github.com/srinji-kaggss/logical-DB/pull/53) then delivered the
-estate-substrate adoption, the paged baseline protocol, the incremental digest
-builder, paged baseline recovery into one atomic client install, and the
-process-kill restore journey. `main` is `0a22f9a7` (merge of #53). These
-merges carry no hosted check evidence: GitHub Actions on this account is
-billing-blocked (every job fails in seconds with zero steps) and branch
-protection on `main` is disabled (API returns 404). Their verification
-receipts are local, recorded below.
+[#53](https://github.com/srinji-kaggss/logical-DB/pull/53) delivered the
+estate-substrate adoption, paged baseline recovery into one atomic client
+install, and the process-kill restore journey. The observed `origin/main` tip
+on 2026-09-20 is `ae502569` (merge of [#62](https://github.com/srinji-kaggss/logical-DB/pull/62)).
+The intervening merged PRs are [#57](https://github.com/srinji-kaggss/logical-DB/pull/57)
+(operation deadline), [#58](https://github.com/srinji-kaggss/logical-DB/pull/58)
+(ratified PRD), [#59](https://github.com/srinji-kaggss/logical-DB/pull/59)
+(SOT/CloudKit documentation), [#60](https://github.com/srinji-kaggss/logical-DB/pull/60)
+(local quickstart), [#61](https://github.com/srinji-kaggss/logical-DB/pull/61),
+and #62 (estate BLAKE3 migration). These merges carry no hosted-check evidence:
+GitHub Actions on this account is billing-blocked and branch protection on
+`main` is disabled (the protection API returned HTTP 404 on 2026-09-20). Their
+verification receipts are local and do not satisfy the unavailable hosted lane.
 
 Local verification at `0a22f9a7` + the retention-store test-lane repair
 (2026-09-14, macOS arm64): the clean-room verifier passes; the workspace test
@@ -85,17 +90,19 @@ Recovery status, stated once here and referenced everywhere else:
 and one atomic client install of recovered state and checkpoint exist on
 `main` (PRs #49 through #53). **Local execution reported** — the 2026-09-14
 local live-cluster receipts below exercise `fdb_recovery_composition` and the
-process-kill restore journey. **Not yet established** — issue #28 stays open
-for its outstanding acceptance checklist: expired-checkpoint recovery exercised
-through the public transport and the position-1 prune/fresh-replica
-counterexample verified item-by-item, plus reproduction on a runnable hosted or
-self-hosted lane. No hosted full-recovery evidence is claimed.
+process-kill restore journey. [PR #65](https://github.com/srinji-kaggss/logical-DB/pull/65)
+is open with a main-targeted FDB expired-checkpoint recovery test; its open
+state is not delivery evidence. **Not yet established** — issue #28 stays open
+until each acceptance item, including the position-1 prune/fresh-replica
+counterexample, is independently reproduced on a runnable hosted or self-hosted
+lane. No hosted full-recovery evidence is claimed.
 
 ## 2026-09-19 domain boundary enforcement (issue #73)
 
-- **Issue #73 implemented** on branch `feat/domain-boundary-enforcement`,
-  stacked on the docs commit `85f2bb2` (PR #65) that defined the four product
-  domains. `contract/domains/*.toml` now declare owned `crates`,
+- **Issue #73 is implemented in open [PR #77](https://github.com/srinji-kaggss/logical-DB/pull/77)**
+  on branch `feat/domain-boundary-enforcement`, stacked on the open PR #65 that
+  defined the four product domains. It is not merged delivery evidence.
+  `contract/domains/*.toml` declare owned `crates`,
   `public_contracts`, `may_depend_on`, and `forbidden_domains`;
   `contract/domains/GRAPH.toml` adds the kernel/facade/adapter/e2e layers, the
   composition-layer exemption, and the predecessor twin denylist.
@@ -113,6 +120,23 @@ self-hosted lane. No hosted full-recovery evidence is claimed.
   is not proof that the target Cairn/LEM/Forge crates or services exist, not the
   external-consumer fixture (PRD WP2), and not issue #25's execution-time
   transition graph. Those remain open.
+
+## 2026-09-20 sovereign-program state (issue #66)
+
+Issue [#66](https://github.com/srinji-kaggss/logical-DB/issues/66) is the
+current nine-axis acceptance program for the proposed sovereign hyperscale
+Cloud Plane. It preserves #25 and #28 as existing correctness gates; it does
+not turn the current scope-frontier FDB relay or local receipts into a scale,
+availability, cost, or sovereignty claim.
+
+The dependency order recorded in #66 is: #73 structure first; then
+[#67](https://github.com/srinji-kaggss/logical-DB/issues/67) partition/routing,
+[#68](https://github.com/srinji-kaggss/logical-DB/issues/68) authorized views,
+and [#69](https://github.com/srinji-kaggss/logical-DB/issues/69) residency/key/exit
+contracts; then #70 delivery, #71 disaster recovery, and #72 matched-scale
+evidence. Because PR #77 is open, #67–#69 remain planned contract work rather
+than an implemented Cloud Plane. Cairn #74, LEM #75, and Forge #76 are separate
+linked migrations; no domain promotion is implied here.
 
 ## Recorded product decision
 
@@ -169,15 +193,14 @@ implementation's correctness dependencies.
 
 | Priority | Work | Observed gap and completion evidence |
 |---|---|---|
-| Delivered in stack | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | The action-binding stack validates native CRDT bytes before authorization, computes a versioned canonical `ActionDigest`, and makes FDB recompute it. Unit HTTP tests and the hosted FDB journey hold a grant fixed across field mutations and preserve exact retry. Independent runtime Braid confirmation remains a separate release requirement |
+| Closed | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | The action-binding stack validates native CRDT bytes before authorization, computes a versioned canonical `ActionDigest`, and makes FDB recompute it. Unit HTTP tests and the recorded FDB journey hold a grant fixed across field mutations and preserve exact retry. Independent runtime Braid confirmation remains a separate release requirement |
 | P0 | [#28: recovery before pruning](https://github.com/srinji-kaggss/logical-DB/issues/28) | PRs #49–#53 delivered the state-bearing snapshot artifact, the paged HTTP baseline protocol, and one atomic client install; the local live-cluster lane now proves `fdb_recovery_composition` and the process-kill restore journey pass. The issue stays open until its acceptance checklist is verified item-by-item against that evidence — in particular expired-checkpoint recovery through the public transport and the position-1 prune/fresh-replica counterexample — and the runnable hosted or self-hosted lane reproduces it |
 | Delivered in stack | [#29: projection semantics](https://github.com/srinji-kaggss/logical-DB/issues/29) | Every `Projection` now requires an application-supplied `ProjectionSemantics` (nonzero version or opaque digest) hashed with its `IndexId` into the v2 durable schema digest. The same index identity and schema version with changed semantics returns migration-required; `Database::migrate_schema` rebuilds the rows in bounded revision-checked pages. The facade test `changed_projection_semantics_requires_migration_and_rebuilds_rows` proves refusal, duplicate-identity refusal, and atomic rebuild |
 | P1 | [#25: checked access graph](https://github.com/srinji-kaggss/logical-DB/issues/25) | Audit migration, sync, and service transition coverage against the issue's graph contract after the action and recovery boundaries are settled |
-| Dependent | [#32: durable episode service](https://github.com/srinji-kaggss/logical-DB/issues/32) | The embedded episode snapshot journey is not a service-backed episode log. Requires resolved ownership, trusted admission, state-bearing recovery, and a real HTTP episode-to-LocalWorld journey |
-| Required profile evidence | Device/service capability profiles and matched trace | The recorded #8 ruling requires explicit backend guarantees and a shared 1M-operation trace; deferred with #33–#35 until a measurement environment exists per the Director's 2026-09-14 ruling |
-| Proposed domain migration | Cloud/Cairn/LEM/Forge boundary enforcement | `docs/architecture/DOMAIN-BOUNDARIES.md`, `DEPENDENCY-RULES.md`, and `contract/domains/*.toml` define the target ownership map. Current crate paths remain stable; no target domain is promoted merely by documentation. Future issues must enforce contract-only imports, no-vendored-twins, independent lanes, and the legal candidate→append→LocalWorld→receipt loop. |
-| Proposed sovereign acceptance | Hyperscale Cloud Plane | ADR-0003 adds partition routing, authorized views, region/key/exit, delivery, DR, and nine-axis requirements. Current FDB scope-frontier code and local receipts do not establish those claims. Closed #35 is predecessor context, not completion. |
-| Proposed operation boundary | Forge above LEM | ADR-0004 reserves actions for a separate capability/receipt domain. Cairn remains evidence/ontology; LEM remains canonical memory; neither receives ambient effect authority. |
+| In delivery stack | [#73: domain boundaries](https://github.com/srinji-kaggss/logical-DB/issues/73) | PR #77 implements the declared import-graph gate and remains open, stacked on PR #65. It proves neither a target-service migration nor a legal runtime authority path. |
+| Proposed Cloud contracts | [#67–#69](https://github.com/srinji-kaggss/logical-DB/issues/66) | Partition routing, authorized views, and region/key/exit are the next Cloud contracts only after #73's structure gate lands. No Cloud implementation or nine-axis performance claim exists. |
+| Proposed dependent delivery | #70–#72 | Fan-out, regional disaster recovery, and matched-scale evidence follow the first Cloud contracts; the 1M-operation comparison remains unmeasured. |
+| Proposed semantic/action migrations | #74–#76 | Cairn ontology/evidence, LEM/ORIGIN LocalWorld, and Forge capability/receipt boundaries remain separate issues. No domain is promoted merely by documentation. |
 | Release evidence | External LEM consumption and deployed-service behavior | The earlier facade/FDB consumer receipt is explicitly retired for an invalid confirmation model. Require current external consumption, verified confirmation, and the deployment journeys listed in `REWRITE_MANIFEST.md` |
 
 Embedded tombstones and export/restore are implemented and have retained tests.
@@ -186,10 +209,12 @@ artifact and gates pruning on that artifact. What remains for #28 is the
 acceptance checklist named in the recovery-status paragraph above, not the
 implementation of the paged route or the atomic install.
 
-Canonical action encoding is owned by `logical-db-protocol`. It uses SHA-256
-over u64 big-endian length frames and a `logical-db-action-v1` domain. A golden
-vector is independently reproducible outside Rust. `OperationDigest` remains
-caller intent; it is included in, but never substituted for, `ActionDigest`.
+Canonical action encoding is owned by `logical-db-protocol`. PRs #61 and #62
+moved repository digests and MACs to `lgwks_std::hash` BLAKE3; this ledger must
+not retain its former SHA-256 description. The encoding retains its versioned
+domain and length framing, and its golden vector remains independently
+reproducible outside Rust. `OperationDigest` remains caller intent; it is
+included in, but never substituted for, `ActionDigest`.
 
 ## Delivery and release gates
 
