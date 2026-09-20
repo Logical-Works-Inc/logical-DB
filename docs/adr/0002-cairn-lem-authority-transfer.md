@@ -47,6 +47,21 @@ preservation; bounded payloads; a real durable ORIGIN store journey.
 Tracked as PRD WP2. Until then, all documentation states "migration in
 progress".
 
+## Migration stages and promotion route
+
+1. Add the current-domain ownership/contract record without moving source.
+2. Define the closed Cairn registry and candidate contract, preserving exact
+   source coordinates and content identity.
+3. Define the LEM adapter that accepts only valid candidates and records v0/v1
+   identity, canonicalization, payload location, and migration status.
+4. Implement durable ORIGIN append and recovery through abstract Cloud public
+   ports; it must not import physical redb/FDB implementation handles.
+5. Prove two-scope malformed/skew/duplicate/reorder/restart/source-coordinate
+   behavior and a real `candidate → append → LocalWorld` journey.
+6. Promote only the proven public contracts. The future Forge domain consumes
+   `LocalWorld` above LEM and returns receipt candidates through Cairn; it never
+   changes ORIGIN directly (ADR-0004).
+
 ## Consequences
 
 - The LEM SOT diff and migration proof required by ADR-0001 are
@@ -55,3 +70,6 @@ progress".
 - Issue #30 is closed as resolved by this authorization.
 - Frozen sibling repositories receive no new feature work and accept no
   reverse dependency from this workspace.
+- `docs/architecture/DOMAIN-BOUNDARIES.md` and `contract/domains/*.toml` are
+  the current workspace ownership map. They do not promote the migration or
+  permit copying a predecessor implementation.

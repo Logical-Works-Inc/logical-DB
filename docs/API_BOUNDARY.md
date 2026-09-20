@@ -152,8 +152,11 @@ The embedded facade implements document tombstones and bounded export/restore,
 including a durable restore cursor. Retained tests cover tombstone propagation,
 reopen, corrupt export refusal, and resuming a restore prefix.
 
-The service has retention operations, but its current baseline is a position
-marker rather than recoverable document state. State-bearing baseline recovery
-remains blocked by issue #28. Multi-upstream fan-out and range/composite queries
-are not implied by the existing API. `GOVERNANCE.md` distinguishes these open
-contracts from implemented embedded functionality.
+The service has a state-bearing baseline, paged public recovery, and an atomic
+client install path; issue #28 remains open for its explicitly recorded
+acceptance/reproduction checklist rather than because the baseline is only a
+position marker. Multi-upstream fan-out, server-authorized partial replication,
+and range/composite queries are not implied by the existing API. Current
+`NamespaceDomain` filtering is client-side scheduling, not an access-control
+view. ADR-0003 owns the future partition/view/delivery contract; `GOVERNANCE.md`
+distinguishes those open Cloud Plane contracts from delivered embedded behavior.

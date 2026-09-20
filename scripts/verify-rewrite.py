@@ -14,7 +14,11 @@ import re
 import stat
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import domain_contract  # noqa: E402
 
 BASELINE = "7cffbc07b6f312854986ae306b583ef891623b2d"
 MINIMUM_CITATIONS = 20
@@ -174,7 +178,10 @@ def citation_failures(files: list[Path], allowed: set[str]) -> list[str]:
         if relative == Path("evidence/SOURCES.md"):
             valid = found & allowed
         else:
-            header = payload[:CITATION_HEADER_BYTES].decode("utf-8", "strict")
+            # The 4096-byte ceiling is a byte bound, so a multibyte character
+            # can straddle it. Decode the prefix leniently rather than crashing
+            # on a boundary split; the header check is unaffected.
+            header = payload[:CITATION_HEADER_BYTES].decode("utf-8", "ignore")
             if "Evidence" not in header:
                 failures.append(f"missing explicit evidence header: {relative}")
             valid = set(SOURCE_PATTERN.findall(header)) & allowed
@@ -273,6 +280,58 @@ def dependency_failures() -> list[str]:
     return failures
 
 
+def domain_contract_failures() -> list[str]:
+    """Validate the four domain manifests and enforce the allowed-edge graph.
+
+    The shape checks keep the descriptive records complete; the delegated
+    `domain_contract` checks prove the live `cargo metadata` graph obeys the
+    declared ownership and allowed edges, and that the committed
+    `evidence/domain-graph.md` receipt still matches. This is a structure gate,
+    not proof that the target crates or services exist.
+    """
+    required = {"cloud", "cairn", "lem", "forge"}
+    directory = ROOT / "contract" / "domains"
+    if not directory.is_dir():
+        return ["missing contract/domains directory"]
+    manifests = sorted(path for path in directory.glob("*.toml") if path.name != "GRAPH.toml")
+    found: set[str] = set()
+    failures: list[str] = []
+    for path in manifests:
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            failures.append(f"invalid domain manifest {path.relative_to(ROOT)}: {error}")
+            continue
+        domain = parsed.get("domain")
+        if not isinstance(domain, str):
+            failures.append(f"domain manifest lacks string domain: {path.relative_to(ROOT)}")
+            continue
+        if domain in found:
+            failures.append(f"duplicate domain manifest declaration: {domain}")
+        found.add(domain)
+        for key in ("owner", "status", "release_lane"):
+            if not isinstance(parsed.get(key), str) or not parsed[key]:
+                failures.append(f"domain {domain} lacks nonempty {key}")
+        for key in ("crates", "may_depend_on", "forbidden_domains", "evidence", "blocked_claims"):
+            values = parsed.get(key)
+            if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                failures.append(f"domain {domain} lacks string list {key}")
+    missing = sorted(required - found)
+    unexpected = sorted(found - required)
+    if missing:
+        failures.append(f"missing domain manifests: {' '.join(missing)}")
+    if unexpected:
+        failures.append(f"unexpected domain manifests: {' '.join(unexpected)}")
+    try:
+        edge_failures, document = domain_contract.enforce(ROOT)
+    except domain_contract.ContractError as error:
+        failures.append(f"domain contract is unreadable: {error}")
+        return failures
+    failures.extend(edge_failures)
+    failures.extend(domain_contract.receipt_failures(document, ROOT))
+    return failures
+
+
 def churn() -> tuple[float, float, list[str]]:
     """Measure changed baseline blob count and changed baseline byte coverage."""
     entries = baseline_entries()
@@ -301,6 +360,7 @@ def main() -> int:
         return 1
     citations = citation_failures(files, allowed_sources)
     dependencies = dependency_failures()
+    domains = domain_contract_failures()
     entries = baseline_entries()
     count_percent, byte_percent, unchanged = churn()
     line_percent = line_churn(entries)
@@ -313,15 +373,18 @@ def main() -> int:
     print(f"unchanged_baseline_blobs={len(unchanged)}")
     print(f"citation_failures={len(citations)}")
     print(f"dependency_failures={len(dependencies)}")
+    print(f"domain_contract_failures={len(domains)}")
 
     for failure in citations:
         print(f"FAIL citation: {failure}")
     for failure in dependencies:
         print(f"FAIL dependency: {failure}")
+    for failure in domains:
+        print(f"FAIL domain contract: {failure}")
     for path in unchanged:
         print(f"FAIL unchanged: {path}")
 
-    if citations or dependencies or unchanged:
+    if citations or dependencies or domains or unchanged:
         return 1
     if (
         count_percent < MINIMUM_HASH_CHURN

@@ -1,0 +1,21 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+# S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in
+# evidence/SOURCES.md.
+
+domain = "forge"
+owner = "Forge"
+status = "planned"
+# No workspace crate exists yet. `logical-db-forge-contract` is the first
+# planned crate; until it lands, Forge owns nothing and can import nothing.
+crates = []
+public_contracts = ["logical-db-forge-contract"]
+future_implementation = ["logical-db-forge-runtime"]
+# Canonical owner labels. Forge may consume the published LEM LocalWorld
+# contract but never a Cloud, Cairn, or LEM implementation crate.
+may_depend_on = ["kernel", "lem"]
+forbidden_domains = ["cloud", "cairn"]
+durable_state_owner = "none; receipts are candidate evidence"
+release_lane = "forge"
+evidence = ["capability scope", "idempotency", "receipt replay", "cancellation", "recovery"]
+blocked_claims = ["silent effects", "direct ORIGIN or Cloud mutation"]

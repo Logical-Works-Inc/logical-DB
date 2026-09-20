@@ -22,176 +22,37 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  rewrite-evidence:
+  selfhosted-evidence:
     name: clean-room evidence
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-      - run: python3 scripts/verify-rewrite.py
-
-  quality:
-    name: ${{ matrix.os }} / test-clippy
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: toolchain identity
-        run: rustc --version --verbose
-      - name: compile all targets
-        run: cargo check --workspace --all-targets --locked
-      - name: dependency register
-        run: cargo test -p logical-db-e2e --locked --test dependency_contract
-      - name: test runtime and restart journeys
-        run: cargo test --workspace --locked
-      - name: lint with warnings denied
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  package-isolation:
-    name: ${{ matrix.crate }} / isolated build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - logical-db
-          - logical-db-braid
-          - logical-db-cairn
-          - logical-db-crdt
-          - logical-db-daemon
-          - logical-db-episode
-          - logical-db-http
-          - logical-db-kv
-          - logical-db-model
-          - logical-db-platform
-          - logical-db-protocol
-          - logical-db-server
-          - logical-db-service
-          - logical-db-store
-          - logical-db-sync
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      # Builds one package with only its own feature set, so a crate that
-      # compiles solely because a sibling enabled a shared dependency feature
-      # fails here instead of in the unified workspace lane.
-      - name: isolated package check
-        run: cargo check -p ${{ matrix.crate }} --all-targets --locked
-
-  format:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: cargo fmt --all -- --check
-
-  supply-chain:
-    name: advisory, license, and source policy
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: install pinned policy checker
-        run: cargo install --locked cargo-deny --version 0.20.2
-      - name: enforce dependency policy
-        run: cargo deny check
-
-  fdb-composition:
-    name: official FDB client / daemon feature
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: stage checksummed FoundationDB 7.3.77 client and server
-        shell: bash
+      - name: verify rewrite evidence
+        run: python3 scripts/verify-rewrite.py
+      - name: falsify domain boundary gate
+        run: python3 scripts/test-domain-contract.py
+      - name: reject hosted runner routing
         run: |
-          set -euo pipefail
-          fdb_root="${RUNNER_TEMP}/foundationdb-7.3.77"
-          mkdir -p "${fdb_root}"
-          for asset in libfdb_c.x86_64.so fdbserver.x86_64 fdbcli.x86_64; do
-            curl --fail --location --retry 5 \
-              "https://github.com/apple/foundationdb/releases/download/7.3.77/${asset}" \
-              --output "${fdb_root}/${asset}"
-            curl --fail --location --retry 5 \
-              "https://github.com/apple/foundationdb/releases/download/7.3.77/${asset}.sha256" \
-              --output "${fdb_root}/${asset}.sha256"
-            (cd "${fdb_root}" && sha256sum --check "${asset}.sha256")
-          done
-          cd "${fdb_root}"
-          ln --symbolic libfdb_c.x86_64.so libfdb_c.so
-          chmod +x fdbserver.x86_64 fdbcli.x86_64
-          echo "FDB_LIBRARY_ROOT=${fdb_root}" >> "${GITHUB_ENV}"
-      - name: compile, lint, and test optional composition
-        shell: bash
-        run: |
-          export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
-          cargo check -p logical-db-store-fdb --features fdb --locked
-          cargo check -p logical-db-e2e --features fdb --all-targets --locked
-          cargo clippy -p logical-db-daemon --features fdb --all-targets --locked -- -D warnings
-          cargo clippy -p logical-db-e2e --features fdb --all-targets --locked -- -D warnings
-          cargo test -p logical-db-store-fdb --features fdb --locked
-          cargo test -p logical-db-daemon --features fdb --locked
-      - name: run retained FDB ambiguity journey
-        shell: bash
-        run: |
-          set -euo pipefail
-          export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
-          live_root="${RUNNER_TEMP}/logical-db-fdb-live"
-          mkdir -p "${live_root}/data" "${live_root}/logs"
-          cluster_file="${live_root}/fdb.cluster"
-          echo "logicaldb:ci@127.0.0.1:4650" > "${cluster_file}"
-          "${FDB_LIBRARY_ROOT}/fdbserver.x86_64" \
-            -p 127.0.0.1:4650 -C "${cluster_file}" \
-            -d "${live_root}/data" -L "${live_root}/logs" \
-            --memory 1GiB --cache-memory 256MiB --storage-memory 256MiB &
-          fdb_pid=$!
-          cleanup() {
-            kill "${fdb_pid}" 2>/dev/null || true
-            wait "${fdb_pid}" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          for _attempt in {1..40}; do
-            if "${FDB_LIBRARY_ROOT}/fdbcli.x86_64" -C "${cluster_file}" \
-              --exec "configure new single memory"; then break; fi
-            sleep 1
-          done
-          for _attempt in {1..40}; do
-            status=$("${FDB_LIBRARY_ROOT}/fdbcli.x86_64" -C "${cluster_file}" \
-              --exec "status minimal" 2>&1 || true)
-            if grep --fixed-strings --line-regexp --quiet \
-              "The database is available." <<< "${status}"; then
-              echo "${status}"
-              break
-            fi
-            if [[ "${_attempt}" == 40 ]]; then
-              echo "${status}"
-              exit 1
-            fi
-            sleep 1
-          done
-          export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
-          cargo run -p logical-db-daemon --bin fdb-ambiguity-journey \
-            --features fdb --locked
-          cargo test -p logical-db-e2e --features fdb --locked \
-            --test fdb_recovery_composition -- --nocapture
-          cargo test -p logical-db-e2e --features fdb --locked \
-            --test fdb_process_kill_restore -- --nocapture
+          actionlint
+          shellcheck scripts/ci-emulated.sh scripts/ci-guest.sh scripts/ci-fdb-linux.sh scripts/ci-wine-runner.sh scripts/ci-windows-runtime.sh
+          python3 scripts/ci-windows-runtime.py test
+          python3 -m venv "$RUNNER_TEMP/ci-policy"
+          "$RUNNER_TEMP/ci-policy/bin/pip" install --disable-pip-version-check -r scripts/ci-requirements.txt
+          "$RUNNER_TEMP/ci-policy/bin/python" scripts/verify-ci.py
 
+  # Legacy check names satisfy the existing main-branch protection rule.
+  # They are status identifiers, not runner selectors: every job is self-hosted.
   selfhosted-quality:
-    name: self-hosted macos arm64 / test-clippy
+    name: macos-latest / test-clippy
+    needs: selfhosted-evidence
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: toolchain identity
-        shell: bash
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustc --version --verbose
@@ -203,11 +64,53 @@ jobs:
         run: cargo test --workspace --locked
       - name: lint with warnings denied
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: check formatting
-        run: cargo fmt --all -- --check
+
+  selfhosted-format:
+    name: rustfmt
+    needs: selfhosted-evidence
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: rustfmt
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo fmt --all -- --check
+          rustfmt --check scripts/ci-windows-smoke.rs
+
+  selfhosted-policy:
+    name: advisory, license, and source policy
+    needs: selfhosted-evidence
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: install pinned policy checker
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" install --locked cargo-deny --version 0.20.2
+      - name: enforce dependency policy
+        run: cargo deny check
+
+  emulated-quality:
+    name: ${{ matrix.check-name }} / test-clippy
+    needs: selfhosted-quality
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {guest: linux, check-name: ubuntu-latest}
+          - {guest: windows, check-name: windows-latest}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Linux x86-64 or Windows-GNU Wine runtime
+        run: bash scripts/ci-emulated.sh "${{ matrix.guest }}"
 
   selfhosted-fdb-composition:
-    name: self-hosted official FDB client / daemon feature
+    name: official FDB client / daemon feature
+    needs: selfhosted-quality
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     steps:
@@ -232,9 +135,11 @@ jobs:
           srvdir="${fdb_root}/expanded/FoundationDB-server.pkg/Payload/usr/local/libexec"
           clidir="${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/bin"
           chmod +x "${srvdir}/fdbserver" "${clidir}/fdbcli"
-          echo "FDB_LIBRARY_ROOT=${libdir}" >> "${GITHUB_ENV}"
-          echo "FDB_SERVER_BIN=${srvdir}/fdbserver" >> "${GITHUB_ENV}"
-          echo "FDB_CLI_BIN=${clidir}/fdbcli" >> "${GITHUB_ENV}"
+          {
+            echo "FDB_LIBRARY_ROOT=${libdir}"
+            echo "FDB_SERVER_BIN=${srvdir}/fdbserver"
+            echo "FDB_CLI_BIN=${clidir}/fdbcli"
+          } >> "${GITHUB_ENV}"
       - name: compile, lint, and test optional composition
         shell: bash
         run: |

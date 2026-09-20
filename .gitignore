@@ -8,6 +8,8 @@
 mutants.out*
 /.idea/
 /.vscode/
+__pycache__/
+*.pyc
 *.redb
 *.redb.tmp
 *.pdb

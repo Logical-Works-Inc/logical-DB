@@ -14,20 +14,24 @@
 
 ## Decision
 
-The semantic crates in this workspace are bounded, non-authoritative ports and
-local models. They are not the canonical CAIRN ingestion plane, the canonical
-ORIGIN database, or the FORGE action plane.
+This ADR preserves the lower-core isolation law while ADR-0002 governs the
+Director-authorized move of Cairn and LEM authority into this workspace. The
+current semantic crates are still bounded migration ports: no migration is
+canonical until the identity, provenance, durable-ORIGIN, and recovery proof
+lands.
 
-| Plane | Canonical owner | Workspace relationship |
+The target four-domain authority table is canonical in
+[`../architecture/DOMAIN-BOUNDARIES.md`](../architecture/DOMAIN-BOUNDARIES.md):
+
+| Domain | Current workspace relationship | Prohibited authority |
 |---|---|---|
-| CAIRN observation / ontology | `~/cairn` | `logical-db-cairn` re-expresses vocabulary and validation only; it has no I/O, storage, or promotion authority |
-| ORIGIN canonical episode DB | `~/LOGICAL-EVENT-MEMORY` and its `FjallFactStore` contract | `logical-db-episode` models a bounded local episode/log surface; its `OriginLog` and snapshots are not durable ORIGIN history |
-| FORGE action and receipts | `~/forge-sdk` + `~/forge-harness` | No FORGE implementation or authority is added here |
+| Cairn evidence/ontology | `logical-db-cairn` is a bounded vocabulary/validation compatibility port while Cairn core/ingest/views contracts migrate | canonical episode promotion and effects |
+| LEM / ORIGIN | `logical-db-episode` is a bounded local model while the v0↔v1 adapter and durable ORIGIN proof migrate | raw-source ingestion and action execution |
+| Forge | planned above LEM by ADR-0004 | direct Cloud/ORIGIN mutation and silent effects |
+| Cloud Plane | existing storage, CRDT, protocol, sync, service, and FDB code remains below all semantic/action domains | ontology truth, canonical semantic promotion, effects |
 
-The LEM SOT is the source of truth for this ownership table. A sibling
-deprecation pointer saying that active development moved to this monorepo does
-not, by itself, transfer canonical authority. Such a transfer requires a
-Director-approved SOT diff and an explicit migration proof.
+A sibling deprecation pointer alone does not establish migration completion.
+ADR-0002 and the applicable domain contract retain the promotion proof.
 
 ## Identity and wire boundary
 

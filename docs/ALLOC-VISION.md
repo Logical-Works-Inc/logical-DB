@@ -13,12 +13,14 @@ ALLOC (Application Ledger of record with Ontology, Clocks, and Checkpoints):
 data and its meaning share one content-addressed ledger, so every read cites
 the immutable changes that produced it.
 
-This is the Logical-DB substrate vision, not a claim that this workspace is
-the canonical LEM ORIGIN database. The current semantic crates provide a
-bounded v1 local model and an in-memory log; LEM’s locked v0 BLAKE3 wire and
-Fjall-backed append-only authority remain external until a versioned adapter,
-source-preserving migration, and independent handoff journey exist. See
-`docs/adr/0001-semantic-plane-boundary.md`.
+This is the Logical-DB substrate vision, not a claim that the current semantic
+crates are already canonical LEM ORIGIN. ADR-0002 authorizes plane transfer into
+this workspace, while the current crates remain bounded migration models until
+the v0 BLAKE3 ↔ v1 SHA-256 adapter, source-preserving migration, durable ORIGIN,
+and independent handoff journey are proven. The four-domain product map is in
+`docs/PRODUCT-MAP.md`: Cloud supplies durable infrastructure, Cairn produces
+evidence candidates, LEM decides canonical episodes, and Forge produces receipts
+through Cairn rather than silently mutating memory.
 
 ## What is data here
 

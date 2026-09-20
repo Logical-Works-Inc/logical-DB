@@ -29,12 +29,14 @@ semantic ports (above model, below applications / LEM; non-authoritative)
   |     `-- logical-db-cairn           typed world-token observation vocabulary
   `-- consumed optionally by logical-db (semantics feature) and logical-db-e2e
 
-The semantic ports are bounded local models. They do not own CAIRN ingestion,
-canonical ORIGIN persistence, or FORGE receipts. The LEM SOT remains the
-authority for those planes; the locked LEM v0 BLAKE3 wire is not interchangeable
-with the workspace v1 SHA-256 semantic snapshot. A future adapter must make
-that translation and its durable handoff explicit. See
-`docs/adr/0001-semantic-plane-boundary.md`.
+The semantic ports are bounded migration models. They do not yet own complete
+CAIRN ingestion, canonical ORIGIN persistence, or FORGE receipts. ADR-0002
+authorizes transfer into this workspace, but the locked LEM v0 BLAKE3 wire is
+not interchangeable with the workspace v1 SHA-256 snapshot: a reviewed adapter
+and durable handoff proof remain required before canonical status. The four-domain
+target and allowed dependency directions are in
+`docs/architecture/DOMAIN-BOUNDARIES.md` and
+`docs/architecture/DEPENDENCY-RULES.md`.
 
 thin client
   `-- logical-db-http                    pooled async TLS/CBOR transport
@@ -65,6 +67,22 @@ single frontier advance, and invocation consumption. The evidence verifier's
 allowed-dependency map must additionally declare the semantic edges
 (`logical-db-episode` on `logical-db-cairn`, facade `logical-db` on both, and
 `logical-db-e2e` on both); these semantic edges are declared in the verifier.
+
+## Domain target and current implementation boundary
+
+The current crates remain at their stable paths while consumers migrate. Their
+ownership target is Cloud Plane (model/protocol/platform are shared kernel;
+CRDT/store/sync/service/FDB are Cloud). `logical-db-cairn` and
+`logical-db-episode` are bounded compatibility ports for the future Cairn and
+LEM domains. Forge is planned above LEM and has no implementation authority in
+this crate graph yet.
+
+The target structure, one-way contract imports, independent CI lanes, and legal
+Cairn candidate → LEM append → LocalWorld → Forge receipt loop are normative in
+`docs/architecture/DOMAIN-BOUNDARIES.md` and
+`docs/architecture/DEPENDENCY-RULES.md`. No current source move follows from
+this paragraph. ADR-0003 defines Cloud partition/view/region work that is not
+present in the current scope-wide FDB frontier.
 
 ## Public API boundary
 

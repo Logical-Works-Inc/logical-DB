@@ -1,0 +1,23 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
+# S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in
+# evidence/SOURCES.md.
+
+domain = "cairn"
+owner = "Cairn"
+status = "migration in progress"
+# Owned workspace crates. `logical-db-cairn` is the bounded compatibility port
+# until the core/sdk contracts land.
+crates = ["logical-db-cairn"]
+# Importable by another domain: the current compatibility port plus the future
+# published contracts. A future crate is not importable until it exists.
+public_contracts = ["logical-db-cairn", "logical-db-cairn-core", "logical-db-cairn-sdk"]
+current_compatibility_surface = ["logical-db-cairn"]
+# Canonical owner labels. Cairn may consume published Cloud contracts but never
+# a Cloud implementation crate; the checker enforces that distinction.
+may_depend_on = ["kernel", "cloud"]
+forbidden_domains = ["lem", "forge"]
+durable_state_owner = "source systems; Cloud Plane only through published ports"
+release_lane = "cairn"
+evidence = ["source-coordinate fidelity", "candidate identity", "closed registry", "rebuildable view"]
+blocked_claims = ["canonical semantic authority", "effect execution"]

@@ -5,11 +5,20 @@
 > S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
 > `evidence/SOURCES.md`.
 
-Logical-DB is a local-first structured state substrate for one person’s apps.
-It is not a FoundationDB client disguised as an application database. Each app
-owns an embedded, immediately durable replica; an optional thin-client layer
-exchanges immutable causal changes with a service whose production storage
-adapter uses FoundationDB.
+Logical-DB is one product with four independently developed domains: the
+sovereign Cloud Plane, Cairn ontology/evidence, LEM/ORIGIN agent memory, and
+Forge operations. They share versioned contracts rather than ambient mutable
+authority. The current public facade is an embedded structured-state API: each
+app owns an immediately durable replica and may exchange immutable causal
+changes through an optional FoundationDB-backed relay.
+
+The desired Cloud Plane is a sovereign hyperscale data substrate; that is a
+measured target, not a present-tense scale claim. Local execution reduces
+retained remote data, transfer, and cloud compute, but does not replace the
+self-hostable distributed service contract. Read the [product map](docs/PRODUCT-MAP.md),
+[domain boundaries](docs/architecture/DOMAIN-BOUNDARIES.md), and
+[Cloud acceptance ADR](docs/adr/0003-sovereign-hyperscale-data-plane.md) before
+choosing a workstream.
 
 ## Install the supported embedded surface
 
