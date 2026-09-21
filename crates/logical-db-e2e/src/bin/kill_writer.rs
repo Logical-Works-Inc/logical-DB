@@ -4,6 +4,14 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 use logical_db::{
     AccountId, Database, DocumentId, Object, OperationDigest, OperationId, ReplicaId, Scalar,
     Scope, SpaceId,
@@ -11,16 +19,24 @@ use logical_db::{
 use std::error::Error;
 use uuid::Uuid;
 
+/// Reports a failed fixture run on stderr and exits nonzero.
 fn main() {
     if let Err(error) = run() {
         eprintln!("kill_writer: {error}");
-        std::process::exit(1);
+        #[expect(
+            clippy::exit,
+            reason = "a failed fixture run must report and exit nonzero"
+        )]
+        {
+            std::process::exit(1);
+        }
     }
 }
 
+/// Writes one edit per iteration until the orchestrator kills this process.
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let [path, account, space, replica, ready] = arguments.as_slice() else {
+    let &[ref path, ref account, ref space, ref replica, ref ready] = arguments.as_slice() else {
         return Err("expected path, account, space, replica, and ready-file arguments".into());
     };
     let scope = Scope::new(

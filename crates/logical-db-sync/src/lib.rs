@@ -32,6 +32,7 @@ pub const MAX_RECOVERY_PAGES: u16 = 256;
 
 /// One durable local change with its private acknowledgement position.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct OutboundChange {
     /// Local sequence acknowledged only after the whole push response validates.
     pub sequence: u64,
@@ -47,8 +48,34 @@ pub struct OutboundChange {
     pub bytes: Vec<u8>,
 }
 
+impl OutboundChange {
+    /// Builds one durable local change from its acknowledgement position and payload.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose outbound changes through here.
+    #[must_use]
+    pub fn new(
+        sequence: u64,
+        document: DocumentId,
+        operation: OperationId,
+        request: OperationDigest,
+        digest: ChangeDigest,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            sequence,
+            document,
+            operation,
+            request,
+            digest,
+            bytes,
+        }
+    }
+}
+
 /// One verified remote change handed to a replica for atomic installation.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct InboundChange {
     /// Changed document.
     pub document: DocumentId,
@@ -121,6 +148,7 @@ pub trait ReplicaPort {
 
 /// Result of requesting one pull page.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PullResult {
     /// A normal bounded page.
     Page(PullPage),
@@ -132,6 +160,7 @@ pub enum PullResult {
 
 /// Result of requesting the state-bearing recovery baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BaselineResult {
     /// A bounded state-bearing artifact and its replacement checkpoint.
     Artifact(BaselinePage),
@@ -140,7 +169,6 @@ pub enum BaselineResult {
 }
 
 /// Network or in-process protocol transport.
-#[allow(async_fn_in_trait)]
 pub trait Transport {
     /// Transport-specific failure.
     type Error;
@@ -167,6 +195,7 @@ pub trait Transport {
 
 /// Resource ceilings for one synchronization cycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SyncLimits {
     /// Maximum changes in each page.
     pub changes_per_page: u16,
@@ -187,36 +216,35 @@ impl Default for SyncLimits {
             bytes_per_page: 4 * 1_048_576,
             pages_per_cycle: 16,
             recovery_pages: MAX_RECOVERY_PAGES,
-            recovery_bytes: u64::from(MAX_RECOVERY_PAGES) * MAX_BASELINE_BYTES as u64,
+            recovery_bytes: u64::from(MAX_RECOVERY_PAGES)
+                .saturating_mul(u64::try_from(MAX_BASELINE_BYTES).unwrap_or(u64::MAX)),
         }
     }
 }
 
 impl SyncLimits {
+    /// Rebuilds the limits through the protocol validator so cycle ceilings stay wire-legal.
     fn validate(self) -> Result<Self, ProtocolError> {
-        let request = PullRequest {
-            protocol: PROTOCOL_VERSION,
-            scope: Scope::new(
+        let request = PullRequest::new(
+            PROTOCOL_VERSION,
+            Scope::new(
                 logical_db_model::AccountId::new(),
                 logical_db_model::SpaceId::new(),
             ),
-            replica: ReplicaId::new(),
-            request: OperationDigest::new([0; 32]),
-            after: None,
-            max_changes: self.changes_per_page,
-            max_bytes: self.bytes_per_page,
-        };
+            ReplicaId::new(),
+            OperationDigest::new([0; 32]),
+            None,
+            self.changes_per_page,
+            self.bytes_per_page,
+        );
         request.validate()?;
         if self.pages_per_cycle == 0 || usize::from(self.pages_per_cycle) > MAX_PAGES_PER_CYCLE {
-            eprintln!("logical-db-sync: pages per cycle exceeds the configured bound");
             return Err(ProtocolError::PageLimit);
         }
         if self.recovery_pages == 0 || self.recovery_pages > MAX_RECOVERY_PAGES {
-            eprintln!("logical-db-sync: recovery pages exceeds the configured bound");
             return Err(ProtocolError::PageLimit);
         }
-        if self.recovery_bytes < MAX_BASELINE_BYTES as u64 {
-            eprintln!("logical-db-sync: recovery bytes cannot carry one legal page");
+        if self.recovery_bytes < u64::try_from(MAX_BASELINE_BYTES).unwrap_or(u64::MAX) {
             return Err(ProtocolError::PageLimit);
         }
         Ok(self)
@@ -225,6 +253,7 @@ impl SyncLimits {
 
 /// Observable result of one bounded cycle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SyncReport {
     /// Local changes accepted or already present remotely.
     pub pushed: usize,
@@ -242,6 +271,7 @@ pub struct SyncReport {
 
 /// Typed synchronization failure preserving both boundary error types.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SyncError<ReplicaError, TransportError> {
     /// Embedded replica failed before or during a durable transition.
     Replica(ReplicaError),
@@ -264,13 +294,21 @@ pub enum SyncError<ReplicaError, TransportError> {
 
 impl<R: fmt::Display, T: fmt::Display> fmt::Display for SyncError<R, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Replica(error) => write!(formatter, "replica synchronization failed: {error}"),
-            Self::Transport(error) => {
+        match *self {
+            Self::Replica(ref error) => {
+                write!(formatter, "replica synchronization failed: {error}")
+            }
+            // fall through to remaining arms
+            Self::Transport(ref error) => {
                 write!(formatter, "transport synchronization failed: {error}")
             }
-            Self::Protocol(error) => write!(formatter, "protocol synchronization failed: {error}"),
-            Self::Rejected { operation, code } => {
+            Self::Protocol(ref error) => {
+                write!(formatter, "protocol synchronization failed: {error}")
+            }
+            Self::Rejected {
+                ref operation,
+                ref code,
+            } => {
                 write!(
                     formatter,
                     "service rejected operation {operation}: {code:?}"
@@ -308,7 +346,6 @@ where
 {
     let limits = limits.validate().map_err(SyncError::Protocol)?;
     if cancelled() {
-        eprintln!("logical-db-sync: synchronization cancelled before binding");
         return Err(SyncError::Cancelled);
     }
     replica.bind_upstream(peer).map_err(SyncError::Replica)?;
@@ -326,7 +363,6 @@ where
     };
 
     if cancelled() {
-        eprintln!("logical-db-sync: synchronization cancelled before pull");
         return Err(SyncError::Cancelled);
     }
     let durable_checkpoint = replica.checkpoint(peer).map_err(SyncError::Replica)?;
@@ -357,8 +393,8 @@ where
             continue;
         };
         let inbound = page.changes.len();
-        report.pulled += inbound;
-        report.pages += 1;
+        report.pulled = report.pulled.saturating_add(inbound);
+        report.pages = report.pages.saturating_add(1);
         let download_more = page.more;
         report.more = upload_more || download_more;
         after = Some(page.checkpoint);
@@ -366,13 +402,13 @@ where
             return Ok(report);
         }
         if cancelled() {
-            eprintln!("logical-db-sync: synchronization cancelled between pull pages");
             return Err(SyncError::Cancelled);
         }
     }
     Ok(report)
 }
 
+/// Drains at most one pending page within the push byte and count budgets.
 async fn push_pending<R, T>(
     replica: &R,
     peer: PeerId,
@@ -396,32 +432,33 @@ where
         let next_bytes = aggregate_bytes
             .checked_add(change.bytes.len())
             .ok_or(SyncError::Protocol(ProtocolError::PageLimit))?;
-        if next_bytes > byte_limit as usize {
+        if next_bytes > usize::try_from(byte_limit).unwrap_or(usize::MAX) {
             break;
         }
         aggregate_bytes = next_bytes;
         pending.push(change);
     }
     if pending.is_empty() {
-        eprintln!("logical-db-sync: pending upload cannot fit within byte limit");
         return Err(SyncError::Protocol(ProtocolError::PageLimit));
     }
-    let request = PushRequest {
-        protocol: PROTOCOL_VERSION,
-        replica: replica.replica(),
-        changes: pending
+    let request = PushRequest::new(
+        PROTOCOL_VERSION,
+        replica.replica(),
+        pending
             .iter()
-            .map(|change| ChangeEnvelope {
-                scope: replica.scope(),
-                document: change.document,
-                replica: replica.replica(),
-                operation: change.operation,
-                request: change.request,
-                digest: change.digest,
-                bytes: change.bytes.clone(),
+            .map(|change| {
+                ChangeEnvelope::new(
+                    replica.scope(),
+                    change.document,
+                    replica.replica(),
+                    change.operation,
+                    change.request,
+                    change.digest,
+                    change.bytes.clone(),
+                )
             })
             .collect(),
-    };
+    );
     request.validate().map_err(SyncError::Protocol)?;
     let response = transport
         .push(request.clone())
@@ -429,8 +466,11 @@ where
         .map_err(SyncError::Transport)?;
     response.validate(&request).map_err(SyncError::Protocol)?;
     for outcome in &response.outcomes {
-        if let PushOutcome::Rejected { operation, code } = outcome {
-            eprintln!("logical-db-sync: upload rejected operation {operation}: {code:?}");
+        if let &PushOutcome::Rejected {
+            ref operation,
+            ref code,
+        } = outcome
+        {
             return Err(SyncError::Rejected {
                 operation: *operation,
                 code: *code,
@@ -445,6 +485,7 @@ where
     Ok((pending.len(), more))
 }
 
+/// Builds the pull request digest binding scope, replica, cursor, and limits.
 fn pull_request_digest(
     scope: Scope,
     replica: ReplicaId,
@@ -470,6 +511,7 @@ fn pull_request_digest(
     OperationDigest::new(*digest.finalize().as_bytes())
 }
 
+/// Fetches exactly one pull page from the transport.
 async fn fetch_page<T: Transport>(
     transport: &mut T,
     request: PullRequest,
@@ -477,6 +519,7 @@ async fn fetch_page<T: Transport>(
     transport.pull(request).await
 }
 
+/// Fetches and installs pull pages for one bounded synchronize cycle.
 async fn pull_and_install<R, T>(
     replica: &R,
     peer: PeerId,
@@ -488,15 +531,15 @@ where
     R: ReplicaPort,
     T: Transport,
 {
-    let request = PullRequest {
-        protocol: PROTOCOL_VERSION,
-        scope: replica.scope(),
-        replica: replica.replica(),
-        request: pull_request_digest(replica.scope(), replica.replica(), after.as_ref(), limits),
-        after: after.clone(),
-        max_changes: limits.changes_per_page,
-        max_bytes: limits.bytes_per_page,
-    };
+    let request = PullRequest::new(
+        PROTOCOL_VERSION,
+        replica.scope(),
+        replica.replica(),
+        pull_request_digest(replica.scope(), replica.replica(), after.as_ref(), limits),
+        after.clone(),
+        limits.changes_per_page,
+        limits.bytes_per_page,
+    );
     request.validate().map_err(SyncError::Protocol)?;
     let pulled = fetch_page(transport, request)
         .await
@@ -504,7 +547,6 @@ where
     let page = match pulled {
         PullResult::Page(page) => page,
         PullResult::CheckpointExpired if after.is_none() => {
-            eprintln!("logical-db-sync: checkpoint expired without a durable checkpoint");
             return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
         }
         PullResult::CheckpointExpired | PullResult::BaselineRequired => return Ok(None),
@@ -535,7 +577,6 @@ where
 /// never a partial install. `false` reports that no baseline is sealed for the
 /// scope, so the durable log still covers every position and the caller restarts
 /// from the floor.
-#[allow(clippy::too_many_arguments)]
 async fn install_recovery<R, T>(
     replica: &R,
     peer: PeerId,
@@ -551,12 +592,10 @@ where
     T: Transport,
 {
     if *restarted {
-        eprintln!("logical-db-sync: recovery requested twice in one cycle");
         return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
     }
     *restarted = true;
     if cancelled() {
-        eprintln!("logical-db-sync: recovery cancelled before the first page");
         return Err(SyncError::Cancelled);
     }
     let BaselineResult::Artifact(page) =
@@ -568,38 +607,33 @@ where
     let descriptor = page
         .validate_page(replica.scope())
         .map_err(SyncError::Protocol)?;
-    let declared = descriptor.document_count() as usize;
+    let declared = usize::try_from(descriptor.document_count()).unwrap_or(usize::MAX);
     let mut accumulator = BaselineAccumulator::new(replica.scope(), descriptor);
     let mut checkpoint = page.checkpoint.clone();
     let mut fetched = 1usize;
     let mut bytes = page_snapshot_bytes(&page);
     let mut accumulated = page.documents.len();
     if accumulated > declared || bytes > limits.recovery_bytes {
-        eprintln!("logical-db-sync: the first recovery page exceeds its declared bounds");
         return Err(SyncError::RecoveryBudgetExhausted);
     }
     let mut complete = accumulator.push(&page).map_err(SyncError::Protocol)?;
     let mut cursor = page.next_document;
     while !complete {
         let Some(next) = cursor else {
-            eprintln!("logical-db-sync: a continued recovery carried no cursor");
             return Err(SyncError::Protocol(ProtocolError::NonProgressPage));
         };
         if cancelled() {
-            eprintln!("logical-db-sync: recovery cancelled between baseline pages");
             return Err(SyncError::Cancelled);
         }
         if fetched >= usize::from(limits.recovery_pages) {
-            eprintln!("logical-db-sync: recovery exceeded its page budget");
             return Err(SyncError::RecoveryBudgetExhausted);
         }
         let BaselineResult::Artifact(page) =
             request_baseline_page(transport, replica, after.as_ref(), Some(next)).await?
         else {
-            eprintln!("logical-db-sync: a continued recovery reported no baseline");
             return Err(SyncError::Protocol(ProtocolError::BaselineMismatch));
         };
-        fetched += 1;
+        fetched = fetched.saturating_add(1);
         bytes = bytes
             .checked_add(page_snapshot_bytes(&page))
             .ok_or(SyncError::RecoveryBudgetExhausted)?;
@@ -607,7 +641,6 @@ where
             .checked_add(page.documents.len())
             .ok_or(SyncError::Protocol(ProtocolError::BaselineMismatch))?;
         if accumulated > declared || bytes > limits.recovery_bytes {
-            eprintln!("logical-db-sync: recovery exceeded its declared bounds");
             return Err(SyncError::RecoveryBudgetExhausted);
         }
         checkpoint = page.checkpoint.clone();
@@ -615,7 +648,6 @@ where
         cursor = page.next_document;
     }
     if cancelled() {
-        eprintln!("logical-db-sync: recovery cancelled before installing the baseline");
         return Err(SyncError::Cancelled);
     }
     let artifact = accumulator.finish().map_err(SyncError::Protocol)?;
@@ -623,7 +655,7 @@ where
         .install_baseline(peer, &artifact, checkpoint.as_wire())
         .map_err(SyncError::Replica)?;
     *after = Some(checkpoint);
-    report.pages += fetched;
+    report.pages = report.pages.saturating_add(fetched);
     Ok(true)
 }
 
@@ -631,7 +663,7 @@ where
 fn page_snapshot_bytes(page: &BaselinePage) -> u64 {
     page.documents
         .iter()
-        .map(|document| document.snapshot.len() as u64)
+        .map(|document| u64::try_from(document.snapshot.len()).unwrap_or(u64::MAX))
         .sum()
 }
 
@@ -646,20 +678,21 @@ where
     R: ReplicaPort,
     T: Transport,
 {
-    let request = BaselineRequest {
-        protocol: PROTOCOL_VERSION,
-        scope: replica.scope(),
-        replica: replica.replica(),
-        request: baseline_request_digest(replica.scope(), replica.replica(), after, cursor),
-        after: after.cloned(),
-        after_document: cursor,
-    };
+    let request = BaselineRequest::new(
+        PROTOCOL_VERSION,
+        replica.scope(),
+        replica.replica(),
+        baseline_request_digest(replica.scope(), replica.replica(), after, cursor),
+        after.cloned(),
+        cursor,
+    );
     request.validate().map_err(SyncError::Protocol)?;
     fetch_baseline(transport, request)
         .await
         .map_err(SyncError::Transport)
 }
 
+/// Fetches exactly one baseline page from the transport.
 async fn fetch_baseline<T: Transport>(
     transport: &mut T,
     request: BaselineRequest,
@@ -667,6 +700,7 @@ async fn fetch_baseline<T: Transport>(
     transport.baseline(request).await
 }
 
+/// Builds the baseline request digest binding scope, replica, and cursors.
 fn baseline_request_digest(
     scope: Scope,
     replica: ReplicaId,
@@ -699,16 +733,25 @@ fn baseline_request_digest(
     OperationDigest::new(*digest.finalize().as_bytes())
 }
 
+/// Borrowed inputs for one namespace pull page install.
 struct NamespacePullContext<'a, F> {
+    /// Namespace whose cursor and policy gate this page.
     namespace: &'a str,
+    /// Predicate selecting documents owned by this namespace.
     is_mine: &'a F,
+    /// Multiplexed durable checkpoint map for the single upstream binding.
     checkpoints: &'a mut NamespaceCheckpoints,
+    /// Observation time used for checkpoint expiry checks.
     now_unix_ms: u64,
+    /// Validated namespace network and page budget policy.
     policy: NamespacePolicy,
+    /// Exclusive pull cursor advanced only for this namespace.
     after: &'a mut Option<Checkpoint>,
+    /// Whether an expiry already forced a restart this cycle.
     restarted_after_expiry: &'a mut bool,
 }
 
+/// Pulls one page for a namespace, installing only its own changes.
 async fn pull_namespace_page<R, T, F>(
     replica: &R,
     peer: PeerId,
@@ -720,21 +763,21 @@ where
     T: Transport,
     F: Fn(DocumentId) -> bool,
 {
-    let request = PullRequest {
-        protocol: PROTOCOL_VERSION,
-        scope: replica.scope(),
-        replica: replica.replica(),
-        request: namespace_pull_digest(
+    let request = PullRequest::new(
+        PROTOCOL_VERSION,
+        replica.scope(),
+        replica.replica(),
+        namespace_pull_digest(
             replica.scope(),
             replica.replica(),
             context.namespace,
             context.after.as_ref(),
             context.policy,
         ),
-        after: context.after.clone(),
-        max_changes: context.policy.changes_per_page(),
-        max_bytes: context.policy.bytes_per_page(),
-    };
+        context.after.clone(),
+        context.policy.changes_per_page(),
+        context.policy.bytes_per_page(),
+    );
     request.validate().map_err(NamespaceSyncError::Protocol)?;
     let pulled = fetch_page(transport, request)
         .await
@@ -742,22 +785,17 @@ where
     let page = match pulled {
         PullResult::Page(page) => page,
         PullResult::BaselineRequired => {
-            eprintln!("logical-db-sync: namespace recovery requires an unsupported baseline");
             return Err(NamespaceSyncError::Protocol(
                 ProtocolError::InvalidCheckpoint,
             ));
         }
         PullResult::CheckpointExpired => {
             if *context.restarted_after_expiry {
-                eprintln!("logical-db-sync: namespace checkpoint expired twice in one cycle");
                 return Err(NamespaceSyncError::Protocol(
                     ProtocolError::InvalidCheckpoint,
                 ));
             }
             *context.restarted_after_expiry = true;
-            eprintln!(
-                "logical-db-sync: namespace checkpoint expired; restarting from the floor once"
-            );
             *context.after = None;
             return Ok(None);
         }
@@ -799,8 +837,11 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 16;
 /// construction; the timestamp decides checkpoint expiry for the cycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceDomain {
+    /// Namespace this domain validates and synchronizes.
     namespace: String,
+    /// Validated policy bound at construction time.
     policy: NamespacePolicy,
+    /// Single observation timestamp deciding checkpoint expiry for the cycle.
     now_unix_ms: u64,
 }
 
@@ -845,6 +886,7 @@ impl NamespaceDomain {
 
 /// Observable result of one bounded namespace cycle.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NamespaceSyncReport {
     /// Namespace this cycle drove.
     pub namespace: String,
@@ -862,6 +904,7 @@ pub struct NamespaceSyncReport {
 
 /// Observable result of one namespace upload page.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NamespaceSendReport {
     /// Namespace whose pending changes were offered.
     pub namespace: String,
@@ -875,6 +918,7 @@ pub struct NamespaceSendReport {
 
 /// Typed namespace synchronization failure preserving every boundary.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum NamespaceSyncError<ReplicaError, TransportError> {
     /// Embedded replica failed before or during a durable transition.
     Replica(ReplicaError),
@@ -897,20 +941,24 @@ pub enum NamespaceSyncError<ReplicaError, TransportError> {
 
 impl<R: fmt::Display, T: fmt::Display> fmt::Display for NamespaceSyncError<R, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Replica(error) => {
+        match *self {
+            Self::Replica(ref error) => {
                 write!(formatter, "namespace synchronization failed: {error}")
             }
-            Self::Transport(error) => {
+            // remaining arms
+            Self::Transport(ref error) => {
                 write!(formatter, "namespace transport failed: {error}")
             }
-            Self::Protocol(error) => {
+            Self::Protocol(ref error) => {
                 write!(formatter, "namespace protocol failed: {error}")
             }
-            Self::Model(error) => {
+            Self::Model(ref error) => {
                 write!(formatter, "namespace sync state failed: {error}")
             }
-            Self::Rejected { operation, code } => {
+            Self::Rejected {
+                ref operation,
+                ref code,
+            } => {
                 write!(
                     formatter,
                     "service rejected operation {operation}: {code:?}"
@@ -964,7 +1012,6 @@ where
         return Ok(report);
     }
     if cancelled() {
-        eprintln!("logical-db-sync: namespace synchronization cancelled before binding");
         return Err(NamespaceSyncError::Cancelled);
     }
     replica
@@ -991,14 +1038,13 @@ where
             report.full_resync = true;
             continue;
         };
-        report.pulled += page.0;
-        report.pages += 1;
+        report.pulled = report.pulled.saturating_add(page.0);
+        report.pages = report.pages.saturating_add(1);
         report.more = page.1;
         if !page.1 {
             return Ok(report);
         }
         if cancelled() {
-            eprintln!("logical-db-sync: namespace synchronization cancelled between pull pages");
             return Err(NamespaceSyncError::Cancelled);
         }
     }
@@ -1039,7 +1085,6 @@ where
         return Ok(report);
     }
     if cancelled() {
-        eprintln!("logical-db-sync: namespace upload cancelled before binding");
         return Err(NamespaceSyncError::Cancelled);
     }
     replica
@@ -1065,32 +1110,33 @@ where
         let next_bytes = aggregate_bytes
             .checked_add(change.bytes.len())
             .ok_or(NamespaceSyncError::Protocol(ProtocolError::PageLimit))?;
-        if next_bytes > policy.bytes_per_page() as usize {
+        if next_bytes > usize::try_from(policy.bytes_per_page()).unwrap_or(usize::MAX) {
             break;
         }
         aggregate_bytes = next_bytes;
         pending.push(change);
     }
     if pending.is_empty() {
-        eprintln!("logical-db-sync: namespace upload cannot fit within byte limit");
         return Err(NamespaceSyncError::Protocol(ProtocolError::PageLimit));
     }
-    let request = PushRequest {
-        protocol: PROTOCOL_VERSION,
-        replica: replica.replica(),
-        changes: pending
+    let request = PushRequest::new(
+        PROTOCOL_VERSION,
+        replica.replica(),
+        pending
             .iter()
-            .map(|change| ChangeEnvelope {
-                scope: replica.scope(),
-                document: change.document,
-                replica: replica.replica(),
-                operation: change.operation,
-                request: change.request,
-                digest: change.digest,
-                bytes: change.bytes.clone(),
+            .map(|change| {
+                ChangeEnvelope::new(
+                    replica.scope(),
+                    change.document,
+                    replica.replica(),
+                    change.operation,
+                    change.request,
+                    change.digest,
+                    change.bytes.clone(),
+                )
             })
             .collect(),
-    };
+    );
     request.validate().map_err(NamespaceSyncError::Protocol)?;
     let response = transport
         .push(request.clone())
@@ -1100,8 +1146,11 @@ where
         .validate(&request)
         .map_err(NamespaceSyncError::Protocol)?;
     for outcome in &response.outcomes {
-        if let PushOutcome::Rejected { operation, code } = outcome {
-            eprintln!("logical-db-sync: namespace upload rejected operation {operation}: {code:?}");
+        if let &PushOutcome::Rejected {
+            ref operation,
+            ref code,
+        } = outcome
+        {
             return Err(NamespaceSyncError::Rejected {
                 operation: *operation,
                 code: *code,
@@ -1118,11 +1167,15 @@ where
 
 /// Loaded pull state for one namespace cycle.
 struct NamespaceStart {
+    /// Decoded multiplexed checkpoint map for the binding.
     checkpoints: NamespaceCheckpoints,
+    /// Exclusive pull cursor after loading and any recovery transition.
     after: Option<Checkpoint>,
+    /// Whether a recovery transition advanced the cursor this cycle.
     recovered: bool,
 }
 
+/// Loads durable namespace checkpoint state and applies expiry recovery.
 fn namespace_start<R, TransportError>(
     replica: &R,
     peer: PeerId,
@@ -1158,6 +1211,7 @@ where
     })
 }
 
+/// Installs one pull page, filtering to this namespace's documents.
 fn install_namespace_page<R, TransportError>(
     replica: &R,
     peer: PeerId,
@@ -1195,14 +1249,21 @@ where
     Ok(inbound.len())
 }
 
+/// Resolves how many pull pages the network condition allows this cycle.
 fn effective_pages(policy: NamespacePolicy) -> u8 {
     match policy.network() {
         NetworkCondition::Online => policy.pages_per_cycle(),
         NetworkCondition::Constrained => policy.pages_per_cycle().min(1),
         NetworkCondition::Offline => 0,
+        // `NetworkCondition` is `#[non_exhaustive]`: a condition this build does
+        // not recognize must defer all work, never spend an unknown budget. Zero
+        // pages is the same safe refusal as `Offline`, so no page is fetched
+        // under a network mode whose semantics are unknown.
+        _unknown => 0,
     }
 }
 
+/// Builds the namespace pull digest binding scope, cursor, and policy.
 fn namespace_pull_digest(
     scope: Scope,
     replica: ReplicaId,
@@ -1242,8 +1303,11 @@ fn namespace_pull_digest(
 /// including server-supplied retry hints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrchestratorPolicy {
+    /// Maximum [`synchronize`] cycles one run may issue before yielding.
     max_cycles: usize,
+    /// Delay before the first retryable transport failure is retried.
     base_backoff_ms: u64,
+    /// Hard ceiling applied to every backoff delay, including retry hints.
     max_backoff_ms: u64,
 }
 
@@ -1260,7 +1324,6 @@ impl OrchestratorPolicy {
         max_backoff_ms: u64,
     ) -> Result<Self, ProtocolError> {
         if max_cycles == 0 || base_backoff_ms == 0 || max_backoff_ms == 0 {
-            eprintln!("logical-db-sync: orchestrator policy contains an empty budget");
             return Err(ProtocolError::PageLimit);
         }
         Ok(Self {
@@ -1309,7 +1372,9 @@ impl Default for OrchestratorPolicy {
 /// sidecar, and restore with [`SyncOrchestrator::restore`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrchestratorState {
+    /// Consecutive retryable transport failures since the last success.
     consecutive_failures: u32,
+    /// Unix timestamp before which the orchestrator must not retry.
     not_ready_until_ms: u64,
 }
 
@@ -1360,16 +1425,13 @@ impl OrchestratorState {
     /// [`OrchestratorStateError::UnsupportedVersion`] for a foreign version.
     pub fn decode(bytes: &[u8]) -> Result<Self, OrchestratorStateError> {
         if bytes.len() != ORCHESTRATOR_STATE_BYTES {
-            eprintln!("logical-db-sync: orchestrator state has an invalid length");
             return Err(OrchestratorStateError::Malformed);
         }
         if bytes[0..ORCHESTRATOR_STATE_MAGIC.len()] != ORCHESTRATOR_STATE_MAGIC {
-            eprintln!("logical-db-sync: orchestrator state magic is invalid");
             return Err(OrchestratorStateError::Malformed);
         }
         let version = u16::from_be_bytes([bytes[8], bytes[9]]);
         if version != ORCHESTRATOR_STATE_VERSION {
-            eprintln!("logical-db-sync: unsupported orchestrator state version {version}");
             return Err(OrchestratorStateError::UnsupportedVersion { actual: version });
         }
         Ok(Self {
@@ -1381,10 +1443,12 @@ impl OrchestratorState {
         })
     }
 
+    /// Clears the failure streak after one successful cycle.
     fn note_success(&mut self) {
         self.consecutive_failures = 0;
     }
 
+    /// Records one retryable failure and schedules the next ready time.
     fn note_retryable(&mut self, now_unix_ms: u64, delay_ms: u64) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.not_ready_until_ms = now_unix_ms.saturating_add(delay_ms);
@@ -1399,6 +1463,7 @@ impl Default for OrchestratorState {
 
 /// Stable orchestrator state-codec failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum OrchestratorStateError {
     /// The blob violated its fixed magic-plus-version-plus-fields encoding.
     Malformed,
@@ -1424,8 +1489,9 @@ impl OrchestratorStateError {
 
 impl fmt::Display for OrchestratorStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        match *self {
             Self::Malformed => formatter.write_str("orchestrator state encoding is malformed"),
+            // remaining arms
             Self::UnsupportedVersion { actual } => {
                 write!(
                     formatter,
@@ -1446,6 +1512,7 @@ impl Error for OrchestratorStateError {}
 /// `is_retryable` predicate and bounded `retry_after` hint directly. A
 /// retryable failure becomes a deferred report with a recorded backoff
 /// deadline; any other failure surfaces immediately with no state recorded.
+#[non_exhaustive]
 pub struct RetrySignal<'signal, TransportError> {
     /// Classifies a transport failure as worth backing off for.
     pub is_retryable: &'signal dyn Fn(&TransportError) -> bool,
@@ -1453,11 +1520,13 @@ pub struct RetrySignal<'signal, TransportError> {
     pub retry_after: &'signal dyn Fn(&TransportError) -> Option<Duration>,
 }
 
+/// Always reports a transport failure as non-retryable so the host fails closed.
 fn never_retryable<TransportError>(error: &TransportError) -> bool {
     std::hint::black_box(error);
     false
 }
 
+/// Never supplies a backoff hint so the host schedules the failure immediately.
 fn no_retry_hint<TransportError>(error: &TransportError) -> Option<Duration> {
     std::hint::black_box(error);
     None
@@ -1476,6 +1545,7 @@ impl<TransportError> RetrySignal<'static, TransportError> {
 
 /// Observable result of one orchestrator run over [`synchronize`] cycles.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct RunReport {
     /// Local changes accepted or already present remotely across cycles.
     pub pushed: usize,
@@ -1503,6 +1573,7 @@ pub struct RunReport {
 /// the shared acknowledgement, the global drain still owns it — even after
 /// the pull side reports [`more`](Self::more) cleared.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NamespaceRunReport {
     /// Namespace this run drove.
     pub namespace: String,
@@ -1538,8 +1609,11 @@ pub struct NamespaceRunReport {
 /// replica's single-upstream binding.
 #[derive(Clone, Debug)]
 pub struct SyncOrchestrator {
+    /// Single upstream peer bound for this orchestrator's lifetime.
     peer: PeerId,
+    /// Cycle and backoff budgets enforced across runs.
     policy: OrchestratorPolicy,
+    /// Durable scheduling state carried across runs.
     state: OrchestratorState,
 }
 
@@ -1623,7 +1697,6 @@ impl SyncOrchestrator {
         T: Transport,
     {
         if cancelled() {
-            eprintln!("logical-db-sync: orchestrator run cancelled before cycle");
             return Err(SyncError::Cancelled);
         }
         let mut report = RunReport::default();
@@ -1633,15 +1706,14 @@ impl SyncOrchestrator {
         }
         for _cycle in 0..self.policy.max_cycles() {
             if cancelled() {
-                eprintln!("logical-db-sync: orchestrator run cancelled between cycles");
                 return Err(SyncError::Cancelled);
             }
             match synchronize(replica, self.peer, transport, limits, &mut cancelled).await {
                 Ok(cycle) => {
-                    report.pushed += cycle.pushed;
-                    report.pulled += cycle.pulled;
-                    report.pages += cycle.pages;
-                    report.cycles += 1;
+                    report.pushed = report.pushed.saturating_add(cycle.pushed);
+                    report.pulled = report.pulled.saturating_add(cycle.pulled);
+                    report.pages = report.pages.saturating_add(cycle.pages);
+                    report.cycles = report.cycles.saturating_add(1);
                     report.full_resync = report.full_resync || cycle.full_resync;
                     report.more = cycle.more;
                     self.state.note_success();
@@ -1656,11 +1728,6 @@ impl SyncOrchestrator {
                     return Ok(report);
                 }
                 Err(error) => {
-                    eprintln!(
-                        "logical-db-sync: namespace run failed (replica={}, transport={})",
-                        std::any::type_name::<R::Error>(),
-                        std::any::type_name::<T::Error>(),
-                    );
                     return Err(error);
                 }
             }
@@ -1764,7 +1831,6 @@ impl SyncOrchestrator {
             ..NamespaceRunReport::default()
         };
         if cancelled() {
-            eprintln!("logical-db-sync: namespace orchestrator run cancelled before send");
             return Err(NamespaceSyncError::Cancelled);
         }
         let now_unix_ms = domain.now_unix_ms();
@@ -1796,18 +1862,12 @@ impl SyncOrchestrator {
                 return Ok(report);
             }
             Err(error) => {
-                eprintln!(
-                    "logical-db-sync: namespace upload failed (replica={}, transport={})",
-                    std::any::type_name::<R::Error>(),
-                    std::any::type_name::<T::Error>()
-                );
                 return Err(error);
             }
         };
         report.send = send;
         for _cycle in 0..self.policy.max_cycles() {
             if cancelled() {
-                eprintln!("logical-db-sync: namespace run cancelled between cycles");
                 return Err(NamespaceSyncError::Cancelled);
             }
             match synchronize_namespace(
@@ -1821,9 +1881,9 @@ impl SyncOrchestrator {
             .await
             {
                 Ok(cycle) => {
-                    report.pulled += cycle.pulled;
-                    report.pages += cycle.pages;
-                    report.cycles += 1;
+                    report.pulled = report.pulled.saturating_add(cycle.pulled);
+                    report.pages = report.pages.saturating_add(cycle.pages);
+                    report.cycles = report.cycles.saturating_add(1);
                     report.full_resync = report.full_resync || cycle.full_resync;
                     report.more = cycle.more;
                     self.state.note_success();
@@ -1838,11 +1898,6 @@ impl SyncOrchestrator {
                     return Ok(report);
                 }
                 Err(error) => {
-                    eprintln!(
-                        "logical-db-sync: namespace cycle failed (replica={}, transport={})",
-                        std::any::type_name::<R::Error>(),
-                        std::any::type_name::<T::Error>(),
-                    );
                     return Err(error);
                 }
             }
@@ -1852,6 +1907,7 @@ impl SyncOrchestrator {
     }
 }
 
+/// Computes the exponential backoff delay for the current failure streak.
 fn backoff_delay_ms(policy: OrchestratorPolicy, consecutive_failures: u32) -> u64 {
     let mut delay = policy.base_backoff_ms();
     for _ in 0..consecutive_failures.min(MAX_BACKOFF_DOUBLINGS) {
@@ -1860,6 +1916,7 @@ fn backoff_delay_ms(policy: OrchestratorPolicy, consecutive_failures: u32) -> u6
     delay.min(policy.max_backoff_ms()).max(1)
 }
 
+/// Clamps a server-supplied retry hint into the local backoff ceiling.
 fn hint_delay_ms(hint: Duration, max_backoff_ms: u64) -> u64 {
     u64::try_from(hint.as_millis())
         .unwrap_or(u64::MAX)
@@ -1867,6 +1924,7 @@ fn hint_delay_ms(hint: Duration, max_backoff_ms: u64) -> u64 {
         .max(1)
 }
 
+/// Records a retryable transport failure into orchestrator scheduling state.
 fn defer_transport<TransportError>(
     state: &mut OrchestratorState,
     policy: OrchestratorPolicy,
@@ -1956,19 +2014,37 @@ mod tests {
         pulls: std::collections::VecDeque<PullResult>,
     }
 
+    /// Fixture failure when a scripted transport response is missing.
+    #[derive(Debug)]
+    struct MissingScriptedResponse;
+
+    impl fmt::Display for MissingScriptedResponse {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("scripted transport response is missing")
+        }
+    }
+
+    impl Error for MissingScriptedResponse {}
+
     impl Transport for Wire {
-        type Error = Infallible;
+        type Error = MissingScriptedResponse;
         fn push(
             &mut self,
             _request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
-            std::future::ready(Ok(self.push.take().unwrap()))
+            match self.push.take() {
+                Some(response) => std::future::ready(Ok(response)),
+                None => std::future::ready(Err(MissingScriptedResponse)),
+            }
         }
         fn pull(
             &mut self,
             _request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
-            std::future::ready(Ok(self.pulls.pop_front().unwrap()))
+            match self.pulls.pop_front() {
+                Some(page) => std::future::ready(Ok(page)),
+                None => std::future::ready(Err(MissingScriptedResponse)),
+            }
         }
         fn baseline(
             &mut self,
@@ -1979,7 +2055,8 @@ mod tests {
     }
 
     #[test]
-    fn expired_checkpoint_restarts_pull_without_guessing_continuity() {
+    fn expired_checkpoint_restarts_pull_without_guessing_continuity() -> Result<(), Box<dyn Error>>
+    {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica_id = ReplicaId::new();
         let operation = OperationId::new();
@@ -1999,20 +2076,20 @@ mod tests {
             installed: std::cell::RefCell::new(Vec::new()),
             baselines: std::cell::RefCell::new(Vec::new()),
         };
-        let new_checkpoint = Checkpoint::from_wire(vec![10]).unwrap();
+        let new_checkpoint = Checkpoint::from_wire(vec![10])?;
         let mut wire = Wire {
-            push: Some(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: vec![PushOutcome::Accepted { operation }],
-            }),
+            push: Some(PushResponse::new(
+                PROTOCOL_VERSION,
+                vec![PushOutcome::Accepted { operation }],
+            )),
             pulls: [
                 PullResult::CheckpointExpired,
-                PullResult::Page(PullPage {
-                    protocol: PROTOCOL_VERSION,
-                    changes: Vec::new(),
-                    checkpoint: new_checkpoint,
-                    more: false,
-                }),
+                PullResult::Page(PullPage::new(
+                    PROTOCOL_VERSION,
+                    Vec::new(),
+                    new_checkpoint,
+                    false,
+                )),
             ]
             .into(),
         };
@@ -2025,8 +2102,7 @@ mod tests {
                 ..SyncLimits::default()
             },
             || false,
-        ))
-        .unwrap();
+        ))?;
         assert_eq!(
             report,
             SyncReport {
@@ -2036,10 +2112,20 @@ mod tests {
                 full_resync: true,
                 recovered: false,
                 more: false
-            }
+            },
+            "expiry forces one full page without guessing continuity"
         );
-        assert_eq!(replica.acknowledged.get(), 4);
-        assert_eq!(*replica.checkpoint.borrow(), Some(vec![10]));
+        assert_eq!(
+            replica.acknowledged.get(),
+            4,
+            "the accepted push must acknowledge through sequence four"
+        );
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(vec![10]),
+            "the expiry restart must install the fresh checkpoint"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2063,23 +2149,29 @@ mod tests {
             baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
-            push: Some(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: vec![PushOutcome::Rejected {
+            push: Some(PushResponse::new(
+                PROTOCOL_VERSION,
+                vec![PushOutcome::Rejected {
                     operation,
                     code: RejectionCode::Forbidden,
                 }],
-            }),
+            )),
             pulls: std::collections::VecDeque::default(),
         };
         assert!(
-            matches!(lgwks_std::task::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation)
+            matches!(lgwks_std::task::block_on(synchronize(&replica, PeerId::new(), &mut wire, SyncLimits::default(), || false)), Err(SyncError::Rejected { operation: value, code: RejectionCode::Forbidden }) if value == operation),
+            "a forbidden push must surface the rejection without acknowledging"
         );
-        assert_eq!(replica.acknowledged.get(), 0);
+        assert_eq!(
+            replica.acknowledged.get(),
+            0,
+            "a rejected push must never advance the acknowledgement"
+        );
     }
 
     #[test]
-    fn upload_page_stops_at_byte_budget_and_advances_only_sent_prefix() {
+    fn upload_page_stops_at_byte_budget_and_advances_only_sent_prefix() -> Result<(), Box<dyn Error>>
+    {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let first = OperationId::new();
         let replica = Replica {
@@ -2088,37 +2180,46 @@ mod tests {
             pending: [first, OperationId::new()]
                 .into_iter()
                 .enumerate()
-                .map(|(offset, operation)| OutboundChange {
-                    sequence: u64::try_from(offset + 1).unwrap(),
-                    document: DocumentId::new(),
-                    operation,
-                    request: OperationDigest::new([u8::try_from(offset + 1).unwrap(); 32]),
-                    digest: ChangeDigest::new([u8::try_from(offset + 3).unwrap(); 32]),
-                    bytes: vec![1],
+                .map(|(offset, operation)| {
+                    Ok::<OutboundChange, std::num::TryFromIntError>(OutboundChange {
+                        sequence: u64::try_from(offset.saturating_add(1))?,
+                        document: DocumentId::new(),
+                        operation,
+                        request: OperationDigest::new(
+                            [u8::try_from(offset.saturating_add(1))?; 32],
+                        ),
+                        digest: ChangeDigest::new([u8::try_from(offset.saturating_add(3))?; 32]),
+                        bytes: vec![1],
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
             baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
-            push: Some(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: vec![PushOutcome::Accepted { operation: first }],
-            }),
+            push: Some(PushResponse::new(
+                PROTOCOL_VERSION,
+                vec![PushOutcome::Accepted { operation: first }],
+            )),
             pulls: std::collections::VecDeque::new(),
         };
         assert_eq!(
-            lgwks_std::task::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))
-                .unwrap(),
-            (1, true)
+            lgwks_std::task::block_on(push_pending(&replica, PeerId::new(), &mut wire, 2, 1,))?,
+            (1, true),
+            "the byte budget must stop after one one-byte change"
         );
-        assert_eq!(replica.acknowledged.get(), 1);
+        assert_eq!(
+            replica.acknowledged.get(),
+            1,
+            "only the sent prefix may advance the acknowledgement"
+        );
+        Ok(())
     }
 
     #[test]
-    fn report_keeps_unsent_upload_backlog_visible() {
+    fn report_keeps_unsent_upload_backlog_visible() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let first = OperationId::new();
         let replica = Replica {
@@ -2127,31 +2228,35 @@ mod tests {
             pending: [first, OperationId::new()]
                 .into_iter()
                 .enumerate()
-                .map(|(offset, operation)| OutboundChange {
-                    sequence: u64::try_from(offset + 1).unwrap(),
-                    document: DocumentId::new(),
-                    operation,
-                    request: OperationDigest::new([u8::try_from(offset + 1).unwrap(); 32]),
-                    digest: ChangeDigest::new([u8::try_from(offset + 1).unwrap(); 32]),
-                    bytes: vec![1],
+                .map(|(offset, operation)| {
+                    Ok::<OutboundChange, std::num::TryFromIntError>(OutboundChange {
+                        sequence: u64::try_from(offset.saturating_add(1))?,
+                        document: DocumentId::new(),
+                        operation,
+                        request: OperationDigest::new(
+                            [u8::try_from(offset.saturating_add(1))?; 32],
+                        ),
+                        digest: ChangeDigest::new([u8::try_from(offset.saturating_add(1))?; 32]),
+                        bytes: vec![1],
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             checkpoint: std::cell::RefCell::new(None),
             acknowledged: std::cell::Cell::new(0),
             installed: std::cell::RefCell::new(Vec::new()),
             baselines: std::cell::RefCell::new(Vec::new()),
         };
         let mut wire = Wire {
-            push: Some(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: vec![PushOutcome::Accepted { operation: first }],
-            }),
-            pulls: [PullResult::Page(PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes: Vec::new(),
-                checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
-                more: false,
-            })]
+            push: Some(PushResponse::new(
+                PROTOCOL_VERSION,
+                vec![PushOutcome::Accepted { operation: first }],
+            )),
+            pulls: [PullResult::Page(PullPage::new(
+                PROTOCOL_VERSION,
+                Vec::new(),
+                Checkpoint::from_wire(vec![1])?,
+                false,
+            ))]
             .into(),
         };
         let report = lgwks_std::task::block_on(synchronize(
@@ -2163,11 +2268,21 @@ mod tests {
                 ..SyncLimits::default()
             },
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.pushed, 1);
-        assert!(report.more);
-        assert_eq!(replica.acknowledged.get(), 1);
+        ))?;
+        assert_eq!(
+            report.pushed, 1,
+            "the accepted first change must report one push"
+        );
+        assert!(
+            report.more,
+            "the unsent second change must keep the backlog visible"
+        );
+        assert_eq!(
+            replica.acknowledged.get(),
+            1,
+            "acknowledgement advances only through the accepted change"
+        );
+        Ok(())
     }
 
     fn empty_replica(scope: Scope) -> Replica {
@@ -2183,22 +2298,27 @@ mod tests {
     }
 
     #[test]
-    fn sync_limits_accept_exact_edges_and_reject_every_zero_or_excess() {
+    fn sync_limits_accept_exact_edges_and_reject_every_zero_or_excess() -> Result<(), Box<dyn Error>>
+    {
         let valid = SyncLimits {
-            changes_per_page: logical_db_model::MAX_CHANGES_PER_PAGE.try_into().unwrap(),
-            bytes_per_page: logical_db_model::MAX_PAGE_BYTES.try_into().unwrap(),
-            pages_per_cycle: MAX_PAGES_PER_CYCLE.try_into().unwrap(),
+            changes_per_page: u16::try_from(logical_db_model::MAX_CHANGES_PER_PAGE)?,
+            bytes_per_page: u32::try_from(logical_db_model::MAX_PAGE_BYTES)?,
+            pages_per_cycle: u8::try_from(MAX_PAGES_PER_CYCLE)?,
             recovery_pages: MAX_RECOVERY_PAGES,
             recovery_bytes: u64::MAX,
         };
-        assert_eq!(valid.validate(), Ok(valid));
+        assert_eq!(
+            valid.validate(),
+            Ok(valid),
+            "the exact protocol edges must validate"
+        );
         for invalid in [
             SyncLimits {
                 changes_per_page: 0,
                 ..valid
             },
             SyncLimits {
-                changes_per_page: valid.changes_per_page + 1,
+                changes_per_page: valid.changes_per_page.saturating_add(1),
                 ..valid
             },
             SyncLimits {
@@ -2206,7 +2326,7 @@ mod tests {
                 ..valid
             },
             SyncLimits {
-                bytes_per_page: valid.bytes_per_page + 1,
+                bytes_per_page: valid.bytes_per_page.saturating_add(1),
                 ..valid
             },
             SyncLimits {
@@ -2214,7 +2334,7 @@ mod tests {
                 ..valid
             },
             SyncLimits {
-                pages_per_cycle: valid.pages_per_cycle + 1,
+                pages_per_cycle: valid.pages_per_cycle.saturating_add(1),
                 ..valid
             },
             SyncLimits {
@@ -2222,16 +2342,23 @@ mod tests {
                 ..valid
             },
             SyncLimits {
-                recovery_pages: valid.recovery_pages + 1,
+                recovery_pages: valid.recovery_pages.saturating_add(1),
                 ..valid
             },
             SyncLimits {
-                recovery_bytes: MAX_BASELINE_BYTES as u64 - 1,
+                recovery_bytes: u64::try_from(MAX_BASELINE_BYTES)
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(1),
                 ..valid
             },
         ] {
-            assert_eq!(invalid.validate(), Err(ProtocolError::PageLimit));
+            assert_eq!(
+                invalid.validate(),
+                Err(ProtocolError::PageLimit),
+                "zero or excess budget edges must fail closed"
+            );
         }
+        Ok(())
     }
 
     #[test]
@@ -2261,21 +2388,21 @@ mod tests {
     }
 
     impl Transport for RecoveryWire {
-        type Error = Infallible;
+        type Error = MissingScriptedResponse;
         fn push(
             &mut self,
             _request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
-            std::future::ready(Ok(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: Vec::new(),
-            }))
+            std::future::ready(Ok(PushResponse::new(PROTOCOL_VERSION, Vec::new())))
         }
         fn pull(
             &mut self,
             _request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
-            std::future::ready(Ok(self.pulls.pop_front().unwrap()))
+            match self.pulls.pop_front() {
+                Some(page) => std::future::ready(Ok(page)),
+                None => std::future::ready(Err(MissingScriptedResponse)),
+            }
         }
         fn baseline(
             &mut self,
@@ -2302,10 +2429,7 @@ mod tests {
             &mut self,
             _request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
-            std::future::ready(Ok(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: Vec::new(),
-            }))
+            std::future::ready(Ok(PushResponse::new(PROTOCOL_VERSION, Vec::new())))
         }
 
         fn pull(
@@ -2319,7 +2443,7 @@ mod tests {
             &mut self,
             _request: BaselineRequest,
         ) -> impl Future<Output = Result<BaselineResult, Self::Error>> {
-            self.requests.set(self.requests.get() + 1);
+            self.requests.set(self.requests.get().saturating_add(1));
             let result = self
                 .pages
                 .pop_front()
@@ -2331,30 +2455,28 @@ mod tests {
         }
     }
 
-    fn paged_recovery_pages(scope: Scope) -> std::collections::VecDeque<BaselinePage> {
-        let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
+    fn paged_recovery_pages(
+        scope: Scope,
+    ) -> Result<std::collections::VecDeque<BaselinePage>, Box<dyn Error>> {
+        let total = MAX_BASELINE_PAGE_DOCUMENTS.saturating_add(44);
         let mut documents = (0..total)
-            .map(|_| logical_db_model::SnapshotDocument {
-                document: DocumentId::new(),
-                snapshot: vec![1],
-                tombstone: false,
-            })
+            .map(|_| logical_db_model::SnapshotDocument::new(DocumentId::new(), vec![1], false))
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
-        let artifact = SnapshotArtifact::new(scope, 7, documents.clone()).unwrap();
+        let artifact = SnapshotArtifact::new(scope, 7, documents.clone())?;
         let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
         let mut pages = std::collections::VecDeque::new();
-        pages.push_back(page_for(&artifact, first, true));
-        pages.push_back(page_for(&artifact, rest, false));
-        pages
+        pages.push_back(page_for(&artifact, first, true)?);
+        pages.push_back(page_for(&artifact, rest, false)?);
+        Ok(pages)
     }
 
     #[test]
-    fn recovery_stops_between_pages_when_cancelled() {
+    fn recovery_stops_between_pages_when_cancelled() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
         *replica.checkpoint.borrow_mut() = Some(vec![9]);
-        let pages = paged_recovery_pages(scope);
+        let pages = paged_recovery_pages(scope)?;
         let requests = std::cell::Cell::new(0usize);
         let cancel = std::rc::Rc::new(std::cell::Cell::new(false));
         let mut wire = BudgetWire {
@@ -2369,21 +2491,30 @@ mod tests {
             SyncLimits::default(),
             || cancel.get(),
         ));
-        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert!(
+            matches!(result, Err(SyncError::Cancelled)),
+            "cancel must stop recovery"
+        );
         assert_eq!(requests.get(), 1, "cancellation must stop the next fetch");
         assert!(
             replica.baselines.borrow().is_empty(),
             "a cancelled recovery must install nothing"
         );
-        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(vec![9]),
+            "cancellation must leave the durable checkpoint untouched"
+        );
+        Ok(())
     }
 
     #[test]
-    fn recovery_refuses_to_exceed_its_page_budget_without_mutating_state() {
+    fn recovery_refuses_to_exceed_its_page_budget_without_mutating_state()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
         *replica.checkpoint.borrow_mut() = Some(vec![9]);
-        let pages = paged_recovery_pages(scope);
+        let pages = paged_recovery_pages(scope)?;
         let requests = std::cell::Cell::new(0usize);
         let mut wire = BudgetWire {
             pages,
@@ -2401,39 +2532,43 @@ mod tests {
             limits,
             || false,
         ));
-        assert!(matches!(result, Err(SyncError::RecoveryBudgetExhausted)));
+        assert!(
+            matches!(result, Err(SyncError::RecoveryBudgetExhausted)),
+            "exceeding the declared page budget must fail closed"
+        );
         assert_eq!(requests.get(), 1, "one page is the whole declared budget");
         assert!(
             replica.baselines.borrow().is_empty(),
             "an exhausted recovery must install nothing"
         );
-        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(vec![9]),
+            "an exhausted recovery must leave the durable checkpoint untouched"
+        );
+        Ok(())
     }
 
-    fn non_progressing_page(scope: Scope) -> BaselinePage {
+    fn non_progressing_page(scope: Scope) -> Result<BaselinePage, Box<dyn Error>> {
         let mut documents = (0..2)
-            .map(|_| logical_db_model::SnapshotDocument {
-                document: DocumentId::new(),
-                snapshot: vec![1],
-                tombstone: false,
-            })
+            .map(|_| logical_db_model::SnapshotDocument::new(DocumentId::new(), vec![1], false))
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
-        let artifact = SnapshotArtifact::new(scope, 5, documents.clone()).unwrap();
-        let mut page = page_for(&artifact, &documents, true);
+        let artifact = SnapshotArtifact::new(scope, 5, documents.clone())?;
+        let mut page = page_for(&artifact, &documents, true)?;
         // A continued page whose cursor points back inside the page body rather
         // than strictly past it must be refused before the next fetch.
         page.next_document = Some(documents[0].document);
-        page
+        Ok(page)
     }
 
     #[test]
-    fn recovery_fails_closed_when_a_page_cursor_does_not_advance() {
+    fn recovery_fails_closed_when_a_page_cursor_does_not_advance() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
         *replica.checkpoint.borrow_mut() = Some(vec![9]);
         let mut pages = std::collections::VecDeque::new();
-        pages.push_back(non_progressing_page(scope));
+        pages.push_back(non_progressing_page(scope)?);
         let requests = std::cell::Cell::new(0usize);
         let mut wire = BudgetWire {
             pages,
@@ -2447,10 +2582,13 @@ mod tests {
             SyncLimits::default(),
             || false,
         ));
-        assert!(matches!(
-            result,
-            Err(SyncError::Protocol(ProtocolError::NonProgressPage))
-        ));
+        assert!(
+            matches!(
+                result,
+                Err(SyncError::Protocol(ProtocolError::NonProgressPage))
+            ),
+            "a non-advancing cursor must fail closed as a protocol error"
+        );
         assert_eq!(
             requests.get(),
             1,
@@ -2460,81 +2598,89 @@ mod tests {
             replica.baselines.borrow().is_empty(),
             "a non-advancing recovery must install nothing"
         );
-        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(vec![9]),
+            "a non-advancing recovery must leave the durable checkpoint untouched"
+        );
+        Ok(())
     }
 
-    fn recovery_page(scope: Scope, position: u64) -> BaselinePage {
+    fn recovery_page(scope: Scope, position: u64) -> Result<BaselinePage, Box<dyn Error>> {
         let artifact = SnapshotArtifact::new(
             scope,
             position,
-            vec![logical_db_model::SnapshotDocument {
-                document: DocumentId::new(),
-                snapshot: vec![1, 2, 3],
-                tombstone: false,
-            }],
-        )
-        .unwrap();
-        BaselinePage {
-            protocol: PROTOCOL_VERSION,
-            descriptor: artifact.baseline.encode().to_vec(),
-            documents: artifact
+            vec![logical_db_model::SnapshotDocument::new(
+                DocumentId::new(),
+                vec![1, 2, 3],
+                false,
+            )],
+        )?;
+        Ok(BaselinePage::new(
+            PROTOCOL_VERSION,
+            artifact.baseline.encode().to_vec(),
+            artifact
                 .documents
                 .iter()
-                .map(|document| logical_db_protocol::BaselineDocument {
-                    document: document.document,
-                    tombstone: document.tombstone,
-                    snapshot: document.snapshot.clone(),
+                .map(|document| {
+                    logical_db_protocol::BaselineDocument::new(
+                        document.document,
+                        document.tombstone,
+                        document.snapshot.clone(),
+                    )
                 })
                 .collect(),
-            checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
-            more: false,
-            next_document: None,
-        }
+            Checkpoint::from_wire(vec![5])?,
+            false,
+            None,
+        ))
     }
 
     fn page_for(
         artifact: &SnapshotArtifact,
         slice: &[logical_db_model::SnapshotDocument],
         more: bool,
-    ) -> BaselinePage {
-        BaselinePage {
-            protocol: PROTOCOL_VERSION,
-            descriptor: artifact.baseline.encode().to_vec(),
-            documents: slice
+    ) -> Result<BaselinePage, Box<dyn Error>> {
+        Ok(BaselinePage::new(
+            PROTOCOL_VERSION,
+            artifact.baseline.encode().to_vec(),
+            slice
                 .iter()
-                .map(|document| logical_db_protocol::BaselineDocument {
-                    document: document.document,
-                    tombstone: document.tombstone,
-                    snapshot: document.snapshot.clone(),
+                .map(|document| {
+                    logical_db_protocol::BaselineDocument::new(
+                        document.document,
+                        document.tombstone,
+                        document.snapshot.clone(),
+                    )
                 })
                 .collect(),
-            checkpoint: Checkpoint::from_wire(vec![5]).unwrap(),
+            Checkpoint::from_wire(vec![5])?,
             more,
-            next_document: if more {
+            if more {
                 slice.last().map(|document| document.document)
             } else {
                 None
             },
-        }
+        ))
     }
 
     #[test]
-    fn baseline_required_installs_state_before_the_suffix_commit() {
+    fn baseline_required_installs_state_before_the_suffix_commit() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
         *replica.checkpoint.borrow_mut() = Some(vec![9]);
-        let baseline = recovery_page(scope, 2);
+        let baseline = recovery_page(scope, 2)?;
         let baseline_checkpoint = baseline.checkpoint.as_wire().to_vec();
-        let suffix_checkpoint = Checkpoint::from_wire(vec![10]).unwrap();
+        let suffix_checkpoint = Checkpoint::from_wire(vec![10])?;
         let mut wire = RecoveryWire {
             pulls: [
                 PullResult::BaselineRequired,
-                PullResult::Page(PullPage {
-                    protocol: PROTOCOL_VERSION,
-                    changes: Vec::new(),
-                    checkpoint: suffix_checkpoint.clone(),
-                    more: false,
-                }),
+                PullResult::Page(PullPage::new(
+                    PROTOCOL_VERSION,
+                    Vec::new(),
+                    suffix_checkpoint.clone(),
+                    false,
+                )),
             ]
             .into(),
             baseline: Some(baseline),
@@ -2545,45 +2691,61 @@ mod tests {
             &mut wire,
             SyncLimits::default(),
             || false,
-        ))
-        .unwrap();
-        assert!(report.recovered);
-        assert!(!report.full_resync);
+        ))?;
+        assert!(report.recovered, "the baseline install must mark recovery");
+        assert!(
+            !report.full_resync,
+            "a baseline recovery must not claim a full resync"
+        );
         assert_eq!(
             report.pages, 2,
             "the recovery page and the suffix page are both accounted"
         );
         let baselines = replica.baselines.borrow();
-        assert_eq!(baselines.len(), 1);
-        assert_eq!(baselines[0].1, baseline_checkpoint);
-        assert!(matches!(
-            logical_db_model::SnapshotBaseline::decode(&baselines[0].0),
-            Ok(logical_db_model::SnapshotRecord::State(baseline)) if baseline.position() == 2
-        ));
+        assert_eq!(baselines.len(), 1, "exactly one baseline must install");
+        assert_eq!(
+            baselines[0].1, baseline_checkpoint,
+            "the baseline must bind its durable checkpoint"
+        );
+        assert!(
+            matches!(
+                logical_db_model::SnapshotBaseline::decode(&baselines[0].0),
+                Ok(logical_db_model::SnapshotRecord::State(baseline)) if baseline.position() == 2
+            ),
+            "the installed baseline must decode as position two"
+        );
         assert_eq!(
             *replica.checkpoint.borrow(),
-            Some(suffix_checkpoint.as_wire().to_vec())
+            Some(suffix_checkpoint.as_wire().to_vec()),
+            "the suffix page checkpoint must be durable after recovery"
         );
+        Ok(())
     }
 
     #[test]
-    fn a_broken_paged_recovery_installs_nothing() {
+    fn a_broken_paged_recovery_installs_nothing() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
         *replica.checkpoint.borrow_mut() = Some(vec![9]);
         let mut documents = (0..=logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS)
-            .map(|index| logical_db_model::SnapshotDocument {
-                document: DocumentId::new(),
-                snapshot: vec![u8::try_from(index % 251).unwrap() + 1],
-                tombstone: false,
+            .map(|index| {
+                logical_db_model::SnapshotDocument::new(
+                    DocumentId::new(),
+                    vec![
+                        u8::try_from(index % 251)
+                            .unwrap_or(u8::MAX)
+                            .saturating_add(1),
+                    ],
+                    false,
+                )
             })
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
-        let artifact = SnapshotArtifact::new(scope, 3, documents.clone()).unwrap();
+        let artifact = SnapshotArtifact::new(scope, 3, documents.clone())?;
         let (first, _rest) = documents.split_at(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
         let mut wire = RecoveryWire {
             pulls: [PullResult::BaselineRequired].into(),
-            baseline: Some(page_for(&artifact, first, true)),
+            baseline: Some(page_for(&artifact, first, true)?),
         };
         let result = lgwks_std::task::block_on(synchronize(
             &replica,
@@ -2592,33 +2754,44 @@ mod tests {
             SyncLimits::default(),
             || false,
         ));
-        assert!(result.is_err());
-        assert!(replica.baselines.borrow().is_empty());
-        assert_eq!(*replica.checkpoint.borrow(), Some(vec![9]));
+        assert!(
+            result.is_err(),
+            "a broken recovery page must fail before installing anything"
+        );
+        assert!(
+            replica.baselines.borrow().is_empty(),
+            "a failed recovery must install nothing"
+        );
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(vec![9]),
+            "a failed recovery must leave the durable checkpoint untouched"
+        );
+        Ok(())
     }
 
     #[test]
-    fn report_counts_every_installed_change_and_page() {
+    fn report_counts_every_installed_change_and_page() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
         let remote_replica = ReplicaId::new();
-        let change = ChangeEnvelope {
+        let change = ChangeEnvelope::new(
             scope,
-            document: DocumentId::new(),
-            replica: remote_replica,
-            operation: OperationId::new(),
-            request: OperationDigest::new([5; 32]),
-            digest: ChangeDigest::new([6; 32]),
-            bytes: vec![1],
-        };
+            DocumentId::new(),
+            remote_replica,
+            OperationId::new(),
+            OperationDigest::new([5; 32]),
+            ChangeDigest::new([6; 32]),
+            vec![1],
+        );
         let mut wire = Wire {
             push: None,
-            pulls: [PullResult::Page(PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes: vec![change.clone()],
-                checkpoint: Checkpoint::from_wire(vec![4]).unwrap(),
-                more: false,
-            })]
+            pulls: [PullResult::Page(PullPage::new(
+                PROTOCOL_VERSION,
+                vec![change.clone()],
+                Checkpoint::from_wire(vec![4])?,
+                false,
+            ))]
             .into(),
         };
         let report = lgwks_std::task::block_on(synchronize(
@@ -2627,35 +2800,43 @@ mod tests {
             &mut wire,
             SyncLimits::default(),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.pulled, 1);
-        assert_eq!(report.pages, 1);
-        assert_eq!(replica.installed.borrow().len(), 1);
-        assert_eq!(replica.installed.borrow()[0].document, change.document);
+        ))?;
+        assert_eq!(report.pulled, 1, "the single installed change is counted");
+        assert_eq!(report.pages, 1, "the single pull page is counted");
+        assert_eq!(
+            replica.installed.borrow().len(),
+            1,
+            "one change lands on the replica"
+        );
+        assert_eq!(
+            replica.installed.borrow()[0].document,
+            change.document,
+            "the installed change keeps its document identity"
+        );
+        Ok(())
     }
 
     #[test]
-    fn exact_pull_page_budget_never_fetches_one_page_too_many() {
+    fn exact_pull_page_budget_never_fetches_one_page_too_many() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = empty_replica(scope);
-        let change = ChangeEnvelope {
+        let change = ChangeEnvelope::new(
             scope,
-            document: DocumentId::new(),
-            replica: ReplicaId::new(),
-            operation: OperationId::new(),
-            request: OperationDigest::new([7; 32]),
-            digest: ChangeDigest::new([8; 32]),
-            bytes: vec![1],
-        };
+            DocumentId::new(),
+            ReplicaId::new(),
+            OperationId::new(),
+            OperationDigest::new([7; 32]),
+            ChangeDigest::new([8; 32]),
+            vec![1],
+        );
         let mut wire = Wire {
             push: None,
-            pulls: [PullResult::Page(PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes: vec![change],
-                checkpoint: Checkpoint::from_wire(vec![2]).unwrap(),
-                more: true,
-            })]
+            pulls: [PullResult::Page(PullPage::new(
+                PROTOCOL_VERSION,
+                vec![change],
+                Checkpoint::from_wire(vec![2])?,
+                true,
+            ))]
             .into(),
         };
         let report = lgwks_std::task::block_on(synchronize(
@@ -2667,11 +2848,11 @@ mod tests {
                 ..SyncLimits::default()
             },
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.pages, 1);
-        assert!(report.more);
-        assert!(wire.pulls.is_empty());
+        ))?;
+        assert_eq!(report.pages, 1, "the page budget is never exceeded");
+        assert!(report.more, "more data remains past the budget");
+        assert!(wire.pulls.is_empty(), "no extra pull is issued");
+        Ok(())
     }
 
     #[test]
@@ -2731,15 +2912,16 @@ mod tests {
             }
         }
 
-        fn stored_map(&self) -> NamespaceCheckpoints {
+        fn stored_map(&self) -> Result<NamespaceCheckpoints, Box<dyn Error>> {
             match self.slot.borrow().clone() {
-                None => NamespaceCheckpoints::new(),
-                Some(bytes) => NamespaceCheckpoints::decode(&bytes).unwrap(),
+                None => Ok(NamespaceCheckpoints::new()),
+                Some(bytes) => Ok(NamespaceCheckpoints::decode(&bytes)?),
             }
         }
 
-        fn seed_map(&self, map: &NamespaceCheckpoints) {
-            *self.slot.borrow_mut() = Some(map.encode().unwrap());
+        fn seed_map(&self, map: &NamespaceCheckpoints) -> Result<(), Box<dyn Error>> {
+            *self.slot.borrow_mut() = Some(map.encode()?);
+            Ok(())
         }
     }
 
@@ -2812,7 +2994,8 @@ mod tests {
     impl PositionalLog {
         fn position(checkpoint: &Checkpoint) -> u64 {
             let wire = checkpoint.as_wire();
-            u64::from_be_bytes(wire.try_into().unwrap())
+            let bytes: [u8; 8] = wire.try_into().unwrap_or([0; 8]);
+            u64::from_be_bytes(bytes)
         }
 
         fn position_bytes(position: u64) -> Vec<u8> {
@@ -2821,7 +3004,7 @@ mod tests {
     }
 
     impl Transport for PositionalLog {
-        type Error = Infallible;
+        type Error = ProtocolError;
         fn push(
             &mut self,
             request: PushRequest,
@@ -2840,16 +3023,13 @@ mod tests {
                     });
                 }
             }
-            std::future::ready(Ok(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes,
-            }))
+            std::future::ready(Ok(PushResponse::new(PROTOCOL_VERSION, outcomes)))
         }
         fn pull(
             &mut self,
             request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
-            self.pulls.set(self.pulls.get() + 1);
+            self.pulls.set(self.pulls.get().saturating_add(1));
             self.pull_afters
                 .borrow_mut()
                 .push(request.after.clone().map(|after| after.as_wire().to_vec()));
@@ -2862,14 +3042,15 @@ mod tests {
                     });
                 }
             }
-            let position = match &request.after {
+            let position = match request.after {
                 None => 0_u64,
-                Some(checkpoint) => Self::position(checkpoint),
+                Some(ref checkpoint) => Self::position(checkpoint),
             };
+            // match is closed over Option
             if position < self.floor {
                 return std::future::ready(Ok(PullResult::CheckpointExpired));
             }
-            let start = usize::try_from(position).unwrap();
+            let start = usize::try_from(position).unwrap_or(0);
             let entries = self.entries.borrow();
             let mut changes = Vec::new();
             let mut used_bytes = 0_usize;
@@ -2878,28 +3059,29 @@ mod tests {
                 .skip(start)
                 .take(usize::from(request.max_changes))
             {
-                if used_bytes + entry.bytes.len() > request.max_bytes as usize {
+                if used_bytes.saturating_add(entry.bytes.len())
+                    > usize::try_from(request.max_bytes).unwrap_or(usize::MAX)
+                {
                     break;
                 }
-                used_bytes += entry.bytes.len();
-                changes.push(ChangeEnvelope {
-                    scope: self.scope,
-                    document: entry.document,
-                    replica: self.origin,
-                    operation: OperationId::new(),
-                    request: OperationDigest::new([3; 32]),
-                    digest: ChangeDigest::new([4; 32]),
-                    bytes: entry.bytes.clone(),
-                });
+                used_bytes = used_bytes.saturating_add(entry.bytes.len());
+                changes.push(ChangeEnvelope::new(
+                    self.scope,
+                    entry.document,
+                    self.origin,
+                    OperationId::new(),
+                    OperationDigest::new([3; 32]),
+                    ChangeDigest::new([4; 32]),
+                    entry.bytes.clone(),
+                ));
             }
-            let next = start + changes.len();
+            let next = start.saturating_add(changes.len());
             let more = next < entries.len();
-            std::future::ready(Ok(PullResult::Page(PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes,
-                checkpoint: Checkpoint::from_wire(Self::position_bytes(next as u64)).unwrap(),
-                more,
-            })))
+            let next_u64 = u64::try_from(next).unwrap_or(u64::MAX);
+            let result = Checkpoint::from_wire(Self::position_bytes(next_u64)).map(|checkpoint| {
+                PullResult::Page(PullPage::new(PROTOCOL_VERSION, changes, checkpoint, more))
+            });
+            std::future::ready(result)
         }
         fn baseline(
             &mut self,
@@ -2954,22 +3136,28 @@ mod tests {
         )
     }
 
-    fn online_policy(changes_per_page: u16, pages_per_cycle: u8) -> NamespacePolicy {
-        NamespacePolicy::new(
+    fn online_policy(
+        changes_per_page: u16,
+        pages_per_cycle: u8,
+    ) -> Result<NamespacePolicy, Box<dyn Error>> {
+        Ok(NamespacePolicy::new(
             changes_per_page,
             1_048_576,
             pages_per_cycle,
             NetworkCondition::Online,
-        )
-        .unwrap()
+        )?)
     }
 
-    fn domain(namespace: &str, policy: NamespacePolicy, now_unix_ms: u64) -> NamespaceDomain {
-        NamespaceDomain::new(namespace, policy, now_unix_ms).unwrap()
+    fn domain(
+        namespace: &str,
+        policy: NamespacePolicy,
+        now_unix_ms: u64,
+    ) -> Result<NamespaceDomain, Box<dyn Error>> {
+        Ok(NamespaceDomain::new(namespace, policy, now_unix_ms)?)
     }
 
     #[test]
-    fn namespace_sync_advances_only_its_own_checkpoint() {
+    fn namespace_sync_advances_only_its_own_checkpoint() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (mut log, ownership) = log_with(scope, &["quiet", "chatty"]);
         let replica = NsReplica::fresh(scope, Vec::new());
@@ -2977,64 +3165,66 @@ mod tests {
         let quiet = ownership
             .iter()
             .find_map(|(document, namespace)| (*namespace == "quiet").then_some(*document))
-            .unwrap();
+            .ok_or("quiet ownership document missing")?;
         let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
-            &domain("quiet", online_policy(16, 8), 1_000),
+            &domain("quiet", online_policy(16, 8)?, 1_000)?,
             |document| ownership.get(&document) == Some(&"quiet"),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.namespace, "quiet");
-        assert_eq!(report.pulled, 1);
-        assert_eq!(report.pages, 1);
-        assert!(!report.full_resync);
-        assert!(!report.more);
-        assert!(!report.deferred);
+        ))?;
+        assert_eq!(report.namespace, "quiet", "namespace identity is reported");
+        assert_eq!(report.pulled, 1, "one change is pulled");
+        assert_eq!(report.pages, 1, "one page advances the cursor");
+        assert!(!report.full_resync, "an ordinary pull is not a full resync");
+        assert!(!report.more, "the quiet log is drained");
+        assert!(!report.deferred, "the work is not deferred");
         let installed: Vec<DocumentId> = replica
             .stored
             .borrow()
             .iter()
-            .flat_map(|(_, changes)| changes.iter().map(|change| change.document))
+            .flat_map(|entry| entry.1.iter().map(|change| change.document))
             .collect();
-        assert_eq!(installed, vec![quiet]);
-        let map = replica.stored_map();
+        assert_eq!(installed, vec![quiet], "only the quiet document installs");
+        let map = replica.stored_map()?;
         assert_eq!(
-            map.get("quiet").unwrap().cursor(),
-            PositionalLog::position_bytes(2)
+            map.get("quiet").ok_or("quiet checkpoint missing")?.cursor(),
+            PositionalLog::position_bytes(2),
+            "the quiet cursor advances past the installed change"
         );
-        assert!(map.get("chatty").is_none());
+        assert!(map.get("chatty").is_none(), "chatty stays uninstalled");
         let rerun = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
-            &domain("quiet", online_policy(16, 8), 2_000),
+            &domain("quiet", online_policy(16, 8)?, 2_000)?,
             |document| ownership.get(&document) == Some(&"quiet"),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(rerun.pulled, 0);
-        assert!(!rerun.more);
+        ))?;
+        assert_eq!(rerun.pulled, 0, "a drained namespace pulls nothing");
+        assert!(!rerun.more, "a drained namespace has no backlog");
+        Ok(())
     }
 
     #[test]
-    fn namespace_expiry_restarts_once_from_the_floor() {
+    fn namespace_expiry_restarts_once_from_the_floor() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let replica = NsReplica::fresh(scope, Vec::new());
         let mut checkpoints = NamespaceCheckpoints::new();
-        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut after = Some(Checkpoint::from_wire(vec![9])?);
         let mut restarted = false;
         let is_mine = |_: DocumentId| true;
-        let mut wire =
-            ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
+        let mut wire = ScriptWire::with_pulls(vec![
+            PullResult::CheckpointExpired,
+            scripted_empty_page(10)?,
+        ]);
         let mut context = NamespacePullContext {
             namespace: "quiet",
             is_mine: &is_mine,
             checkpoints: &mut checkpoints,
             now_unix_ms: 1_000,
-            policy: online_policy(16, 8),
+            policy: online_policy(16, 8)?,
             after: &mut after,
             restarted_after_expiry: &mut restarted,
         };
@@ -3043,8 +3233,7 @@ mod tests {
             PeerId::new(),
             &mut wire,
             &mut context,
-        ))
-        .unwrap();
+        ))?;
         assert!(
             first.is_none(),
             "an ordinary expiry must restart instead of failing closed"
@@ -3062,18 +3251,18 @@ mod tests {
             PeerId::new(),
             &mut wire,
             &mut context,
-        ))
-        .unwrap();
-        assert_eq!(second, Some((0, false)));
+        ))?;
+        assert_eq!(second, Some((0, false)), "the restart pulls from the floor");
+        Ok(())
     }
 
     #[test]
-    fn namespace_repeated_expiry_and_baseline_required_fail_closed() {
+    fn namespace_repeated_expiry_and_baseline_required_fail_closed() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let replica = NsReplica::fresh(scope, Vec::new());
         let is_mine = |_: DocumentId| true;
         let mut checkpoints = NamespaceCheckpoints::new();
-        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut after = Some(Checkpoint::from_wire(vec![9])?);
         let mut restarted = true;
         let mut expired = ScriptWire::with_pulls(vec![PullResult::CheckpointExpired]);
         {
@@ -3082,24 +3271,27 @@ mod tests {
                 is_mine: &is_mine,
                 checkpoints: &mut checkpoints,
                 now_unix_ms: 1_000,
-                policy: online_policy(16, 8),
+                policy: online_policy(16, 8)?,
                 after: &mut after,
                 restarted_after_expiry: &mut restarted,
             };
-            assert!(matches!(
-                lgwks_std::task::block_on(pull_namespace_page(
-                    &replica,
-                    PeerId::new(),
-                    &mut expired,
-                    &mut context,
-                )),
-                Err(NamespaceSyncError::Protocol(
-                    ProtocolError::InvalidCheckpoint
-                ))
-            ));
+            assert!(
+                matches!(
+                    lgwks_std::task::block_on(pull_namespace_page(
+                        &replica,
+                        PeerId::new(),
+                        &mut expired,
+                        &mut context,
+                    )),
+                    Err(NamespaceSyncError::Protocol(
+                        ProtocolError::InvalidCheckpoint
+                    ))
+                ),
+                "repeated expiry must fail closed"
+            );
         }
 
-        let mut after = Some(Checkpoint::from_wire(vec![9]).unwrap());
+        let mut after = Some(Checkpoint::from_wire(vec![9])?);
         let mut restarted = false;
         let mut baseline = ScriptWire::with_pulls(vec![PullResult::BaselineRequired]);
         let mut context = NamespacePullContext {
@@ -3107,29 +3299,33 @@ mod tests {
             is_mine: &is_mine,
             checkpoints: &mut checkpoints,
             now_unix_ms: 1_000,
-            policy: online_policy(16, 8),
+            policy: online_policy(16, 8)?,
             after: &mut after,
             restarted_after_expiry: &mut restarted,
         };
-        assert!(matches!(
-            lgwks_std::task::block_on(pull_namespace_page(
-                &replica,
-                PeerId::new(),
-                &mut baseline,
-                &mut context,
-            )),
-            Err(NamespaceSyncError::Protocol(
-                ProtocolError::InvalidCheckpoint
-            ))
-        ));
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(pull_namespace_page(
+                    &replica,
+                    PeerId::new(),
+                    &mut baseline,
+                    &mut context,
+                )),
+                Err(NamespaceSyncError::Protocol(
+                    ProtocolError::InvalidCheckpoint
+                ))
+            ),
+            "baseline-required must fail closed"
+        );
         assert!(
             !*context.restarted_after_expiry,
             "baseline-required must fail closed without spending the restart"
         );
+        Ok(())
     }
 
     #[test]
-    fn chatty_flood_never_blocks_quiet_convergence_or_upload() {
+    fn chatty_flood_never_blocks_quiet_convergence_or_upload() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (mut log, ownership) = log_with(scope, &["quiet"]);
         log.grow_per_pull = 20;
@@ -3138,15 +3334,17 @@ mod tests {
             &replica,
             PeerId::new(),
             &mut log,
-            &domain("quiet", online_policy(4, 8), 1_000),
+            &domain("quiet", online_policy(4, 8)?, 1_000)?,
             |document| ownership.get(&document) == Some(&"quiet"),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.pulled, 1);
-        assert_eq!(report.pages, 8);
-        assert!(report.more);
-        assert!(log.entries.borrow().len() >= 161);
+        ))?;
+        assert_eq!(report.pulled, 1, "the first page installs");
+        assert_eq!(report.pages, 8, "the page budget is used");
+        assert!(report.more, "the flood still has a backlog");
+        assert!(
+            log.entries.borrow().len() >= 161,
+            "the chatty log keeps growing"
+        );
 
         let quiet_document = DocumentId::new();
         let mut pending = Vec::new();
@@ -3162,132 +3360,160 @@ mod tests {
             &sender,
             PeerId::new(),
             &mut uplink,
-            &domain("quiet", online_policy(64, 8), 1_000),
+            &domain("quiet", online_policy(64, 8)?, 1_000)?,
             |document| document == quiet_document,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(send.namespace, "quiet");
-        assert_eq!(send.uploaded, 1);
-        assert!(!send.deferred);
-        assert_eq!(*uplink.pushed_operations.borrow(), vec![quiet_operation]);
-        assert_eq!(sender.acknowledged.get(), 0);
+        ))?;
+        assert_eq!(
+            send.namespace, "quiet",
+            "upload targets the quiet namespace"
+        );
+        assert_eq!(send.uploaded, 1, "only the quiet change uploads");
+        assert!(!send.deferred, "the quiet upload is not deferred");
+        assert_eq!(
+            *uplink.pushed_operations.borrow(),
+            vec![quiet_operation],
+            "exactly the quiet operation leaves"
+        );
+        assert_eq!(
+            sender.acknowledged.get(),
+            0,
+            "acks stay at zero until the remote confirms"
+        );
+        Ok(())
     }
 
     #[test]
-    fn expired_namespace_checkpoint_takes_the_explicit_recovery_transition() {
+    fn expired_namespace_checkpoint_takes_the_explicit_recovery_transition()
+    -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (mut log, ownership) = log_with(scope, &["quiet", "quiet"]);
         let replica = NsReplica::fresh(scope, Vec::new());
         let mut stale = NamespaceCheckpoints::new();
-        stale
-            .insert(
-                "quiet",
-                NamespaceCheckpoint::new(PositionalLog::position_bytes(1), 100).unwrap(),
-            )
-            .unwrap();
-        replica.seed_map(&stale);
+        stale.insert(
+            "quiet",
+            NamespaceCheckpoint::new(PositionalLog::position_bytes(1), 100)?,
+        )?;
+        replica.seed_map(&stale)?;
         let peer = PeerId::new();
         let report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
-            &domain("quiet", online_policy(16, 8), 200),
+            &domain("quiet", online_policy(16, 8)?, 200)?,
             |document| ownership.get(&document) == Some(&"quiet"),
             || false,
-        ))
-        .unwrap();
-        assert!(report.full_resync);
-        assert_eq!(report.pulled, 2);
-        assert_eq!(log.pull_afters.borrow().first(), Some(&None));
+        ))?;
+        assert!(report.full_resync, "an expired cursor forces a full resync");
+        assert_eq!(report.pulled, 2, "both quiet changes reinstall");
         assert_eq!(
-            replica.stored_map().get("quiet").unwrap().cursor(),
-            PositionalLog::position_bytes(2)
+            log.pull_afters.borrow().first(),
+            Some(&None),
+            "the first pull restarts from the floor"
+        );
+        assert_eq!(
+            replica
+                .stored_map()?
+                .get("quiet")
+                .ok_or("quiet checkpoint missing")?
+                .cursor(),
+            PositionalLog::position_bytes(2),
+            "the recovered cursor advances past both changes"
         );
 
         let mut expired_service = log_with(scope, &[]).0;
         expired_service.floor = u64::MAX;
         let fresh = NsReplica::fresh(scope, Vec::new());
-        assert!(matches!(
-            lgwks_std::task::block_on(synchronize_namespace(
-                &fresh,
-                PeerId::new(),
-                &mut expired_service,
-                &domain("quiet", online_policy(16, 8), 300),
-                |_| true,
-                || false,
-            )),
-            Err(NamespaceSyncError::Protocol(
-                logical_db_protocol::ProtocolError::InvalidCheckpoint
-            ))
-        ));
-        assert!(fresh.slot.borrow().is_none());
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(synchronize_namespace(
+                    &fresh,
+                    PeerId::new(),
+                    &mut expired_service,
+                    &domain("quiet", online_policy(16, 8)?, 300)?,
+                    |_| true,
+                    || false,
+                )),
+                Err(NamespaceSyncError::Protocol(
+                    logical_db_protocol::ProtocolError::InvalidCheckpoint
+                ))
+            ),
+            "a second expiry without a durable restart fails closed"
+        );
+        assert!(
+            fresh.slot.borrow().is_none(),
+            "a failed recovery installs nothing"
+        );
+        Ok(())
     }
 
     #[test]
-    fn network_condition_gates_namespace_work() {
+    fn network_condition_gates_namespace_work() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (mut log, ownership) = log_with(scope, &["quiet"; 6]);
         let replica = NsReplica::fresh(scope, Vec::new());
-        let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
+        let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline)?;
         let deferred = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
-            &domain("quiet", offline, 1_000),
+            &domain("quiet", offline, 1_000)?,
             |document| ownership.get(&document) == Some(&"quiet"),
             || false,
-        ))
-        .unwrap();
-        assert!(deferred.deferred);
-        assert_eq!(deferred.pulled, 0);
-        assert_eq!(deferred.pages, 0);
-        assert_eq!(log.pulls.get(), 0);
-        assert!(replica.slot.borrow().is_none());
+        ))?;
+        assert!(deferred.deferred, "offline defers namespace work");
+        assert_eq!(deferred.pulled, 0, "offline pulls nothing");
+        assert_eq!(deferred.pages, 0, "offline fetches no pages");
+        assert_eq!(log.pulls.get(), 0, "offline never reaches the transport");
+        assert!(replica.slot.borrow().is_none(), "offline installs nothing");
 
-        let constrained =
-            NamespacePolicy::new(2, 1_048_576, 8, NetworkCondition::Constrained).unwrap();
+        let constrained = NamespacePolicy::new(2, 1_048_576, 8, NetworkCondition::Constrained)?;
         let partial = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             PeerId::new(),
             &mut log,
-            &domain("quiet", constrained, 1_000),
+            &domain("quiet", constrained, 1_000)?,
             |document| ownership.get(&document) == Some(&"quiet"),
             || false,
-        ))
-        .unwrap();
-        assert!(!partial.deferred);
-        assert_eq!(partial.pages, 1);
-        assert_eq!(partial.pulled, 2);
-        assert!(partial.more);
+        ))?;
+        assert!(!partial.deferred, "constrained still runs");
+        assert_eq!(partial.pages, 1, "constrained pulls one page");
+        assert_eq!(partial.pulled, 2, "the constrained page installs two");
+        assert!(partial.more, "the backlog remains past one page");
+        Ok(())
     }
 
     #[test]
-    fn foreign_slot_bytes_fail_closed_before_any_pull() {
+    fn foreign_slot_bytes_fail_closed_before_any_pull() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (mut log, _) = log_with(scope, &["quiet"]);
         let replica = NsReplica::fresh(scope, Vec::new());
         *replica.slot.borrow_mut() = Some(b"legacy-global-cursor".to_vec());
-        assert!(matches!(
-            lgwks_std::task::block_on(synchronize_namespace(
-                &replica,
-                PeerId::new(),
-                &mut log,
-                &domain("quiet", online_policy(16, 8), 1_000),
-                |_| true,
-                || false,
-            )),
-            Err(NamespaceSyncError::Model(_))
-        ));
-        assert_eq!(log.pulls.get(), 0);
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(synchronize_namespace(
+                    &replica,
+                    PeerId::new(),
+                    &mut log,
+                    &domain("quiet", online_policy(16, 8)?, 1_000)?,
+                    |_| true,
+                    || false,
+                )),
+                Err(NamespaceSyncError::Model(_))
+            ),
+            "foreign slot bytes fail closed"
+        );
+        assert_eq!(log.pulls.get(), 0, "foreign slot bytes never pull");
         assert_eq!(
             replica.slot.borrow().clone(),
-            Some(b"legacy-global-cursor".to_vec())
+            Some(b"legacy-global-cursor".to_vec()),
+            "the foreign slot bytes stay untouched"
         );
+        Ok(())
     }
 
     #[test]
-    fn two_namespaces_converge_independently_over_one_binding() {
+    fn two_namespaces_converge_independently_over_one_binding() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (mut log, ownership) = log_with(scope, &["alpha", "beta", "alpha", "beta"]);
         let replica = NsReplica::fresh(scope, Vec::new());
@@ -3296,50 +3522,53 @@ mod tests {
             &replica,
             peer,
             &mut log,
-            &domain("alpha", online_policy(1, 8), 1_000),
+            &domain("alpha", online_policy(1, 8)?, 1_000)?,
             |document| ownership.get(&document) == Some(&"alpha"),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(alpha_report.pulled, 2);
-        assert_eq!(alpha_report.pages, 4);
-        assert!(!alpha_report.more);
-        assert!(replica.stored_map().get("beta").is_none());
+        ))?;
+        assert_eq!(alpha_report.pulled, 2, "alpha pulls both of its changes");
+        assert_eq!(alpha_report.pages, 4, "alpha uses four pages");
+        assert!(!alpha_report.more, "alpha is drained");
+        assert!(
+            replica.stored_map()?.get("beta").is_none(),
+            "alpha leaves beta untouched"
+        );
         let beta_report = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
-            &domain("beta", online_policy(1, 8), 1_000),
+            &domain("beta", online_policy(1, 8)?, 1_000)?,
             |document| ownership.get(&document) == Some(&"beta"),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(beta_report.pulled, 2);
-        assert!(!beta_report.more);
-        let map = replica.stored_map();
+        ))?;
+        assert_eq!(beta_report.pulled, 2, "beta pulls both of its changes");
+        assert!(!beta_report.more, "beta is drained");
+        let map = replica.stored_map()?;
         assert_eq!(
-            map.get("alpha").unwrap().cursor(),
-            PositionalLog::position_bytes(4)
+            map.get("alpha").ok_or("alpha checkpoint missing")?.cursor(),
+            PositionalLog::position_bytes(4),
+            "alpha cursor advances over the shared log"
         );
         assert_eq!(
-            map.get("beta").unwrap().cursor(),
-            PositionalLog::position_bytes(4)
+            map.get("beta").ok_or("beta checkpoint missing")?.cursor(),
+            PositionalLog::position_bytes(4),
+            "beta cursor advances over the shared log"
         );
         let quiet_rerun = lgwks_std::task::block_on(synchronize_namespace(
             &replica,
             peer,
             &mut log,
-            &domain("alpha", online_policy(1, 8), 2_000),
+            &domain("alpha", online_policy(1, 8)?, 2_000)?,
             |document| ownership.get(&document) == Some(&"alpha"),
             || false,
-        ))
-        .unwrap();
-        assert_eq!(quiet_rerun.pulled, 0);
-        assert!(!quiet_rerun.more);
+        ))?;
+        assert_eq!(quiet_rerun.pulled, 0, "alpha is already drained");
+        assert!(!quiet_rerun.more, "alpha has no backlog");
+        Ok(())
     }
 
     #[test]
-    fn rejected_namespace_upload_surfaces_without_acknowledgement() {
+    fn rejected_namespace_upload_surfaces_without_acknowledgement() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let document = DocumentId::new();
         let change = outbound(1, document);
@@ -3347,21 +3576,29 @@ mod tests {
         let replica = NsReplica::fresh(scope, vec![change]);
         let mut uplink = log_with(scope, &[]).0;
         uplink.reject_push = true;
-        assert!(matches!(
-            lgwks_std::task::block_on(send_namespace_now(
-                &replica,
-                PeerId::new(),
-                &mut uplink,
-                &domain("quiet", online_policy(16, 8), 1_000),
-                |candidate| candidate == document,
-                || false,
-            )),
-            Err(NamespaceSyncError::Rejected {
-                operation: value,
-                code: RejectionCode::Forbidden,
-            }) if value == operation
-        ));
-        assert_eq!(replica.acknowledged.get(), 0);
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(send_namespace_now(
+                    &replica,
+                    PeerId::new(),
+                    &mut uplink,
+                    &domain("quiet", online_policy(16, 8)?, 1_000)?,
+                    |candidate| candidate == document,
+                    || false,
+                )),
+                Err(NamespaceSyncError::Rejected {
+                    operation: value,
+                    code: RejectionCode::Forbidden,
+                }) if value == operation
+            ),
+            "a rejected upload surfaces without acknowledging"
+        );
+        assert_eq!(
+            replica.acknowledged.get(),
+            0,
+            "a rejected upload never acknowledges"
+        );
+        Ok(())
     }
 
     struct ScriptWire {
@@ -3381,7 +3618,7 @@ mod tests {
     }
 
     impl Transport for ScriptWire {
-        type Error = Infallible;
+        type Error = MissingScriptedResponse;
         fn push(
             &mut self,
             request: PushRequest,
@@ -3389,26 +3626,26 @@ mod tests {
             for change in &request.changes {
                 self.pushed.borrow_mut().push(change.operation);
             }
-            std::future::ready(Ok(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: request
+            std::future::ready(Ok(PushResponse::new(
+                PROTOCOL_VERSION,
+                request
                     .changes
                     .iter()
                     .map(|change| PushOutcome::Accepted {
                         operation: change.operation,
                     })
                     .collect(),
-            }))
+            )))
         }
         fn pull(
             &mut self,
             _request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
-            self.pulls_seen.set(self.pulls_seen.get() + 1);
-            std::future::ready(Ok(self
-                .pulls
-                .pop_front()
-                .expect("orchestrator pulled past the scripted pages")))
+            self.pulls_seen.set(self.pulls_seen.get().saturating_add(1));
+            match self.pulls.pop_front() {
+                Some(page) => std::future::ready(Ok(page)),
+                None => std::future::ready(Err(MissingScriptedResponse)),
+            }
         }
         fn baseline(
             &mut self,
@@ -3423,33 +3660,35 @@ mod tests {
         checkpoint: u8,
         more: bool,
         documents: &[DocumentId],
-    ) -> PullResult {
-        PullResult::Page(PullPage {
-            protocol: PROTOCOL_VERSION,
-            changes: documents
+    ) -> Result<PullResult, Box<dyn Error>> {
+        Ok(PullResult::Page(PullPage::new(
+            PROTOCOL_VERSION,
+            documents
                 .iter()
-                .map(|document| ChangeEnvelope {
-                    scope,
-                    document: *document,
-                    replica: ReplicaId::new(),
-                    operation: OperationId::new(),
-                    request: OperationDigest::new([3; 32]),
-                    digest: ChangeDigest::new([4; 32]),
-                    bytes: vec![1],
+                .map(|document| {
+                    ChangeEnvelope::new(
+                        scope,
+                        *document,
+                        ReplicaId::new(),
+                        OperationId::new(),
+                        OperationDigest::new([3; 32]),
+                        ChangeDigest::new([4; 32]),
+                        vec![1],
+                    )
                 })
                 .collect(),
-            checkpoint: Checkpoint::from_wire(vec![checkpoint]).unwrap(),
+            Checkpoint::from_wire(vec![checkpoint])?,
             more,
-        })
+        )))
     }
 
-    fn scripted_empty_page(checkpoint: u8) -> PullResult {
-        PullResult::Page(PullPage {
-            protocol: PROTOCOL_VERSION,
-            changes: Vec::new(),
-            checkpoint: Checkpoint::from_wire(vec![checkpoint]).unwrap(),
-            more: false,
-        })
+    fn scripted_empty_page(checkpoint: u8) -> Result<PullResult, Box<dyn Error>> {
+        Ok(PullResult::Page(PullPage::new(
+            PROTOCOL_VERSION,
+            Vec::new(),
+            Checkpoint::from_wire(vec![checkpoint])?,
+            false,
+        )))
     }
 
     fn pending_replica(scope: Scope, count: u64) -> (Replica, Vec<OperationId>) {
@@ -3486,8 +3725,9 @@ mod tests {
 
     impl std::fmt::Display for WireFault {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
+            match *self {
                 Self::Retryable => formatter.write_str("retryable wire fault"),
+                // remaining arms
                 Self::Permanent => formatter.write_str("permanent wire fault"),
             }
         }
@@ -3509,40 +3749,43 @@ mod tests {
             request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
             if self.faults_left > 0 {
-                self.faults_left -= 1;
-                eprintln!("logical-db-sync test transport: scripted push fault");
+                self.faults_left = self.faults_left.saturating_sub(1);
                 return std::future::ready(Err(self.fault));
             }
             for change in &request.changes {
                 self.pushes.borrow_mut().push(change.operation);
             }
-            std::future::ready(Ok(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: request
+            std::future::ready(Ok(PushResponse::new(
+                PROTOCOL_VERSION,
+                request
                     .changes
                     .iter()
                     .map(|change| PushOutcome::Accepted {
                         operation: change.operation,
                     })
                     .collect(),
-            }))
+            )))
         }
         fn pull(
             &mut self,
             _request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
             if self.faults_left > 0 {
-                self.faults_left -= 1;
-                eprintln!("logical-db-sync test transport: scripted pull fault");
+                self.faults_left = self.faults_left.saturating_sub(1);
                 return std::future::ready(Err(self.fault));
             }
-            self.pulls_seen.set(self.pulls_seen.get() + 1);
-            std::future::ready(Ok(PullResult::Page(PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes: Vec::new(),
-                checkpoint: Checkpoint::from_wire(vec![7]).unwrap(),
-                more: false,
-            })))
+            self.pulls_seen.set(self.pulls_seen.get().saturating_add(1));
+            let result = Checkpoint::from_wire(vec![7])
+                .map_err(|_| WireFault::Permanent)
+                .map(|checkpoint| {
+                    PullResult::Page(PullPage::new(
+                        PROTOCOL_VERSION,
+                        Vec::new(),
+                        checkpoint,
+                        false,
+                    ))
+                });
+            std::future::ready(result)
         }
         fn baseline(
             &mut self,
@@ -3558,7 +3801,7 @@ mod tests {
     }
 
     impl Transport for ServiceLog {
-        type Error = Infallible;
+        type Error = ProtocolError;
         fn push(
             &mut self,
             request: PushRequest,
@@ -3584,44 +3827,43 @@ mod tests {
                     });
                 }
             }
-            std::future::ready(Ok(PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes,
-            }))
+            std::future::ready(Ok(PushResponse::new(PROTOCOL_VERSION, outcomes)))
         }
         fn pull(
             &mut self,
             request: PullRequest,
         ) -> impl Future<Output = Result<PullResult, Self::Error>> {
-            let position = match &request.after {
+            let position = match request.after {
                 None => 0_u64,
-                Some(checkpoint) => PositionalLog::position(checkpoint),
+                Some(ref checkpoint) => PositionalLog::position(checkpoint),
             };
-            let start = usize::try_from(position).unwrap();
+            // match is closed over Option
+            let start = usize::try_from(position).unwrap_or(0);
             let entries = self.entries.borrow();
             let changes = entries
                 .iter()
                 .skip(start)
                 .take(usize::from(request.max_changes))
-                .map(|entry| ChangeEnvelope {
-                    scope: request.scope,
-                    document: entry.document,
-                    replica: ReplicaId::new(),
-                    operation: OperationId::new(),
-                    request: OperationDigest::new([3; 32]),
-                    digest: ChangeDigest::new([4; 32]),
-                    bytes: entry.bytes.clone(),
+                .map(|entry| {
+                    ChangeEnvelope::new(
+                        request.scope,
+                        entry.document,
+                        ReplicaId::new(),
+                        OperationId::new(),
+                        OperationDigest::new([3; 32]),
+                        ChangeDigest::new([4; 32]),
+                        entry.bytes.clone(),
+                    )
                 })
                 .collect::<Vec<_>>();
-            let next = start + changes.len();
+            let next = start.saturating_add(changes.len());
             let more = next < entries.len();
-            std::future::ready(Ok(PullResult::Page(PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes,
-                checkpoint: Checkpoint::from_wire(PositionalLog::position_bytes(next as u64))
-                    .unwrap(),
-                more,
-            })))
+            let next_u64 = u64::try_from(next).unwrap_or(u64::MAX);
+            let result =
+                Checkpoint::from_wire(PositionalLog::position_bytes(next_u64)).map(|checkpoint| {
+                    PullResult::Page(PullPage::new(PROTOCOL_VERSION, changes, checkpoint, more))
+                });
+            std::future::ready(result)
         }
         fn baseline(
             &mut self,
@@ -3632,53 +3874,78 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_policy_rejects_empty_budgets_fail_closed() {
+    fn orchestrator_policy_rejects_empty_budgets_fail_closed() -> Result<(), Box<dyn Error>> {
         assert_eq!(
             OrchestratorPolicy::new(0, 1_000, 60_000),
-            Err(ProtocolError::PageLimit)
+            Err(ProtocolError::PageLimit),
+            "zero page budget fails closed"
         );
         assert_eq!(
             OrchestratorPolicy::new(8, 0, 60_000),
-            Err(ProtocolError::PageLimit)
+            Err(ProtocolError::PageLimit),
+            "zero byte budget fails closed"
         );
         assert_eq!(
             OrchestratorPolicy::new(8, 1_000, 0),
-            Err(ProtocolError::PageLimit)
+            Err(ProtocolError::PageLimit),
+            "zero cycle budget fails closed"
         );
         assert_eq!(
-            OrchestratorPolicy::new(8, 1_000, 60_000).unwrap(),
-            OrchestratorPolicy::default()
+            OrchestratorPolicy::new(8, 1_000, 60_000)?,
+            OrchestratorPolicy::default(),
+            "a valid policy matches the default"
         );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_state_blob_is_versioned_and_fail_closed() {
+    fn orchestrator_state_blob_is_versioned_and_fail_closed() -> Result<(), Box<dyn Error>> {
         let state = OrchestratorState::new();
-        assert_eq!(state.encode().len(), ORCHESTRATOR_STATE_BYTES);
-        assert_eq!(OrchestratorState::decode(&state.encode()).unwrap(), state);
-        assert!(matches!(
-            OrchestratorState::decode(&[0_u8; 4]),
-            Err(OrchestratorStateError::Malformed)
-        ));
+        assert_eq!(
+            state.encode().len(),
+            ORCHESTRATOR_STATE_BYTES,
+            "state blobs are fixed size"
+        );
+        assert_eq!(
+            OrchestratorState::decode(&state.encode())?,
+            state,
+            "encode then decode roundtrips"
+        );
+        assert!(
+            matches!(
+                OrchestratorState::decode(&[0_u8; 4]),
+                Err(OrchestratorStateError::Malformed)
+            ),
+            "a short blob fails closed"
+        );
         let mut bad_magic = state.encode();
         bad_magic[0] ^= 0xFF;
-        assert!(matches!(
-            OrchestratorState::decode(&bad_magic),
-            Err(OrchestratorStateError::Malformed)
-        ));
+        assert!(
+            matches!(
+                OrchestratorState::decode(&bad_magic),
+                Err(OrchestratorStateError::Malformed)
+            ),
+            "a bad magic fails closed"
+        );
         let mut bad_version = state.encode();
         bad_version[8..10].copy_from_slice(&(ORCHESTRATOR_STATE_VERSION + 1).to_be_bytes());
-        assert!(matches!(
-            OrchestratorState::decode(&bad_version),
-            Err(OrchestratorStateError::UnsupportedVersion { actual: 2 })
-        ));
+        assert!(
+            matches!(
+                OrchestratorState::decode(&bad_version),
+                Err(OrchestratorStateError::UnsupportedVersion { actual: 2 })
+            ),
+            "an unknown version fails closed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_send_now_drains_upload_pages_without_app_paging() {
+    fn orchestrator_send_now_drains_upload_pages_without_app_paging() -> Result<(), Box<dyn Error>>
+    {
         let scope = log_scope();
         let (replica, operations) = pending_replica(scope, 3);
-        let mut wire = ScriptWire::with_pulls(vec![scripted_empty_page(1), scripted_empty_page(2)]);
+        let mut wire =
+            ScriptWire::with_pulls(vec![scripted_empty_page(1)?, scripted_empty_page(2)?]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
         let report = lgwks_std::task::block_on(engine.send_now(
@@ -3691,21 +3958,30 @@ mod tests {
             1_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.pushed, 3);
-        assert_eq!(report.pulled, 0);
-        assert_eq!(report.pages, 2);
-        assert_eq!(report.cycles, 2);
-        assert!(!report.more);
-        assert!(!report.deferred);
-        assert!(!report.full_resync);
-        assert_eq!(*wire.pushed.borrow(), operations);
-        assert_eq!(replica.acknowledged.get(), 3);
+        ))?;
+        assert_eq!(report.pushed, 3, "all three pending changes upload");
+        assert_eq!(report.pulled, 0, "send_now does not pull");
+        assert_eq!(report.pages, 2, "upload pages respect the page size");
+        assert_eq!(report.cycles, 2, "two cycles drain the backlog");
+        assert!(!report.more, "the upload backlog is drained");
+        assert!(!report.deferred, "send_now is not deferred");
+        assert!(!report.full_resync, "send_now is not a full resync");
+        assert_eq!(
+            *wire.pushed.borrow(),
+            operations,
+            "wire sees every operation"
+        );
+        assert_eq!(
+            replica.acknowledged.get(),
+            3,
+            "acknowledgement advances through the last upload"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_fetch_now_drains_pull_backlog_until_more_clears() {
+    fn orchestrator_fetch_now_drains_pull_backlog_until_more_clears() -> Result<(), Box<dyn Error>>
+    {
         let scope = log_scope();
         let replica = empty_replica(scope);
         let documents = [
@@ -3716,9 +3992,9 @@ mod tests {
             DocumentId::new(),
         ];
         let mut wire = ScriptWire::with_pulls(vec![
-            scripted_page(scope, 1, true, &documents[0..2]),
-            scripted_page(scope, 2, true, &documents[2..4]),
-            scripted_page(scope, 3, false, &documents[4..5]),
+            scripted_page(scope, 1, true, &documents[0..2])?,
+            scripted_page(scope, 2, true, &documents[2..4])?,
+            scripted_page(scope, 3, false, &documents[4..5])?,
         ]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
@@ -3732,35 +4008,38 @@ mod tests {
             1_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.pulled, 5);
-        assert_eq!(report.pages, 3);
-        assert_eq!(report.cycles, 3);
-        assert!(!report.more);
-        assert!(!report.deferred);
+        ))?;
+        assert_eq!(report.pulled, 5, "every scripted change installs");
+        assert_eq!(report.pages, 3, "every scripted page is fetched");
+        assert_eq!(report.cycles, 3, "one cycle per page budget");
+        assert!(!report.more, "more clears after the final page");
+        assert!(!report.deferred, "fetch_now is not deferred");
         let installed = replica
             .installed
             .borrow()
             .iter()
             .map(|change| change.document)
             .collect::<Vec<_>>();
-        assert_eq!(installed, documents);
-        assert_eq!(*replica.checkpoint.borrow(), Some(vec![3]));
+        assert_eq!(installed, documents, "documents install in order");
+        assert_eq!(
+            *replica.checkpoint.borrow(),
+            Some(vec![3]),
+            "the checkpoint advances to the last page"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_cycle_budget_stops_without_claiming_completion() {
+    fn orchestrator_cycle_budget_stops_without_claiming_completion() -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let replica = empty_replica(scope);
         let documents = [DocumentId::new(), DocumentId::new(), DocumentId::new()];
         let mut wire = ScriptWire::with_pulls(vec![
-            scripted_page(scope, 1, true, &documents[0..1]),
-            scripted_page(scope, 2, true, &documents[1..2]),
-            scripted_page(scope, 3, false, &documents[2..3]),
+            scripted_page(scope, 1, true, &documents[0..1])?,
+            scripted_page(scope, 2, true, &documents[1..2])?,
+            scripted_page(scope, 3, false, &documents[2..3])?,
         ]);
-        let policy =
-            OrchestratorPolicy::new(2, 1_000, 60_000).expect("nonzero test policy is valid");
+        let policy = OrchestratorPolicy::new(2, 1_000, 60_000)?;
         let mut engine = SyncOrchestrator::new(PeerId::new(), policy);
 
         let report = lgwks_std::task::block_on(engine.fetch_now(
@@ -3773,17 +4052,22 @@ mod tests {
             1_000,
             &RetrySignal::never(),
             || false,
-        ))
-        .expect("bounded orchestration succeeds");
+        ))?;
 
-        assert_eq!(report.cycles, 2);
-        assert_eq!(report.pages, 2);
-        assert!(report.more);
-        assert_eq!(replica.installed.borrow().len(), 2);
+        assert_eq!(report.cycles, 2, "the cycle budget stops the run");
+        assert_eq!(report.pages, 2, "only budgeted pages fetch");
+        assert!(report.more, "the remaining backlog is not claimed complete");
+        assert_eq!(
+            replica.installed.borrow().len(),
+            2,
+            "only budgeted pages install"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_surfaces_single_recovery_and_second_expiry_as_protocol_error() {
+    fn orchestrator_surfaces_single_recovery_and_second_expiry_as_protocol_error()
+    -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let replica = Replica {
             scope,
@@ -3794,8 +4078,10 @@ mod tests {
             installed: RefCell::new(Vec::new()),
             baselines: RefCell::new(Vec::new()),
         };
-        let mut wire =
-            ScriptWire::with_pulls(vec![PullResult::CheckpointExpired, scripted_empty_page(10)]);
+        let mut wire = ScriptWire::with_pulls(vec![
+            PullResult::CheckpointExpired,
+            scripted_empty_page(10)?,
+        ]);
         let mut engine = orchestrator();
         let retry = RetrySignal::never();
         let report = lgwks_std::task::block_on(engine.fetch_now(
@@ -3805,13 +4091,16 @@ mod tests {
             1_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert!(report.full_resync);
-        assert_eq!(report.pages, 1);
-        assert!(!report.more);
-        assert!(!report.deferred);
-        assert_eq!(engine.state().consecutive_failures(), 0);
+        ))?;
+        assert!(report.full_resync, "one expiry takes the full-resync path");
+        assert_eq!(report.pages, 1, "the restart page is fetched");
+        assert!(!report.more, "the restart page drains the backlog");
+        assert!(!report.deferred, "recovery is not deferred");
+        assert_eq!(
+            engine.state().consecutive_failures(),
+            0,
+            "one expiry is not a failure"
+        );
 
         let fresh = empty_replica(scope);
         let mut expired = ScriptWire::with_pulls(vec![
@@ -3820,23 +4109,36 @@ mod tests {
         ]);
         *fresh.checkpoint.borrow_mut() = Some(vec![9]);
         let mut retrying = orchestrator();
-        assert!(matches!(
-            lgwks_std::task::block_on(retrying.fetch_now(
-                &fresh,
-                &mut expired,
-                SyncLimits::default(),
-                1_000,
-                &retry,
-                || false,
-            )),
-            Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint))
-        ));
-        assert_eq!(retrying.state().consecutive_failures(), 0);
-        assert_eq!(retrying.state().not_ready_until_ms(), 0);
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(retrying.fetch_now(
+                    &fresh,
+                    &mut expired,
+                    SyncLimits::default(),
+                    1_000,
+                    &retry,
+                    || false,
+                )),
+                Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint))
+            ),
+            "a second expiry without durable restart fails closed"
+        );
+        assert_eq!(
+            retrying.state().consecutive_failures(),
+            0,
+            "a protocol failure does not count as retryable"
+        );
+        assert_eq!(
+            retrying.state().not_ready_until_ms(),
+            0,
+            "a protocol failure does not arm backoff"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_backs_off_retryable_then_succeeds_and_surfaces_permanent() {
+    fn orchestrator_backs_off_retryable_then_succeeds_and_surfaces_permanent()
+    -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (replica, _) = pending_replica(scope, 1);
         let mut wire = FlakyTransport {
@@ -3859,14 +4161,24 @@ mod tests {
             0,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert!(deferred.deferred);
-        assert!(deferred.more);
-        assert_eq!(deferred.cycles, 0);
-        assert_eq!(engine.state().consecutive_failures(), 1);
-        assert_eq!(engine.state().not_ready_until_ms(), 50);
-        assert!(wire.pushes.borrow().is_empty());
+        ))?;
+        assert!(deferred.deferred, "a retryable fault defers the cycle");
+        assert!(deferred.more, "pending work remains");
+        assert_eq!(deferred.cycles, 0, "a deferred cycle is not counted");
+        assert_eq!(
+            engine.state().consecutive_failures(),
+            1,
+            "one retryable failure is recorded"
+        );
+        assert_eq!(
+            engine.state().not_ready_until_ms(),
+            50,
+            "backoff uses the retry-after hint"
+        );
+        assert!(
+            wire.pushes.borrow().is_empty(),
+            "nothing pushes while gated"
+        );
 
         let gated = lgwks_std::task::block_on(engine.send_now(
             &replica,
@@ -3875,12 +4187,11 @@ mod tests {
             10,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert!(gated.deferred);
-        assert_eq!(gated.cycles, 0);
-        assert!(wire.pushes.borrow().is_empty());
-        assert_eq!(wire.pulls_seen.get(), 0);
+        ))?;
+        assert!(gated.deferred, "backoff still gates the cycle");
+        assert_eq!(gated.cycles, 0, "gated cycles are not counted");
+        assert!(wire.pushes.borrow().is_empty(), "still nothing pushes");
+        assert_eq!(wire.pulls_seen.get(), 0, "gated cycles do not pull");
 
         let recovered = lgwks_std::task::block_on(engine.send_now(
             &replica,
@@ -3889,14 +4200,17 @@ mod tests {
             60,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert!(!recovered.deferred);
-        assert_eq!(recovered.pushed, 1);
-        assert!(!recovered.more);
-        assert_eq!(engine.state().consecutive_failures(), 0);
-        assert_eq!(wire.pushes.borrow().len(), 1);
-        assert_eq!(wire.pulls_seen.get(), 1);
+        ))?;
+        assert!(!recovered.deferred, "after backoff the cycle runs");
+        assert_eq!(recovered.pushed, 1, "the pending change uploads");
+        assert!(!recovered.more, "the backlog is drained");
+        assert_eq!(
+            engine.state().consecutive_failures(),
+            0,
+            "success clears the failure counter"
+        );
+        assert_eq!(wire.pushes.borrow().len(), 1, "one push lands");
+        assert_eq!(wire.pulls_seen.get(), 1, "post-send pull follows");
 
         let (stuck, _) = pending_replica(scope, 1);
         let mut fatal = FlakyTransport {
@@ -3906,32 +4220,48 @@ mod tests {
             pulls_seen: Cell::new(0),
         };
         let mut failing = orchestrator();
-        assert!(matches!(
-            lgwks_std::task::block_on(failing.send_now(
-                &stuck,
-                &mut fatal,
-                SyncLimits::default(),
-                0,
-                &retry,
-                || false,
-            )),
-            Err(SyncError::Transport(WireFault::Permanent))
-        ));
-        assert_eq!(failing.state().consecutive_failures(), 0);
-        assert_eq!(failing.state().not_ready_until_ms(), 0);
-        assert!(fatal.pushes.borrow().is_empty());
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(failing.send_now(
+                    &stuck,
+                    &mut fatal,
+                    SyncLimits::default(),
+                    0,
+                    &retry,
+                    || false,
+                )),
+                Err(SyncError::Transport(WireFault::Permanent))
+            ),
+            "a permanent fault surfaces as an error"
+        );
+        assert_eq!(
+            failing.state().consecutive_failures(),
+            0,
+            "permanent faults do not arm retry backoff"
+        );
+        assert_eq!(
+            failing.state().not_ready_until_ms(),
+            0,
+            "permanent faults do not set a ready delay"
+        );
+        assert!(
+            fatal.pushes.borrow().is_empty(),
+            "a permanent fault never pushes"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_state_restored_after_restart_resumes_without_duplicate_delivery() {
+    fn orchestrator_state_restored_after_restart_resumes_without_duplicate_delivery()
+    -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let (replica, operations) = pending_replica(scope, 3);
-        let policy = OrchestratorPolicy::new(1, 1_000, 60_000).unwrap();
+        let policy = OrchestratorPolicy::new(1, 1_000, 60_000)?;
         let peer = PeerId::new();
         let mut wire = ScriptWire::with_pulls(vec![
-            scripted_empty_page(1),
-            scripted_empty_page(2),
-            scripted_empty_page(3),
+            scripted_empty_page(1)?,
+            scripted_empty_page(2)?,
+            scripted_empty_page(3)?,
         ]);
         let mut engine = SyncOrchestrator::new(peer, policy);
         let retry = RetrySignal::never();
@@ -3946,14 +4276,17 @@ mod tests {
             1_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(partial.pushed, 1);
-        assert!(partial.more);
+        ))?;
+        assert_eq!(partial.pushed, 1, "one change uploads before export");
+        assert!(partial.more, "the backlog remains after export");
 
         let blob = engine.export_state();
-        assert_eq!(OrchestratorState::decode(&blob).unwrap(), engine.state());
-        let mut revived = SyncOrchestrator::restore(peer, policy, &blob).unwrap();
+        assert_eq!(
+            OrchestratorState::decode(&blob)?,
+            engine.state(),
+            "exported state decodes to the live state"
+        );
+        let mut revived = SyncOrchestrator::restore(peer, policy, &blob)?;
         let resumed = lgwks_std::task::block_on(revived.send_now(
             &replica,
             &mut wire,
@@ -3961,10 +4294,9 @@ mod tests {
             2_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(resumed.pushed, 1);
-        assert!(resumed.more);
+        ))?;
+        assert_eq!(resumed.pushed, 1, "the second change resumes after restart");
+        assert!(resumed.more, "one change still remains");
         let finished = lgwks_std::task::block_on(revived.send_now(
             &replica,
             &mut wire,
@@ -3972,21 +4304,33 @@ mod tests {
             3_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(finished.pushed, 1);
-        assert!(!finished.more);
-        assert_eq!(*wire.pushed.borrow(), operations);
-        assert_eq!(replica.acknowledged.get(), 3);
+        ))?;
+        assert_eq!(finished.pushed, 1, "the last change uploads");
+        assert!(!finished.more, "the backlog is drained");
+        assert_eq!(
+            *wire.pushed.borrow(),
+            operations,
+            "every operation uploads exactly once"
+        );
+        assert_eq!(
+            replica.acknowledged.get(),
+            3,
+            "acknowledgement catches up after restart"
+        );
 
-        assert!(matches!(
-            SyncOrchestrator::restore(peer, policy, &[7_u8; 3]),
-            Err(OrchestratorStateError::Malformed)
-        ));
+        assert!(
+            matches!(
+                SyncOrchestrator::restore(peer, policy, &[7_u8; 3]),
+                Err(OrchestratorStateError::Malformed)
+            ),
+            "a short state blob fails closed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn orchestrator_drives_namespace_domains_without_duplicating_cursors() {
+    fn orchestrator_drives_namespace_domains_without_duplicating_cursors()
+    -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let document = DocumentId::new();
         let change = outbound(1, document);
@@ -4000,49 +4344,66 @@ mod tests {
         let report = lgwks_std::task::block_on(engine.run_namespace(
             &replica,
             &mut log,
-            &domain("quiet", online_policy(16, 8), 1_000),
+            &domain("quiet", online_policy(16, 8)?, 1_000)?,
             &is_mine,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(report.namespace, "quiet");
-        assert_eq!(report.send.namespace, "quiet");
-        assert_eq!(report.send.uploaded, 1);
-        assert!(report.send.more);
-        assert_eq!(report.pulled, 1);
-        assert_eq!(report.pages, 1);
-        assert_eq!(report.cycles, 1);
-        assert!(!report.more);
-        assert!(!report.deferred);
-        assert_eq!(*log.pushed_operations.borrow(), vec![operation]);
-        assert_eq!(replica.acknowledged.get(), 0);
+        ))?;
+        assert_eq!(report.namespace, "quiet", "namespace identity is reported");
+        assert_eq!(report.send.namespace, "quiet", "send targets the domain");
+        assert_eq!(report.send.uploaded, 1, "the domain change uploads");
+        assert!(report.send.more, "the send page reports remaining work");
+        assert_eq!(report.pulled, 1, "the domain pull installs one change");
+        assert_eq!(report.pages, 1, "one page advances the domain cursor");
+        assert_eq!(report.cycles, 1, "one cycle drains the domain");
+        assert!(!report.more, "the domain has no backlog after the cycle");
+        assert!(!report.deferred, "the domain cycle is not deferred");
         assert_eq!(
-            replica.stored_map().get("quiet").unwrap().cursor(),
-            PositionalLog::position_bytes(1)
+            *log.pushed_operations.borrow(),
+            vec![operation],
+            "exactly the domain operation uploads"
+        );
+        assert_eq!(
+            replica.acknowledged.get(),
+            0,
+            "acks stay zero until the remote confirms"
+        );
+        assert_eq!(
+            replica
+                .stored_map()?
+                .get("quiet")
+                .ok_or("quiet checkpoint missing")?
+                .cursor(),
+            PositionalLog::position_bytes(1),
+            "the domain cursor advances over the installed change"
         );
 
         let pulls_before = log.pulls.get();
-        let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline).unwrap();
+        let offline = NamespacePolicy::new(16, 1_048_576, 8, NetworkCondition::Offline)?;
         let parked = lgwks_std::task::block_on(engine.run_namespace(
             &replica,
             &mut log,
-            &domain("quiet", offline, 2_000),
+            &domain("quiet", offline, 2_000)?,
             &is_mine,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert!(parked.deferred);
-        assert!(parked.send.deferred);
-        assert_eq!(parked.cycles, 0);
-        assert_eq!(parked.send.uploaded, 0);
-        assert_eq!(parked.pulled, 0);
-        assert_eq!(log.pulls.get(), pulls_before);
+        ))?;
+        assert!(parked.deferred, "offline defers the domain cycle");
+        assert!(parked.send.deferred, "offline defers the domain send");
+        assert_eq!(parked.cycles, 0, "a deferred cycle is not counted");
+        assert_eq!(parked.send.uploaded, 0, "offline uploads nothing");
+        assert_eq!(parked.pulled, 0, "offline pulls nothing");
+        assert_eq!(
+            log.pulls.get(),
+            pulls_before,
+            "offline never reaches the transport"
+        );
+        Ok(())
     }
 
     #[test]
-    fn two_replicas_converge_through_orchestrator_runs_without_duplicate_delivery() {
+    fn two_replicas_converge_through_orchestrator_runs_without_duplicate_delivery()
+    -> Result<(), Box<dyn Error>> {
         let scope = log_scope();
         let first_document = DocumentId::new();
         let second_document = DocumentId::new();
@@ -4076,10 +4437,9 @@ mod tests {
             1_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(sent.pushed, 2);
-        assert!(!sent.more);
+        ))?;
+        assert_eq!(sent.pushed, 2, "both sender changes upload");
+        assert!(!sent.more, "the sender backlog drains");
 
         let mut downlink = SyncOrchestrator::new(PeerId::new(), OrchestratorPolicy::default());
         let fetched = lgwks_std::task::block_on(downlink.fetch_now(
@@ -4089,19 +4449,26 @@ mod tests {
             2_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(fetched.pulled, 2);
-        assert!(!fetched.more);
-        assert!(!fetched.full_resync);
+        ))?;
+        assert_eq!(fetched.pulled, 2, "both changes download");
+        assert!(!fetched.more, "the receiver backlog drains");
+        assert!(!fetched.full_resync, "an ordinary fetch is not a resync");
         let installed_docs = receiver
             .installed
             .borrow()
             .iter()
             .map(|change| change.document)
             .collect::<Vec<_>>();
-        assert_eq!(installed_docs, vec![first_document, second_document]);
-        assert_eq!(*log.pushes.borrow(), operations);
+        assert_eq!(
+            installed_docs,
+            vec![first_document, second_document],
+            "documents install in order without duplicates"
+        );
+        assert_eq!(
+            *log.pushes.borrow(),
+            operations,
+            "the wire carries both operations"
+        );
 
         let quiet = lgwks_std::task::block_on(downlink.send_now(
             &receiver,
@@ -4110,11 +4477,10 @@ mod tests {
             3_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(quiet.pushed, 0);
-        assert_eq!(quiet.pulled, 0);
-        assert!(!quiet.more);
+        ))?;
+        assert_eq!(quiet.pushed, 0, "the receiver has nothing new to push");
+        assert_eq!(quiet.pulled, 0, "send_now does not pull");
+        assert!(!quiet.more, "the receiver is settled");
         let settled = lgwks_std::task::block_on(uplink.fetch_now(
             &sender,
             &mut log,
@@ -4122,10 +4488,14 @@ mod tests {
             4_000,
             &retry,
             || false,
-        ))
-        .unwrap();
-        assert_eq!(settled.pulled, 0);
-        assert!(!settled.more);
-        assert_eq!(*log.pushes.borrow(), operations);
+        ))?;
+        assert_eq!(settled.pulled, 0, "the sender sees no new data");
+        assert!(!settled.more, "both replicas are settled");
+        assert_eq!(
+            *log.pushes.borrow(),
+            operations,
+            "no duplicate delivery appears"
+        );
+        Ok(())
     }
 }

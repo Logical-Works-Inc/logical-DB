@@ -34,34 +34,30 @@ async fn invoke<C: CredentialProvider>(
     let request = OperationDigest::new([1; 32]);
     match operation {
         Operation::Push => transport
-            .push(PushRequest {
-                protocol: PROTOCOL_VERSION,
-                replica,
-                changes: Vec::new(),
-            })
+            .push(PushRequest::new(PROTOCOL_VERSION, replica, Vec::new()))
             .await
             .map(|_| ()),
         Operation::Pull => transport
-            .pull(PullRequest {
-                protocol: PROTOCOL_VERSION,
+            .pull(PullRequest::new(
+                PROTOCOL_VERSION,
                 scope,
                 replica,
                 request,
-                after: None,
-                max_changes: 1,
-                max_bytes: 1_024,
-            })
+                None,
+                1,
+                1_024,
+            ))
             .await
             .map(|_| ()),
         Operation::Baseline => transport
-            .baseline(BaselineRequest {
-                protocol: PROTOCOL_VERSION,
+            .baseline(BaselineRequest::new(
+                PROTOCOL_VERSION,
                 scope,
                 replica,
                 request,
-                after: None,
-                after_document: None,
-            })
+                None,
+                None,
+            ))
             .await
             .map(|_| ()),
     }
@@ -103,101 +99,102 @@ impl CredentialProvider for Refresh {
     }
 }
 
-fn undispatched_endpoint() -> (TcpListener, Url) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
-    (listener, endpoint.parse().unwrap())
+fn undispatched_endpoint() -> Result<(TcpListener, Url), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let endpoint = format!("http://{}/", listener.local_addr()?);
+    Ok((listener, endpoint.parse()?))
 }
 
-fn assert_undispatched(listener: &TcpListener) {
+fn assert_undispatched(listener: &TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+    let Err(error) = listener.accept() else {
+        return Err("the request must never reach the undispatched listener".into());
+    };
     assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
+        error.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a nonblocking listener with no client must report WouldBlock"
     );
+    Ok(())
 }
 
-fn successful_endpoint(operation: Operation) -> Url {
+fn successful_endpoint(operation: Operation) -> Result<Url, Box<dyn std::error::Error>> {
     let (status, body) = match operation {
         Operation::Push => (
             "200 OK",
-            encode(&PushResponse {
-                protocol: PROTOCOL_VERSION,
-                outcomes: Vec::new(),
-            })
-            .unwrap(),
+            encode(&PushResponse::new(PROTOCOL_VERSION, Vec::new()))?,
         ),
         Operation::Pull => (
             "200 OK",
-            encode(&PullPage {
-                protocol: PROTOCOL_VERSION,
-                changes: Vec::new(),
-                checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
-                more: false,
-            })
-            .unwrap(),
+            encode(&PullPage::new(
+                PROTOCOL_VERSION,
+                Vec::new(),
+                Checkpoint::from_wire(vec![1])?,
+                false,
+            ))?,
         ),
         Operation::Baseline => ("404 Not Found", Vec::new()),
     };
     spawn_raw_server(move |stream| {
         write_bytes(
-            stream,
+            &mut *stream,
             format!(
                 "HTTP/1.1 {status}\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: {}\r\n\r\n",
                 body.len()
             )
             .as_bytes(),
         );
-        write_bytes(stream, &body);
+        write_bytes(&mut *stream, &body);
     })
 }
 
 #[test]
-fn pending_credentials_timeout_without_dispatch_on_every_route() {
-    test_runtime().block_on(async {
+fn pending_credentials_timeout_without_dispatch_on_every_route()
+-> Result<(), Box<dyn std::error::Error>> {
+    test_runtime()?.block_on(async {
         for operation in OPERATIONS {
-            let (listener, endpoint) = undispatched_endpoint();
-            let mut transport = HttpTransport::new(endpoint, Refresh::new(None)).unwrap();
+            let (listener, endpoint) = undispatched_endpoint()?;
+            let mut transport = HttpTransport::new(endpoint, Refresh::new(None))?;
             assert_eq!(transport.operation_timeout, Duration::from_secs(30));
             transport.operation_timeout = Duration::from_millis(50);
             let started = Instant::now();
-            let outcome = timeout(Duration::from_secs(1), invoke(&mut transport, operation))
-                .await
-                .expect("refresh must not hang");
+            let outcome =
+                timeout(Duration::from_secs(1), invoke(&mut transport, operation)).await?;
             assert!(matches!(outcome, Err(HttpError::CredentialTimeout)));
             assert!(started.elapsed() >= transport.operation_timeout);
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 1);
-            assert_undispatched(&listener);
+            assert_undispatched(&listener)?;
         }
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn refresh_and_http_headers_or_body_share_one_budget() {
-    test_runtime().block_on(async {
+fn refresh_and_http_headers_or_body_share_one_budget() -> Result<(), Box<dyn std::error::Error>> {
+    test_runtime()?.block_on(async {
         for operation in OPERATIONS {
             for stall_body in [false, true] {
                 let endpoint = spawn_raw_server(move |stream| {
                     if !stall_body {
-                        std::thread::sleep(Duration::from_millis(300));
+                        std::thread::park_timeout(Duration::from_millis(300));
                     }
-                    write_bytes(stream, &chunked_head());
+                    write_bytes(&mut *stream, &chunked_head());
                     if stall_body {
-                        chunk(stream, &[0xa0]);
-                        std::thread::sleep(Duration::from_millis(300));
+                        chunk(&mut *stream, &[0xa0]);
+                        std::thread::park_timeout(Duration::from_millis(300));
                     } else {
-                        chunk(stream, &[0xa0]);
+                        chunk(&mut *stream, &[0xa0]);
                     }
-                    write_bytes(stream, b"0\r\n\r\n");
-                });
+                    write_bytes(&mut *stream, b"0\r\n\r\n");
+                })?;
                 let mut transport =
-                    HttpTransport::new(endpoint, Refresh::new(Some(Duration::from_millis(300))))
-                        .unwrap();
+                    HttpTransport::new(endpoint, Refresh::new(Some(Duration::from_millis(300))))?;
                 transport.operation_timeout = Duration::from_millis(500);
                 let started = Instant::now();
-                let outcome = timeout(Duration::from_secs(2), invoke(&mut transport, operation))
-                    .await
-                    .expect("exchange must not hang");
+                let outcome =
+                    timeout(Duration::from_secs(2), invoke(&mut transport, operation)).await?;
                 let elapsed = started.elapsed();
                 assert!(
                     matches!(outcome, Err(HttpError::OperationTimeout)),
@@ -207,91 +204,106 @@ fn refresh_and_http_headers_or_body_share_one_budget() {
                 assert!(elapsed < Duration::from_secs(1));
             }
         }
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn cancelling_refresh_drops_it_and_reuses_the_same_transport() {
-    test_runtime().block_on(async {
+fn cancelling_refresh_drops_it_and_reuses_the_same_transport()
+-> Result<(), Box<dyn std::error::Error>> {
+    test_runtime()?.block_on(async {
         for operation in OPERATIONS {
-            let (listener, endpoint) = undispatched_endpoint();
-            let mut transport = HttpTransport::new(endpoint, Refresh::new(None)).unwrap();
+            let (listener, endpoint) = undispatched_endpoint()?;
+            let mut transport = HttpTransport::new(endpoint, Refresh::new(None))?;
             assert!(
                 timeout(Duration::from_millis(50), invoke(&mut transport, operation))
                     .await
                     .is_err()
             );
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 1);
-            assert_undispatched(&listener);
+            assert_undispatched(&listener)?;
             transport.credentials.delay = Some(Duration::ZERO);
-            transport.endpoint = successful_endpoint(operation);
-            timeout(Duration::from_secs(2), invoke(&mut transport, operation))
-                .await
-                .unwrap()
-                .unwrap();
+            transport.endpoint = successful_endpoint(operation)?;
+            timeout(Duration::from_secs(2), invoke(&mut transport, operation)).await??;
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 2);
         }
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn credential_failures_and_timeout_retry_policy_stay_distinct() {
-    test_runtime().block_on(async {
+fn credential_failures_and_timeout_retry_policy_stay_distinct()
+-> Result<(), Box<dyn std::error::Error>> {
+    test_runtime()?.block_on(async {
         for operation in OPERATIONS {
-            let (listener, endpoint) = undispatched_endpoint();
+            let (listener, endpoint) = undispatched_endpoint()?;
             let mut credentials = Refresh::new(Some(Duration::ZERO));
             credentials.fail = true;
-            let mut transport = HttpTransport::new(endpoint, credentials).unwrap();
-            let error = invoke(&mut transport, operation).await.unwrap_err();
+            let mut transport = HttpTransport::new(endpoint, credentials)?;
+            let Err(error) = invoke(&mut transport, operation).await else {
+                return Err("a failing refresh must make the exchange fail".into());
+            };
             assert!(matches!(
                 error,
                 HttpError::Credential(CredentialError::Refresh)
             ));
             assert!(!error.is_retryable());
             assert!(!format!("{error:?} {error}").contains("never-print-me"));
-            assert_undispatched(&listener);
+            assert_undispatched(&listener)?;
         }
         for error in [HttpError::CredentialTimeout, HttpError::OperationTimeout] {
             assert!(error.is_retryable());
             assert_eq!(error.retry_after(), None);
             assert!(!format!("{error:?} {error}").contains("never-print-me"));
         }
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn static_and_refreshed_credentials_keep_all_routes_working() {
-    test_runtime().block_on(async {
+fn static_and_refreshed_credentials_keep_all_routes_working()
+-> Result<(), Box<dyn std::error::Error>> {
+    test_runtime()?.block_on(async {
         for operation in OPERATIONS {
             let mut transport = HttpTransport::new(
-                successful_endpoint(operation),
-                StaticBearer::new("integration").unwrap(),
-            )
-            .unwrap();
-            invoke(&mut transport, operation).await.unwrap();
+                successful_endpoint(operation)?,
+                StaticBearer::new("integration")?,
+            )?;
+            invoke(&mut transport, operation).await?;
             let mut transport = HttpTransport::new(
-                successful_endpoint(operation),
+                successful_endpoint(operation)?,
                 Refresh::new(Some(Duration::from_millis(10))),
-            )
-            .unwrap();
-            invoke(&mut transport, operation).await.unwrap();
+            )?;
+            invoke(&mut transport, operation).await?;
         }
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn expired_deadline_never_polls_the_next_stage() {
-    test_runtime().block_on(async {
+fn expired_deadline_never_polls_the_next_stage() -> Result<(), Box<dyn std::error::Error>> {
+    test_runtime()?.block_on(async {
         let outcome = within_deadline(Instant::now(), HttpError::OperationTimeout, async {
-            panic!("an expired stage must not start")
+            Err::<(), HttpError>(HttpError::BodyTooLarge)
         })
         .await;
         assert!(matches!(outcome, Err(HttpError::OperationTimeout)));
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn late_ready_credentials_are_refused_before_dispatch() {
+fn late_ready_credentials_are_refused_before_dispatch() -> Result<(), Box<dyn std::error::Error>> {
     struct Late;
     impl CredentialProvider for Late {
         fn authorization(
@@ -299,20 +311,23 @@ fn late_ready_credentials_are_refused_before_dispatch() {
         ) -> impl std::future::Future<Output = Result<HeaderValue, CredentialError>> {
             // Deliberately violate the cooperative-provider contract to prove
             // the post-poll check rejects a late ready value, not to promise preemption.
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::park_timeout(Duration::from_millis(50));
             std::future::ready(Ok(HeaderValue::from_static("Bearer never-print-me")))
         }
     }
-    test_runtime().block_on(async {
+    test_runtime()?.block_on(async {
         for operation in OPERATIONS {
-            let (listener, endpoint) = undispatched_endpoint();
-            let mut transport = HttpTransport::new(endpoint, Late).unwrap();
+            let (listener, endpoint) = undispatched_endpoint()?;
+            let mut transport = HttpTransport::new(endpoint, Late)?;
             transport.operation_timeout = Duration::from_millis(10);
             assert!(matches!(
                 invoke(&mut transport, operation).await,
                 Err(HttpError::CredentialTimeout)
             ));
-            assert_undispatched(&listener);
+            assert_undispatched(&listener)?;
         }
-    });
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    Ok(())
 }

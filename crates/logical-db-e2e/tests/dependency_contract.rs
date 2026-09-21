@@ -10,19 +10,19 @@
 //! before any behavioural test runs.
 
 /// The repository root is two directories above the e2e crate manifest.
-fn repository_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn repository_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
-        .expect("e2e crate lives two levels below the workspace root")
-        .to_path_buf()
+        .ok_or("e2e crate lives two levels below the workspace root")?
+        .to_path_buf())
 }
 
+/// Every authored external edge is owned by an approved register entry.
 #[test]
-fn every_authored_external_edge_is_owned() {
-    let root = repository_root();
-    let (contract, refusals) =
-        lgwks_deps::check_dependencies(&root).expect("dependency register is readable");
+fn every_authored_external_edge_is_owned() -> Result<(), Box<dyn std::error::Error>> {
+    let root = repository_root()?;
+    let (contract, refusals) = lgwks_deps::check_dependencies(&root)?;
     assert!(
         refusals.is_empty(),
         "{} semantic approvals do not cover every authored edge: {refusals:#?}",
@@ -32,23 +32,29 @@ fn every_authored_external_edge_is_owned() {
         contract.enforce,
         "the register stands enforcement down; that is a reviewable diff, not a default"
     );
+    Ok(())
 }
 
 /// The committed register, read once so every fixture mutates a real document.
-fn committed_register() -> &'static str {
+fn committed_register() -> Result<&'static str, Box<dyn std::error::Error>> {
     static REGISTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    REGISTER.get_or_init(|| {
-        std::fs::read_to_string(repository_root().join("contract/APPROVED.toml"))
-            .expect("committed register is readable")
-    })
+    if let Some(loaded) = REGISTER.get() {
+        return Ok(loaded);
+    }
+    let text = std::fs::read_to_string(repository_root()?.join("contract/APPROVED.toml"))?;
+    Ok(REGISTER.get_or_init(|| text))
 }
 
 /// Rewrites one `[[approved]]` block for `krate`.
-fn mutate_block(register: &str, krate: &str, edit: impl Fn(&str) -> String) -> String {
+fn mutate_block(
+    register: &str,
+    krate: &str,
+    edit: impl Fn(&str) -> String,
+) -> Result<String, Box<dyn std::error::Error>> {
     let needle = format!("crate = \"{krate}\"\n");
     let (head, rest) = register
         .split_once("[[approved]]")
-        .expect("a register has approvals");
+        .ok_or("a register has approvals")?;
     let mut blocks = Vec::new();
     let mut current = String::from("[[approved]]\n");
     for line in rest.lines() {
@@ -72,14 +78,15 @@ fn mutate_block(register: &str, krate: &str, edit: impl Fn(&str) -> String) -> S
         })
         .filter(|block| !block.contains("crate = \"logical-db-gate-dropped-uuid\""))
         .collect();
-    format!("{head}{}", kept.join(""))
+    Ok(format!("{head}{}", kept.join("")))
 }
 
 /// Drops the whole approval for `krate`.
-fn drop_block(register: &str, krate: &str) -> String {
+fn drop_block(register: &str, krate: &str) -> Result<String, Box<dyn std::error::Error>> {
     mutate_block(register, krate, |_| String::new())
 }
 
+/// Rewrites each `field = ...` line so the block pins `value`.
 fn replace_field(block: &str, field: &str, value: &str) -> String {
     let prefix = format!("{field} = ");
     block
@@ -97,27 +104,28 @@ fn replace_field(block: &str, field: &str, value: &str) -> String {
 /// Runs the real gate entry point against a mutated copy of the register.
 fn gate_with(
     register: &str,
-) -> Result<(lgwks_deps::contract::Contract, Vec<lgwks_deps::Refusal>), lgwks_deps::GateError> {
+) -> Result<(lgwks_deps::contract::Contract, Vec<lgwks_deps::Refusal>), Box<dyn std::error::Error>>
+{
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let path =
         std::env::temp_dir().join(format!("logical-db-gate-{}-{id}.toml", std::process::id()));
-    std::fs::write(&path, register).expect("mutated register is writable");
-    let outcome = lgwks_deps::check_dependencies_against(&repository_root(), &path);
-    std::fs::remove_file(&path).expect("mutated register is removable");
-    outcome
+    std::fs::write(&path, register)?;
+    let outcome = lgwks_deps::check_dependencies_against(&repository_root()?, &path);
+    std::fs::remove_file(&path)?;
+    Ok(outcome?)
 }
 
-fn refusals_of(register: &str) -> Vec<lgwks_deps::Refusal> {
-    gate_with(register)
-        .expect("the gate accepts a well-formed register")
-        .1
+/// The refusals the gate reports for `register`, or the gate failure itself.
+fn refusals_of(register: &str) -> Result<Vec<lgwks_deps::Refusal>, Box<dyn std::error::Error>> {
+    Ok(gate_with(register)?.1)
 }
 
 /// The gate must refuse an authored edge whose approval was withdrawn.
 #[test]
-fn withdrawing_an_approval_surfaces_an_unregistered_edge() {
-    let refusals = refusals_of(&drop_block(committed_register(), "uuid"));
+fn withdrawing_an_approval_surfaces_an_unregistered_edge() -> Result<(), Box<dyn std::error::Error>>
+{
+    let refusals = refusals_of(&drop_block(committed_register()?, "uuid")?)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
@@ -125,16 +133,17 @@ fn withdrawing_an_approval_surfaces_an_unregistered_edge() {
         )),
         "a withdrawn approval left no refusal: {refusals:?}"
     );
+    Ok(())
 }
 
 /// An approval names its consumers exactly; a crate outside that list is a
 /// refusal, not a silent widening.
 #[test]
-fn a_consumer_outside_the_approval_list_is_refused() {
-    let mutated = mutate_block(committed_register(), "uuid", |block| {
+fn a_consumer_outside_the_approval_list_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let mutated = mutate_block(committed_register()?, "uuid", |block| {
         replace_field(block, "allowed_consumers", "\"logical-db-model\"")
-    });
-    let refusals = refusals_of(&mutated);
+    })?;
+    let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
@@ -142,15 +151,16 @@ fn a_consumer_outside_the_approval_list_is_refused() {
         )),
         "an unlisted consumer passed the gate: {refusals:?}"
     );
+    Ok(())
 }
 
 /// Approving `normal` must not authorise a `dev` edge for the same crate.
 #[test]
-fn a_dev_edge_under_a_normal_only_approval_is_refused() {
-    let mutated = mutate_block(committed_register(), "ciborium", |block| {
+fn a_dev_edge_under_a_normal_only_approval_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let mutated = mutate_block(committed_register()?, "ciborium", |block| {
         replace_field(block, "allowed_kinds", "\"normal\"")
-    });
-    let refusals = refusals_of(&mutated);
+    })?;
+    let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
@@ -159,15 +169,17 @@ fn a_dev_edge_under_a_normal_only_approval_is_refused() {
         )),
         "kind drift passed the gate: {refusals:?}"
     );
+    Ok(())
 }
 
 /// The approved requirement is exact; a bumped manifest edge is a refusal.
 #[test]
-fn a_requirement_that_differs_from_the_approval_is_refused() {
-    let mutated = mutate_block(committed_register(), "uuid", |block| {
+fn a_requirement_that_differs_from_the_approval_is_refused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mutated = mutate_block(committed_register()?, "uuid", |block| {
         replace_field(block, "version", "\"=1.25.0\"")
-    });
-    let refusals = refusals_of(&mutated);
+    })?;
+    let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
@@ -176,15 +188,16 @@ fn a_requirement_that_differs_from_the_approval_is_refused() {
         )),
         "requirement drift passed the gate: {refusals:?}"
     );
+    Ok(())
 }
 
 /// Changing a registry edge to a git edge is a source-class refusal.
 #[test]
-fn a_source_class_change_is_refused() {
-    let mutated = mutate_block(committed_register(), "uuid", |block| {
+fn a_source_class_change_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let mutated = mutate_block(committed_register()?, "uuid", |block| {
         replace_field(block, "source", "\"git\"")
-    });
-    let refusals = refusals_of(&mutated);
+    })?;
+    let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
@@ -193,16 +206,17 @@ fn a_source_class_change_is_refused() {
         )),
         "source-class drift passed the gate: {refusals:?}"
     );
+    Ok(())
 }
 
 /// An approval with no authored edge is stale authority and must be refused.
 #[test]
-fn an_approval_with_no_authored_edge_is_stale() {
+fn an_approval_with_no_authored_edge_is_stale() -> Result<(), Box<dyn std::error::Error>> {
     let mutated = format!(
         "{}\n[[approved]]\ncrate = \"logical-db-gate-dropped-uuid\"\ntier = \"boundary\"\nversion = \"=1.26.0\"\nowner = \"logical-db-model\"\ncapability = \"identity.unused\"\nsource = \"registry\"\nallowed_consumers = \"logical-db-model\"\nallowed_kinds = \"normal\"\nreason = \"Fixture proving stale authority is refused.\"\napproved_by = \"Director\"\napproved_on = \"2026-09-14\"\nreview = \"https://github.com/srinji-kaggss/logical-DB/pull/47\"\n",
-        committed_register()
+        committed_register()?
     );
-    let refusals = refusals_of(&mutated);
+    let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
@@ -211,29 +225,38 @@ fn an_approval_with_no_authored_edge_is_stale() {
         )),
         "stale authority passed the gate: {refusals:?}"
     );
+    Ok(())
 }
 
 /// A malformed register fails the entry point loudly; it never degrades to
 /// "no edges to check".
 #[test]
-fn a_malformed_register_fails_the_gate() {
-    let outcome = gate_with("[[approved\ncrate = ");
+fn a_malformed_register_fails_the_gate() -> Result<(), Box<dyn std::error::Error>> {
+    let Err(outcome) = gate_with("[[approved\ncrate = ") else {
+        return Err("a malformed register must not pass the gate".into());
+    };
     assert!(
-        matches!(outcome, Err(lgwks_deps::GateError::Contract(_))),
-        "a malformed register must be a contract error, got {outcome:?}"
+        matches!(
+            outcome.downcast_ref::<lgwks_deps::GateError>(),
+            Some(lgwks_deps::GateError::Contract(_))
+        ),
+        "a malformed register must be a contract error, got {outcome}"
     );
+    Ok(())
 }
 
 /// Standing enforcement down is visible to the caller, never implied.
 #[test]
-fn an_enforcement_stand_down_is_reported_not_silently_honoured() {
-    let mutated = committed_register().replace("enforce = true", "enforce = false");
-    let (contract, refusals) = gate_with(&mutated).expect("register still parses");
+fn an_enforcement_stand_down_is_reported_not_silently_honoured()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mutated = committed_register()?.replace("enforce = true", "enforce = false");
+    let (contract, refusals) = gate_with(&mutated)?;
     assert!(!contract.enforce, "the stand-down was not read back");
     assert!(
         refusals.is_empty(),
         "the fixture register must otherwise be clean: {refusals:?}"
     );
+    Ok(())
 }
 
 /// Scope of this gate, stated as an assertion: `source` is a CLASS, so the
@@ -241,37 +264,46 @@ fn an_enforcement_stand_down_is_reported_not_silently_honoured() {
 /// plus source-policy lanes, not by the register. A drift in the pinned rev
 /// must therefore be visible in `Cargo.lock`.
 #[test]
-fn a_git_revision_is_pinned_by_the_lockfile_beyond_this_gates_class_check() {
-    let lock = std::fs::read_to_string(repository_root().join("Cargo.lock")).expect("lockfile");
+fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
+-> Result<(), Box<dyn std::error::Error>> {
+    let lock = std::fs::read_to_string(repository_root()?.join("Cargo.lock"))?;
     let estate = lock
         .split("[[package]]")
-        .find(|block| block.contains("name = \"lgwks_std\"") && block.contains("source = \"git+"))
-        .expect("the git-pinned estate edge is in the lockfile");
-    let source = estate
+        .find(|block| {
+            block.contains("name = \"lgwks_std\"")
+                && block.contains("version = \"0.6.")
+                && block
+                    .contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
+        })
+        .ok_or("the workspace registry estate edge is in the lockfile")?;
+    let version = estate
         .lines()
-        .find(|line| line.starts_with("source = "))
-        .expect("a git source line");
+        .find(|line| line.starts_with("version = "))
+        .ok_or("a version line on the registry estate edge")?;
     assert!(
-        source.contains("rev="),
-        "the lockfile lost the pinned revision: {source}"
+        version.contains("0.6."),
+        "the workspace estate edge is the current lgwks_std minor: {version}"
     );
-    let manifest =
-        std::fs::read_to_string(repository_root().join("Cargo.toml")).expect("workspace manifest");
-    let pinned = manifest
+    let manifest = std::fs::read_to_string(repository_root()?.join("Cargo.toml"))?;
+    let declared = manifest
         .lines()
         .find(|line| line.starts_with("lgwks_std = "))
-        .expect("the estate edge is declared");
-    let manifest_rev = pinned
-        .split("rev = \"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .expect("a pinned rev in the manifest");
+        .ok_or("the estate edge is declared")?;
     assert!(
-        source.contains(manifest_rev),
-        "the lockfile revision no longer matches the manifest pin"
+        !declared.contains("git = "),
+        "the workspace estate edge must not fall back to a git pin: {declared}"
     );
     assert!(
-        committed_register().contains("source = \"git\""),
-        "the register documents git as a class, not a URL"
+        declared.contains("version = \"0.6."),
+        "the manifest requirement matches the current lgwks_std minor: {declared}"
     );
+    assert!(
+        !declared.contains("rev = "),
+        "a registry edge is versioned, not revision-pinned: {declared}"
+    );
+    assert!(
+        committed_register()?.contains("source = \"registry\""),
+        "the register documents registry as the estate edge class"
+    );
+    Ok(())
 }

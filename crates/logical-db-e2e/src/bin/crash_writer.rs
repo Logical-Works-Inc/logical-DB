@@ -5,6 +5,14 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 
 use logical_db::{
     AccountId, Database, DocumentId, Object, OperationDigest, OperationId, ReplicaId, Scalar,
@@ -13,16 +21,25 @@ use logical_db::{
 use std::error::Error;
 use uuid::Uuid;
 
+/// Reports a failed fixture run on stderr and exits nonzero.
 fn main() {
     if let Err(error) = run() {
         eprintln!("crash_writer: {error}");
-        std::process::exit(1);
+        #[expect(
+            clippy::exit,
+            reason = "a failed fixture run must report and exit nonzero"
+        )]
+        {
+            std::process::exit(1);
+        }
     }
 }
 
+/// Commits one edit, then exits without running destructors.
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let [path, account, space, replica, document] = arguments.as_slice() else {
+    let &[ref path, ref account, ref space, ref replica, ref document] = arguments.as_slice()
+    else {
         return Err("expected path, account, space, replica, and document arguments".into());
     };
     let scope = Scope::new(
@@ -44,5 +61,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         },
     )?;
-    std::process::exit(71);
+    #[expect(
+        clippy::exit,
+        reason = "the crash fixture must exit without running destructors"
+    )]
+    {
+        std::process::exit(71);
+    }
 }

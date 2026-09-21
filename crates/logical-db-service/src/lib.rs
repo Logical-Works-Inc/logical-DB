@@ -22,12 +22,16 @@ use logical_db_protocol::{
 };
 use thiserror::Error;
 
+/// Magic prefix identifying a versioned checkpoint token body.
 const CHECKPOINT_MAGIC: &[u8; 4] = b"LCP\x01";
+/// Byte length of the authenticated checkpoint body before the MAC tag.
 const CHECKPOINT_BODY_BYTES: usize = 52;
+/// Total checkpoint token length: body plus a 32-byte authentication tag.
 const CHECKPOINT_BYTES: usize = CHECKPOINT_BODY_BYTES + 32;
 
 /// Compact, typed failures from state-bearing baseline materialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[non_exhaustive]
 pub enum SnapshotMaterializationError {
     /// The supplied base artifact or one of its tombstone markers is invalid.
     #[error("snapshot base artifact is invalid at {context}")]
@@ -67,8 +71,7 @@ pub fn materialize_snapshot(
 ) -> Result<SnapshotArtifact, SnapshotMaterializationError> {
     let base_position = match base {
         Some(artifact) => {
-            artifact.validate(scope).map_err(|error| {
-                eprintln!("logical-db-service: materialize_snapshot base validation: {error}");
+            artifact.validate(scope).map_err(|_error| {
                 SnapshotMaterializationError::InvalidBase {
                     context: "base validation",
                 }
@@ -80,34 +83,26 @@ pub fn materialize_snapshot(
     let expected = through
         .checked_sub(base_position)
         .ok_or(SnapshotMaterializationError::Coverage)?;
-    if expected != changes.len() as u64 {
-        eprintln!(
-            "logical-db-service: materialize_snapshot coverage: through={through} base={base_position} changes={}",
-            changes.len()
-        );
+    let change_count =
+        u64::try_from(changes.len()).map_err(|_error| SnapshotMaterializationError::Coverage)?;
+    if expected != change_count {
         return Err(SnapshotMaterializationError::Coverage);
     }
 
     let mut documents = BTreeMap::<logical_db_model::DocumentId, Document>::new();
     if let Some(artifact) = base {
         for state in &artifact.documents {
-            let mut document = Document::load(&state.snapshot).map_err(|error| {
-                eprintln!("logical-db-service: materialize_snapshot document load: {error}");
+            let mut document = Document::load(&state.snapshot).map_err(|_error| {
                 SnapshotMaterializationError::InvalidBase {
                     context: "document load",
                 }
             })?;
-            let tombstone = document.is_deleted().map_err(|error| {
-                eprintln!("logical-db-service: materialize_snapshot tombstone read: {error}");
+            let tombstone = document.is_deleted().map_err(|_error| {
                 SnapshotMaterializationError::InvalidBase {
                     context: "tombstone read",
                 }
             })?;
             if tombstone != state.tombstone {
-                eprintln!(
-                    "logical-db-service: materialize_snapshot tombstone mismatch: document={}",
-                    state.document
-                );
                 return Err(SnapshotMaterializationError::InvalidBase {
                     context: "tombstone mismatch",
                 });
@@ -118,56 +113,38 @@ pub fn materialize_snapshot(
 
     for change in changes {
         if change.scope != scope {
-            eprintln!(
-                "logical-db-service: materialize_snapshot scope mismatch: document={}",
-                change.document
-            );
             return Err(SnapshotMaterializationError::ScopeMismatch);
         }
-        change.validate().map_err(|error| {
-            eprintln!("logical-db-service: materialize_snapshot change validation: {error}");
-            SnapshotMaterializationError::InvalidChange
-        })?;
-        let encoded = EncodedChange {
-            digest: change.digest,
-            bytes: change.bytes.clone(),
-        };
-        encoded.validate().map_err(|error| {
-            eprintln!("logical-db-service: materialize_snapshot encoded validation: {error}");
-            SnapshotMaterializationError::InvalidChange
-        })?;
+        change
+            .validate()
+            .map_err(|_error| SnapshotMaterializationError::InvalidChange)?;
+        let encoded = EncodedChange::new(change.digest, change.bytes.clone());
+        encoded
+            .validate()
+            .map_err(|_error| SnapshotMaterializationError::InvalidChange)?;
         documents
             .entry(change.document)
             .or_default()
             .apply(&[encoded])
-            .map_err(|error| {
-                eprintln!("logical-db-service: materialize_snapshot apply: {error}");
-                SnapshotMaterializationError::InvalidChange
-            })?;
+            .map_err(|_error| SnapshotMaterializationError::InvalidChange)?;
     }
 
     let states = documents
         .into_iter()
         .map(|(document, mut state)| {
-            let tombstone = state.is_deleted().map_err(|error| {
-                eprintln!("logical-db-service: materialize_snapshot output tombstone: {error}");
-                SnapshotMaterializationError::InvalidChange
-            })?;
-            let snapshot = state.save().map_err(|error| {
-                eprintln!("logical-db-service: materialize_snapshot save: {error}");
-                SnapshotMaterializationError::ResourceLimit
-            })?;
-            Ok(logical_db_model::SnapshotDocument {
-                document,
-                snapshot,
-                tombstone,
-            })
+            let tombstone = state
+                .is_deleted()
+                .map_err(|_error| SnapshotMaterializationError::InvalidChange)?;
+            let snapshot = state
+                .save()
+                .map_err(|_error| SnapshotMaterializationError::ResourceLimit)?;
+            Ok(logical_db_model::SnapshotDocument::new(
+                document, snapshot, tombstone,
+            ))
         })
         .collect::<Result<Vec<_>, SnapshotMaterializationError>>()?;
-    SnapshotArtifact::new(scope, through, states).map_err(|error| {
-        eprintln!("logical-db-service: materialize_snapshot artifact: {error}");
-        SnapshotMaterializationError::ResourceLimit
-    })
+    SnapshotArtifact::new(scope, through, states)
+        .map_err(|_error| SnapshotMaterializationError::ResourceLimit)
 }
 
 /// Verifier-produced execution proof consumed by a storage transaction.
@@ -202,6 +179,7 @@ pub trait Authority {
 
 /// Durable outcome of accepting one immutable change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum AcceptResult {
     /// Newly appended to the scoped change log.
     Accepted,
@@ -219,6 +197,7 @@ pub enum AcceptResult {
 
 /// Bounded page returned by a service storage adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct StoredPage {
     /// Changes strictly after the requested position.
     pub changes: Vec<ChangeEnvelope>,
@@ -228,8 +207,24 @@ pub struct StoredPage {
     pub more: bool,
 }
 
+impl StoredPage {
+    /// Builds one durable page returned by a service storage adapter.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose stored pages through here.
+    #[must_use]
+    pub fn new(changes: Vec<ChangeEnvelope>, position: u64, more: bool) -> Self {
+        Self {
+            changes,
+            position,
+            more,
+        }
+    }
+}
+
 /// Durable outcome of executing one frontier-bound page invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PageResult {
     /// The transaction observed the justified frontier and returned a page.
     Page(StoredPage),
@@ -244,6 +239,7 @@ pub enum PageResult {
 
 /// Stable retry classification for failures crossing the service boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum StoreFailureClass {
     /// Retrying the exact idempotent request after backoff may make progress.
     Transient,
@@ -342,6 +338,7 @@ where
 
 /// Stable refusal reasons for one peer-aware prune decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PruneRefusal {
     /// No state-bearing recovery artifact covers the requested prefix.
     MissingBaseline,
@@ -388,17 +385,14 @@ pub fn prune_decision(
         return Ok(floor);
     }
     if requested_up_to > frontier {
-        eprintln!("logical-db-service: prune_decision: BeyondFrontier");
         return Err(PruneRefusal::BeyondFrontier { frontier });
     }
     if let Some(min_live) = min_live
         && requested_up_to > min_live
     {
-        eprintln!("logical-db-service: prune_decision: LiveCheckpoint");
         return Err(PruneRefusal::LiveCheckpoint { min_live });
     }
     if requested_up_to > consumed_through {
-        eprintln!("logical-db-service: prune_decision: PendingOperations");
         return Err(PruneRefusal::PendingOperations { consumed_through });
     }
     Ok(requested_up_to)
@@ -406,6 +400,7 @@ pub fn prune_decision(
 
 /// Durable receipt for one collected log prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct PruneReceipt {
     /// Highest log position collected by this decision, inclusive.
     pub pruned_through: u64,
@@ -413,8 +408,23 @@ pub struct PruneReceipt {
     pub floor: u64,
 }
 
+impl PruneReceipt {
+    /// Builds one durable collection receipt from its inclusive prefix and floor.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose prune receipts through here.
+    #[must_use]
+    pub const fn new(pruned_through: u64, floor: u64) -> Self {
+        Self {
+            pruned_through,
+            floor,
+        }
+    }
+}
+
 /// Durable outcome of executing one frontier-bound prune invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PruneResult {
     /// The prefix decision committed and the floor advanced (or held).
     Pruned(PruneReceipt),
@@ -426,6 +436,7 @@ pub enum PruneResult {
 
 /// Durable outcome of executing one frontier-bound snapshot seal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SealResult {
     /// The versioned baseline committed durably.
     Sealed {
@@ -443,6 +454,7 @@ pub enum SealResult {
 
 /// Durable outcome of executing one frontier-bound consumption mark.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ConsumedResult {
     /// The consumption watermark advanced monotonically.
     Advanced {
@@ -467,6 +479,7 @@ pub enum ConsumedResult {
 ///
 /// One ordered slice of a sealed baseline after an exclusive document cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct BaselinePageSlice {
     /// Strictly ascending documents after the requested cursor.
     pub documents: Vec<SnapshotDocument>,
@@ -474,8 +487,20 @@ pub struct BaselinePageSlice {
     pub more: bool,
 }
 
+impl BaselinePageSlice {
+    /// Builds one ordered sealed-baseline slice after an exclusive cursor.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose baseline slices through here.
+    #[must_use]
+    pub fn new(documents: Vec<SnapshotDocument>, more: bool) -> Self {
+        Self { documents, more }
+    }
+}
+
 /// Durable outcome of one grant-bound recovery page read.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BaselinePageResult {
     /// The read observed the justified frontier and returned a page slice.
     Page(BaselinePageSlice),
@@ -640,7 +665,9 @@ where
 /// Constant-time authenticated codec for opaque, expiring scoped positions.
 #[derive(Clone)]
 pub struct CheckpointCodec {
+    /// Host-managed 256-bit authentication key.
     key: [u8; 32],
+    /// Token lifetime in milliseconds.
     ttl_ms: u64,
 }
 
@@ -652,16 +679,20 @@ impl CheckpointCodec {
     /// Refuses an all-zero key or zero TTL.
     pub fn new(key: [u8; 32], ttl_ms: u64) -> Result<Self, CheckpointError> {
         if key == [0; 32] {
-            eprintln!("logical-db-service: new: WeakKey");
             return Err(CheckpointError::WeakKey);
         }
         if ttl_ms == 0 {
-            eprintln!("logical-db-service: new: InvalidTtl");
             return Err(CheckpointError::InvalidTtl);
         }
         Ok(Self { key, ttl_ms })
     }
 
+    /// Mints an authenticated checkpoint for one scoped position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::TimeOverflow`] when expiry arithmetic overflows,
+    /// or [`CheckpointError::Protocol`] when the encoded token is rejected.
     fn issue(
         &self,
         scope: Scope,
@@ -684,6 +715,11 @@ impl CheckpointCodec {
         Checkpoint::from_wire(token).map_err(CheckpointError::Protocol)
     }
 
+    /// Verifies an opaque checkpoint and returns its exclusive position.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed authentication, scope, expiry, or encoding failure.
     fn open(
         &self,
         scope: Scope,
@@ -692,7 +728,6 @@ impl CheckpointCodec {
     ) -> Result<u64, CheckpointError> {
         let bytes = token.as_wire();
         if bytes.len() != CHECKPOINT_BYTES || &bytes[..4] != CHECKPOINT_MAGIC {
-            eprintln!("logical-db-service: open: Malformed");
             return Err(CheckpointError::Malformed);
         }
         let expected = lgwks_std::hash::keyed(&self.key, &bytes[..CHECKPOINT_BODY_BYTES]);
@@ -700,24 +735,22 @@ impl CheckpointCodec {
             return Err(CheckpointError::Malformed);
         };
         if !tags_equal(expected.as_bytes(), &supplied) {
-            eprintln!("logical-db-service: CheckpointError::InvalidMac");
             return Err(CheckpointError::InvalidMac);
         }
         if bytes[4..20] != *scope.account().as_uuid().as_bytes()
             || bytes[20..36] != *scope.space().as_uuid().as_bytes()
         {
-            eprintln!("logical-db-service: open: WrongScope");
             return Err(CheckpointError::WrongScope);
         }
         let position = decode_u64(&bytes[36..44])?;
         let expires = decode_u64(&bytes[44..52])?;
         if now_unix_ms >= expires {
-            eprintln!("logical-db-service: open: Expired");
             return Err(CheckpointError::Expired);
         }
         Ok(position)
     }
 
+    /// Computes the keyed authentication tag for one checkpoint body.
     fn tag(&self, body: &[u8]) -> [u8; 32] {
         *lgwks_std::hash::keyed(&self.key, body).as_bytes()
     }
@@ -739,6 +772,7 @@ pub fn tags_equal(computed: &[u8; 32], expected: &[u8; 32]) -> bool {
 
 /// Opaque checkpoint validation failures.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CheckpointError {
     /// Key material is an obvious unconfigured sentinel.
     #[error("checkpoint key must not be all zero")]
@@ -768,6 +802,7 @@ pub enum CheckpointError {
 
 /// Pull response distinguishes expiry from invalid or unauthorized input.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ServicePull {
     /// Valid bounded page.
     Page(PullPage),
@@ -786,6 +821,7 @@ pub enum ServicePull {
 
 /// Response to one recovery request: the sealed artifact or its absence.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ServiceBaseline {
     /// A sealed state-bearing artifact covers the retained prefix.
     Artifact(Box<BaselinePage>),
@@ -796,9 +832,13 @@ pub enum ServiceBaseline {
 
 /// Stateless service orchestration over a durable storage adapter.
 pub struct ProtocolService<Store, Policy> {
+    /// Durable storage adapter.
     store: Store,
+    /// Host authority boundary used to mint execution grants.
     policy: Policy,
+    /// Authenticated opaque checkpoint codec.
     checkpoints: CheckpointCodec,
+    /// Backend capability profile published by this service.
     profile: CapabilityProfile,
 }
 
@@ -859,11 +899,7 @@ where
         let mut outcomes = Vec::with_capacity(request.changes.len());
         for change in &request.changes {
             let operation = change.operation;
-            let validation = (EncodedChange {
-                digest: change.digest,
-                bytes: change.bytes.clone(),
-            })
-            .validate();
+            let validation = EncodedChange::new(change.digest, change.bytes.clone()).validate();
             if let Err(error) = validation {
                 outcomes.push(PushOutcome::Rejected {
                     operation,
@@ -901,10 +937,7 @@ where
             let outcome = push_outcome(operation, accepted);
             outcomes.push(outcome);
         }
-        Ok(PushResponse {
-            protocol: PROTOCOL_VERSION,
-            outcomes,
-        })
+        Ok(PushResponse::new(PROTOCOL_VERSION, outcomes))
     }
 
     /// Reads one authorized page after an authenticated opaque checkpoint.
@@ -931,25 +964,19 @@ where
             .retention_floor(request.scope)
             .await
             .map_err(ServiceError::Store)?;
-        let checkpoint_position = match &request.after {
+        let checkpoint_position = match request.after.as_ref() {
             Some(token) => match self.checkpoints.open(request.scope, token, now_unix_ms) {
                 Ok(position) if is_behind_retention(position, floor) => {
-                    eprintln!("logical-db-service: pull: BaselineRequired");
                     return Ok(ServicePull::BaselineRequired { floor });
                 }
                 Ok(position) => Some(position),
                 Err(CheckpointError::Expired) if floor > 0 => {
-                    eprintln!("logical-db-service: pull: BaselineRequired");
                     return Ok(ServicePull::BaselineRequired { floor });
                 }
                 Err(CheckpointError::Expired) => return Ok(ServicePull::CheckpointExpired),
-                Err(error) => {
-                    eprintln!("logical-db-service: pull checkpoint: {error}");
-                    return Err(ServiceError::Checkpoint(error));
-                }
+                Err(error) => return Err(ServiceError::Checkpoint(error)),
             },
             None if floor > 0 => {
-                eprintln!("logical-db-service: pull: BaselineRequired");
                 return Ok(ServicePull::BaselineRequired { floor });
             }
             None => None,
@@ -971,14 +998,14 @@ where
         frontier: u64,
         now_unix_ms: u64,
     ) -> Result<ServicePull, ServiceError<Store::Error>> {
-        let action = PageAction {
-            scope: request.scope,
-            replica: request.replica,
-            intent: request.request,
+        let action = PageAction::new(
+            request.scope,
+            request.replica,
+            request.request,
             after,
-            max_changes: request.max_changes,
-            max_bytes: request.max_bytes,
-        };
+            request.max_changes,
+            request.max_bytes,
+        );
         let Some(grant) = self.policy.authorize(
             request.scope,
             Effect::Sync,
@@ -986,7 +1013,6 @@ where
             frontier,
             now_unix_ms,
         ) else {
-            eprintln!("logical-db-service: pull: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         let result = self
@@ -997,13 +1023,9 @@ where
         let stored = match result {
             PageResult::Page(stored) => stored,
             PageResult::BehindFloor => return Ok(ServicePull::CheckpointExpired),
-            PageResult::StaleAuthority => {
-                eprintln!("logical-db-service: pull: StaleAuthority");
-                return Err(ServiceError::StaleAuthority);
-            }
+            PageResult::StaleAuthority => return Err(ServiceError::StaleAuthority),
         };
         if !valid_stored_page(after, frontier, &stored) {
-            eprintln!("logical-db-service: pull: CorruptStoreData");
             return Err(ServiceError::CorruptStoreData);
         }
         if stored
@@ -1011,30 +1033,18 @@ where
             .iter()
             .any(|change| change.scope != request.scope)
         {
-            eprintln!("logical-db-service: pull: CrossScopeStoreData");
             return Err(ServiceError::CrossScopeStoreData);
         }
         for change in &stored.changes {
-            EncodedChange {
-                digest: change.digest,
-                bytes: change.bytes.clone(),
-            }
-            .validate()
-            .map_err(|error| {
-                eprintln!("logical-db-service: ServiceError::CorruptStoreData: {error}");
-                ServiceError::CorruptStoreData
-            })?;
+            EncodedChange::new(change.digest, change.bytes.clone())
+                .validate()
+                .map_err(|_error| ServiceError::CorruptStoreData)?;
         }
         let checkpoint = self
             .checkpoints
             .issue(request.scope, stored.position, now_unix_ms)
             .map_err(ServiceError::Checkpoint)?;
-        let page = PullPage {
-            protocol: PROTOCOL_VERSION,
-            changes: stored.changes,
-            checkpoint,
-            more: stored.more,
-        };
+        let page = PullPage::new(PROTOCOL_VERSION, stored.changes, checkpoint, stored.more);
         page.validate(request.scope)
             .map_err(ServiceError::Protocol)?;
         Ok(ServicePull::Page(page))
@@ -1079,7 +1089,6 @@ where
             frontier,
             now_unix_ms,
         ) else {
-            eprintln!("logical-db-service: seal_snapshot: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         self.store
@@ -1112,19 +1121,18 @@ where
             .frontier(request.scope)
             .await
             .map_err(ServiceError::Store)?;
-        let action = RecoveryAction {
-            scope: request.scope,
-            replica: request.replica,
-            intent: request.request,
-            after: request.after.clone(),
-            after_document: request.after_document,
-        };
+        let action = RecoveryAction::new(
+            request.scope,
+            request.replica,
+            request.request,
+            request.after.clone(),
+            request.after_document,
+        );
         let digest = action.digest();
         let Some(grant) =
             self.policy
                 .authorize(request.scope, Effect::Sync, digest, frontier, now_unix_ms)
         else {
-            eprintln!("logical-db-service: recover: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         if grant.scope() != request.scope
@@ -1132,7 +1140,6 @@ where
             || grant.action() != digest
             || grant.frontier() != frontier
         {
-            eprintln!("logical-db-service: recover: Forbidden");
             return Err(ServiceError::Forbidden);
         }
         let sealed = self
@@ -1150,13 +1157,9 @@ where
             .map_err(ServiceError::Store)?
         {
             BaselinePageResult::Page(slice) => slice,
-            BaselinePageResult::StaleAuthority => {
-                eprintln!("logical-db-service: recover: StaleAuthority");
-                return Err(ServiceError::StaleAuthority);
-            }
+            BaselinePageResult::StaleAuthority => return Err(ServiceError::StaleAuthority),
         };
         if slice.more && slice.documents.is_empty() {
-            eprintln!("logical-db-service: recover: CorruptStoreData");
             return Err(ServiceError::CorruptStoreData);
         }
         let checkpoint = self
@@ -1168,22 +1171,24 @@ where
         } else {
             None
         };
-        let page = BaselinePage {
-            protocol: PROTOCOL_VERSION,
-            descriptor: descriptor.encode().to_vec(),
-            documents: slice
+        let page = BaselinePage::new(
+            PROTOCOL_VERSION,
+            descriptor.encode().to_vec(),
+            slice
                 .documents
                 .iter()
-                .map(|document| BaselineDocument {
-                    document: document.document,
-                    tombstone: document.tombstone,
-                    snapshot: document.snapshot.clone(),
+                .map(|document| {
+                    BaselineDocument::new(
+                        document.document,
+                        document.tombstone,
+                        document.snapshot.clone(),
+                    )
                 })
                 .collect(),
             checkpoint,
-            more: slice.more,
+            slice.more,
             next_document,
-        };
+        );
         page.validate_page(request.scope)
             .map_err(ServiceError::Protocol)?;
         Ok(ServiceBaseline::Artifact(Box::new(page)))
@@ -1214,7 +1219,6 @@ where
             frontier,
             now_unix_ms,
         ) else {
-            eprintln!("logical-db-service: mark_consumed: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         self.store
@@ -1252,7 +1256,6 @@ where
             frontier,
             now_unix_ms,
         ) else {
-            eprintln!("logical-db-service: prune: Forbidden");
             return Err(ServiceError::Forbidden);
         };
         self.store
@@ -1262,6 +1265,7 @@ where
     }
 }
 
+/// Maps one durable accept outcome onto its stable wire representation.
 fn push_outcome(operation: OperationId, accepted: AcceptResult) -> PushOutcome {
     match accepted {
         AcceptResult::Accepted => PushOutcome::Accepted { operation },
@@ -1283,6 +1287,7 @@ fn push_outcome(operation: OperationId, accepted: AcceptResult) -> PushOutcome {
     }
 }
 
+/// Checks page shape against the justified prefix and durable frontier.
 fn valid_stored_page(after: u64, frontier: u64, page: &StoredPage) -> bool {
     let Ok(count) = u64::try_from(page.changes.len()) else {
         return false;
@@ -1297,6 +1302,7 @@ fn valid_stored_page(after: u64, frontier: u64, page: &StoredPage) -> bool {
 
 /// Service boundary failures.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ServiceError<StoreError> {
     /// Protocol validation failed.
     #[error("service protocol rejected input: {0}")]
@@ -1324,30 +1330,41 @@ pub enum ServiceError<StoreError> {
     Model(logical_db_model::ModelError),
 }
 
+/// Decodes one big-endian `u64` from an eight-byte checkpoint slice.
 fn decode_u64(bytes: &[u8]) -> Result<u64, CheckpointError> {
-    bytes.try_into().map(u64::from_be_bytes).map_err(|error| {
-        eprintln!("logical-db-service: CheckpointError::Malformed: {error}");
-        CheckpointError::Malformed
-    })
+    bytes
+        .try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_error| CheckpointError::Malformed)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, convert::Infallible, sync::Mutex};
+    use std::{
+        collections::HashMap,
+        error::Error,
+        sync::{Mutex, PoisonError},
+    };
 
     use logical_db_crdt::{Document, Object, Scalar};
     use logical_db_model::{AccountId, ChangeDigest, DocumentId, OperationId, ReplicaId, SpaceId};
 
     use super::*;
-
     use logical_db_protocol::recover_action;
 
+    /// Authority fixture that always issues a fresh grant.
     struct Allow;
+    /// Authority fixture that always issues a grant against a moved frontier.
     struct Stale;
+    /// Concrete execution grant captured by the fixture authorities.
     struct Grant {
+        /// Scope proven by the invocation.
         scope: Scope,
+        /// Strongest database effect proven by the invocation.
         effect: Effect,
+        /// Canonical action digest bound into the invocation snapshot.
         action: ActionDigest,
+        /// Exact durable scope frontier justified before execution.
         frontier: u64,
     }
 
@@ -1412,8 +1429,11 @@ mod tests {
     /// Certifies exactly one captured invocation, like a host authority that
     /// binds a grant to the action digest it justified.
     struct ExactRecovery {
+        /// Scope the captured invocation must match.
         scope: Scope,
+        /// Action digest the captured invocation must match.
         action: ActionDigest,
+        /// Frontier the captured invocation must match.
         frontier: u64,
     }
 
@@ -1444,49 +1464,75 @@ mod tests {
         }
     }
 
+    /// Mutable retention fixture state for one scope.
     #[derive(Clone, Default)]
     struct RetentionState {
+        /// Durable retention floor after collection.
         floor: u64,
+        /// Highest position fully consumed by every live peer.
         consumed: u64,
+        /// Sealed state-bearing recovery artifact, when present.
         baseline: Option<SnapshotArtifact>,
     }
 
+    /// In-memory service store used by the fixture tests.
     #[derive(Default)]
     struct Memory {
+        /// Ordered durable change log shared across scopes.
         changes: Mutex<Vec<ChangeEnvelope>>,
+        /// Idempotent operation registry keyed by operation identity.
         operations: Mutex<HashMap<OperationId, (OperationDigest, ChangeDigest)>>,
+        /// Per-scope retention fixture state.
         retention: Mutex<HashMap<Scope, RetentionState>>,
     }
 
+    /// Fixture failures raised while materializing or validating retained state.
+    #[derive(Debug, Error)]
+    enum MemoryError {
+        /// Durable fixture materialization refused the requested prefix.
+        #[error(transparent)]
+        Materialization(#[from] SnapshotMaterializationError),
+        /// A retained fixture artifact failed its model validation.
+        #[error("retained fixture artifact failed validation: {0}")]
+        Artifact(#[from] logical_db_model::ModelError),
+    }
+
     impl Memory {
+        /// Reads the scoped frontier as floor plus retained change count.
         fn scope_frontier(&self, scope: Scope) -> u64 {
-            let changes = self.changes.lock().unwrap();
+            let changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
             let state = self
                 .retention
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(&scope)
                 .cloned()
                 .unwrap_or_default();
-            state.floor + Self::retained_count(&changes, scope)
+            state
+                .floor
+                .saturating_add(Self::retained_count(&changes, scope))
         }
 
+        /// Counts retained changes belonging to one scope.
         fn retained_count(changes: &[ChangeEnvelope], scope: Scope) -> u64 {
-            changes
+            let count = changes
                 .iter()
                 .filter(|change| change.scope == scope)
-                .count() as u64
+                .count();
+            u64::try_from(count).unwrap_or(u64::MAX)
         }
 
+        /// Reads the per-scope retention fixture state, defaulting when absent.
         fn retention_state(&self, scope: Scope) -> RetentionState {
             self.retention
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(&scope)
                 .cloned()
                 .unwrap_or_default()
         }
 
+        /// Rechecks a retention grant against the observed durable frontier.
         fn check_retention_grant(
             &self,
             scope: Scope,
@@ -1506,7 +1552,7 @@ mod tests {
     }
 
     impl ServiceStore for Memory {
-        type Error = Infallible;
+        type Error = MemoryError;
         fn accept(
             &self,
             change: &ChangeEnvelope,
@@ -1550,7 +1596,7 @@ mod tests {
             scope: Scope,
             through: u64,
         ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
-            std::future::ready(Ok(self.build_snapshot_result(scope, through)))
+            std::future::ready(self.build_snapshot_result(scope, through))
         }
         fn read_baseline_page(
             &self,
@@ -1588,13 +1634,17 @@ mod tests {
             request: OperationDigest,
             grant: &impl ExecutionGrant,
         ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
-            std::future::ready(Ok(self.prune_result(scope, up_to, min_live, request, grant)))
+            std::future::ready(self.prune_result(scope, up_to, min_live, request, grant))
         }
     }
 
     impl Memory {
+        /// Applies one accepted change to the durable operation and change logs.
         fn accept_result(&self, change: &ChangeEnvelope) -> AcceptResult {
-            let mut operations = self.operations.lock().unwrap();
+            let mut operations = self
+                .operations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(existing) = operations.get(&change.operation) {
                 return if *existing == (change.request, change.digest) {
                     AcceptResult::Duplicate
@@ -1603,15 +1653,21 @@ mod tests {
                 };
             }
             operations.insert(change.operation, (change.request, change.digest));
-            self.changes.lock().unwrap().push(change.clone());
+            self.changes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(change.clone());
             AcceptResult::Accepted
         }
+        /// Reads the scoped durable frontier.
         fn frontier_result(&self, scope: Scope) -> u64 {
             self.scope_frontier(scope)
         }
+        /// Reads the per-scope retention floor.
         fn retention_floor_result(&self, scope: Scope) -> u64 {
             self.retention_state(scope).floor
         }
+        /// Serves one bounded ordered page after a durable position.
         fn page_result(&self, action: PageAction, grant: &impl ExecutionGrant) -> PageResult {
             if grant.scope() != action.scope
                 || grant.effect() != Effect::Sync
@@ -1627,25 +1683,27 @@ mod tests {
             if after < floor {
                 return PageResult::BehindFloor;
             }
-            let changes = self.changes.lock().unwrap();
-            let frontier = floor + Self::retained_count(&changes, scope);
+            let changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+            let frontier = floor.saturating_add(Self::retained_count(&changes, scope));
             if grant.frontier() != frontier {
                 return PageResult::StaleAuthority;
             }
-            let skip = usize::try_from(after - floor).unwrap_or(usize::MAX);
-            let mut bytes = 0usize;
+            let skip = usize::try_from(after.saturating_sub(floor)).unwrap_or(usize::MAX);
+            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut bytes = 0_usize;
             let page = changes
                 .iter()
                 .filter(|change| change.scope == scope)
                 .skip(skip)
                 .take(usize::from(max_changes))
                 .take_while(|change| {
-                    bytes += change.bytes.len();
-                    bytes <= max_bytes as usize
+                    bytes = bytes.saturating_add(change.bytes.len());
+                    bytes <= limit
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let position = after + page.len() as u64;
+            let page_len = u64::try_from(page.len()).unwrap_or(u64::MAX);
+            let position = after.saturating_add(page_len);
             let more = frontier > position;
             PageResult::Page(StoredPage {
                 changes: page,
@@ -1653,15 +1711,22 @@ mod tests {
                 more,
             })
         }
+        /// Reads the peer-consumption watermark for one scope.
         fn consumed_through_result(&self, scope: Scope) -> u64 {
             self.retention_state(scope).consumed
         }
+        /// Reads the sealed state-bearing recovery artifact for one scope.
         fn snapshot_baseline_result(&self, scope: Scope) -> Option<SnapshotRecord> {
             self.retention_state(scope)
                 .baseline
                 .map(|artifact| SnapshotRecord::State(artifact.baseline))
         }
-        fn build_snapshot_result(&self, scope: Scope, through: u64) -> SnapshotArtifact {
+        /// Materializes a bounded state artifact through one position.
+        fn build_snapshot_result(
+            &self,
+            scope: Scope,
+            through: u64,
+        ) -> Result<SnapshotArtifact, MemoryError> {
             let state = self.retention_state(scope);
             let base = state
                 .baseline
@@ -1673,7 +1738,7 @@ mod tests {
                 usize::try_from(base_position.saturating_sub(state.floor)).unwrap_or(usize::MAX);
             let retained =
                 usize::try_from(through.saturating_sub(base_position)).unwrap_or(usize::MAX);
-            let changes = self.changes.lock().unwrap();
+            let changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
             let changes = changes
                 .iter()
                 .filter(|change| change.scope == scope)
@@ -1681,9 +1746,14 @@ mod tests {
                 .take(retained)
                 .cloned()
                 .collect::<Vec<_>>();
-            materialize_snapshot(scope, through, base.as_ref(), &changes)
-                .expect("memory store must build a bounded test artifact")
+            Ok(materialize_snapshot(
+                scope,
+                through,
+                base.as_ref(),
+                &changes,
+            )?)
         }
+        /// Reads one bounded ordered page of the sealed baseline.
         fn read_baseline_page_result(
             &self,
             action: &RecoveryAction,
@@ -1721,6 +1791,7 @@ mod tests {
             documents.truncate(logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS);
             BaselinePageResult::Page(BaselinePageSlice { documents, more })
         }
+        /// Durably records one sealed state-bearing baseline.
         fn seal_snapshot_result(
             &self,
             scope: Scope,
@@ -1741,7 +1812,7 @@ mod tests {
             }
             self.retention
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .entry(scope)
                 .or_default()
                 .baseline = Some(artifact.clone());
@@ -1749,6 +1820,7 @@ mod tests {
                 position: baseline.position(),
             }
         }
+        /// Advances the peer-consumption watermark for one scope.
         fn mark_consumed_result(
             &self,
             scope: Scope,
@@ -1766,7 +1838,10 @@ mod tests {
             if through > frontier {
                 return ConsumedResult::BeyondFrontier { frontier };
             }
-            let mut retention = self.retention.lock().unwrap();
+            let mut retention = self
+                .retention
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let state = retention.entry(scope).or_default();
             if through <= state.consumed {
                 return ConsumedResult::Unchanged {
@@ -1778,6 +1853,7 @@ mod tests {
                 consumed_through: through,
             }
         }
+        /// Collects the log prefix the peer-aware prune decision allows.
         fn prune_result(
             &self,
             scope: Scope,
@@ -1785,70 +1861,75 @@ mod tests {
             min_live: Option<u64>,
             request: OperationDigest,
             grant: &impl ExecutionGrant,
-        ) -> PruneResult {
+        ) -> Result<PruneResult, MemoryError> {
             let Some(frontier) = self.check_retention_grant(
                 scope,
                 prune_action(scope, request, up_to, min_live),
                 grant,
             ) else {
-                return PruneResult::StaleAuthority;
+                return Ok(PruneResult::StaleAuthority);
             };
             let state = self.retention_state(scope);
             let through =
                 match prune_decision(frontier, state.floor, up_to, min_live, state.consumed) {
                     Ok(through) => through,
-                    Err(refusal) => return PruneResult::Refused(refusal),
+                    Err(refusal) => return Ok(PruneResult::Refused(refusal)),
                 };
             if through > state.floor {
                 let Some(artifact) = state.baseline else {
-                    return PruneResult::Refused(PruneRefusal::MissingBaseline);
+                    return Ok(PruneResult::Refused(PruneRefusal::MissingBaseline));
                 };
                 if artifact.baseline.position() < through {
-                    return PruneResult::Refused(PruneRefusal::BaselineBehind {
+                    return Ok(PruneResult::Refused(PruneRefusal::BaselineBehind {
                         position: artifact.baseline.position(),
-                    });
+                    }));
                 }
-                artifact
-                    .validate(scope)
-                    .expect("memory store retains validated snapshot artifacts");
+                artifact.validate(scope)?;
                 let floor = state.floor;
                 let mut position = floor;
-                self.changes.lock().unwrap().retain(|change| {
-                    if change.scope != scope {
-                        return true;
-                    }
-                    position += 1;
-                    position > through
-                });
+                self.changes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|change| {
+                        if change.scope != scope {
+                            return true;
+                        }
+                        position = position.saturating_add(1);
+                        position > through
+                    });
                 self.retention
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .entry(scope)
                     .or_default()
                     .floor = through;
             }
-            PruneResult::Pruned(PruneReceipt {
+            Ok(PruneResult::Pruned(PruneReceipt {
                 pruned_through: through,
                 floor: through.max(state.floor),
-            })
+            }))
         }
     }
 
-    fn change(scope: Scope, replica: ReplicaId, operation: OperationId) -> ChangeEnvelope {
+    /// Builds one fixture change envelope with a single integer put.
+    fn change(
+        scope: Scope,
+        replica: ReplicaId,
+        operation: OperationId,
+    ) -> Result<ChangeEnvelope, Box<dyn Error>> {
         let mut document = Document::new();
-        let ((), mut changes) = document
-            .edit(|editor| editor.put(&Object::root(), "x", Scalar::Integer(1)))
-            .unwrap();
-        let encoded = changes.pop().unwrap();
-        ChangeEnvelope {
+        let ((), mut changes) =
+            document.edit(|editor| editor.put(&Object::root(), "x", Scalar::Integer(1)))?;
+        let encoded = changes.pop().ok_or("edit must stage exactly one change")?;
+        Ok(ChangeEnvelope::new(
             scope,
-            document: DocumentId::new(),
+            DocumentId::new(),
             replica,
             operation,
-            request: OperationDigest::new([4; 32]),
-            digest: encoded.digest,
-            bytes: encoded.bytes,
-        }
+            OperationDigest::new([4; 32]),
+            encoded.digest,
+            encoded.bytes,
+        ))
     }
 
     #[test]
@@ -1859,34 +1940,39 @@ mod tests {
         let consumed = AcceptResult::InvocationConsumed;
         assert_eq!(
             push_outcome(operation, recovered),
-            PushOutcome::Duplicate { operation }
+            PushOutcome::Duplicate { operation },
+            "recovered unknown commits must map to a duplicate wire outcome"
         );
         assert_eq!(
             push_outcome(operation, stale),
             PushOutcome::Rejected {
                 operation,
                 code: RejectionCode::StaleAuthority
-            }
+            },
+            "stale authority must map to the stale-authority rejection code"
         );
         assert_eq!(
             push_outcome(operation, consumed),
             PushOutcome::Rejected {
                 operation,
                 code: RejectionCode::InvocationConsumed
-            }
+            },
+            "consumed invocation must map to the invocation-consumed rejection code"
         );
     }
 
     #[test]
-    fn service_publishes_distributed_profile_and_refuses_embedded_only_guarantees() {
+    fn service_publishes_distributed_profile_and_refuses_embedded_only_guarantees()
+    -> Result<(), Box<dyn Error>> {
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([7; 32], 100).unwrap(),
+            CheckpointCodec::new([7; 32], 100)?,
         );
         assert_eq!(
             service.capability_profile(),
-            CapabilityProfile::distributed_transactional()
+            CapabilityProfile::distributed_transactional(),
+            "service must publish the distributed transactional profile"
         );
         assert!(
             service
@@ -1894,14 +1980,15 @@ mod tests {
                     Capability::DistributedSerializableTransactions,
                     Capability::ClusterRecovery,
                 ])
-                .is_ok()
+                .is_ok(),
+            "distributed guarantees must be satisfied by the distributed profile"
         );
-        let refusal = service
-            .require_guarantees(&[
-                Capability::DistributedSerializableTransactions,
-                Capability::ExportRestore,
-            ])
-            .expect_err("distributed class must not claim embedded-only guarantees");
+        let Err(refusal) = service.require_guarantees(&[
+            Capability::DistributedSerializableTransactions,
+            Capability::ExportRestore,
+        ]) else {
+            return Err("distributed class must not claim embedded-only guarantees".into());
+        };
         match refusal {
             ServiceError::Model(logical_db_model::ModelError::UnsupportedGuarantees {
                 class,
@@ -1909,227 +1996,285 @@ mod tests {
             }) => {
                 assert_eq!(
                     class,
-                    logical_db_model::BackendClass::DistributedTransactional
+                    logical_db_model::BackendClass::DistributedTransactional,
+                    "refusal must name the distributed transactional class"
                 );
-                assert_eq!(missing, vec![Capability::ExportRestore]);
+                assert_eq!(
+                    missing,
+                    vec![Capability::ExportRestore],
+                    "refusal must list every missing guarantee"
+                );
             }
-            other => panic!("unexpected refusal: {other:?}"),
+            other => return Err(format!("unexpected refusal: {other:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
-    fn exact_retry_is_duplicate_and_forged_checkpoint_fails_closed() {
+    fn exact_retry_is_duplicate_and_forged_checkpoint_fails_closed() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let operation = OperationId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([7; 32], 100).unwrap(),
+            CheckpointCodec::new([7; 32], 100)?,
         );
-        let request = PushRequest {
-            protocol: PROTOCOL_VERSION,
+        let request = PushRequest::new(
+            PROTOCOL_VERSION,
             replica,
-            changes: vec![change(scope, replica, operation)],
-        };
-        assert!(matches!(
-            lgwks_std::task::block_on(service.push(&request, 10))
-                .unwrap()
-                .outcomes[0],
-            PushOutcome::Accepted { .. }
-        ));
-        assert!(matches!(
-            lgwks_std::task::block_on(service.push(&request, 10))
-                .unwrap()
-                .outcomes[0],
-            PushOutcome::Duplicate { .. }
-        ));
-        let pull = PullRequest {
-            protocol: PROTOCOL_VERSION,
+            vec![change(scope, replica, operation)?],
+        );
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(service.push(&request, 10))?.outcomes[0],
+                PushOutcome::Accepted { .. }
+            ),
+            "first admission must be accepted"
+        );
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(service.push(&request, 10))?.outcomes[0],
+                PushOutcome::Duplicate { .. }
+            ),
+            "exact retry must be a duplicate"
+        );
+        let pull = PullRequest::new(
+            PROTOCOL_VERSION,
             scope,
             replica,
-            request: OperationDigest::new([9; 32]),
-            after: None,
-            max_changes: 10,
-            max_bytes: 1024,
-        };
-        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10)).unwrap()
-        else {
-            panic!("page expected")
+            OperationDigest::new([9; 32]),
+            None,
+            10,
+            1024,
+        );
+        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10))? else {
+            return Err("page expected".into());
         };
         let mut forged = page.checkpoint.as_wire().to_vec();
         forged[40] ^= 1;
-        let forged = PullRequest {
-            after: Some(Checkpoint::from_wire(forged).unwrap()),
-            ..pull
-        };
-        assert!(matches!(
-            lgwks_std::task::block_on(service.pull(&forged, 11)),
-            Err(ServiceError::Checkpoint(CheckpointError::InvalidMac))
-        ));
+        let forged = PullRequest::new(
+            pull.protocol,
+            pull.scope,
+            pull.replica,
+            pull.request,
+            Some(Checkpoint::from_wire(forged)?),
+            pull.max_changes,
+            pull.max_bytes,
+        );
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(service.pull(&forged, 11)),
+                Err(ServiceError::Checkpoint(CheckpointError::InvalidMac))
+            ),
+            "forged checkpoint must fail the MAC check"
+        );
+        Ok(())
     }
 
     #[test]
-    fn valid_expired_checkpoint_requests_explicit_full_resync() {
+    fn valid_expired_checkpoint_requests_explicit_full_resync() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
-        let service = ProtocolService::new(
-            Memory::default(),
-            Allow,
-            CheckpointCodec::new([8; 32], 5).unwrap(),
-        );
-        let pull = PullRequest {
-            protocol: PROTOCOL_VERSION,
+        let service =
+            ProtocolService::new(Memory::default(), Allow, CheckpointCodec::new([8; 32], 5)?);
+        let pull = PullRequest::new(
+            PROTOCOL_VERSION,
             scope,
             replica,
-            request: OperationDigest::new([1; 32]),
-            after: None,
-            max_changes: 10,
-            max_bytes: 1024,
-        };
-        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10)).unwrap()
-        else {
-            panic!("page expected")
-        };
-        let expired = PullRequest {
-            after: Some(page.checkpoint),
-            ..pull
-        };
-        assert_eq!(
-            lgwks_std::task::block_on(service.pull(&expired, 15)).unwrap(),
-            ServicePull::CheckpointExpired
+            OperationDigest::new([1; 32]),
+            None,
+            10,
+            1024,
         );
+        let ServicePull::Page(page) = lgwks_std::task::block_on(service.pull(&pull, 10))? else {
+            return Err("page expected".into());
+        };
+        let expired = PullRequest::new(
+            pull.protocol,
+            pull.scope,
+            pull.replica,
+            pull.request,
+            Some(page.checkpoint),
+            pull.max_changes,
+            pull.max_bytes,
+        );
+        assert_eq!(
+            lgwks_std::task::block_on(service.pull(&expired, 15))?,
+            ServicePull::CheckpointExpired,
+            "valid expired checkpoint must request explicit full resync"
+        );
+        Ok(())
     }
 
     #[test]
-    fn push_distinguishes_malformed_change_from_digest_mismatch() {
+    fn push_distinguishes_malformed_change_from_digest_mismatch() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([5; 32], 100).unwrap(),
+            CheckpointCodec::new([5; 32], 100)?,
         );
-        let mut malformed = change(scope, replica, OperationId::new());
+        let mut malformed = change(scope, replica, OperationId::new())?;
         malformed.bytes = vec![1];
-        let mut mismatched = change(scope, replica, OperationId::new());
+        let mut mismatched = change(scope, replica, OperationId::new())?;
         mismatched.digest = ChangeDigest::new([0; 32]);
         let response = lgwks_std::task::block_on(service.push(
-            &PushRequest {
-                protocol: PROTOCOL_VERSION,
-                replica,
-                changes: vec![malformed, mismatched],
-            },
+            &PushRequest::new(PROTOCOL_VERSION, replica, vec![malformed, mismatched]),
             10,
-        ))
-        .unwrap();
-        assert!(matches!(
-            response.outcomes[0],
-            PushOutcome::Rejected {
-                code: RejectionCode::InvalidChange,
-                ..
-            }
-        ));
-        assert!(matches!(
-            response.outcomes[1],
-            PushOutcome::Rejected {
-                code: RejectionCode::DigestMismatch,
-                ..
-            }
-        ));
+        ))?;
+        assert!(
+            matches!(
+                response.outcomes[0],
+                PushOutcome::Rejected {
+                    code: RejectionCode::InvalidChange,
+                    ..
+                }
+            ),
+            "malformed change bytes must reject as invalid change"
+        );
+        assert!(
+            matches!(
+                response.outcomes[1],
+                PushOutcome::Rejected {
+                    code: RejectionCode::DigestMismatch,
+                    ..
+                }
+            ),
+            "digest mismatch must reject as digest mismatch"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pull_store_consumes_exact_grant_and_rejects_stale_frontier() {
+    fn pull_store_consumes_exact_grant_and_rejects_stale_frontier() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
-        let service = ProtocolService::new(
-            Memory::default(),
-            Stale,
-            CheckpointCodec::new([8; 32], 50).unwrap(),
-        );
-        let pull = PullRequest {
-            protocol: PROTOCOL_VERSION,
+        let service =
+            ProtocolService::new(Memory::default(), Stale, CheckpointCodec::new([8; 32], 50)?);
+        let pull = PullRequest::new(
+            PROTOCOL_VERSION,
             scope,
             replica,
-            request: OperationDigest::new([3; 32]),
-            after: None,
-            max_changes: 1,
-            max_bytes: 1024,
-        };
-        assert!(matches!(
-            lgwks_std::task::block_on(service.pull(&pull, 10)),
-            Err(ServiceError::StaleAuthority)
-        ));
+            OperationDigest::new([3; 32]),
+            None,
+            1,
+            1024,
+        );
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(service.pull(&pull, 10)),
+                Err(ServiceError::StaleAuthority)
+            ),
+            "stale frontier grant must be rejected"
+        );
+        Ok(())
     }
 
     #[test]
-    fn checkpoint_shape_scope_axes_and_integer_decode_fail_independently() {
+    fn checkpoint_shape_scope_axes_and_integer_decode_fail_independently()
+    -> Result<(), Box<dyn Error>> {
         let account = AccountId::new();
         let space = SpaceId::new();
         let scope = Scope::new(account, space);
-        let codec = CheckpointCodec::new([13; 32], 100).unwrap();
-        let token = codec.issue(scope, 2, 10).unwrap();
-        assert_eq!(codec.open(scope, &token, 11), Ok(2));
-        assert_eq!(decode_u64(&2_u64.to_be_bytes()), Ok(2));
-        assert_eq!(decode_u64(&[0; 7]), Err(CheckpointError::Malformed));
+        let codec = CheckpointCodec::new([13; 32], 100)?;
+        let token = codec.issue(scope, 2, 10)?;
+        assert_eq!(
+            codec.open(scope, &token, 11),
+            Ok(2),
+            "well-formed checkpoint must decode to its position"
+        );
+        assert_eq!(
+            decode_u64(&2_u64.to_be_bytes()),
+            Ok(2),
+            "eight-byte big-endian integer must decode"
+        );
+        assert_eq!(
+            decode_u64(&[0; 7]),
+            Err(CheckpointError::Malformed),
+            "short integer slice must be malformed"
+        );
 
         let mut wrong_magic = token.as_wire().to_vec();
         wrong_magic[..4].copy_from_slice(b"NOPE");
-        let wrong_magic = Checkpoint::from_wire(wrong_magic).unwrap();
+        let wrong_magic = Checkpoint::from_wire(wrong_magic)?;
         assert_eq!(
             codec.open(scope, &wrong_magic, 11),
-            Err(CheckpointError::Malformed)
+            Err(CheckpointError::Malformed),
+            "wrong magic must be malformed"
         );
-        let short = Checkpoint::from_wire(CHECKPOINT_MAGIC.to_vec()).unwrap();
+        let short = Checkpoint::from_wire(CHECKPOINT_MAGIC.to_vec())?;
         assert_eq!(
             codec.open(scope, &short, 11),
-            Err(CheckpointError::Malformed)
+            Err(CheckpointError::Malformed),
+            "short token must be malformed"
         );
         assert_eq!(
             codec.open(Scope::new(AccountId::new(), space), &token, 11),
-            Err(CheckpointError::WrongScope)
+            Err(CheckpointError::WrongScope),
+            "account axis must be authenticated"
         );
         assert_eq!(
             codec.open(Scope::new(account, SpaceId::new()), &token, 11),
-            Err(CheckpointError::WrongScope)
+            Err(CheckpointError::WrongScope),
+            "space axis must be authenticated"
         );
+        Ok(())
     }
 
     #[test]
-    fn stored_page_shape_cannot_skip_or_lie_about_the_bound_frontier() {
+    fn stored_page_shape_cannot_skip_or_lie_about_the_bound_frontier() -> Result<(), Box<dyn Error>>
+    {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let page = StoredPage {
-            changes: vec![change(scope, replica, OperationId::new())],
+            changes: vec![change(scope, replica, OperationId::new())?],
             position: 5,
             more: true,
         };
-        assert!(valid_stored_page(4, 6, &page));
+        assert!(
+            valid_stored_page(4, 6, &page),
+            "valid page must pass shape check"
+        );
         let stalled = StoredPage {
             changes: Vec::new(),
             position: 4,
             more: true,
         };
-        assert!(!valid_stored_page(4, 6, &stalled));
+        assert!(
+            !valid_stored_page(4, 6, &stalled),
+            "empty page claiming more must fail shape check"
+        );
         let skipped = StoredPage {
             position: 6,
             ..page.clone()
         };
-        assert!(!valid_stored_page(4, 6, &skipped));
+        assert!(
+            !valid_stored_page(4, 6, &skipped),
+            "skipped position must fail shape check"
+        );
         let false_end = StoredPage {
             more: false,
             ..page.clone()
         };
-        assert!(!valid_stored_page(4, 6, &false_end));
+        assert!(
+            !valid_stored_page(4, 6, &false_end),
+            "false end claim must fail shape check"
+        );
         let beyond = StoredPage {
             position: 6,
             more: false,
             ..page
         };
-        assert!(!valid_stored_page(4, 6, &beyond));
+        assert!(
+            !valid_stored_page(4, 6, &beyond),
+            "position past frontier must fail shape check"
+        );
+        Ok(())
     }
 
+    /// Authority fixture that always refuses authorization.
     struct Deny;
 
     impl Authority for Deny {
@@ -2147,57 +2292,55 @@ mod tests {
         }
     }
 
+    /// Builds a fixture envelope with an explicit request digest byte.
     fn envelope_with(
         scope: Scope,
         replica: ReplicaId,
         operation: OperationId,
         request_byte: u8,
-    ) -> ChangeEnvelope {
-        let mut envelope = change(scope, replica, operation);
+    ) -> Result<ChangeEnvelope, Box<dyn Error>> {
+        let mut envelope = change(scope, replica, operation)?;
         envelope.request = OperationDigest::new([request_byte; 32]);
-        envelope
+        Ok(envelope)
     }
 
+    /// Builds a fixture envelope whose payload is a document tombstone.
     fn tombstone_envelope(
         scope: Scope,
         replica: ReplicaId,
         operation: OperationId,
         request_byte: u8,
-    ) -> ChangeEnvelope {
+    ) -> Result<ChangeEnvelope, Box<dyn Error>> {
         let mut document = Document::new();
-        document
-            .edit(|editor| editor.put(&Object::root(), "k", Scalar::Integer(1)))
-            .unwrap();
-        let mut staged = document.delete().unwrap();
-        let encoded = staged.pop().unwrap();
-        assert!(staged.is_empty());
-        ChangeEnvelope {
+        document.edit(|editor| editor.put(&Object::root(), "k", Scalar::Integer(1)))?;
+        let mut staged = document.delete()?;
+        let encoded = staged.pop().ok_or("delete must stage exactly one change")?;
+        assert!(staged.is_empty(), "delete must stage exactly one change");
+        Ok(ChangeEnvelope::new(
             scope,
-            document: DocumentId::new(),
+            DocumentId::new(),
             replica,
             operation,
-            request: OperationDigest::new([request_byte; 32]),
-            digest: encoded.digest,
-            bytes: encoded.bytes,
-        }
+            OperationDigest::new([request_byte; 32]),
+            encoded.digest,
+            encoded.bytes,
+        ))
     }
 
+    /// Pushes one bounded page of fixture changes through the service.
     fn push_all<Store, Policy>(
         service: &ProtocolService<Store, Policy>,
         replica: ReplicaId,
         changes: Vec<ChangeEnvelope>,
-    ) -> PushResponse
+    ) -> Result<PushResponse, Box<dyn Error>>
     where
         Store: ServiceStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        let request = PushRequest {
-            protocol: PROTOCOL_VERSION,
-            replica,
-            changes,
-        };
-        lgwks_std::task::block_on(service.push(&request, 10)).unwrap()
+        let request = PushRequest::new(PROTOCOL_VERSION, replica, changes);
+        Ok(lgwks_std::task::block_on(service.push(&request, 10))
+            .map_err(|error| format!("push failed: {error:?}"))?)
     }
 
     fn pull_after<Store, Policy>(
@@ -2206,22 +2349,23 @@ mod tests {
         replica: ReplicaId,
         after: Option<Checkpoint>,
         now: u64,
-    ) -> ServicePull
+    ) -> Result<ServicePull, Box<dyn Error>>
     where
         Store: ServiceStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        let request = PullRequest {
-            protocol: PROTOCOL_VERSION,
+        let request = PullRequest::new(
+            PROTOCOL_VERSION,
             scope,
             replica,
-            request: OperationDigest::new([91; 32]),
+            OperationDigest::new([91; 32]),
             after,
-            max_changes: 10,
-            max_bytes: 1_048_576,
-        };
-        lgwks_std::task::block_on(service.pull(&request, now)).unwrap()
+            10,
+            1_048_576,
+        );
+        Ok(lgwks_std::task::block_on(service.pull(&request, now))
+            .map_err(|error| format!("pull failed: {error:?}"))?)
     }
 
     fn recover_at<Store, Policy>(
@@ -2230,21 +2374,22 @@ mod tests {
         replica: ReplicaId,
         after: Option<Checkpoint>,
         now: u64,
-    ) -> ServiceBaseline
+    ) -> Result<ServiceBaseline, Box<dyn Error>>
     where
         Store: RetentionStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        let request = BaselineRequest {
-            protocol: PROTOCOL_VERSION,
+        let request = BaselineRequest::new(
+            PROTOCOL_VERSION,
             scope,
             replica,
-            request: OperationDigest::new([92; 32]),
+            OperationDigest::new([92; 32]),
             after,
-            after_document: None,
-        };
-        lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+            None,
+        );
+        Ok(lgwks_std::task::block_on(service.recover(&request, now))
+            .map_err(|error| format!("recover failed: {error:?}"))?)
     }
 
     fn recover_page_at<Store, Policy>(
@@ -2253,25 +2398,26 @@ mod tests {
         replica: ReplicaId,
         after_document: Option<DocumentId>,
         now: u64,
-    ) -> ServiceBaseline
+    ) -> Result<ServiceBaseline, Box<dyn Error>>
     where
         Store: RetentionStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        let request = BaselineRequest {
-            protocol: PROTOCOL_VERSION,
+        let request = BaselineRequest::new(
+            PROTOCOL_VERSION,
             scope,
             replica,
-            request: OperationDigest::new([93; 32]),
-            after: None,
+            OperationDigest::new([93; 32]),
+            None,
             after_document,
-        };
-        lgwks_std::task::block_on(service.recover(&request, now)).unwrap()
+        );
+        Ok(lgwks_std::task::block_on(service.recover(&request, now))
+            .map_err(|error| format!("recover page failed: {error:?}"))?)
     }
 
     #[test]
-    fn a_recovery_grant_for_one_cursor_cannot_authorize_another() {
+    fn a_recovery_grant_for_one_cursor_cannot_authorize_another() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let intent = OperationDigest::new([92; 32]);
@@ -2290,42 +2436,36 @@ mod tests {
                 action: authorized,
                 frontier: 0,
             },
-            CheckpointCodec::new([6; 32], 100).unwrap(),
+            CheckpointCodec::new([6; 32], 100)?,
         );
-        let other = BaselineRequest {
-            protocol: PROTOCOL_VERSION,
-            scope,
-            replica,
-            request: intent,
-            after: None,
-            after_document: Some(cursor),
-        };
-        assert!(matches!(
-            lgwks_std::task::block_on(service.recover(&other, 10)),
-            Err(ServiceError::Forbidden)
-        ));
-        let exact = BaselineRequest {
-            protocol: PROTOCOL_VERSION,
-            scope,
-            replica,
-            request: intent,
-            after: None,
-            after_document: None,
-        };
-        assert!(matches!(
-            lgwks_std::task::block_on(service.recover(&exact, 10)),
-            Ok(ServiceBaseline::Unavailable)
-        ));
+        let other =
+            BaselineRequest::new(PROTOCOL_VERSION, scope, replica, intent, None, Some(cursor));
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(service.recover(&other, 10)),
+                Err(ServiceError::Forbidden)
+            ),
+            "cursor mismatch must refuse the recovery grant"
+        );
+        let exact = BaselineRequest::new(PROTOCOL_VERSION, scope, replica, intent, None, None);
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(service.recover(&exact, 10)),
+                Ok(ServiceBaseline::Unavailable)
+            ),
+            "exact grant without a sealed baseline must report unavailable"
+        );
+        Ok(())
     }
 
     #[test]
-    fn recovery_pages_a_baseline_larger_than_one_page() {
+    fn recovery_pages_a_baseline_larger_than_one_page() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([6; 32], 100).unwrap(),
+            CheckpointCodec::new([6; 32], 100)?,
         );
         let total = logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS + 44;
         let changes = (0..total)
@@ -2334,47 +2474,71 @@ mod tests {
                     scope,
                     replica,
                     OperationId::new(),
-                    u8::try_from(index % 256).unwrap(),
+                    u8::try_from(index % 256).unwrap_or(0),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         for chunk in changes.chunks(logical_db_model::MAX_CHANGES_PER_PAGE) {
-            push_all(&service, replica, chunk.to_vec());
+            push_all(&service, replica, chunk.to_vec())?;
         }
-        assert!(matches!(
-            seal_at(&service, scope, total as u64, 10),
-            SealResult::Sealed { .. }
-        ));
+        assert!(
+            matches!(
+                seal_at(
+                    &service,
+                    scope,
+                    u64::try_from(total).unwrap_or(u64::MAX),
+                    10
+                )?,
+                SealResult::Sealed { .. }
+            ),
+            "multi-page baseline must seal"
+        );
 
-        let ServiceBaseline::Artifact(first) = recover_page_at(&service, scope, replica, None, 11)
+        let ServiceBaseline::Artifact(first) = recover_page_at(&service, scope, replica, None, 11)?
         else {
-            panic!("sealed baseline must be available");
+            return Err("sealed baseline must be available".into());
         };
-        assert!(first.more);
+        assert!(first.more, "first page must report more documents");
         assert_eq!(
             first.documents.len(),
-            logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS
+            logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS,
+            "first page must be full"
         );
         let cursor = first
             .next_document
-            .expect("continued page carries a cursor");
+            .ok_or("continued page carries a cursor")?;
         let ServiceBaseline::Artifact(second) =
-            recover_page_at(&service, scope, replica, Some(cursor), 12)
+            recover_page_at(&service, scope, replica, Some(cursor), 12)?
         else {
-            panic!("continued baseline page must be available");
+            return Err("continued baseline page must be available".into());
         };
-        assert!(!second.more);
-        assert_eq!(second.documents.len(), 44);
-        assert_eq!(second.descriptor, first.descriptor);
-        assert!(second.next_document.is_none());
-
-        let mut accumulator = logical_db_protocol::BaselineAccumulator::new(
-            scope,
-            first.validate_page(scope).unwrap(),
+        assert!(!second.more, "final page must not report more documents");
+        assert_eq!(second.documents.len(), 44, "final page must hold the tail");
+        assert_eq!(
+            second.descriptor, first.descriptor,
+            "pages must share one descriptor"
         );
-        assert!(!accumulator.push(&first).unwrap());
-        assert!(accumulator.push(&second).unwrap());
-        assert_eq!(accumulator.finish().unwrap().documents.len(), total);
+        assert!(
+            second.next_document.is_none(),
+            "final page must not carry a cursor"
+        );
+
+        let mut accumulator =
+            logical_db_protocol::BaselineAccumulator::new(scope, first.validate_page(scope)?);
+        assert!(
+            !accumulator.push(&first)?,
+            "first page must not complete the accumulator"
+        );
+        assert!(
+            accumulator.push(&second)?,
+            "second page must complete the accumulator"
+        );
+        assert_eq!(
+            accumulator.finish()?.documents.len(),
+            total,
+            "accumulator must reassemble every document"
+        );
+        Ok(())
     }
 
     fn seal_at<Store, Policy>(
@@ -2382,19 +2546,19 @@ mod tests {
         scope: Scope,
         position: u64,
         now: u64,
-    ) -> SealResult
+    ) -> Result<SealResult, Box<dyn Error>>
     where
         Store: RetentionStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        lgwks_std::task::block_on(service.seal_snapshot(
+        Ok(lgwks_std::task::block_on(service.seal_snapshot(
             scope,
             position,
             OperationDigest::new([61; 32]),
             now,
         ))
-        .unwrap()
+        .map_err(|error| format!("seal failed: {error:?}"))?)
     }
 
     fn consume_through<Store, Policy>(
@@ -2402,19 +2566,19 @@ mod tests {
         scope: Scope,
         through: u64,
         now: u64,
-    ) -> ConsumedResult
+    ) -> Result<ConsumedResult, Box<dyn Error>>
     where
         Store: RetentionStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        lgwks_std::task::block_on(service.mark_consumed(
+        Ok(lgwks_std::task::block_on(service.mark_consumed(
             scope,
             through,
             OperationDigest::new([62; 32]),
             now,
         ))
-        .unwrap()
+        .map_err(|error| format!("mark_consumed failed: {error:?}"))?)
     }
 
     fn collect<Store, Policy>(
@@ -2423,267 +2587,323 @@ mod tests {
         up_to: u64,
         min_live: Option<u64>,
         now: u64,
-    ) -> PruneResult
+    ) -> Result<PruneResult, Box<dyn Error>>
     where
         Store: RetentionStore,
         Store::Error: std::fmt::Debug,
         Policy: Authority,
     {
-        lgwks_std::task::block_on(service.prune(
+        Ok(lgwks_std::task::block_on(service.prune(
             scope,
             up_to,
             min_live,
             OperationDigest::new([63; 32]),
             now,
         ))
-        .unwrap()
+        .map_err(|error| format!("prune failed: {error:?}"))?)
     }
 
     #[test]
-    fn prune_refuses_a_prefix_still_referenced_by_a_live_checkpoint() {
+    fn prune_refuses_a_prefix_still_referenced_by_a_live_checkpoint() -> Result<(), Box<dyn Error>>
+    {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([21; 32], 10_000).unwrap(),
+            CheckpointCodec::new([21; 32], 10_000)?,
         );
         let changes = (30u8..33)
             .map(|request| envelope_with(scope, replica, OperationId::new(), request))
-            .collect::<Vec<_>>();
-        let response = push_all(&service, replica, changes);
+            .collect::<Result<Vec<_>, _>>()?;
+        let response = push_all(&service, replica, changes)?;
         assert!(
             response
                 .outcomes
                 .iter()
-                .all(|outcome| matches!(outcome, PushOutcome::Accepted { .. }))
+                .all(|outcome| matches!(outcome, PushOutcome::Accepted { .. })),
+            "every fixture change must be accepted"
         );
         assert_eq!(
-            consume_through(&service, scope, 3, 11),
+            consume_through(&service, scope, 3, 11)?,
             ConsumedResult::Advanced {
                 consumed_through: 3
-            }
+            },
+            "watermark must advance through the prefix"
         );
         assert_eq!(
-            collect(&service, scope, 3, Some(1), 12),
-            PruneResult::Refused(PruneRefusal::LiveCheckpoint { min_live: 1 })
+            collect(&service, scope, 3, Some(1), 12)?,
+            PruneResult::Refused(PruneRefusal::LiveCheckpoint { min_live: 1 }),
+            "live checkpoint must refuse collection"
         );
         assert_eq!(
-            collect(&service, scope, 0, None, 13),
+            collect(&service, scope, 0, None, 13)?,
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 0,
                 floor: 0
-            })
+            }),
+            "request at or below the floor is an idempotent no-op"
         );
-        let ServicePull::Page(page) = pull_after(&service, scope, replica, None, 14) else {
-            panic!("page expected")
+        let ServicePull::Page(page) = pull_after(&service, scope, replica, None, 14)? else {
+            return Err("page expected".into());
         };
-        assert_eq!(page.changes.len(), 3);
+        assert_eq!(
+            page.changes.len(),
+            3,
+            "page must serve every retained change"
+        );
+        Ok(())
     }
 
     #[test]
-    fn prune_refuses_a_prefix_with_unconsumed_operation_records() {
+    fn prune_refuses_a_prefix_with_unconsumed_operation_records() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([22; 32], 10_000).unwrap(),
+            CheckpointCodec::new([22; 32], 10_000)?,
         );
         let changes = (40u8..43)
             .map(|request| envelope_with(scope, replica, OperationId::new(), request))
-            .collect::<Vec<_>>();
-        push_all(&service, replica, changes);
+            .collect::<Result<Vec<_>, _>>()?;
+        push_all(&service, replica, changes)?;
         assert_eq!(
-            collect(&service, scope, 2, None, 11),
+            collect(&service, scope, 2, None, 11)?,
             PruneResult::Refused(PruneRefusal::PendingOperations {
                 consumed_through: 0
-            })
+            }),
+            "unconsumed operations must refuse collection"
         );
         assert_eq!(
-            consume_through(&service, scope, 2, 12),
+            consume_through(&service, scope, 2, 12)?,
             ConsumedResult::Advanced {
                 consumed_through: 2
-            }
+            },
+            "watermark must advance"
         );
         assert_eq!(
-            collect(&service, scope, 2, None, 13),
-            PruneResult::Refused(PruneRefusal::MissingBaseline)
+            collect(&service, scope, 2, None, 13)?,
+            PruneResult::Refused(PruneRefusal::MissingBaseline),
+            "missing baseline must refuse collection"
         );
         assert_eq!(
-            seal_at(&service, scope, 2, 14),
-            SealResult::Sealed { position: 2 }
+            seal_at(&service, scope, 2, 14)?,
+            SealResult::Sealed { position: 2 },
+            "baseline must seal at position two"
         );
         assert_eq!(
-            collect(&service, scope, 2, None, 15),
+            collect(&service, scope, 2, None, 15)?,
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 2,
                 floor: 2
-            })
+            }),
+            "covered prefix must collect"
         );
         assert_eq!(
-            collect(&service, scope, 3, None, 16),
+            collect(&service, scope, 3, None, 16)?,
             PruneResult::Refused(PruneRefusal::PendingOperations {
                 consumed_through: 2
-            })
+            }),
+            "prefix past the watermark must refuse"
         );
+        Ok(())
     }
 
     #[test]
-    fn prune_refuses_a_prefix_beyond_the_state_bearing_baseline() {
+    fn prune_refuses_a_prefix_beyond_the_state_bearing_baseline() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([29; 32], 10_000).unwrap(),
+            CheckpointCodec::new([29; 32], 10_000)?,
         );
         let changes = (70u8..73)
             .map(|request| envelope_with(scope, replica, OperationId::new(), request))
-            .collect::<Vec<_>>();
-        push_all(&service, replica, changes);
+            .collect::<Result<Vec<_>, _>>()?;
+        push_all(&service, replica, changes)?;
         assert_eq!(
-            seal_at(&service, scope, 2, 11),
-            SealResult::Sealed { position: 2 }
+            seal_at(&service, scope, 2, 11)?,
+            SealResult::Sealed { position: 2 },
+            "baseline must seal at position two"
         );
         assert_eq!(
-            consume_through(&service, scope, 3, 12),
+            consume_through(&service, scope, 3, 12)?,
             ConsumedResult::Advanced {
                 consumed_through: 3
-            }
+            },
+            "watermark must advance past the baseline"
         );
         assert_eq!(
-            collect(&service, scope, 3, None, 13),
-            PruneResult::Refused(PruneRefusal::BaselineBehind { position: 2 })
+            collect(&service, scope, 3, None, 13)?,
+            PruneResult::Refused(PruneRefusal::BaselineBehind { position: 2 }),
+            "prefix past the baseline must refuse"
         );
         assert_eq!(
-            collect(&service, scope, 2, None, 14),
+            collect(&service, scope, 2, None, 14)?,
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 2,
                 floor: 2
-            })
+            }),
+            "prefix covered by the baseline must collect"
         );
+        Ok(())
     }
 
     #[test]
-    fn behind_floor_checkpoint_requires_baseline_then_suffix_completes() {
+    fn behind_floor_checkpoint_requires_baseline_then_suffix_completes()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([23; 32], 10_000).unwrap(),
+            CheckpointCodec::new([23; 32], 10_000)?,
         );
-        let first = envelope_with(scope, replica, OperationId::new(), 50);
-        push_all(&service, replica, vec![first]);
-        let ServicePull::Page(first_page) = pull_after(&service, scope, replica, None, 11) else {
-            panic!("page expected")
+        let first = envelope_with(scope, replica, OperationId::new(), 50)?;
+        push_all(&service, replica, vec![first])?;
+        let ServicePull::Page(first_page) = pull_after(&service, scope, replica, None, 11)? else {
+            return Err("page expected".into());
         };
-        assert_eq!(first_page.changes.len(), 1);
-        let stale_checkpoint = first_page.checkpoint.clone();
-        let second = envelope_with(scope, replica, OperationId::new(), 51);
-        let tombstone = tombstone_envelope(scope, replica, OperationId::new(), 52);
-        let tombstone_bytes = tombstone.bytes.clone();
-        let fourth = envelope_with(scope, replica, OperationId::new(), 53);
-        push_all(&service, replica, vec![second, tombstone, fourth]);
         assert_eq!(
-            seal_at(&service, scope, 2, 12),
-            SealResult::Sealed { position: 2 }
+            first_page.changes.len(),
+            1,
+            "first page must hold one change"
+        );
+        let stale_checkpoint = first_page.checkpoint;
+        let second = envelope_with(scope, replica, OperationId::new(), 51)?;
+        let tombstone = tombstone_envelope(scope, replica, OperationId::new(), 52)?;
+        let tombstone_bytes = tombstone.bytes.clone();
+        let fourth = envelope_with(scope, replica, OperationId::new(), 53)?;
+        push_all(&service, replica, vec![second, tombstone, fourth])?;
+        assert_eq!(
+            seal_at(&service, scope, 2, 12)?,
+            SealResult::Sealed { position: 2 },
+            "baseline must seal at position two"
         );
         assert_eq!(
-            consume_through(&service, scope, 4, 13),
+            consume_through(&service, scope, 4, 13)?,
             ConsumedResult::Advanced {
                 consumed_through: 4
-            }
+            },
+            "watermark must advance through the prefix"
         );
         assert_eq!(
-            collect(&service, scope, 2, None, 14),
+            collect(&service, scope, 2, None, 14)?,
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 2,
                 floor: 2
-            })
+            }),
+            "covered prefix must collect"
         );
         assert_eq!(
-            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15),
-            ServicePull::BaselineRequired { floor: 2 }
+            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15)?,
+            ServicePull::BaselineRequired { floor: 2 },
+            "checkpoint behind the floor must require baseline recovery"
         );
         assert_eq!(
-            pull_after(&service, scope, replica, None, 15),
-            ServicePull::BaselineRequired { floor: 2 }
+            pull_after(&service, scope, replica, None, 15)?,
+            ServicePull::BaselineRequired { floor: 2 },
+            "fresh replica facing a nonzero floor must require baseline recovery"
         );
         let ServiceBaseline::Artifact(baseline) =
-            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)
+            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)?
         else {
-            panic!("state-bearing baseline expected")
+            return Err("state-bearing baseline expected".into());
         };
-        let artifact = baseline.validate(scope).unwrap();
-        assert_eq!(artifact.baseline.position(), 2);
-        assert_eq!(artifact.documents.len(), 2);
+        let artifact = baseline.validate(scope)?;
+        assert_eq!(
+            artifact.baseline.position(),
+            2,
+            "recovered baseline must cover position two"
+        );
+        assert_eq!(
+            artifact.documents.len(),
+            2,
+            "recovered baseline must hold two documents"
+        );
         let ServicePull::Page(recovered) = pull_after(
             &service,
             scope,
             replica,
             Some(baseline.checkpoint.clone()),
             17,
-        ) else {
-            panic!("recovery suffix page expected")
+        )?
+        else {
+            return Err("recovery suffix page expected".into());
         };
-        assert_eq!(recovered.changes.len(), 2);
-        assert_eq!(recovered.changes[0].bytes, tombstone_bytes);
-        assert!(!recovered.more);
+        assert_eq!(
+            recovered.changes.len(),
+            2,
+            "suffix must hold the tail changes"
+        );
+        assert_eq!(
+            recovered.changes[0].bytes, tombstone_bytes,
+            "suffix must replay the tombstone payload"
+        );
+        assert!(!recovered.more, "suffix page must be final");
+        Ok(())
     }
 
     #[test]
-    fn chunk_manifest_and_invocation_references_stay_consistent_after_collection() {
+    fn chunk_manifest_and_invocation_references_stay_consistent_after_collection()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let service = ProtocolService::new(
             Memory::default(),
             Allow,
-            CheckpointCodec::new([24; 32], 10_000).unwrap(),
+            CheckpointCodec::new([24; 32], 10_000)?,
         );
         let operations = [OperationId::new(), OperationId::new(), OperationId::new()];
         let changes = operations
             .iter()
             .zip(60u8..63)
             .map(|(operation, request)| envelope_with(scope, replica, *operation, request))
-            .collect::<Vec<_>>();
-        push_all(&service, replica, changes.clone());
+            .collect::<Result<Vec<_>, _>>()?;
+        push_all(&service, replica, changes.clone())?;
         assert_eq!(
-            seal_at(&service, scope, 2, 11),
-            SealResult::Sealed { position: 2 }
+            seal_at(&service, scope, 2, 11)?,
+            SealResult::Sealed { position: 2 },
+            "baseline must seal at position two"
         );
         assert_eq!(
-            consume_through(&service, scope, 3, 12),
+            consume_through(&service, scope, 3, 12)?,
             ConsumedResult::Advanced {
                 consumed_through: 3
-            }
+            },
+            "watermark must advance"
         );
         assert_eq!(
-            collect(&service, scope, 2, None, 13),
+            collect(&service, scope, 2, None, 13)?,
             PruneResult::Pruned(PruneReceipt {
                 pruned_through: 2,
                 floor: 2
-            })
+            }),
+            "covered prefix must collect"
         );
-        let duplicate = push_all(&service, replica, vec![changes[0].clone()]);
-        assert!(matches!(
-            duplicate.outcomes[0],
-            PushOutcome::Duplicate { .. }
-        ));
+        let duplicate = push_all(&service, replica, vec![changes[0].clone()])?;
+        assert!(
+            matches!(duplicate.outcomes[0], PushOutcome::Duplicate { .. }),
+            "exact retry after collection must remain a duplicate"
+        );
         let mut conflicting = changes[1].clone();
         conflicting.request = OperationDigest::new([99; 32]);
-        let conflict = push_all(&service, replica, vec![conflicting]);
-        assert!(matches!(
-            conflict.outcomes[0],
-            PushOutcome::Rejected {
-                code: RejectionCode::OperationConflict,
-                ..
-            }
-        ));
-        let ServiceBaseline::Artifact(baseline) = recover_at(&service, scope, replica, None, 13)
+        let conflict = push_all(&service, replica, vec![conflicting])?;
+        assert!(
+            matches!(
+                conflict.outcomes[0],
+                PushOutcome::Rejected {
+                    code: RejectionCode::OperationConflict,
+                    ..
+                }
+            ),
+            "conflicting request bytes must reject as operation conflict"
+        );
+        let ServiceBaseline::Artifact(baseline) = recover_at(&service, scope, replica, None, 13)?
         else {
-            panic!("state-bearing baseline expected")
+            return Err("state-bearing baseline expected".into());
         };
         let ServicePull::Page(page) = pull_after(
             &service,
@@ -2691,108 +2911,149 @@ mod tests {
             replica,
             Some(baseline.checkpoint.clone()),
             13,
-        ) else {
-            panic!("page expected")
+        )?
+        else {
+            return Err("page expected".into());
         };
-        assert_eq!(page.changes.len(), 1);
-        assert_eq!(page.changes[0].operation, operations[2]);
-        assert!(!page.more);
+        assert_eq!(page.changes.len(), 1, "suffix must hold one change");
+        assert_eq!(
+            page.changes[0].operation, operations[2],
+            "suffix must carry the uncollected operation"
+        );
+        assert!(!page.more, "suffix page must be final");
+        Ok(())
     }
 
     #[test]
-    fn retention_floor_and_baseline_survive_service_restart() {
+    fn retention_floor_and_baseline_survive_service_restart() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let store = std::sync::Arc::new(Memory::default());
         let changes = (70u8..73)
             .map(|request| envelope_with(scope, replica, OperationId::new(), request))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let stale_checkpoint = {
             let service = ProtocolService::new(
-                store.clone(),
+                Arc::clone(&store),
                 Allow,
-                CheckpointCodec::new([25; 32], 10_000).unwrap(),
+                CheckpointCodec::new([25; 32], 10_000)?,
             );
-            push_all(&service, replica, vec![changes[0].clone()]);
-            let ServicePull::Page(first) = pull_after(&service, scope, replica, None, 11) else {
-                panic!("page expected")
+            push_all(&service, replica, vec![changes[0].clone()])?;
+            let ServicePull::Page(first) = pull_after(&service, scope, replica, None, 11)? else {
+                return Err("page expected".into());
             };
-            push_all(&service, replica, changes[1..].to_vec());
+            push_all(&service, replica, changes[1..].to_vec())?;
             assert_eq!(
-                seal_at(&service, scope, 2, 12),
-                SealResult::Sealed { position: 2 }
+                seal_at(&service, scope, 2, 12)?,
+                SealResult::Sealed { position: 2 },
+                "baseline must seal at position two"
             );
             assert_eq!(
-                consume_through(&service, scope, 3, 13),
+                consume_through(&service, scope, 3, 13)?,
                 ConsumedResult::Advanced {
                     consumed_through: 3
-                }
+                },
+                "watermark must advance"
             );
             assert_eq!(
-                collect(&service, scope, 2, None, 14),
+                collect(&service, scope, 2, None, 14)?,
                 PruneResult::Pruned(PruneReceipt {
                     pruned_through: 2,
                     floor: 2
-                })
+                }),
+                "covered prefix must collect"
             );
             first.checkpoint
         };
         let service = ProtocolService::new(
-            store.clone(),
+            Arc::clone(&store),
             Allow,
-            CheckpointCodec::new([25; 32], 10_000).unwrap(),
+            CheckpointCodec::new([25; 32], 10_000)?,
         );
         assert_eq!(
-            lgwks_std::task::block_on(store.retention_floor(scope)).unwrap(),
-            2
+            lgwks_std::task::block_on(store.retention_floor(scope))?,
+            2,
+            "retention floor must survive restart"
         );
-        assert!(matches!(
-            lgwks_std::task::block_on(store.snapshot_baseline(scope)).unwrap(),
-            Some(SnapshotRecord::State(ref baseline)) if baseline.position() == 2
-        ));
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(store.snapshot_baseline(scope))?,
+                Some(SnapshotRecord::State(ref baseline)) if baseline.position() == 2
+            ),
+            "sealed baseline must survive restart"
+        );
         assert_eq!(
-            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15),
-            ServicePull::BaselineRequired { floor: 2 }
+            pull_after(&service, scope, replica, Some(stale_checkpoint.clone()), 15)?,
+            ServicePull::BaselineRequired { floor: 2 },
+            "stale checkpoint after restart must require baseline recovery"
         );
         let ServiceBaseline::Artifact(baseline) =
-            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)
+            recover_at(&service, scope, replica, Some(stale_checkpoint), 16)?
         else {
-            panic!("state-bearing baseline must survive restart")
+            return Err("state-bearing baseline must survive restart".into());
         };
-        let artifact = baseline.validate(scope).unwrap();
-        assert_eq!(artifact.baseline.position(), 2);
-        assert_eq!(artifact.documents.len(), 2);
+        let artifact = baseline.validate(scope)?;
+        assert_eq!(
+            artifact.baseline.position(),
+            2,
+            "recovered baseline must cover position two"
+        );
+        assert_eq!(
+            artifact.documents.len(),
+            2,
+            "recovered baseline must hold two documents"
+        );
+        Ok(())
     }
 
     #[test]
     fn prune_decision_rejects_every_uncollectible_edge() {
-        assert_eq!(prune_decision(10, 2, 2, None, 5), Ok(2));
-        assert_eq!(prune_decision(10, 2, 1, None, 5), Ok(2));
-        assert_eq!(prune_decision(10, 2, 5, None, 5), Ok(5));
-        assert_eq!(prune_decision(10, 2, 5, Some(5), 9), Ok(5));
+        assert_eq!(
+            prune_decision(10, 2, 2, None, 5),
+            Ok(2),
+            "request at floor is a no-op"
+        );
+        assert_eq!(
+            prune_decision(10, 2, 1, None, 5),
+            Ok(2),
+            "request below floor is a no-op"
+        );
+        assert_eq!(
+            prune_decision(10, 2, 5, None, 5),
+            Ok(5),
+            "covered prefix advances"
+        );
+        assert_eq!(
+            prune_decision(10, 2, 5, Some(5), 9),
+            Ok(5),
+            "prefix at the live checkpoint advances"
+        );
         assert_eq!(
             prune_decision(3, 0, 4, None, 4),
-            Err(PruneRefusal::BeyondFrontier { frontier: 3 })
+            Err(PruneRefusal::BeyondFrontier { frontier: 3 }),
+            "prefix past the frontier must refuse"
         );
         assert_eq!(
             prune_decision(10, 0, 5, Some(4), 9),
-            Err(PruneRefusal::LiveCheckpoint { min_live: 4 })
+            Err(PruneRefusal::LiveCheckpoint { min_live: 4 }),
+            "prefix past a live checkpoint must refuse"
         );
         assert_eq!(
             prune_decision(10, 0, 5, None, 4),
             Err(PruneRefusal::PendingOperations {
                 consumed_through: 4
-            })
+            }),
+            "prefix past the consumption watermark must refuse"
         );
     }
 
     #[test]
-    fn retention_writes_require_fresh_authority() {
+    fn retention_writes_require_fresh_authority() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let stale = ProtocolService::new(
             Memory::default(),
             Stale,
-            CheckpointCodec::new([26; 32], 10_000).unwrap(),
+            CheckpointCodec::new([26; 32], 10_000)?,
         );
         assert_eq!(
             lgwks_std::task::block_on(stale.seal_snapshot(
@@ -2800,9 +3061,9 @@ mod tests {
                 0,
                 OperationDigest::new([61; 32]),
                 10,
-            ))
-            .unwrap(),
-            SealResult::StaleAuthority
+            ))?,
+            SealResult::StaleAuthority,
+            "seal must require fresh authority"
         );
         assert_eq!(
             lgwks_std::task::block_on(stale.mark_consumed(
@@ -2810,9 +3071,9 @@ mod tests {
                 0,
                 OperationDigest::new([62; 32]),
                 10,
-            ))
-            .unwrap(),
-            ConsumedResult::StaleAuthority
+            ))?,
+            ConsumedResult::StaleAuthority,
+            "mark_consumed must require fresh authority"
         );
         assert_eq!(
             lgwks_std::task::block_on(stale.prune(
@@ -2821,24 +3082,28 @@ mod tests {
                 None,
                 OperationDigest::new([63; 32]),
                 10,
-            ))
-            .unwrap(),
-            PruneResult::StaleAuthority
+            ))?,
+            PruneResult::StaleAuthority,
+            "prune must require fresh authority"
         );
         let denied = ProtocolService::new(
             Memory::default(),
             Deny,
-            CheckpointCodec::new([27; 32], 10_000).unwrap(),
+            CheckpointCodec::new([27; 32], 10_000)?,
         );
-        assert!(matches!(
-            lgwks_std::task::block_on(denied.prune(
-                scope,
-                0,
-                None,
-                OperationDigest::new([63; 32]),
-                10,
-            )),
-            Err(ServiceError::Forbidden)
-        ));
+        assert!(
+            matches!(
+                lgwks_std::task::block_on(denied.prune(
+                    scope,
+                    0,
+                    None,
+                    OperationDigest::new([63; 32]),
+                    10,
+                )),
+                Err(ServiceError::Forbidden)
+            ),
+            "denied authority must fail closed"
+        );
+        Ok(())
     }
 }

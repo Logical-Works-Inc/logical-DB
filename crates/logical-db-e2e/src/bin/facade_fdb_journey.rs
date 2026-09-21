@@ -5,6 +5,14 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 
 use std::{error::Error, fs, io};
 
@@ -15,6 +23,7 @@ use logical_db::{
 };
 use uuid::Uuid;
 
+/// Reads one required environment variable, naming it when it is missing.
 fn required(name: &'static str) -> Result<String, io::Error> {
     std::env::var(name).map_err(|error| {
         io::Error::new(
@@ -24,10 +33,12 @@ fn required(name: &'static str) -> Result<String, io::Error> {
     })
 }
 
+/// Boots the async runtime and drives the facade journey to completion.
 fn main() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Runtime::new()?.block_on(journey())
 }
 
+/// Pulls, verifies, and reopens one document through the public facade.
 async fn journey() -> Result<(), Box<dyn Error>> {
     let endpoint: Url = required("LOGICAL_DB_JOURNEY_ENDPOINT")?.parse()?;
     let bearer_token = required("LOGICAL_DB_BEARER_TOKEN")?;

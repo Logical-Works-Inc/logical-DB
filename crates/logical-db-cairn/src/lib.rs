@@ -231,6 +231,31 @@ pub struct Observation {
 }
 
 impl Observation {
+    /// Builds one observation from its identity, classification, and payload.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose observations through here.
+    #[must_use]
+    pub fn new(
+        id: EpisodeRef,
+        kind: TokenKind,
+        modality: Modality,
+        uncertainty: f32,
+        actionability: Actionability,
+        value: Vec<u8>,
+        links: Vec<TokenLink>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            modality,
+            uncertainty,
+            actionability,
+            value,
+            links,
+        }
+    }
+
     /// Validates bounds on id, uncertainty, value, and links.
     ///
     /// # Errors
@@ -562,9 +587,17 @@ mod tests {
             TokenKind::as_str,
             TokenKind::parse,
         );
-        roundtrip(&[TokenKind::Uncertainty], TokenKind::as_str, TokenKind::parse);
         roundtrip(
-            &[LinkRelation::Before, LinkRelation::After, LinkRelation::CausedBy],
+            &[TokenKind::Uncertainty],
+            TokenKind::as_str,
+            TokenKind::parse,
+        );
+        roundtrip(
+            &[
+                LinkRelation::Before,
+                LinkRelation::After,
+                LinkRelation::CausedBy,
+            ],
             LinkRelation::as_str,
             LinkRelation::parse,
         );
@@ -600,12 +633,20 @@ mod tests {
         );
         roundtrip(&[Modality::Workflow], Modality::as_str, Modality::parse);
         roundtrip(
-            &[Actionability::None, Actionability::Inspect, Actionability::Ask],
+            &[
+                Actionability::None,
+                Actionability::Inspect,
+                Actionability::Ask,
+            ],
             Actionability::as_str,
             Actionability::parse,
         );
         roundtrip(
-            &[Actionability::Repair, Actionability::Execute, Actionability::Block],
+            &[
+                Actionability::Repair,
+                Actionability::Execute,
+                Actionability::Block,
+            ],
             Actionability::as_str,
             Actionability::parse,
         );

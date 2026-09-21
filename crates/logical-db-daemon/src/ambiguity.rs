@@ -28,6 +28,9 @@ use logical_db_service::{
 };
 use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
 
+#[path = "bin/journey_report/mod.rs"]
+mod journey_report;
+
 const FULL_FDB_CHUNK_PROBE_BYTES: usize = 65_536;
 const MAX_VERIFIED_PAGES: usize = 1_024;
 
@@ -126,10 +129,14 @@ fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    lgwks_bot::Runtime::new()?.block_on(run())
+    let reports = lgwks_bot::Runtime::new()?.block_on(run())?;
+    for line in &reports {
+        journey_report::emit(line);
+    }
+    Ok(())
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<Vec<String>, Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     let network_builder = FdbApiBuilder::default().build()?;
     let network_builder = network_builder.set_option(NetworkOption::ClientBuggifyEnable)?;
@@ -137,7 +144,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         network_builder.set_option(NetworkOption::ClientBuggifySectionActivatedProbability(100))?;
     let network_builder =
         network_builder.set_option(NetworkOption::ClientBuggifySectionFiredProbability(12))?;
-    #[allow(unsafe_code)]
+    #[expect(
+        unsafe_code,
+        reason = "FoundationDB network-boot FFI is the one reviewed unsafe leaf in this journey binary; the safe surface forbids unsafe_code at the crate root"
+    )]
     // SAFETY: this dedicated test process boots exactly one FDB network and
     // retains the auto-stop guard beyond every database, store, and future.
     let network = unsafe { network_builder.boot()? };
@@ -156,15 +166,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let audit_store = FdbServiceStore::new(audit_database, root.clone())?;
     let http_store = FdbServiceStore::new(http_database, root.clone())?;
     let replica = ReplicaId::new();
-    verify_http_action_binding(http_store, &audit_store, scope, replica).await?;
+    let binding_report =
+        verify_http_action_binding(http_store, &audit_store, scope, replica).await?;
     let store = FdbServiceStore::new(database, root)?;
-    verify_live_baseline_retention(&store, replica).await?;
+    let retention_report = verify_live_baseline_retention(&store, replica).await?;
+    let mut reports = vec![binding_report, retention_report];
 
     for attempt in 0_u16..512 {
         let change = match ambiguity_probe_change(scope, replica, attempt) {
             Ok(change) => change,
             Err(error) => {
-                eprintln!("fdb-ambiguity: could not build attempt {attempt}: {error}");
                 return Err(error);
             }
         };
@@ -177,17 +188,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
             Ok(AcceptResult::RecoveredUnknownCommit) => {
                 let observed =
                     complete_recovery_path(&store, scope, frontier, &change, &grant).await?;
-                println!(
+                reports.push(format!(
                     "PASS fdb-commit-unknown-recovered attempt={attempt} frontier={observed} invocation=consumed page=bounded scope=isolated"
-                );
+                ));
                 drop(store);
                 drop(network);
-                return Ok(());
+                return Ok(reports);
             }
             Ok(result) if probe_result_is_nonterminal(result) => {}
             Err(_) => {}
             Ok(other) => {
-                eprintln!("fdb-ambiguity: unexpected acceptance result: {other:?}");
                 return Err(
                     io::Error::other(format!("unexpected acceptance result: {other:?}")).into(),
                 );
@@ -204,7 +214,7 @@ fn probe_result_is_nonterminal(result: AcceptResult) -> bool {
 async fn verify_live_baseline_retention(
     store: &FdbServiceStore,
     replica: ReplicaId,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<String, Box<dyn Error>> {
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let artifact_one = seed_and_build_first(store, scope, replica).await?;
     seal_first_baseline(store, scope, &artifact_one).await?;
@@ -218,9 +228,6 @@ async fn seed_and_build_first(
 ) -> Result<SnapshotArtifact, Box<dyn Error>> {
     let initial_frontier = read_frontier_with_retry(store, scope).await?;
     if initial_frontier != 0 {
-        eprintln!(
-            "fdb-ambiguity: baseline journey scope was not fresh frontier={initial_frontier}"
-        );
         return Err(io::Error::other(format!(
             "baseline journey scope was not fresh: frontier={initial_frontier}"
         ))
@@ -230,7 +237,6 @@ async fn seed_and_build_first(
     let first = ambiguity_probe_change(scope, replica, 700)?;
     let first_frontier = accept_seed_with_retry(store, &first, 0).await?;
     if first_frontier != 1 {
-        eprintln!("fdb-ambiguity: baseline journey first seed frontier={first_frontier}");
         return Err(io::Error::other(format!(
             "baseline journey first seed frontier={first_frontier}"
         ))
@@ -239,9 +245,6 @@ async fn seed_and_build_first(
     let second = tombstone_probe_change(scope, replica, &first, 701)?;
     let second_frontier = accept_seed_with_retry(store, &second, 1).await?;
     if second_frontier != 2 || read_frontier_with_retry(store, scope).await? != 2 {
-        eprintln!(
-            "fdb-ambiguity: baseline journey seed frontier did not reach two: {second_frontier}"
-        );
         return Err(io::Error::other(format!(
             "baseline journey seed frontier did not reach two: {second_frontier}"
         ))
@@ -261,13 +264,11 @@ async fn seed_and_build_first(
                 consumed_through: 2,
             })
     {
-        eprintln!("fdb-ambiguity: baseline journey consumed result was {consumed:?}");
         return Err(
             io::Error::other(format!("baseline journey consumed result was {consumed:?}")).into(),
         );
     }
     if read_consumed_with_retry(store, scope).await? != 2 {
-        eprintln!("fdb-ambiguity: baseline journey consumption did not reach two");
         return Err(io::Error::other("baseline journey consumption did not reach two").into());
     }
 
@@ -276,7 +277,6 @@ async fn seed_and_build_first(
     let missing_grant = fixture_grant(scope, Effect::Sync, missing_action, 2);
     let missing = prune_with_retry(store, scope, missing_request, &missing_grant).await?;
     if missing != PruneResult::Refused(PruneRefusal::MissingBaseline) {
-        eprintln!("fdb-ambiguity: baseline journey missing-baseline result was {missing:?}");
         return Err(io::Error::other(format!(
             "baseline journey missing-baseline result was {missing:?}"
         ))
@@ -285,7 +285,6 @@ async fn seed_and_build_first(
     if read_frontier_with_retry(store, scope).await? != 2
         || read_floor_with_retry(store, scope).await? != 0
     {
-        eprintln!("fdb-ambiguity: missing baseline prune changed frontier or floor");
         return Err(io::Error::other("missing baseline prune changed frontier or floor").into());
     }
 
@@ -295,12 +294,10 @@ async fn seed_and_build_first(
         || artifact_one.documents[0].document != first.document
         || artifact_one.documents[0].tombstone
     {
-        eprintln!("fdb-ambiguity: first state-bearing artifact was incomplete");
         return Err(io::Error::other("first state-bearing artifact was incomplete").into());
     }
     let mut first_state = Document::load(&artifact_one.documents[0].snapshot)?;
     if first_state.is_deleted()? {
-        eprintln!("fdb-ambiguity: first state-bearing artifact was unexpectedly deleted");
         return Err(io::Error::other("first state-bearing artifact lost live state").into());
     }
     Ok(artifact_one)
@@ -330,7 +327,6 @@ async fn seal_first_baseline(
         corrupt_result,
         Err(FdbStoreError::Corruption(FdbDataError::BaselineCorrupt))
     ) {
-        eprintln!("fdb-ambiguity: corrupt baseline seal result was {corrupt_result:?}");
         return Err(io::Error::other(format!(
             "corrupt baseline seal result was {corrupt_result:?}"
         ))
@@ -339,7 +335,6 @@ async fn seal_first_baseline(
     if read_snapshot_with_retry(store, scope).await?.is_some()
         || read_floor_with_retry(store, scope).await? != 0
     {
-        eprintln!("fdb-ambiguity: corrupt baseline seal changed pointer or floor");
         return Err(io::Error::other("corrupt baseline seal changed pointer or floor").into());
     }
 
@@ -357,14 +352,12 @@ async fn seal_first_baseline(
     .await?
         != (SealResult::Sealed { position: 1 })
     {
-        eprintln!("fdb-ambiguity: first state-bearing baseline did not seal");
         return Err(io::Error::other("first state-bearing baseline did not seal").into());
     }
     if !matches!(
         read_snapshot_with_retry(store, scope).await?,
         Some(SnapshotRecord::State(ref baseline)) if baseline == &artifact_one.baseline
     ) {
-        eprintln!("fdb-ambiguity: first state-bearing baseline pointer was wrong");
         return Err(io::Error::other("first state-bearing baseline pointer was wrong").into());
     }
     Ok(())
@@ -375,13 +368,12 @@ async fn finish_baseline_retention(
     scope: Scope,
     replica: ReplicaId,
     artifact_one: &SnapshotArtifact,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<String, Box<dyn Error>> {
     let behind_request = OperationDigest::new([0x95; 32]);
     let behind_action = prune_action(scope, behind_request, 2, None);
     let behind_grant = fixture_grant(scope, Effect::Sync, behind_action, 2);
     let behind = prune_with_retry(store, scope, behind_request, &behind_grant).await?;
     if behind != PruneResult::Refused(PruneRefusal::BaselineBehind { position: 1 }) {
-        eprintln!("fdb-ambiguity: behind baseline prune result was {behind:?}");
         return Err(
             io::Error::other(format!("behind baseline prune result was {behind:?}")).into(),
         );
@@ -389,7 +381,6 @@ async fn finish_baseline_retention(
     if read_frontier_with_retry(store, scope).await? != 2
         || read_floor_with_retry(store, scope).await? != 0
     {
-        eprintln!("fdb-ambiguity: behind baseline prune changed frontier or floor");
         return Err(io::Error::other("behind baseline prune changed frontier or floor").into());
     }
 
@@ -399,12 +390,10 @@ async fn finish_baseline_retention(
         || artifact_two.documents[0].document != artifact_one.documents[0].document
         || !artifact_two.documents[0].tombstone
     {
-        eprintln!("fdb-ambiguity: second state-bearing artifact was incomplete");
         return Err(io::Error::other("second state-bearing artifact was incomplete").into());
     }
     let mut deleted_state = Document::load(&artifact_two.documents[0].snapshot)?;
     if !deleted_state.is_deleted()? {
-        eprintln!("fdb-ambiguity: second state-bearing artifact lost its tombstone");
         return Err(io::Error::other("second state-bearing artifact lost its tombstone").into());
     }
     let artifact_two_request = OperationDigest::new([0x96; 32]);
@@ -421,7 +410,6 @@ async fn finish_baseline_retention(
     .await?
         != (SealResult::Sealed { position: 2 })
     {
-        eprintln!("fdb-ambiguity: second state-bearing baseline did not seal");
         return Err(io::Error::other("second state-bearing baseline did not seal").into());
     }
 
@@ -435,15 +423,11 @@ async fn finish_baseline_retention(
             floor: 2,
         })
     {
-        eprintln!("fdb-ambiguity: state-bearing prune result was {pruned:?}");
         return Err(io::Error::other(format!("state-bearing prune result was {pruned:?}")).into());
     }
     let final_frontier = read_frontier_with_retry(store, scope).await?;
     let final_floor = read_floor_with_retry(store, scope).await?;
     if final_frontier != 2 || final_floor != 2 {
-        eprintln!(
-            "fdb-ambiguity: state-bearing prune ended at frontier={final_frontier} floor={final_floor}"
-        );
         return Err(io::Error::other(format!(
             "state-bearing prune ended at frontier={final_frontier} floor={final_floor}"
         ))
@@ -452,13 +436,11 @@ async fn finish_baseline_retention(
     let page = page_action(scope, replica, 0, 1, u32::try_from(MAX_PAGE_BYTES)?);
     let page_grant = fixture_grant(scope, Effect::Sync, page.digest(), final_frontier);
     if page_behind_floor_with_retry(store, page, &page_grant).await? != PageResult::BehindFloor {
-        eprintln!("fdb-ambiguity: pruned checkpoint was not behind the floor");
         return Err(io::Error::other("pruned checkpoint was not behind the floor").into());
     }
-    println!(
+    Ok(format!(
         "PASS fdb-live-baseline-retention seeded=2 consumed=2 missing=refused corrupt=typed-baseline-corrupt baseline1=sealed baseline2=sealed prune=2 frontier={final_frontier} floor={final_floor} page_after=0=behind-floor scope=isolated"
-    );
-    Ok(())
+    ))
 }
 
 async fn read_frontier_with_retry(
@@ -583,9 +565,6 @@ async fn accept_seed_with_retry(
             ) => match store.frontier(change.scope).await {
                 Ok(frontier) if frontier == expected_frontier + 1 => return Ok(frontier),
                 Ok(frontier) if frontier > expected_frontier + 1 => {
-                    eprintln!(
-                        "fdb-ambiguity: seed frontier advanced past expected position: {frontier}"
-                    );
                     return Err(io::Error::other(format!(
                         "seed frontier advanced past expected position: {frontier}"
                     ))
@@ -594,7 +573,6 @@ async fn accept_seed_with_retry(
                 Ok(_) | Err(_) => {}
             },
             Ok(other) => {
-                eprintln!("fdb-ambiguity: seed change returned unexpected outcome: {other:?}");
                 return Err(io::Error::other(format!(
                     "seed change returned unexpected outcome: {other:?}"
                 ))
@@ -622,11 +600,9 @@ async fn mark_consumed_with_retry(
                 return Ok(ConsumedResult::Unchanged { consumed_through });
             }
             Ok(ConsumedResult::StaleAuthority) => {
-                eprintln!("fdb-ambiguity: mark-consumed authority became stale");
                 return Err(io::Error::other("mark-consumed authority became stale").into());
             }
             Ok(other) => {
-                eprintln!("fdb-ambiguity: mark-consumed returned unexpected outcome: {other:?}");
                 return Err(io::Error::other(format!(
                     "mark-consumed returned unexpected outcome: {other:?}"
                 ))
@@ -652,7 +628,6 @@ async fn seal_snapshot_with_retry(
     for _retry in 0..128 {
         match store.seal_snapshot(scope, artifact, request, grant).await {
             Ok(SealResult::StaleAuthority) => {
-                eprintln!("fdb-ambiguity: seal snapshot authority became stale");
                 return Err(io::Error::other("seal snapshot authority became stale").into());
             }
             Ok(result) => return Ok(result),
@@ -678,7 +653,6 @@ async fn prune_with_retry(
                 return Ok(result);
             }
             Ok(PruneResult::StaleAuthority) => {
-                eprintln!("fdb-ambiguity: prune authority became stale");
                 return Err(io::Error::other("prune authority became stale").into());
             }
             Err(error) => last_error = Some(error),
@@ -692,7 +666,7 @@ async fn verify_http_action_binding(
     observer: &FdbServiceStore,
     scope: Scope,
     replica: ReplicaId,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<String, Box<dyn Error>> {
     let original = ambiguity_probe_change(scope, replica, 600)?;
     let authority = FixedActionAuthority {
         scope,
@@ -717,17 +691,14 @@ async fn verify_http_action_binding(
         first,
         PushOutcome::Accepted { .. } | PushOutcome::Duplicate { .. }
     ) {
-        eprintln!("fdb-ambiguity: canonical HTTP write was {first:?}");
         return Err(io::Error::other(format!("canonical HTTP write was {first:?}")).into());
     }
     let after_first = read_frontier_with_retry(observer, scope).await?;
     if after_first != before + 1 {
-        eprintln!("fdb-ambiguity: HTTP frontier moved from {before} to {after_first}");
         return Err(io::Error::other("canonical HTTP write did not advance once").into());
     }
     let replay = push_over_http(&client, &endpoint, &original).await?;
     if !matches!(replay, PushOutcome::Duplicate { .. }) {
-        eprintln!("fdb-ambiguity: exact HTTP replay was {replay:?}");
         return Err(io::Error::other(format!("exact HTTP replay was {replay:?}")).into());
     }
 
@@ -754,25 +725,19 @@ async fn verify_http_action_binding(
             RejectionCode::Forbidden
         };
         if !matches!(outcome, PushOutcome::Rejected { code, .. } if code == expected) {
-            eprintln!("fdb-ambiguity: mutated HTTP action was {outcome:?}");
             return Err(io::Error::other(format!("mutated HTTP action was {outcome:?}")).into());
         }
     }
     if read_frontier_with_retry(observer, scope).await? != after_first {
-        eprintln!("fdb-ambiguity: rejected HTTP action advanced canonical scope");
         return Err(io::Error::other("rejected HTTP action advanced the frontier").into());
     }
     if read_frontier_with_retry(observer, account_scope).await? != 0
         || read_frontier_with_retry(observer, space_scope).await? != 0
     {
-        eprintln!("fdb-ambiguity: rejected HTTP scope mutation created durable state");
         return Err(io::Error::other("rejected HTTP scope mutation created state").into());
     }
-    println!(
-        "PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated"
-    );
     server.abort();
-    Ok(())
+    Ok("PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated".to_string())
 }
 
 async fn push_over_http(
@@ -780,11 +745,7 @@ async fn push_over_http(
     endpoint: &str,
     change: &ChangeEnvelope,
 ) -> Result<PushOutcome, Box<dyn Error>> {
-    let request = PushRequest {
-        protocol: PROTOCOL_VERSION,
-        replica: change.replica,
-        changes: vec![change.clone()],
-    };
+    let request = PushRequest::new(PROTOCOL_VERSION, change.replica, vec![change.clone()]);
     let mut body = Vec::new();
     ciborium::into_writer(&request, &mut body)?;
     for _attempt in 0..32 {
@@ -801,7 +762,6 @@ async fn push_over_http(
             continue;
         }
         if !response.status().is_success() {
-            eprintln!("fdb-ambiguity: HTTP push status {}", response.status());
             return Err(io::Error::other(format!("HTTP push status {}", response.status())).into());
         }
         let bytes = response.bytes().await?;
@@ -851,15 +811,15 @@ fn ambiguity_probe_change(
         .ok_or_else(|| io::Error::other("missing CRDT change"))?;
     let request_byte = u8::try_from(attempt % 256).map_err(io::Error::other)?;
     let request = OperationDigest::new([request_byte; 32]);
-    Ok(ChangeEnvelope {
+    Ok(ChangeEnvelope::new(
         scope,
-        document: DocumentId::new(),
+        DocumentId::new(),
         replica,
-        operation: OperationId::new(),
+        OperationId::new(),
         request,
-        digest: encoded.digest,
-        bytes: encoded.bytes,
-    })
+        encoded.digest,
+        encoded.bytes,
+    ))
 }
 
 fn tombstone_probe_change(
@@ -869,24 +829,21 @@ fn tombstone_probe_change(
     attempt: u16,
 ) -> Result<ChangeEnvelope, Box<dyn Error>> {
     let mut document = Document::new();
-    document.apply(&[EncodedChange {
-        digest: previous.digest,
-        bytes: previous.bytes.clone(),
-    }])?;
+    document.apply(&[EncodedChange::new(previous.digest, previous.bytes.clone())])?;
     let encoded = document
         .delete()?
         .pop()
         .ok_or_else(|| io::Error::other("missing CRDT tombstone change"))?;
     let request_byte = u8::try_from(attempt % 256).map_err(io::Error::other)?;
-    Ok(ChangeEnvelope {
+    Ok(ChangeEnvelope::new(
         scope,
-        document: previous.document,
+        previous.document,
         replica,
-        operation: OperationId::new(),
-        request: OperationDigest::new([request_byte; 32]),
-        digest: encoded.digest,
-        bytes: encoded.bytes,
-    })
+        OperationId::new(),
+        OperationDigest::new([request_byte; 32]),
+        encoded.digest,
+        encoded.bytes,
+    ))
 }
 
 async fn append_continuation_record(
@@ -899,7 +856,6 @@ async fn append_continuation_record(
             continue;
         };
         if frontier < minimum_frontier {
-            eprintln!("fdb-ambiguity: frontier regressed from {minimum_frontier} to {frontier}");
             return Err(io::Error::other("durable frontier regressed").into());
         }
         let mut document = Document::new();
@@ -914,15 +870,15 @@ async fn append_continuation_record(
             .pop()
             .ok_or_else(|| io::Error::other("missing continuation CRDT change"))?;
         let request = continuation_fixture_request(scope, frontier, attempt);
-        let change = ChangeEnvelope {
+        let change = ChangeEnvelope::new(
             scope,
-            document: DocumentId::new(),
-            replica: ReplicaId::new(),
-            operation: OperationId::new(),
+            DocumentId::new(),
+            ReplicaId::new(),
+            OperationId::new(),
             request,
-            digest: encoded.digest,
-            bytes: encoded.bytes,
-        };
+            encoded.digest,
+            encoded.bytes,
+        );
         let grant = fixture_grant(scope, Effect::Write, write_action(&change), frontier);
         if matches!(
             store.accept(&change, &grant).await,
@@ -963,10 +919,6 @@ async fn verify_recovered_write(
     }
     let observed = observed.ok_or_else(|| io::Error::other("frontier retry budget exhausted"))?;
     if observed != frontier + 1 {
-        eprintln!(
-            "fdb-ambiguity: recovered frontier expected={} observed={observed}",
-            frontier + 1
-        );
         return Err(io::Error::other("unknown recovery advanced more than once").into());
     }
     let mut exact_retry = None;
@@ -980,7 +932,6 @@ async fn verify_recovered_write(
         exact_retry,
         Some(AcceptResult::Duplicate | AcceptResult::RecoveredUnknownCommit)
     ) {
-        eprintln!("fdb-ambiguity: exact retry result was {exact_retry:?}");
         return Err(io::Error::other("exact retry was not a durable duplicate").into());
     }
     let mut collision = change.clone();
@@ -998,7 +949,6 @@ async fn verify_recovered_write(
         }
     }
     if collision_result != Some(AcceptResult::Conflict) {
-        eprintln!("fdb-ambiguity: collision result was {collision_result:?}");
         return Err(io::Error::other("operation collision was accepted as an exact retry").into());
     }
     let mut rebound = change.clone();
@@ -1015,7 +965,6 @@ async fn verify_recovered_write(
         }
     }
     if reused != Some(AcceptResult::InvocationConsumed) {
-        eprintln!("fdb-ambiguity: reused invocation result was {reused:?}");
         return Err(io::Error::other("runnable invocation was reusable").into());
     }
     Ok((observed, rebound))
@@ -1051,10 +1000,6 @@ async fn verify_page(
             || page.changes.len() > usize::from(count)
             || page.more != (page.position < observed)
         {
-            eprintln!(
-                "fdb-ambiguity: page bounds failed after={after} position={} observed={observed}",
-                page.position
-            );
             return Err(io::Error::other("ordered FDB page violated its bounds").into());
         }
         returned = returned
@@ -1068,10 +1013,6 @@ async fn verify_page(
         }
         for returned_change in &page.changes {
             if !operations.insert(returned_change.operation) {
-                eprintln!(
-                    "fdb-ambiguity: repeated operation {}",
-                    returned_change.operation
-                );
                 return Err(io::Error::other("ordered FDB pages repeated an operation").into());
             }
             recovered_change_count += usize::from(returned_change == change);
@@ -1093,9 +1034,6 @@ async fn verify_page(
         || recovered_change_count != 1
         || continuation_change_count != 1
     {
-        eprintln!(
-            "fdb-ambiguity: incomplete pages pages={pages} after={after} observed={observed} returned={returned}"
-        );
         return Err(io::Error::other("ordered FDB pages lost their frontier").into());
     }
     let mut byte_ceiling_proven = false;
@@ -1112,7 +1050,6 @@ async fn verify_page(
         }
     }
     if !byte_ceiling_proven {
-        eprintln!("fdb-ambiguity: one-byte page accepted an oversized change");
         return Err(io::Error::other("page byte ceiling was not enforced").into());
     }
     let rebound_action = page_action(scope, change.replica, 0, 1, bytes);
@@ -1130,10 +1067,6 @@ async fn read_page_with_retry(
             Ok(PageResult::Page(page)) => return Ok(page),
             Ok(PageResult::StaleAuthority) => {
                 let durable = store.frontier(action.scope).await;
-                eprintln!(
-                    "fdb-ambiguity: stale page authority after={} durable={durable:?}",
-                    action.after
-                );
                 return Err(io::Error::other(format!(
                     "page authority became stale after={} expected_frontier={} durable_frontier={durable:?}", action.after,
                     grant.frontier()
@@ -1141,10 +1074,6 @@ async fn read_page_with_retry(
                 .into());
             }
             Ok(PageResult::BehindFloor) => {
-                eprintln!(
-                    "fdb-ambiguity: page checkpoint expired after={}",
-                    action.after
-                );
                 return Err(io::Error::other(format!(
                     "page checkpoint expired after={} expected_frontier={}",
                     action.after,
@@ -1170,14 +1099,14 @@ fn page_action(
     max_changes: u16,
     max_bytes: u32,
 ) -> PageAction {
-    PageAction {
+    PageAction::new(
         scope,
         replica,
-        intent: OperationDigest::new([0x70; 32]),
+        OperationDigest::new([0x70; 32]),
         after,
         max_changes,
         max_bytes,
-    }
+    )
 }
 
 async fn verify_rebound_grants(
@@ -1207,7 +1136,6 @@ async fn verify_rebound_grants(
     };
     for invalid in [wrong_scope, wrong_effect, wrong_action] {
         if store.accept(rebound, &invalid).await? != AcceptResult::StaleAuthority {
-            eprintln!("fdb-ambiguity: accept admitted an invalid rebound grant");
             return Err(io::Error::other("accept admitted a rebound grant").into());
         }
     }
@@ -1219,7 +1147,6 @@ async fn verify_rebound_grants(
         }
     }
     if foreign_frontier != Some(0) {
-        eprintln!("fdb-ambiguity: foreign scope frontier was {foreign_frontier:?}");
         return Err(io::Error::other("scope tuple axis leaked a frontier").into());
     }
     let stale = ForgedGrant {
@@ -1237,7 +1164,6 @@ async fn verify_rebound_grants(
         }
     }
     if stale_result != Some(PageResult::StaleAuthority) {
-        eprintln!("fdb-ambiguity: stale page grant result was {stale_result:?}");
         return Err(io::Error::other("page ignored its justified frontier").into());
     }
     Ok(())

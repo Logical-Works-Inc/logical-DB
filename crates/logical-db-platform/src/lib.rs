@@ -48,7 +48,7 @@ pub fn database_path_in(
 ///
 /// Each supported target binds `root` exactly once, so an unsupported target is
 /// a typed refusal rather than unreachable code. This replaces the previous
-/// `#[allow(unreachable_code)]`, which lowered a lint to reach the fallback.
+/// an `allow` on `unreachable_code`, which lowered a lint to reach the fallback.
 fn platform_data_root() -> Result<PathBuf, PlatformError> {
     #[cfg(target_os = "windows")]
     let root = absolute_data_root(nonempty_env("LOCALAPPDATA")?);
@@ -60,8 +60,9 @@ fn platform_data_root() -> Result<PathBuf, PlatformError> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let root = match nonempty_env("XDG_DATA_HOME") {
         Ok(explicit) => absolute_data_root(explicit),
-        Err(_) => absolute_data_root(nonempty_env("HOME")?)
-            .map(|home| home.join(".local").join("share")),
+        Err(_) => {
+            absolute_data_root(nonempty_env("HOME")?).map(|home| home.join(".local").join("share"))
+        }
     };
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
@@ -171,7 +172,8 @@ mod tests {
     }
 
     #[test]
-    fn native_root_and_default_path_are_nonempty_and_composed_exactly() -> Result<(), Box<dyn Error>> {
+    fn native_root_and_default_path_are_nonempty_and_composed_exactly() -> Result<(), Box<dyn Error>>
+    {
         let root = platform_data_root()?;
         assert!(!root.as_os_str().is_empty());
         assert_eq!(

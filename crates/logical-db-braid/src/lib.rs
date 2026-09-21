@@ -32,19 +32,29 @@ pub const WRITE_CAPABILITY: &str = "logical_db.write";
 /// Braid capability prefix authorizing replica synchronization.
 pub const SYNC_CAPABILITY: &str = "logical_db.sync";
 
+/// SCOPE FACT
 const SCOPE_FACT: &str = "logical_db.scope";
+/// EFFECT FACT
 const EFFECT_FACT: &str = "logical_db.effect";
+/// ACTION FACT
 const ACTION_FACT: &str = "logical_db.action.v1";
+/// FRONTIER FACT
 const FRONTIER_FACT: &str = "logical_db.frontier";
+/// EXPIRY FACT
 const EXPIRY_FACT: &str = "logical_db.expires_at_unix_ms";
 
 /// Exact logical facts and expiry supplied to Braid preparation as one value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionBinding {
+    /// Exact account and application space the action is bound to.
     scope: Scope,
+    /// Strongest effect the action may exercise.
     effect: Effect,
+    /// Versioned digest of the native CRDT action bytes.
     action: ActionDigest,
+    /// Observed durable tuple-space frontier at preparation time.
     frontier: u64,
+    /// Exclusive expiry in Unix milliseconds.
     expires_at_unix_ms: u64,
 }
 
@@ -71,17 +81,21 @@ impl ActionBinding {
 /// Constructs the exact Braid capability for one DB action.
 #[must_use]
 pub fn capability_for(scope: Scope, effect: Effect, action: ActionDigest) -> Capability {
+    /// HEX
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let prefix = match effect {
         Effect::Read => READ_CAPABILITY,
         Effect::Scan => SCAN_CAPABILITY,
         Effect::Write => WRITE_CAPABILITY,
         Effect::Sync => SYNC_CAPABILITY,
+        // `Effect` is non_exhaustive: a future effect must not mint a
+        // capability under an existing prefix, so this fails closed.
+        _ => return Capability::new(String::new()),
     };
     let mut action_hex = String::with_capacity(64);
     for byte in action.into_bytes() {
-        action_hex.push(HEX[usize::from(byte >> 4)] as char);
-        action_hex.push(HEX[usize::from(byte & 0x0f)] as char);
+        action_hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        action_hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     Capability::new(format!(
         "{prefix}.{}.{}.{action_hex}",
@@ -93,12 +107,19 @@ pub fn capability_for(scope: Scope, effect: Effect, action: ActionDigest) -> Cap
 /// Opaque verifier/planner product passed unchanged into the store transaction.
 #[derive(Clone, Debug)]
 pub struct BraidGrant {
+    /// Verifier-owned runnable invocation retained by this grant.
     runnable: RunnableInvocation,
+    /// Exact account and application space the grant is bound to.
     scope: Scope,
+    /// Strongest effect the grant may exercise.
     effect: Effect,
+    /// Versioned digest of the native CRDT action bytes.
     action: ActionDigest,
+    /// Observed durable tuple-space frontier at preparation time.
     frontier: u64,
+    /// Exclusive expiry in Unix milliseconds.
     expires_at_unix_ms: u64,
+    /// Stable identity of the prepared runnable invocation.
     invocation_id: [u8; 32],
 }
 
@@ -109,6 +130,7 @@ impl BraidGrant {
         &self.runnable
     }
 
+    /// Permits
     fn permits(
         &self,
         scope: Scope,
@@ -126,18 +148,23 @@ impl BraidGrant {
 }
 
 impl ExecutionGrant for BraidGrant {
+    /// Scope
     fn scope(&self) -> Scope {
         self.scope
     }
+    /// Effect
     fn effect(&self) -> Effect {
         self.effect
     }
+    /// Action
     fn action(&self) -> ActionDigest {
         self.action
     }
+    /// Frontier
     fn frontier(&self) -> u64 {
         self.frontier
     }
+    /// Invocation id
     fn invocation_id(&self) -> [u8; 32] {
         self.invocation_id
     }
@@ -169,18 +196,13 @@ pub fn prepare_request(
     let capsule = Capsule::from_bytes(capsule_bytes).map_err(BraidAdapterError::Capsule)?;
     let required = capability_for(scope, effect, action);
     if !capsule.grants.iter().any(|grant| grant == &required) {
-        eprintln!("logical-db-braid: prepare_request: MissingExactGrant");
         return Err(BraidAdapterError::MissingExactGrant);
     }
     validate_operation_policy(&capsule, registry, &required, effect)?;
-    let frontier_value = i64::try_from(frontier).map_err(|error| {
-        eprintln!("logical-db-braid: BraidAdapterError::Frontier: {error}");
-        BraidAdapterError::Frontier(frontier)
-    })?;
-    let expiry_value = i64::try_from(expires_at_unix_ms).map_err(|error| {
-        eprintln!("logical-db-braid: BraidAdapterError::Expiry: {error}");
-        BraidAdapterError::Expiry(expires_at_unix_ms)
-    })?;
+    let frontier_value =
+        i64::try_from(frontier).map_err(|_| BraidAdapterError::Frontier(frontier))?;
+    let expiry_value = i64::try_from(expires_at_unix_ms)
+        .map_err(|_| BraidAdapterError::Expiry(expires_at_unix_ms))?;
     let facts = action_facts(scope, effect, action, frontier_value, expiry_value);
     let snapshot = FlowSnapshot::new(facts.clone());
     let predicate = action_predicate(&facts)?;
@@ -208,6 +230,7 @@ pub fn prepare_request(
     })
 }
 
+/// Validate operation policy
 fn validate_operation_policy(
     capsule: &Capsule,
     registry: &TermRegistry,
@@ -220,7 +243,6 @@ fn validate_operation_policy(
         EffectClass::Irreversible | EffectClass::Egress
     ) && capsule.confirm != ConfirmPolicy::HumanConfirm
     {
-        eprintln!("logical-db-braid: validate_operation_policy: EffectPolicyMismatch");
         return Err(BraidAdapterError::EffectPolicyMismatch);
     }
     let mut exposures = Vec::with_capacity(capsule.braid.strands.len());
@@ -234,7 +256,10 @@ fn validate_operation_policy(
             .iter()
             .try_fold(Exposure::Public, |value, index| {
                 exposures
-                    .get(*index as usize)
+                    .get(
+                        usize::try_from(*index)
+                            .map_err(|_| BraidAdapterError::EffectPolicyMismatch)?,
+                    )
                     .copied()
                     .map(|exposure| value.max(exposure))
                     .ok_or(BraidAdapterError::EffectPolicyMismatch)
@@ -247,7 +272,6 @@ fn validate_operation_policy(
             || spec.egress_ceiling != required_ceiling
             || incoming != Exposure::Vault
         {
-            eprintln!("logical-db-braid: validate_operation_policy: EffectPolicyMismatch");
             return Err(BraidAdapterError::EffectPolicyMismatch);
         }
         matched = true;
@@ -260,6 +284,7 @@ fn validate_operation_policy(
     }
 }
 
+/// Action facts
 fn action_facts(
     scope: Scope,
     effect: Effect,
@@ -282,6 +307,7 @@ fn action_facts(
     ])
 }
 
+/// Action predicate
 fn action_predicate(facts: &BTreeMap<String, Value>) -> Result<Predicate, BraidAdapterError> {
     let mut clauses = Vec::with_capacity(facts.len());
     for (name, value) in facts {
@@ -294,6 +320,7 @@ fn action_predicate(facts: &BTreeMap<String, Value>) -> Result<Predicate, BraidA
     Ok(Predicate::And(clauses))
 }
 
+/// Invocation id
 fn invocation_id(runnable: &RunnableInvocation) -> [u8; 32] {
     let mut digest = Hasher::new();
     digest.update(b"logical-db/braid-invocation/v1\0");
@@ -305,12 +332,16 @@ fn invocation_id(runnable: &RunnableInvocation) -> [u8; 32] {
     *digest.finalize().as_bytes()
 }
 
+/// Effect name
 fn effect_name(effect: Effect) -> &'static str {
     match effect {
         Effect::Read => "read",
         Effect::Scan => "scan",
         Effect::Write => "write",
         Effect::Sync => "sync",
+        // Unknown future effects are named for logging only; policy still
+        // refuses them below, so a neutral label cannot authorize anything.
+        _ => "unknown",
     }
 }
 
@@ -376,11 +407,15 @@ pub fn prepare_local_request(
     )
 }
 
+/// Operation policy
 fn operation_policy(effect: Effect) -> (EffectClass, Option<Exposure>) {
     match effect {
         Effect::Read | Effect::Scan => (EffectClass::Read, None),
         Effect::Write => (EffectClass::Irreversible, Some(Exposure::Vault)),
         Effect::Sync => (EffectClass::Egress, Some(Exposure::Vault)),
+        // A future effect is treated as the most restrictive local class
+        // with no exposure surface; the authority still refuses it outright.
+        _ => (EffectClass::Irreversible, None),
     }
 }
 
@@ -391,7 +426,9 @@ fn operation_policy(effect: Effect) -> (EffectClass, Option<Exposure>) {
 /// egress synchronization. Hosts must supply externally prepared grants through
 /// [`BraidAuthority`] for those effects.
 pub struct LocalBraidAuthority {
+    /// Exact account and application space this authority may authorize.
     scope: Scope,
+    /// Exclusive expiry in Unix milliseconds.
     expires_at_unix_ms: u64,
 }
 
@@ -407,8 +444,10 @@ impl LocalBraidAuthority {
 }
 
 impl Authority for LocalBraidAuthority {
+    /// Grant
     type Grant = BraidGrant;
 
+    /// Authorize
     fn authorize(
         &self,
         scope: Scope,
@@ -429,6 +468,7 @@ impl Authority for LocalBraidAuthority {
 
 /// Bounded externally prepared runnable grant collection.
 pub struct BraidAuthority {
+    /// Externally prepared runnable grants this authority may admit.
     grants: Vec<BraidGrant>,
 }
 
@@ -440,7 +480,6 @@ impl BraidAuthority {
     /// Returns [`BraidAdapterError::GrantCount`] outside `1..=256`.
     pub fn new(grants: Vec<BraidGrant>) -> Result<Self, BraidAdapterError> {
         if grants.is_empty() || grants.len() > 256 {
-            eprintln!("logical-db-braid: new: GrantCount");
             return Err(BraidAdapterError::GrantCount(grants.len()));
         }
         Ok(Self { grants })
@@ -448,8 +487,10 @@ impl BraidAuthority {
 }
 
 impl Authority for BraidAuthority {
+    /// Grant
     type Grant = BraidGrant;
 
+    /// Authorize
     fn authorize(
         &self,
         scope: Scope,
@@ -467,6 +508,7 @@ impl Authority for BraidAuthority {
 
 /// Fail-closed Braid integration failures.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BraidAdapterError {
     /// Independent admission rejected the canonical capsule.
     #[error("Braid admission rejected the capsule: {0:?}")]
@@ -511,10 +553,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_runnable_is_bound_to_scope_effect_action_frontier_and_expiry() {
+    /// Real runnable is bound to scope effect action frontier and expiry
+    fn real_runnable_is_bound_to_scope_effect_action_frontier_and_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([9; 32]);
-        let grant = prepare_local_request(scope, Effect::Read, action, 7, 100).unwrap();
+        let grant = prepare_local_request(scope, Effect::Read, action, 7, 100)?;
         assert_eq!(ExecutionGrant::scope(&grant), scope);
         assert_eq!(ExecutionGrant::effect(&grant), Effect::Read);
         assert_eq!(ExecutionGrant::action(&grant), action);
@@ -524,36 +568,42 @@ mod tests {
         assert!(!grant.permits(scope, Effect::Sync, action, 7, 99));
         assert!(!grant.permits(scope, Effect::Read, ActionDigest::new([8; 32]), 7, 99));
         assert!(!grant.permits(scope, Effect::Read, action, 7, 100));
+        Ok(())
     }
 
     #[test]
-    fn invocation_identity_changes_with_frontier_action_and_expiry() {
+    /// Invocation identity changes with frontier action and expiry
+    fn invocation_identity_changes_with_frontier_action_and_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let first =
-            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 1, 9).unwrap();
+        let first = prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 1, 9)?;
         let frontier =
-            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 2, 9).unwrap();
-        let action =
-            prepare_local_request(scope, Effect::Read, ActionDigest::new([2; 32]), 1, 9).unwrap();
-        let expiry =
-            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 1, 10).unwrap();
+            prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 2, 9)?;
+        let action = prepare_local_request(scope, Effect::Read, ActionDigest::new([2; 32]), 1, 9)?;
+        let expiry = prepare_local_request(scope, Effect::Read, ActionDigest::new([1; 32]), 1, 10)?;
         assert_ne!(first.invocation_id(), frontier.invocation_id());
         assert_ne!(first.invocation_id(), action.invocation_id());
         assert_ne!(first.invocation_id(), expiry.invocation_id());
+        Ok(())
     }
 
     #[test]
-    fn scan_and_point_read_require_distinct_capabilities() {
+    /// Scan and point read require distinct capabilities
+    fn scan_and_point_read_require_distinct_capabilities() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([3; 32]);
         assert_ne!(
             capability_for(scope, Effect::Read, action),
             capability_for(scope, Effect::Scan, action)
         );
+        Ok(())
     }
 
     #[test]
-    fn durable_and_network_effects_are_never_downgraded() {
+    /// Durable and network effects are never downgraded
+    fn durable_and_network_effects_are_never_downgraded() -> Result<(), Box<dyn std::error::Error>>
+    {
         assert_eq!(
             operation_policy(Effect::Write),
             (EffectClass::Irreversible, Some(Exposure::Vault))
@@ -564,46 +614,45 @@ mod tests {
         );
         assert_eq!(operation_policy(Effect::Read), (EffectClass::Read, None));
         assert_eq!(operation_policy(Effect::Scan), (EffectClass::Read, None));
+        Ok(())
     }
 
     #[test]
-    fn external_capsule_cannot_attach_write_capability_to_a_weaker_effect() {
+    /// External capsule cannot attach write capability to a weaker effect
+    fn external_capsule_cannot_attach_write_capability_to_a_weaker_effect()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([5; 32]);
         let capability = capability_for(scope, Effect::Write, action);
         let mut registry = TermRegistry::new(1);
-        registry
-            .insert(TermSpec {
-                id: "action".into(),
-                inputs: vec![],
-                output: TypeTag::Bool,
-                capability: None,
-                effect: EffectClass::Pure,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: None,
-                cost: 1,
-            })
-            .unwrap();
-        registry
-            .insert(TermSpec {
-                id: "downgraded_write".into(),
-                inputs: vec![TypeTag::Bool],
-                output: TypeTag::Bool,
-                capability: Some(capability.clone()),
-                effect: EffectClass::ReversibleWrite,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: Some(Exposure::Vault),
-                cost: 1,
-            })
-            .unwrap();
+        registry.insert(TermSpec {
+            id: "action".into(),
+            inputs: vec![],
+            output: TypeTag::Bool,
+            capability: None,
+            effect: EffectClass::Pure,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: None,
+            cost: 1,
+        })?;
+        registry.insert(TermSpec {
+            id: "downgraded_write".into(),
+            inputs: vec![TypeTag::Bool],
+            output: TypeTag::Bool,
+            capability: Some(capability.clone()),
+            effect: EffectClass::ReversibleWrite,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: Some(Exposure::Vault),
+            cost: 1,
+        })?;
         let mut builder = Builder::new(&registry, "attempt write downgrade");
-        let source = builder.strand("action", &[]).unwrap();
-        let sink = builder.strand("downgraded_write", &[source]).unwrap();
+        let source = builder.strand("action", &[])?;
+        let sink = builder.strand("downgraded_write", &[source])?;
         builder
             .output(sink)
             .budget_tight()
             .confirm(ConfirmPolicy::HumanConfirm);
-        let capsule = builder.build().unwrap();
+        let capsule = builder.build()?;
         assert!(matches!(
             prepare_request(
                 &capsule.to_bytes(),
@@ -613,91 +662,88 @@ mod tests {
             ),
             Err(BraidAdapterError::EffectPolicyMismatch)
         ));
+        Ok(())
     }
 
     #[test]
-    fn externally_confirmed_exact_write_capsule_is_accepted() {
+    /// Externally confirmed exact write capsule is accepted
+    fn externally_confirmed_exact_write_capsule_is_accepted()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([6; 32]);
         let capability = capability_for(scope, Effect::Write, action);
         let mut registry = TermRegistry::new(1);
-        registry
-            .insert(TermSpec {
-                id: "action".into(),
-                inputs: vec![],
-                output: TypeTag::Bool,
-                capability: None,
-                effect: EffectClass::Pure,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: None,
-                cost: 1,
-            })
-            .unwrap();
-        registry
-            .insert(TermSpec {
-                id: "write".into(),
-                inputs: vec![TypeTag::Bool],
-                output: TypeTag::Bool,
-                capability: Some(capability.clone()),
-                effect: EffectClass::Irreversible,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: Some(Exposure::Vault),
-                cost: 1,
-            })
-            .unwrap();
+        registry.insert(TermSpec {
+            id: "action".into(),
+            inputs: vec![],
+            output: TypeTag::Bool,
+            capability: None,
+            effect: EffectClass::Pure,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: None,
+            cost: 1,
+        })?;
+        registry.insert(TermSpec {
+            id: "write".into(),
+            inputs: vec![TypeTag::Bool],
+            output: TypeTag::Bool,
+            capability: Some(capability.clone()),
+            effect: EffectClass::Irreversible,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: Some(Exposure::Vault),
+            cost: 1,
+        })?;
         let mut builder = Builder::new(&registry, "externally confirmed write");
-        let source = builder.strand("action", &[]).unwrap();
-        let sink = builder.strand("write", &[source]).unwrap();
+        let source = builder.strand("action", &[])?;
+        let sink = builder.strand("write", &[source])?;
         builder
             .output(sink)
             .budget_tight()
             .confirm(ConfirmPolicy::HumanConfirm);
-        let capsule = builder.build().unwrap();
+        let capsule = builder.build()?;
         let grant = prepare_request(
             &capsule.to_bytes(),
             &registry,
             &[capability],
             ActionBinding::new(scope, Effect::Write, action, 0, 1),
-        )
-        .unwrap();
+        )?;
         assert_eq!(grant.effect(), Effect::Write);
+        Ok(())
     }
 
     #[test]
-    fn external_read_capsule_cannot_change_the_required_ceiling_shape() {
+    /// External read capsule cannot change the required ceiling shape
+    fn external_read_capsule_cannot_change_the_required_ceiling_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([7; 32]);
         let capability = capability_for(scope, Effect::Read, action);
         let mut registry = TermRegistry::new(1);
-        registry
-            .insert(TermSpec {
-                id: "action".into(),
-                inputs: vec![],
-                output: TypeTag::Bool,
-                capability: None,
-                effect: EffectClass::Pure,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: None,
-                cost: 1,
-            })
-            .unwrap();
-        registry
-            .insert(TermSpec {
-                id: "read".into(),
-                inputs: vec![TypeTag::Bool],
-                output: TypeTag::Bool,
-                capability: Some(capability.clone()),
-                effect: EffectClass::Read,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: Some(Exposure::Vault),
-                cost: 1,
-            })
-            .unwrap();
+        registry.insert(TermSpec {
+            id: "action".into(),
+            inputs: vec![],
+            output: TypeTag::Bool,
+            capability: None,
+            effect: EffectClass::Pure,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: None,
+            cost: 1,
+        })?;
+        registry.insert(TermSpec {
+            id: "read".into(),
+            inputs: vec![TypeTag::Bool],
+            output: TypeTag::Bool,
+            capability: Some(capability.clone()),
+            effect: EffectClass::Read,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: Some(Exposure::Vault),
+            cost: 1,
+        })?;
         let mut builder = Builder::new(&registry, "attempt read policy drift");
-        let source = builder.strand("action", &[]).unwrap();
-        let sink = builder.strand("read", &[source]).unwrap();
+        let source = builder.strand("action", &[])?;
+        let sink = builder.strand("read", &[source])?;
         builder.output(sink).budget_tight();
-        let capsule = builder.build().unwrap();
+        let capsule = builder.build()?;
         assert!(matches!(
             prepare_request(
                 &capsule.to_bytes(),
@@ -707,46 +753,45 @@ mod tests {
             ),
             Err(BraidAdapterError::EffectPolicyMismatch)
         ));
+        Ok(())
     }
 
     #[test]
-    fn external_sync_capsule_must_route_vault_tainted_request_material() {
+    /// External sync capsule must route vault tainted request material
+    fn external_sync_capsule_must_route_vault_tainted_request_material()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([8; 32]);
         let capability = capability_for(scope, Effect::Sync, action);
         let mut registry = TermRegistry::new(1);
-        registry
-            .insert(TermSpec {
-                id: "public_request".into(),
-                inputs: vec![],
-                output: TypeTag::Bool,
-                capability: None,
-                effect: EffectClass::Pure,
-                source_exposure: Exposure::Public,
-                egress_ceiling: None,
-                cost: 1,
-            })
-            .unwrap();
-        registry
-            .insert(TermSpec {
-                id: "sync".into(),
-                inputs: vec![TypeTag::Bool],
-                output: TypeTag::Bool,
-                capability: Some(capability.clone()),
-                effect: EffectClass::Egress,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: Some(Exposure::Vault),
-                cost: 1,
-            })
-            .unwrap();
+        registry.insert(TermSpec {
+            id: "public_request".into(),
+            inputs: vec![],
+            output: TypeTag::Bool,
+            capability: None,
+            effect: EffectClass::Pure,
+            source_exposure: Exposure::Public,
+            egress_ceiling: None,
+            cost: 1,
+        })?;
+        registry.insert(TermSpec {
+            id: "sync".into(),
+            inputs: vec![TypeTag::Bool],
+            output: TypeTag::Bool,
+            capability: Some(capability.clone()),
+            effect: EffectClass::Egress,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: Some(Exposure::Vault),
+            cost: 1,
+        })?;
         let mut builder = Builder::new(&registry, "attempt untainted sync");
-        let source = builder.strand("public_request", &[]).unwrap();
-        let sink = builder.strand("sync", &[source]).unwrap();
+        let source = builder.strand("public_request", &[])?;
+        let sink = builder.strand("sync", &[source])?;
         builder
             .output(sink)
             .budget_tight()
             .confirm(ConfirmPolicy::HumanConfirm);
-        let capsule = builder.build().unwrap();
+        let capsule = builder.build()?;
         assert!(matches!(
             prepare_request(
                 &capsule.to_bytes(),
@@ -756,10 +801,13 @@ mod tests {
             ),
             Err(BraidAdapterError::EffectPolicyMismatch)
         ));
+        Ok(())
     }
 
     #[test]
-    fn local_policy_generates_only_exact_authenticated_runnable_grants() {
+    /// Local policy generates only exact authenticated runnable grants
+    fn local_policy_generates_only_exact_authenticated_runnable_grants()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let policy = LocalBraidAuthority::new(scope, 20);
         let action = ActionDigest::new([4; 32]);
@@ -784,10 +832,13 @@ mod tests {
                 braid_sdk::BuildError::ConfirmRequired { .. }
             ))
         ));
+        Ok(())
     }
 
     #[test]
-    fn effect_fact_names_and_external_authority_lookup_are_exact() {
+    /// Effect fact names and external authority lookup are exact
+    fn effect_fact_names_and_external_authority_lookup_are_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(effect_name(Effect::Read), "read");
         assert_eq!(effect_name(Effect::Scan), "scan");
         assert_eq!(effect_name(Effect::Write), "write");
@@ -795,73 +846,70 @@ mod tests {
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([6; 32]);
-        let grant = prepare_local_request(scope, Effect::Read, action, 11, 30).unwrap();
+        let grant = prepare_local_request(scope, Effect::Read, action, 11, 30)?;
         let expected_id = grant.invocation_id();
-        let authority = BraidAuthority::new(vec![grant]).unwrap();
-        assert_eq!(
-            authority
-                .authorize(scope, Effect::Read, action, 11, 29)
-                .unwrap()
-                .invocation_id(),
-            expected_id
-        );
+        let authority = BraidAuthority::new(vec![grant])?;
+        let authorized = authority
+            .authorize(scope, Effect::Read, action, 11, 29)
+            .ok_or("expected an external authority lookup to grant read")?;
+        assert_eq!(authorized.invocation_id(), expected_id);
         assert!(
             authority
                 .authorize(scope, Effect::Read, action, 12, 29)
                 .is_none()
         );
+        Ok(())
     }
 
+    /// Confirmed dangerous material
     fn confirmed_dangerous_material(
         scope: Scope,
         effect: Effect,
         action: ActionDigest,
-    ) -> (Vec<u8>, TermRegistry, Capability) {
+    ) -> Result<(Vec<u8>, TermRegistry, Capability), Box<dyn std::error::Error>> {
         let (operation_effect, _) = operation_policy(effect);
         let capability = capability_for(scope, effect, action);
         let mut registry = TermRegistry::new(1);
-        registry
-            .insert(TermSpec {
-                id: "action".into(),
-                inputs: vec![],
-                output: TypeTag::Bool,
-                capability: None,
-                effect: EffectClass::Pure,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: None,
-                cost: 1,
-            })
-            .unwrap();
-        registry
-            .insert(TermSpec {
-                id: "invoke".into(),
-                inputs: vec![TypeTag::Bool],
-                output: TypeTag::Bool,
-                capability: Some(capability.clone()),
-                effect: operation_effect,
-                source_exposure: Exposure::Vault,
-                egress_ceiling: Some(Exposure::Vault),
-                cost: 1,
-            })
-            .unwrap();
+        registry.insert(TermSpec {
+            id: "action".into(),
+            inputs: vec![],
+            output: TypeTag::Bool,
+            capability: None,
+            effect: EffectClass::Pure,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: None,
+            cost: 1,
+        })?;
+        registry.insert(TermSpec {
+            id: "invoke".into(),
+            inputs: vec![TypeTag::Bool],
+            output: TypeTag::Bool,
+            capability: Some(capability.clone()),
+            effect: operation_effect,
+            source_exposure: Exposure::Vault,
+            egress_ceiling: Some(Exposure::Vault),
+            cost: 1,
+        })?;
         let mut builder = Builder::new(&registry, "externally confirmed action");
-        let source = builder.strand("action", &[]).unwrap();
-        let sink = builder.strand("invoke", &[source]).unwrap();
+        let source = builder.strand("action", &[])?;
+        let sink = builder.strand("invoke", &[source])?;
         builder
             .output(sink)
             .budget_tight()
             .confirm(ConfirmPolicy::HumanConfirm);
-        let capsule = builder.build().unwrap();
-        (capsule.to_bytes(), registry, capability)
+        let capsule = builder.build()?;
+        Ok((capsule.to_bytes(), registry, capability))
     }
 
     #[test]
-    fn fabricated_confirmation_is_rejected_for_write_evidence() {
+    /// Fabricated confirmation is rejected for write evidence
+    fn fabricated_confirmation_is_rejected_for_write_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([11; 32]);
         let (bytes, registry, capability) =
-            confirmed_dangerous_material(scope, Effect::Write, action);
-        let mut tampered = Capsule::from_bytes(&bytes).unwrap();
+            confirmed_dangerous_material(scope, Effect::Write, action)?;
+        let mut tampered = Capsule::from_bytes(&bytes)?;
         tampered.confirm = ConfirmPolicy::None;
         let result = prepare_request(
             &tampered.to_bytes(),
@@ -873,10 +921,12 @@ mod tests {
             matches!(result, Err(BraidAdapterError::Rejected(_))),
             "independent admission must refuse a write strand without human confirm"
         );
+        Ok(())
     }
 
     #[test]
-    fn local_fabrication_cannot_mint_sync_evidence() {
+    /// Local fabrication cannot mint sync evidence
+    fn local_fabrication_cannot_mint_sync_evidence() -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([12; 32]);
         assert!(matches!(
@@ -891,27 +941,29 @@ mod tests {
                 .authorize(scope, Effect::Sync, action, 3, 19)
                 .is_none()
         );
+        Ok(())
     }
 
     #[test]
-    fn external_write_grant_lookup_is_exact_across_scope_effect_and_expiry() {
+    /// External write grant lookup is exact across scope effect and expiry
+    fn external_write_grant_lookup_is_exact_across_scope_effect_and_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([13; 32]);
         let (bytes, registry, capability) =
-            confirmed_dangerous_material(scope, Effect::Write, action);
+            confirmed_dangerous_material(scope, Effect::Write, action)?;
         let grant = prepare_request(
             &bytes,
             &registry,
             &[capability],
             ActionBinding::new(scope, Effect::Write, action, 5, 100),
-        )
-        .unwrap();
+        )?;
         let expected_id = grant.invocation_id();
-        let authority = BraidAuthority::new(vec![grant]).unwrap();
+        let authority = BraidAuthority::new(vec![grant])?;
         assert_eq!(
             authority
                 .authorize(scope, Effect::Write, action, 5, 99)
-                .unwrap()
+                .ok_or("expected authorize to grant a matching invocation")?
                 .invocation_id(),
             expected_id
         );
@@ -946,22 +998,24 @@ mod tests {
                 .authorize(scope, Effect::Write, action, 6, 99)
                 .is_none()
         );
+        Ok(())
     }
 
     #[test]
-    fn external_sync_grant_authorizes_exact_sync_evidence() {
+    /// External sync grant authorizes exact sync evidence
+    fn external_sync_grant_authorizes_exact_sync_evidence() -> Result<(), Box<dyn std::error::Error>>
+    {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let action = ActionDigest::new([15; 32]);
         let (bytes, registry, capability) =
-            confirmed_dangerous_material(scope, Effect::Sync, action);
+            confirmed_dangerous_material(scope, Effect::Sync, action)?;
         let grant = prepare_request(
             &bytes,
             &registry,
             &[capability],
             ActionBinding::new(scope, Effect::Sync, action, 5, 100),
-        )
-        .unwrap();
-        let authority = BraidAuthority::new(vec![grant]).unwrap();
+        )?;
+        let authority = BraidAuthority::new(vec![grant])?;
         assert!(
             authority
                 .authorize(scope, Effect::Sync, action, 5, 99)
@@ -977,5 +1031,6 @@ mod tests {
                 .authorize(scope, Effect::Write, action, 5, 99)
                 .is_none()
         );
+        Ok(())
     }
 }

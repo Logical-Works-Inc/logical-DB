@@ -69,7 +69,6 @@ impl EpisodeId {
     #[must_use = "the zero-digest rejection must be handled"]
     pub fn new(bytes: [u8; 32]) -> Result<Self, EpisodeError> {
         if bytes == [0; 32] {
-            eprintln!("logical-db-episode: rejected zero episode id");
             return Err(EpisodeError::ZeroId);
         }
         Ok(Self(bytes))
@@ -246,6 +245,8 @@ pub fn content_id(episode: &Episode) -> [u8; 32] {
     ])
 }
 
+/// Encodes an optional `(account, space)` scope as a presence byte plus both
+/// 16-byte UUIDs, so a `None` scope hashes distinctly from any real pair.
 fn scope_bytes(scope: Option<(Uuid, Uuid)>) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(33);
     bytes.push(u8::from(scope.is_some()));
@@ -256,6 +257,7 @@ fn scope_bytes(scope: Option<(Uuid, Uuid)>) -> Vec<u8> {
     bytes
 }
 
+/// Encodes all seven clock readings as little-endian `i64`s in enum order.
 fn time_bytes(time: EpisodeTime) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(56);
     for clock in [
@@ -272,8 +274,9 @@ fn time_bytes(time: EpisodeTime) -> Vec<u8> {
     bytes
 }
 
+/// Encodes a reference list as the concatenation of its 32-byte identities.
 fn reference_bytes(ids: &[EpisodeId]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(ids.len() * 32);
+    let mut bytes = Vec::with_capacity(ids.len().saturating_mul(32));
     for id in ids {
         bytes.extend_from_slice(&id.into_bytes());
     }
@@ -303,16 +306,16 @@ fn check_ref_list(ids: &[EpisodeId], what: &'static str) -> Result<(), EpisodeEr
         _ => MAX_REFERENCES,
     };
     if ids.len() > limit {
-        eprintln!("logical-db-episode: rejected {what} count {}", ids.len());
         return Err(EpisodeError::TooManyReferences);
     }
     if ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
-        eprintln!("logical-db-episode: rejected duplicate {what} reference");
         return Err(EpisodeError::DuplicateReference);
     }
     Ok(())
 }
 
+/// Bounds and dedupes the deserialized `evidence` list before it reaches the
+/// aggregate constructor.
 fn deserialize_evidence<'de, D>(deserializer: D) -> Result<Vec<EpisodeId>, D::Error>
 where
     D: Deserializer<'de>,
@@ -320,6 +323,8 @@ where
     deserialize_bounded_vec(deserializer, MAX_REFERENCES, "bounded episode evidence")
 }
 
+/// Bounds and dedupes the deserialized `parents` list before it reaches the
+/// aggregate constructor.
 fn deserialize_parents<'de, D>(deserializer: D) -> Result<Vec<EpisodeId>, D::Error>
 where
     D: Deserializer<'de>,
@@ -327,6 +332,7 @@ where
     deserialize_bounded_vec(deserializer, MAX_PARENTS, "bounded episode parents")
 }
 
+/// Bounds the deserialized payload to [`MAX_PAYLOAD_BYTES`] during decode.
 fn deserialize_payload<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
@@ -334,6 +340,7 @@ where
     deserialize_bounded_vec(deserializer, MAX_PAYLOAD_BYTES, "bounded episode payload")
 }
 
+/// Bounds the deserialized origin-log episode list before replay.
 fn deserialize_episodes<'de, D>(deserializer: D) -> Result<Vec<Episode>, D::Error>
 where
     D: Deserializer<'de>,
@@ -345,6 +352,7 @@ where
     )
 }
 
+/// Collects at most `maximum` sequence items, refusing the first excess item.
 fn deserialize_bounded_vec<'de, D, T>(
     deserializer: D,
     maximum: usize,
@@ -354,9 +362,13 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
+    /// Visitor that caps a sequence at its configured item bound.
     struct BoundedVisitor<T> {
+        /// Maximum number of items the sequence may yield.
         maximum: usize,
+        /// Human-readable description used in decode errors.
         expectation: &'static str,
+        /// Type marker for the deserialized element.
         marker: std::marker::PhantomData<T>,
     }
 
@@ -378,11 +390,10 @@ where
             let mut values = Vec::with_capacity(capacity);
             while let Some(value) = sequence.next_element()? {
                 if values.len() == self.maximum {
-                    eprintln!(
-                        "logical-db-episode: rejected {} above {} items",
-                        self.expectation, self.maximum
-                    );
-                    return Err(A::Error::invalid_length(self.maximum + 1, &self));
+                    return Err(A::Error::invalid_length(
+                        self.maximum.saturating_add(1),
+                        &self,
+                    ));
                 }
                 values.push(value);
             }
@@ -441,10 +452,6 @@ impl Episode {
         check_ref_list(&evidence, "evidence")?;
         check_ref_list(&parents, "parents")?;
         if payload.len() > MAX_PAYLOAD_BYTES {
-            eprintln!(
-                "logical-db-episode: rejected payload length {}",
-                payload.len()
-            );
             return Err(EpisodeError::PayloadTooLarge);
         }
         let mut episode = Self {
@@ -471,35 +478,41 @@ impl Episode {
         check_ref_list(&self.evidence, "evidence")?;
         check_ref_list(&self.parents, "parents")?;
         if self.payload.len() > MAX_PAYLOAD_BYTES {
-            eprintln!(
-                "logical-db-episode: rejected stored payload length {}",
-                self.payload.len()
-            );
             return Err(EpisodeError::PayloadTooLarge);
         }
         let recomputed = content_id(self);
         if self.id.into_bytes() != recomputed {
-            eprintln!("logical-db-episode: rejected mismatched content id");
             return Err(EpisodeError::IdMismatch);
         }
         Ok(())
     }
 }
 
+/// Wire form of one episode, carrying the explicit schema version and the
+/// content-derived identity so decoding can re-verify both.
 #[derive(Deserialize, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(deny_unknown_fields)]
 struct EpisodeWire {
+    /// Protocol schema version; decoding refuses any other value.
     version: u16,
+    /// Content-derived episode identity as stored on the wire.
     id: EpisodeId,
+    /// Monotonic local sequence, assigned by the appender.
     seq: u64,
+    /// Episode kind from the CAIRN token vocabulary.
     kind: TokenKind,
+    /// Account/space scope as an `(account, space)` UUID pair.
     scope: Option<(Uuid, Uuid)>,
+    /// Seven-clock timestamp.
     time: EpisodeTime,
+    /// Bounded, deduped upstream episodes.
     #[serde(deserialize_with = "deserialize_evidence")]
     evidence: Vec<EpisodeId>,
+    /// Bounded, deduped superseded or cited episodes.
     #[serde(deserialize_with = "deserialize_parents")]
     parents: Vec<EpisodeId>,
+    /// Bounded raw payload bytes.
     #[serde(deserialize_with = "deserialize_payload")]
     payload: Vec<u8>,
 }
@@ -536,10 +549,6 @@ impl<'de> Deserialize<'de> for Episode {
     {
         let wire = EpisodeWire::deserialize(deserializer)?;
         if wire.version != EPISODE_SCHEMA_VERSION {
-            eprintln!(
-                "logical-db-episode: rejected episode schema version {}",
-                wire.version
-            );
             return Err(D::Error::custom("unsupported episode schema version"));
         }
         let episode = Self {
@@ -602,17 +611,14 @@ impl LocalWorldRecord {
         rendered: Vec<u8>,
         scope: Option<(Uuid, Uuid)>,
     ) -> Result<Self, EpisodeError> {
-        if source_sequence > i64::MAX as u64 {
-            eprintln!("logical-db-episode: rejected source sequence {source_sequence}");
+        if i64::try_from(source_sequence).is_err() {
             return Err(EpisodeError::BadSequence);
         }
         if source_heads.is_empty() {
-            eprintln!("logical-db-episode: rejected empty source heads");
             return Err(EpisodeError::UnprovenReference);
         }
         check_ref_list(&source_heads, "source_heads")?;
         if evidence.is_empty() {
-            eprintln!("logical-db-episode: rejected empty projection evidence");
             return Err(EpisodeError::UnprovenReference);
         }
         check_ref_list(&evidence, "evidence")?;
@@ -624,18 +630,12 @@ impl LocalWorldRecord {
             .chain(contradictions.iter())
             .all(|id| cover.contains(id));
         if !covered {
-            eprintln!("logical-db-episode: rejected uncovered projection reference");
             return Err(EpisodeError::UnprovenReference);
         }
         if rendered.is_empty() {
-            eprintln!("logical-db-episode: rejected empty rendered projection");
             return Err(EpisodeError::EmptyRepresentation);
         }
         if rendered.len() > MAX_RENDERED_BYTES {
-            eprintln!(
-                "logical-db-episode: rejected rendered length {}",
-                rendered.len()
-            );
             return Err(EpisodeError::RepresentationTooLarge);
         }
         Ok(Self {
@@ -654,15 +654,21 @@ impl LocalWorldRecord {
 /// This is not the canonical ORIGIN database.
 #[derive(Clone, Debug, Default)]
 pub struct OriginLog {
+    /// Episodes in append order; position equals the episode sequence.
     episodes: Vec<Episode>,
+    /// Identity-to-position index rebuilt on decode and kept in sync on append.
     index: HashMap<[u8; 32], usize>,
 }
 
+/// Wire form of the append-only origin log, carrying the explicit schema
+/// version and a bounded episode list.
 #[derive(Deserialize, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 #[serde(deny_unknown_fields)]
 struct OriginLogWire {
+    /// Protocol schema version; decoding refuses any other value.
     version: u16,
+    /// Bounded episodes replayed through `append` during decoding.
     #[serde(deserialize_with = "deserialize_episodes")]
     episodes: Vec<Episode>,
 }
@@ -687,10 +693,6 @@ impl<'de> Deserialize<'de> for OriginLog {
     {
         let wire = OriginLogWire::deserialize(deserializer)?;
         if wire.version != EPISODE_SCHEMA_VERSION {
-            eprintln!(
-                "logical-db-episode: rejected origin-log schema version {}",
-                wire.version
-            );
             return Err(D::Error::custom("unsupported origin-log schema version"));
         }
         let mut log = Self::default();
@@ -711,22 +713,14 @@ impl OriginLog {
     pub fn append(&mut self, episode: Episode) -> Result<EpisodeId, EpisodeError> {
         episode.validate()?;
         if self.index.contains_key(&episode.id.into_bytes()) {
-            eprintln!(
-                "logical-db-episode: rejected duplicate append {}",
-                episode.id
-            );
             return Err(EpisodeError::Duplicate);
         }
         if self.episodes.len() == MAX_EPISODES_PER_SNAPSHOT {
-            eprintln!("logical-db-episode: rejected append above log capacity");
             return Err(EpisodeError::LogTooLarge);
         }
-        if episode.seq != self.episodes.len() as u64 {
-            eprintln!(
-                "logical-db-episode: rejected append sequence {} at head {}",
-                episode.seq,
-                self.episodes.len()
-            );
+        let head =
+            u64::try_from(self.episodes.len()).map_err(|_error| EpisodeError::BadSequence)?;
+        if episode.seq != head {
             return Err(EpisodeError::BadSequence);
         }
         let id = episode.id;
@@ -771,7 +765,7 @@ impl OriginLog {
         let mut head = 0;
         while head < queue.len() {
             let current = queue[head];
-            head += 1;
+            head = head.saturating_add(1);
             if !seen.insert(current.into_bytes()) {
                 continue;
             }
@@ -819,7 +813,7 @@ impl OriginLog {
         let mut head = 0;
         while head < frontier.len() {
             let current = frontier[head];
-            head += 1;
+            head = head.saturating_add(1);
             let Some(next) = children.get(&current.into_bytes()) else {
                 continue;
             };
@@ -866,7 +860,6 @@ impl OriginLog {
     /// Returns [`EpisodeError::InvalidBounds`] for a zero budget.
     pub fn at(&self, seq: u64, limit: usize) -> Result<Vec<&Episode>, EpisodeError> {
         if limit == 0 {
-            eprintln!("logical-db-episode: rejected zero at-slice limit");
             return Err(EpisodeError::InvalidBounds);
         }
         Ok(self
@@ -885,7 +878,6 @@ impl OriginLog {
     /// Returns [`EpisodeError::InvalidBounds`] for a zero budget.
     pub fn near(&self, kind: &TokenKind, limit: usize) -> Result<Vec<&Episode>, EpisodeError> {
         if limit == 0 {
-            eprintln!("logical-db-episode: rejected zero near-query limit");
             return Err(EpisodeError::InvalidBounds);
         }
         Ok(self
@@ -905,11 +897,8 @@ impl OriginLog {
     pub fn verify_log(&self) -> Result<(), EpisodeError> {
         for (position, episode) in self.episodes.iter().enumerate() {
             episode.validate()?;
-            if episode.seq != position as u64 {
-                eprintln!(
-                    "logical-db-episode: rejected log sequence {} at position {position}",
-                    episode.seq
-                );
+            let expected = u64::try_from(position).map_err(|_error| EpisodeError::BadSequence)?;
+            if episode.seq != expected {
                 return Err(EpisodeError::BadSequence);
             }
         }
@@ -919,17 +908,23 @@ impl OriginLog {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
 
+    /// Builds a non-zero fixture identity directly, bypassing the zero-digest
+    /// guard the tests that exercise it call explicitly.
     fn episode_id(value: u8) -> EpisodeId {
-        EpisodeId::new([value; 32]).expect("non-zero fixture id")
+        EpisodeId([value; 32])
     }
 
+    /// Returns the fixed `(account, space)` scope used by most fixtures.
     fn scope() -> (Uuid, Uuid) {
         (Uuid::from_bytes([1u8; 16]), Uuid::from_bytes([2u8; 16]))
     }
 
-    fn episode(seq: u64, payload: &[u8]) -> Episode {
+    /// Builds a valid evidence-bearing episode, failing loudly on a bound bug.
+    fn episode(seq: u64, payload: &[u8]) -> Result<Episode, EpisodeError> {
         Episode::new(
             seq,
             TokenKind::Event,
@@ -939,10 +934,10 @@ mod tests {
             payload.to_vec(),
             Some(scope()),
         )
-        .expect("valid fixture episode")
     }
 
-    fn linked(seq: u64, payload: &[u8], parents: Vec<EpisodeId>) -> Episode {
+    /// Builds a valid parent-linked episode, failing loudly on a bound bug.
+    fn linked(seq: u64, payload: &[u8], parents: Vec<EpisodeId>) -> Result<Episode, EpisodeError> {
         Episode::new(
             seq,
             TokenKind::Event,
@@ -952,19 +947,35 @@ mod tests {
             payload.to_vec(),
             Some(scope()),
         )
-        .expect("valid fixture episode")
-    }
-    #[test]
-    fn zero_id_is_rejected() {
-        assert_eq!(EpisodeId::new([0; 32]), Err(EpisodeError::ZeroId));
-        assert_eq!(episode_id(9).to_string().len(), 64);
     }
 
     #[test]
-    fn content_id_is_deterministic() {
-        let first = episode(0, b"same");
-        assert_eq!(first.id, episode(0, b"same").id);
-        assert_ne!(first.id, episode(0, b"different").id);
+    fn zero_id_is_rejected() {
+        assert_eq!(
+            EpisodeId::new([0; 32]),
+            Err(EpisodeError::ZeroId),
+            "the zero digest must be refused"
+        );
+        assert_eq!(
+            episode_id(9).to_string().len(),
+            64,
+            "a rendered identity is 32 lowercase hex bytes"
+        );
+    }
+
+    #[test]
+    fn content_id_is_deterministic() -> Result<(), Box<dyn Error>> {
+        let first = episode(0, b"same")?;
+        assert_eq!(
+            first.id,
+            episode(0, b"same")?.id,
+            "identical content must hash identically"
+        );
+        assert_ne!(
+            first.id,
+            episode(0, b"different")?.id,
+            "payload must be bound into identity"
+        );
         let time = EpisodeTime {
             observed: 1,
             ..EpisodeTime::default()
@@ -977,9 +988,8 @@ mod tests {
             vec![],
             b"same".to_vec(),
             Some(scope()),
-        )
-        .expect("retimed episode");
-        assert_ne!(first.id, retimed.id);
+        )?;
+        assert_ne!(first.id, retimed.id, "time must be bound into identity");
         let rescoped = Episode::new(
             0,
             TokenKind::Event,
@@ -988,9 +998,8 @@ mod tests {
             vec![],
             b"same".to_vec(),
             None,
-        )
-        .expect("rescoped episode");
-        assert_ne!(first.id, rescoped.id);
+        )?;
+        assert_ne!(first.id, rescoped.id, "scope must be bound into identity");
         let reparented = Episode::new(
             0,
             TokenKind::Event,
@@ -999,9 +1008,11 @@ mod tests {
             vec![episode_id(2)],
             b"same".to_vec(),
             Some(scope()),
-        )
-        .expect("reparented episode");
-        assert_ne!(first.id, reparented.id);
+        )?;
+        assert_ne!(
+            first.id, reparented.id,
+            "parents must be bound into identity"
+        );
         let reattested = Episode::new(
             0,
             TokenKind::Event,
@@ -1010,33 +1021,51 @@ mod tests {
             vec![],
             b"same".to_vec(),
             Some(scope()),
-        )
-        .expect("reattested episode");
-        assert_ne!(first.id, reattested.id);
+        )?;
+        assert_ne!(
+            first.id, reattested.id,
+            "evidence must be bound into identity"
+        );
+        Ok(())
     }
 
     #[test]
-    fn append_get_roundtrip() {
+    fn append_get_roundtrip() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
-        let expected = episode(0, b"hello");
-        let id = log.append(expected.clone()).expect("append");
-        assert_eq!(log.get(id), Ok(&expected));
-        assert!(log.verify_log().is_ok());
+        let expected = episode(0, b"hello")?;
+        let id = log.append(expected.clone())?;
+        assert_eq!(
+            log.get(id),
+            Ok(&expected),
+            "the log must return the appended episode"
+        );
+        assert!(log.verify_log().is_ok(), "a clean log must verify");
+        Ok(())
     }
 
     #[test]
-    fn bad_sequence_is_rejected() {
+    fn bad_sequence_is_rejected() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
-        let skipped = log.append(episode(3, b"skipped"));
-        assert_eq!(skipped, Err(EpisodeError::BadSequence));
+        let skipped = log.append(episode(3, b"skipped")?);
+        assert_eq!(
+            skipped,
+            Err(EpisodeError::BadSequence),
+            "a gap in the sequence must be refused"
+        );
+        Ok(())
     }
 
     #[test]
-    fn duplicate_append_is_rejected() {
+    fn duplicate_append_is_rejected() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
-        let first = episode(0, b"once");
-        log.append(first.clone()).expect("first append");
-        assert_eq!(log.append(first), Err(EpisodeError::Duplicate));
+        let first = episode(0, b"once")?;
+        log.append(first.clone())?;
+        assert_eq!(
+            log.append(first),
+            Err(EpisodeError::Duplicate),
+            "a repeated identity must be refused"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1046,7 +1075,11 @@ mod tests {
         let bad = vec![episode_id(3)];
         let uncovered =
             LocalWorldRecord::new(0, heads, evidence, bad, vec![], vec![1], Some(scope()));
-        assert_eq!(uncovered, Err(EpisodeError::UnprovenReference));
+        assert_eq!(
+            uncovered,
+            Err(EpisodeError::UnprovenReference),
+            "an evidence-uncovered trajectory must be refused"
+        );
     }
 
     #[test]
@@ -1062,82 +1095,114 @@ mod tests {
                 Some(scope()),
             )
         };
-        assert_eq!(build(vec![]), Err(EpisodeError::EmptyRepresentation));
+        assert_eq!(
+            build(vec![]),
+            Err(EpisodeError::EmptyRepresentation),
+            "empty rendered state must be refused"
+        );
         assert_eq!(
             build(vec![0; MAX_RENDERED_BYTES + 1]),
-            Err(EpisodeError::RepresentationTooLarge)
+            Err(EpisodeError::RepresentationTooLarge),
+            "one byte above the budget must be refused"
         );
-        assert!(build(b"state".to_vec()).is_ok());
+        assert!(
+            build(b"state".to_vec()).is_ok(),
+            "an in-budget rendering must be accepted"
+        );
     }
 
     #[test]
-    fn verify_log_catches_tamper() {
+    fn verify_log_catches_tamper() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
-        log.append(episode(0, b"pristine")).expect("append");
+        log.append(episode(0, b"pristine")?)?;
         log.episodes[0].payload.push(0xFF);
-        assert_eq!(log.verify_log(), Err(EpisodeError::IdMismatch));
+        assert_eq!(
+            log.verify_log(),
+            Err(EpisodeError::IdMismatch),
+            "a tampered payload must fail verification"
+        );
         let missing = episode_id(0xAA);
         assert_eq!(
             log.get(missing),
             Err(EpisodeError::NotFound {
                 context: "OriginLog::get.index",
                 id: missing.to_string(),
-            })
+            }),
+            "an unknown identity must fail closed at the index lookup"
         );
+        Ok(())
     }
 
     #[test]
-    fn dangling_ancestry_fails_closed() {
+    fn dangling_ancestry_fails_closed() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
-        let id = log.append(episode(0, b"root")).expect("append");
+        let id = log.append(episode(0, b"root")?)?;
         let missing = episode_id(1);
         assert_eq!(
             log.ancestors(id, 16),
             Err(EpisodeError::NotFound {
                 context: "OriginLog::get.index",
                 id: missing.to_string(),
-            })
+            }),
+            "a dangling evidence link must fail closed with the missing id"
         );
+        Ok(())
     }
 
     #[test]
-    fn at_and_near_enforce_budget() {
+    fn at_and_near_enforce_budget() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
         for (seq, payload) in [b"a".as_slice(), b"b", b"c"].iter().enumerate() {
-            log.append(linked(seq as u64, payload, vec![]))
-                .expect("append");
+            let seq = u64::try_from(seq)?;
+            log.append(linked(seq, payload, vec![])?)?;
         }
-        assert_eq!(log.at(10, 0), Err(EpisodeError::InvalidBounds));
+        assert_eq!(
+            log.at(10, 0),
+            Err(EpisodeError::InvalidBounds),
+            "a zero at-slice budget must be refused"
+        );
         assert_eq!(
             log.near(&TokenKind::Event, 0),
-            Err(EpisodeError::InvalidBounds)
+            Err(EpisodeError::InvalidBounds),
+            "a zero near-query budget must be refused"
         );
-        assert_eq!(log.at(10, 2).expect("at").len(), 2);
-        assert_eq!(log.at(0, 8).expect("at").len(), 1);
-        assert_eq!(log.near(&TokenKind::Event, 8).expect("near").len(), 3);
-        assert!(log.near(&TokenKind::Entity, 8).expect("near").is_empty());
+        assert_eq!(
+            log.at(10, 2)?.len(),
+            2,
+            "the at-slice must cap at its limit"
+        );
+        assert_eq!(log.at(0, 8)?.len(), 1, "the at-slice must respect seq");
+        assert_eq!(log.near(&TokenKind::Event, 8)?.len(), 3, "all events match");
+        assert!(
+            log.near(&TokenKind::Entity, 8)?.is_empty(),
+            "a different kind must match nothing"
+        );
+        Ok(())
     }
 
     #[test]
-    fn worldline_terminates_on_forks_and_respects_budget() {
+    fn worldline_terminates_on_forks_and_respects_budget() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
-        let root_id = log.append(linked(0, b"root", vec![])).expect("append");
-        let left_id = log
-            .append(linked(1, b"left", vec![root_id]))
-            .expect("append");
-        let right_id = log
-            .append(linked(2, b"right", vec![root_id]))
-            .expect("append");
-        let joined_id = log
-            .append(linked(3, b"joined", vec![left_id, right_id]))
-            .expect("append");
-        let line = log.worldline(root_id, 16).expect("worldline");
-        assert_eq!(line, vec![left_id, right_id, joined_id]);
-        assert_eq!(log.worldline(root_id, 2).expect("worldline").len(), 2);
+        let root_id = log.append(linked(0, b"root", vec![])?)?;
+        let left_id = log.append(linked(1, b"left", vec![root_id])?)?;
+        let right_id = log.append(linked(2, b"right", vec![root_id])?)?;
+        let joined_id = log.append(linked(3, b"joined", vec![left_id, right_id])?)?;
+        let line = log.worldline(root_id, 16)?;
+        assert_eq!(
+            line,
+            vec![left_id, right_id, joined_id],
+            "a fork must join deterministically"
+        );
+        assert_eq!(
+            log.worldline(root_id, 2)?.len(),
+            2,
+            "the worldline must honour its budget"
+        );
+        Ok(())
     }
 
     #[test]
-    fn content_id_uses_stable_wire_string() {
+    fn content_id_uses_stable_wire_string() -> Result<(), Box<dyn Error>> {
         let item = Episode::new(
             7,
             TokenKind::MemoryEpisode,
@@ -1146,39 +1211,57 @@ mod tests {
             vec![],
             b"payload".to_vec(),
             Some(scope()),
-        )
-        .expect("episode");
-        assert_eq!(content_id(&item), item.id.into_bytes());
-        assert_ne!(item.kind.as_str(), format!("{:?}", item.kind));
+        )?;
+        assert_eq!(
+            content_id(&item),
+            item.id.into_bytes(),
+            "the stored identity must equal the recomputed content hash"
+        );
+        assert_ne!(
+            item.kind.as_str(),
+            format!("{:?}", item.kind),
+            "the wire token must not be the debug rendering"
+        );
+        Ok(())
     }
 
     #[test]
-    fn episode_ref_conversions_roundtrip() {
+    fn episode_ref_conversions_roundtrip() -> Result<(), Box<dyn Error>> {
         let id = episode_id(4);
-        let reference = EpisodeRef::try_from(id).expect("valid reference");
-        assert_eq!(reference.into_bytes(), id.into_bytes());
-        assert_eq!(EpisodeId::try_from(reference), Ok(id));
+        let reference = EpisodeRef::try_from(id)?;
+        assert_eq!(
+            reference.into_bytes(),
+            id.into_bytes(),
+            "the reference must carry the same bytes"
+        );
+        assert_eq!(
+            EpisodeId::try_from(reference),
+            Ok(id),
+            "the identity must round-trip through the reference"
+        );
+        Ok(())
     }
 
     #[test]
-    fn aggregates_are_serde_snapshots() {
-        fn roundtrip<T>(value: &T) -> T
+    fn aggregates_are_serde_snapshots() -> Result<(), Box<dyn Error>> {
+        /// Re-encodes and decodes one aggregate through CBOR.
+        fn roundtrip<T>(value: &T) -> Result<T, Box<dyn Error>>
         where
             T: Serialize + for<'de> Deserialize<'de>,
         {
             let mut encoded = Vec::new();
-            ciborium::into_writer(value, &mut encoded).expect("CBOR encode");
-            ciborium::from_reader(encoded.as_slice()).expect("CBOR decode")
+            ciborium::into_writer(value, &mut encoded)?;
+            Ok(ciborium::from_reader(encoded.as_slice())?)
         }
 
-        let item = episode(0, b"snapshot");
-        assert_eq!(roundtrip(&item), item);
+        let item = episode(0, b"snapshot")?;
+        assert_eq!(roundtrip(&item)?, item, "an episode must round-trip");
 
         let evidence = Evidence {
             episode: episode_id(1),
             role: "source".into(),
         };
-        assert_eq!(roundtrip(&evidence), evidence);
+        assert_eq!(roundtrip(&evidence)?, evidence, "evidence must round-trip");
 
         let record = LocalWorldRecord::new(
             0,
@@ -1188,32 +1271,56 @@ mod tests {
             vec![],
             b"state".to_vec(),
             Some(scope()),
-        )
-        .expect("valid local-world record");
-        assert_eq!(roundtrip(&record), record);
+        )?;
+        assert_eq!(
+            roundtrip(&record)?,
+            record,
+            "a local-world record must round-trip"
+        );
 
         let mut log = OriginLog::default();
-        log.append(item).expect("valid log");
-        let rebuilt = roundtrip(&log);
-        assert_eq!(rebuilt.get(log.episodes[0].id), Ok(&log.episodes[0]));
+        log.append(item)?;
+        let rebuilt = roundtrip(&log)?;
+        assert_eq!(
+            rebuilt.get(log.episodes[0].id),
+            Ok(&log.episodes[0]),
+            "a decoded log must rebuild its identity index"
+        );
+        Ok(())
     }
 
     #[test]
-    fn full_log_replay_remains_duplicate() {
+    fn full_log_replay_remains_duplicate() -> Result<(), Box<dyn Error>> {
         let mut log = OriginLog::default();
         for seq in 0..MAX_EPISODES_PER_SNAPSHOT {
-            log.append(episode(seq as u64, b"capacity"))
-                .expect("append");
+            log.append(episode(u64::try_from(seq)?, b"capacity")?)?;
         }
         let replay = log.episodes[0].clone();
-        assert_eq!(log.append(replay), Err(EpisodeError::Duplicate));
+        assert_eq!(
+            log.append(replay),
+            Err(EpisodeError::Duplicate),
+            "a full-log replay must be refused as a duplicate"
+        );
+        Ok(())
     }
 
     #[test]
     fn request_digest_is_deterministic_and_sensitive() {
         let first = request_digest("schema", b"op", b"record");
-        assert_eq!(first, request_digest("schema", b"op", b"record"));
-        assert_ne!(first, request_digest("schema", b"op", b"changed"));
-        assert_ne!(first, request_digest("schema", b"other", b"record"));
+        assert_eq!(
+            first,
+            request_digest("schema", b"op", b"record"),
+            "identical requests must hash identically"
+        );
+        assert_ne!(
+            first,
+            request_digest("schema", b"op", b"changed"),
+            "the record must be bound into the request digest"
+        );
+        assert_ne!(
+            first,
+            request_digest("schema", b"other", b"record"),
+            "the operation must be bound into the request digest"
+        );
     }
 }

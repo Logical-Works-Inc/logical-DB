@@ -8,8 +8,10 @@ use std::{fs, process::Command, thread, time::Duration};
 
 use logical_db::{AccountId, Database, Item, Object, ReplicaId, Scalar, Scope, SpaceId};
 
+/// A killed writer never exposes a partial embedded transition on reopen.
 #[test]
-fn forced_termination_never_exposes_a_partial_embedded_transition() {
+fn forced_termination_never_exposes_a_partial_embedded_transition()
+-> Result<(), Box<dyn std::error::Error>> {
     let suffix = uuid::Uuid::now_v7();
     let path = std::env::temp_dir().join(format!("logical-db-kill-{suffix}.redb"));
     let ready = std::env::temp_dir().join(format!("logical-db-kill-{suffix}.ready"));
@@ -21,51 +23,69 @@ fn forced_termination_never_exposes_a_partial_embedded_transition() {
         .arg(scope.space().to_string())
         .arg(replica.to_string())
         .arg(&ready)
-        .spawn()
-        .unwrap();
+        .spawn()?;
     for _ in 0..500 {
         if ready.exists() {
             break;
         }
-        assert!(child.try_wait().unwrap().is_none());
+        assert!(
+            child.try_wait()?.is_none(),
+            "kill writer must still be running while waiting for ready"
+        );
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(ready.exists());
+    assert!(ready.exists(), "kill writer must create the ready file");
     thread::sleep(Duration::from_millis(20));
-    child.kill().unwrap();
-    let status = child.wait().unwrap();
-    assert!(!status.success());
+    child.kill()?;
+    let status = child.wait()?;
+    assert!(!status.success(), "kill writer must not exit cleanly");
 
-    let database = Database::open(&path, scope, replica).unwrap();
+    let database = Database::open(&path, scope, replica)?;
     let mut cursor = 0;
     let mut events = Vec::new();
     loop {
-        let page = database.changes_since(cursor, 32).unwrap();
+        let page = database.changes_since(cursor, 32)?;
         if page.is_empty() {
             break;
         }
-        cursor = page.last().unwrap().sequence();
+        cursor = page.last().ok_or("page must not be empty")?.sequence();
         events.extend(page);
     }
-    assert!(!events.is_empty());
+    assert!(
+        !events.is_empty(),
+        "recovery must replay at least one event"
+    );
     for (offset, event) in events.iter().enumerate() {
-        assert_eq!(event.sequence(), u64::try_from(offset + 1).unwrap());
-        assert!(matches!(
-            database
-                .read(event.document().unwrap(), |reader| reader
-                    .get(&Object::root(), "sequence"))
-                .unwrap(),
-            Some(Some(Item::Scalar(Scalar::Unsigned(_))))
-        ));
+        assert_eq!(
+            event.sequence(),
+            u64::try_from(offset.saturating_add(1))?,
+            "event sequence must be contiguous from one"
+        );
+        assert!(
+            matches!(
+                database.read(
+                    event.document().ok_or("event must name a document")?,
+                    |reader| reader.get(&Object::root(), "sequence")
+                )?,
+                Some(Some(Item::Scalar(Scalar::Unsigned(_))))
+            ),
+            "each recovered event must read back its unsigned sequence"
+        );
     }
     assert_eq!(
-        database.pending_changes(0, 256).unwrap().len(),
-        events.len()
+        database.pending_changes(0, 256)?.len(),
+        events.len(),
+        "pending changes must match recovered events"
     );
     drop(database);
-    let reopened = Database::open(&path, scope, replica).unwrap();
-    assert_eq!(reopened.changes_since(0, 256).unwrap(), events);
+    let reopened = Database::open(&path, scope, replica)?;
+    assert_eq!(
+        reopened.changes_since(0, 256)?,
+        events,
+        "reopened log must equal pre-close events"
+    );
     drop(reopened);
-    fs::remove_file(path).unwrap();
-    fs::remove_file(ready).unwrap();
+    fs::remove_file(path)?;
+    fs::remove_file(ready)?;
+    Ok(())
 }

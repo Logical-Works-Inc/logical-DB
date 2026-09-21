@@ -33,6 +33,29 @@ pub struct PageAction {
 }
 
 impl PageAction {
+    /// Builds one normalized page action from its scope, actor, and limits.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose page actions through here.
+    #[must_use]
+    pub const fn new(
+        scope: Scope,
+        replica: ReplicaId,
+        intent: OperationDigest,
+        after: u64,
+        max_changes: u16,
+        max_bytes: u32,
+    ) -> Self {
+        Self {
+            scope,
+            replica,
+            intent,
+            after,
+            max_changes,
+            max_bytes,
+        }
+    }
+
     /// Hashes every normalized page parameter under the page action domain.
     #[must_use]
     pub fn digest(self) -> ActionDigest {
@@ -66,6 +89,27 @@ pub struct RecoveryAction {
 }
 
 impl RecoveryAction {
+    /// Builds one normalized recovery action from its scope, actor, and cursors.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose recovery actions through here.
+    #[must_use]
+    pub fn new(
+        scope: Scope,
+        replica: ReplicaId,
+        intent: OperationDigest,
+        after: Option<Checkpoint>,
+        after_document: Option<DocumentId>,
+    ) -> Self {
+        Self {
+            scope,
+            replica,
+            intent,
+            after,
+            after_document,
+        }
+    }
+
     /// Recomputes the canonical action digest from the actual parameters.
     #[must_use]
     pub fn digest(&self) -> ActionDigest {
@@ -160,6 +204,8 @@ pub fn prune_action(
     ActionDigest::new(*digest.finalize().as_bytes())
 }
 
+/// Seeds the action hasher with the domain tag, protocol version, action kind,
+/// scope, and caller intent shared by every action encoder.
 fn action_hash(kind: &[u8], scope: Scope, intent: OperationDigest) -> Hasher {
     let mut digest = Hasher::new();
     frame(&mut digest, b"logical-db-action-v1");
@@ -171,16 +217,21 @@ fn action_hash(kind: &[u8], scope: Scope, intent: OperationDigest) -> Hasher {
     digest
 }
 
+/// Feeds one length-prefixed byte frame into the action hasher.
 fn frame(digest: &mut Hasher, bytes: &[u8]) {
-    digest.update(&(bytes.len() as u64).to_be_bytes());
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    digest.update(&length.to_be_bytes());
     digest.update(bytes);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
     use logical_db_model::{AccountId, ChangeDigest, DocumentId, OperationId, SpaceId};
 
+    /// Builds one valid change envelope with distinct non-fixture identities.
     fn change() -> ChangeEnvelope {
         ChangeEnvelope {
             scope: Scope::new(AccountId::new(), SpaceId::new()),
@@ -194,19 +245,15 @@ mod tests {
     }
 
     #[test]
-    fn write_action_v1_has_a_portable_golden_encoding() {
+    fn write_action_v1_has_a_portable_golden_encoding() -> Result<(), Box<dyn Error>> {
         let change = ChangeEnvelope {
             scope: Scope::new(
-                AccountId::from_uuid("01010101-0101-0101-0101-010101010101".parse().unwrap()),
-                SpaceId::from_uuid("02020202-0202-0202-0202-020202020202".parse().unwrap()),
+                AccountId::from_uuid("01010101-0101-0101-0101-010101010101".parse()?),
+                SpaceId::from_uuid("02020202-0202-0202-0202-020202020202".parse()?),
             ),
-            document: DocumentId::from_uuid(
-                "03030303-0303-0303-0303-030303030303".parse().unwrap(),
-            ),
-            operation: OperationId::from_uuid(
-                "04040404-0404-0404-0404-040404040404".parse().unwrap(),
-            ),
-            replica: ReplicaId::from_uuid("05050505-0505-0505-0505-050505050505".parse().unwrap()),
+            document: DocumentId::from_uuid("03030303-0303-0303-0303-030303030303".parse()?),
+            operation: OperationId::from_uuid("04040404-0404-0404-0404-040404040404".parse()?),
+            replica: ReplicaId::from_uuid("05050505-0505-0505-0505-050505050505".parse()?),
             request: OperationDigest::new([6; 32]),
             digest: ChangeDigest::new([7; 32]),
             bytes: vec![0, 1, 255],
@@ -219,15 +266,21 @@ mod tests {
                 0xbf, 0x4a, 0x28, 0x73, 0xe9, 0x91, 0x12, 0x87, 0xf4, 0xb6, 0x48, 0x36, 0xce, 0x3e,
                 0x84, 0xf2, 0x66, 0xd9, 0x68, 0x5b, 0x49, 0x74, 0xb8, 0x68, 0x29, 0xe4, 0x52, 0xef,
                 0xc7, 0x15, 0xa4, 0x87,
-            ]
+            ],
+            "the v1 write action encoding drifted"
         );
+        Ok(())
     }
 
     #[test]
     fn write_identity_changes_for_every_authorized_field() {
         let original = change();
         let expected = write_action(&original);
-        assert_eq!(expected, write_action(&original));
+        assert_eq!(
+            expected,
+            write_action(&original),
+            "the action digest must be deterministic"
+        );
         let mut variants = vec![original.clone(); 8];
         variants[0].scope = Scope::new(AccountId::new(), original.scope.space());
         variants[1].scope = Scope::new(original.scope.account(), SpaceId::new());
@@ -238,7 +291,11 @@ mod tests {
         variants[6].digest = ChangeDigest::new([6; 32]);
         variants[7].bytes.push(7);
         for variant in variants {
-            assert_ne!(expected, write_action(&variant));
+            assert_ne!(
+                expected,
+                write_action(&variant),
+                "every authorized field must be bound into the action digest"
+            );
         }
     }
 
@@ -269,7 +326,11 @@ mod tests {
             },
         ];
         for variant in variants {
-            assert_ne!(page.digest(), variant.digest());
+            assert_ne!(
+                page.digest(),
+                variant.digest(),
+                "actor, position, and limits must be bound into the page digest"
+            );
         }
     }
 
@@ -280,11 +341,20 @@ mod tests {
         let original = change();
         let (scope, intent) = (original.scope, original.request);
         let consumed = mark_consumed_action(scope, intent, 1);
-        assert_ne!(consumed, mark_consumed_action(scope, intent, 2));
-        assert_ne!(consumed, prune_action(scope, intent, 1, None));
+        assert_ne!(
+            consumed,
+            mark_consumed_action(scope, intent, 2),
+            "the consumed position must be bound"
+        );
+        assert_ne!(
+            consumed,
+            prune_action(scope, intent, 1, None),
+            "mark-consumed and prune must be domain separated"
+        );
         assert_ne!(
             prune_action(scope, intent, 1, None),
-            prune_action(scope, intent, 1, Some(0))
+            prune_action(scope, intent, 1, Some(0)),
+            "the optional live checkpoint must be bound"
         );
         let baseline = SnapshotBaseline::new(1, BaselineDigest::new([1; 32]), 1, 10);
         for rebound in [
@@ -295,7 +365,8 @@ mod tests {
         ] {
             assert_ne!(
                 seal_snapshot_action(scope, intent, &baseline),
-                seal_snapshot_action(scope, intent, &rebound)
+                seal_snapshot_action(scope, intent, &rebound),
+                "every descriptor path must be bound into the seal digest"
             );
         }
     }

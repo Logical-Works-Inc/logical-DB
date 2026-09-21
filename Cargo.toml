@@ -50,21 +50,26 @@ tower = { version = "=0.5.3", features = ["util"] }
 # (INV-RT-SINGLE-ENTRY): its `tokio` edge is owned by `lgwks_deps` inside the
 # foundation, so no logical-db crate authors `tokio` or `futures`.
 #
-# Transitive boundary, not one unified identity: the lockfile carries TWO
-# `lgwks_std` versions. 0.6.1 is this workspace's direct estate edge; 0.5.1
-# arrives only through the git-pinned `braid-run` authority adapter. They are
-# separate crate identities that coexist in one binary and never share types,
-# so a `lgwks_std` type crossing the Braid boundary must be converted at the
-# adapter, not assumed compatible. Upgrading Braid's estate edge is what
-# collapses this to one version; until then the pair is the accurate state.
+# Estate edges are crates.io releases, not git revs. A git pin cannot witness
+# that it still matches a published release, and it silently drifts behind the
+# estate's own published surface; `Cargo.lock` plus `cargo deny` now pin the
+# exact resolved version of each registry edge.
+#
+# Transitive boundary, not one unified identity: the lockfile may still carry
+# TWO `lgwks_std` versions if the git-pinned `braid-run` authority adapter
+# declares its own older estate edge. They are separate crate identities that
+# coexist in one binary and never share types, so a `lgwks_std` type crossing
+# the Braid boundary must be converted at the adapter, not assumed compatible.
+# Upgrading Braid's estate edge is what collapses this to one version; until
+# then the pair is the accurate state.
 #
 # `json` re-exports the serde crate the estate owns, so logical-db derives
 # through `lgwks_std::json::{Serialize, Deserialize}` and never declares serde.
-lgwks_std = { version = "0.6.1", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", features = ["json", "hash"] }
-lgwks_bot = { version = "0.3.0", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", features = ["net", "signal"] }
+lgwks_std = { version = "0.6.6", features = ["json", "hash"] }
+lgwks_bot = { version = "0.4.2", features = ["net", "signal"] }
 # The dependency gate itself. `default-features = false` keeps the storefront's
 # Rust scanner out: the contract lane only needs `check_dependencies`.
-lgwks_deps = { version = "0.1.5", git = "https://github.com/srinji-kaggss/logicalworks-crates", rev = "88d2a75b8988c37e77118cdf69b80a7fde5c3fb2", default-features = false }
+lgwks_deps = { version = "0.1.12", default-features = false }
 
 [workspace.lints.rust]
 improper_ctypes = "forbid"
@@ -102,7 +107,11 @@ dbg_macro = "forbid"
 empty_drop = "forbid"
 exhaustive_enums = "forbid"
 exhaustive_structs = "forbid"
-exit = "forbid"
+# `deny`, not `forbid`, for `exit` as well: the process-kill / no-destructor
+# crash fixtures must call `process::exit` to simulate a crash that skips
+# Drop, and `forbid` cannot be lowered (E0453). Those sites state
+# `#[expect(clippy::exit, reason = "...")]`.
+exit = "deny"
 expect_fun_call = "forbid"
 expect_used = "forbid"
 explicit_deref_methods = "forbid"
@@ -133,8 +142,14 @@ needless_range_loop = "forbid"
 panic = "forbid"
 panicking_unwrap = "forbid"
 pattern_type_mismatch = "forbid"
-print_stderr = "forbid"
-print_stdout = "forbid"
+# `deny`, not `forbid`, for the two print lints only: the execution contract's
+# PRINTS rule exempts `main.rs`, `src/bin/`, `examples/`, and `benches/`, and
+# `forbid` cannot be lowered even there (E0453). Library crates carry zero
+# prints under this `deny`; each binary surface states its exemption with
+# `#[expect(clippy::print_std*, reason = "...")]`, which `allow_attributes`
+# already forces to carry a reason.
+print_stderr = "deny"
+print_stdout = "deny"
 ptr_arg = "forbid"
 rc_buffer = "forbid"
 redundant_clone = "forbid"

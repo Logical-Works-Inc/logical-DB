@@ -42,6 +42,92 @@ attempt 3, bounded page, isolated scope), `fdb_recovery_composition`, and
 Hosted CI remains the required reproduction environment until a self-hosted
 runner exists; these local receipts do not substitute for it.
 
+## 2026-09-21 debt cleanup, estate alignment, and nine-axis reassessment
+
+This entry records a debt-cleanup pass and an alignment reassessment. It makes
+no production-completion claim and no nine-axis receipt claim.
+
+### Estate and toolchain alignment (this change)
+
+| Edge | Was | Now | Receipt |
+|---|---|---|---|
+| Rust toolchain | `1.98.0` | `1.98.1` (latest stable) | `rustup show active-toolchain` → `1.98.1-aarch64-apple-darwin (overridden by rust-toolchain.toml)` |
+| `lgwks_std` | `0.6.1`, git rev `88d2a75b` | `0.6.6` from crates.io | `Cargo.lock` source `registry+https://github.com/rust-lang/crates.io-index` |
+| `lgwks_bot` | `0.3.0`, git rev `88d2a75b` | `0.4.2` from crates.io | same; `contract/APPROVED.toml` now `version = "^0.4.2"`, `source = "registry"` |
+| `lgwks_deps` | `0.1.5`, git rev `88d2a75b` | `0.1.12` from crates.io | same |
+
+A git pin cannot witness that it still matches a published estate release, and
+this one was five `lgwks_std` releases and one `lgwks_bot` minor behind
+crates.io. `deny.toml` no longer git-allowlists `logicalworks-crates` (nothing
+depends on it as a git edge any more); `Braid` stays the sole approved git
+source.
+
+Residual, stated accurately: the lockfile still carries **two** `lgwks_std`
+versions (`0.5.1` through `braid-run`, `0.6.6` as this workspace's estate
+edge). They are separate crate identities and never share types. Collapsing the
+pair is a Braid-side change — Braid `main` at `30c5d3a` still declares
+`lgwks_std = "0.5.2"`, so bumping the Braid pin here would not do it.
+
+### Contract receipts repaired this change
+
+`python3 scripts/verify-rewrite.py` was **FAIL** (8 citation failures:
+`clippy.toml` had no evidence header and three `evidence/matched-trace/*.json`
+carried none; `evidence/domain-graph.md` was stale). Now **PASS** —
+`citation_failures=0 dependency_failures=0 domain_contract_failures=0`.
+`python3 scripts/test-domain-contract.py` 8/8 OK; `python3
+scripts/test-access-graph.py` 6/6 OK; `cargo deny check` → advisories ok, bans
+ok, licenses ok, sources ok.
+
+### Rust anti-pattern contract (this change)
+
+`.cargo/config.toml` runs `clippy-driver` as the workspace rustc wrapper, so
+the `[workspace.lints]` forbid-list binds every `cargo check`, and `clippy.toml`
+deliberately holds test code to the same contract as production
+(no `allow-*-in-tests`). The tree was **red** under that contract at `0c4a0b4`:
+620 clippy errors first surfaced in `logical-db-store` / `logical-db-sync` /
+`logical-db-service`, plus 259 `eprintln!`/`println!` in library code, 12
+reasonless `#[allow]` suppressions, and `E0639`/`E0004` fallout from
+half-applied `#[non_exhaustive]`. Full inventory after the build could get
+past those three crates was larger still (unwrap debt in `logical-db`,
+`logical-db-kv`, `logical-db-http`, and `logical-db-sync`).
+
+Remediation rules applied uniformly: tests return `Result<(), Box<dyn Error>>`
+and use `?`; fixture helpers bubble `Result`; every assert carries a message;
+every private item carries a doc comment; no `as` casts; `checked_*` /
+`saturating_*` for arithmetic; `#[expect(..., reason = "...")]` only where a
+fix is genuinely unavailable (11 sites, each with a concrete reason, covering
+the one reviewed FoundationDB unsafe leaf and journey-shape exceptions). No
+lint, `clippy.toml`, or `.cargo/config.toml` was weakened, with one recorded
+exception that *aligns* the table with the contract: `print_stderr`,
+`print_stdout`, and `exit` are now `deny` rather than `forbid`. The execution
+contract's PRINTS rule exempts `main.rs`, `src/bin/`, `examples/`, and
+`benches/`, and the process-kill fixtures must call `process::exit` to skip
+Drop; `forbid` cannot be lowered even there (E0453). Every binary surface
+states its exemption with `#[expect(..., reason = "...")]`, which
+`allow_attributes` / `allow_attributes_without_reason` already force to carry a
+concrete reason. Library crates carry zero prints and zero `process::exit`
+under that `deny`. Every other lint remains `forbid`.
+
+### Nine-axis reassessment (posture only — no axis is claimed)
+
+Against `docs/adr/0003-sovereign-hyperscale-data-plane.md` and the SLO matrix in
+the execution contract. Honest state after this cleanup:
+
+| Axis | Posture | Observed gap |
+|---|---|---|
+| Frontier | Not established | Director ruled 2026-09-14: #33–#35 stay open until a measurement environment exists. No corpus, baseline, or workload is committed. |
+| Hyperscale | Not established | Program is #66/#67/#70/#72. No >1M concurrent evidence. Current scope is embedded + one FDB cluster. |
+| Idiomatic | Improving to sound | This change. Compiler/lint contract is the receipt; failure-path tests exist for the bound crates. |
+| Generalized | Partial | Wire round-trips, bounds, and mutation campaigns exist. Declared tenant/region/topology families are Cloud work (#67–#69) and unbuilt. |
+| Decoupled | Strong internally, one residual | `domain_contract` 8 owners / 32 edges is green. Residual: dual `lgwks_std` across the Braid adapter (above). Frozen boundaries (`reqwest`, `axum`) stay registered. |
+| Ephemeral | Strong at local/FDB scope | `crash_recovery`, `kill_recovery`, `fdb_process_kill_restore`, `fdb_recovery_composition`. #28 stays open for item-by-item acceptance. Multi-region DR (#71) unbuilt. |
+| Portable | Partial | `logical-db-platform` covers Windows/macOS/Linux placement; CI has macos + ubuntu + windows guests. No per-target e2e receipt matrix in `evidence/`. |
+| Multi-tenant | Partial at embedded scope | Account+space scoping is first-class in the model. Cross-tenant/cross-region negatives for Cloud views (#68) unbuilt. |
+| Performance | Thin | `evidence/matched-trace/embedded-{5000,20000,60000}.json` carry p50/p99/throughput. No criterion benches, no matched architecture-class comparison (depends on Frontier), no allocation or contention profiling. |
+
+No present-tense scale, cost, availability, or superiority claim becomes
+eligible from this pass. Issue #66 remains the acceptance program.
+
 ## 2026-09-16 delivered state and Director decisions
 
 - **PR #57 merged** as `f19867b`: the HTTP transport bounds credential

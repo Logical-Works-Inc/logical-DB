@@ -25,9 +25,7 @@ mod tests {
         ServiceStore,
     };
 
-    pub use crate::support::{
-        FixedClock, Grant, MemoryServiceStore, TestAuthentication,
-    };
+    pub use crate::support::{FixedClock, Grant, MemoryServiceStore, TestAuthentication};
 
     use logical_db_protocol::{mark_consumed_action, prune_action, seal_snapshot_action};
 
@@ -36,6 +34,13 @@ mod tests {
             "logical-db-network-{label}-{}.redb",
             uuid::Uuid::now_v7()
         ))
+    }
+
+    /// Builds the two-thread runtime every async journey runs on.
+    fn test_runtime() -> Result<lgwks_bot::Runtime, Box<dyn std::error::Error>> {
+        Ok(lgwks_bot::Builder::new()
+            .worker_threads(std::num::NonZeroUsize::new(2))
+            .build()?)
     }
 
     fn projection(index: IndexId) -> Projection {
@@ -47,15 +52,17 @@ mod tests {
         })
     }
 
-    fn assert_converged(database: &Database, document: DocumentId, index: IndexId) {
-        let values = database
-            .read(document, |reader| {
-                Ok((
-                    reader.get(&Object::root(), "left")?,
-                    reader.get(&Object::root(), "right")?,
-                ))
-            })
-            .unwrap();
+    fn assert_converged(
+        database: &Database,
+        document: DocumentId,
+        index: IndexId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let values = database.read(document, |reader| {
+            Ok((
+                reader.get(&Object::root(), "left")?,
+                reader.get(&Object::root(), "right")?,
+            ))
+        })?;
         assert_eq!(
             values,
             Some((
@@ -64,12 +71,10 @@ mod tests {
             ))
         );
         assert_eq!(
-            database
-                .query_index(index, &IndexValue::Text("record".into()), None, 10)
-                .unwrap(),
+            database.query_index(index, &IndexValue::Text("record".into()), None, 10)?,
             vec![document]
         );
-        let events = database.changes_since(0, 10).unwrap();
+        let events = database.changes_since(0, 10)?;
         assert_eq!(events.len(), 3);
         assert!(
             events
@@ -78,38 +83,39 @@ mod tests {
         );
         assert!(
             database
-                .changes_since(events.last().unwrap().sequence(), 10)
-                .unwrap()
+                .changes_since(
+                    events
+                        .last()
+                        .ok_or("the fixture must record at least one event")?
+                        .sequence(),
+                    10
+                )?
                 .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn two_embedded_replicas_converge_through_real_http_and_keep_indexes_current() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(two_embedded_replicas_body());
+    fn two_embedded_replicas_converge_through_real_http_and_keep_indexes_current()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(two_embedded_replicas_body())
     }
 
-    async fn two_embedded_replicas_body() {
+    async fn two_embedded_replicas_body() -> Result<(), Box<dyn std::error::Error>> {
         let app = router(
             MemoryServiceStore::default(),
             TestAuthentication,
-            CheckpointCodec::new([21; 32], 60_000).unwrap(),
+            CheckpointCodec::new([21; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let first_path = path("first");
         let second_path = path("second");
@@ -122,78 +128,67 @@ mod tests {
             ReplicaId::new(),
             7,
             vec![projection(index)],
-        )
-        .unwrap();
+        )?;
         let second = Database::open_with_schema(
             &second_path,
             scope,
             ReplicaId::new(),
             7,
             vec![projection(index)],
-        )
-        .unwrap();
+        )?;
         let peer = PeerId::new();
 
-        first
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([1; 32]),
-                |editor| editor.put(&Object::root(), "kind", Scalar::String("record".into())),
-            )
-            .unwrap();
+        first.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([1; 32]),
+            |editor| editor.put(&Object::root(), "kind", Scalar::String("record".into())),
+        )?;
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         second
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
 
-        first
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([2; 32]),
-                |editor| editor.put(&Object::root(), "left", Scalar::Integer(11)),
-            )
-            .unwrap();
-        second
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([3; 32]),
-                |editor| editor.put(&Object::root(), "right", Scalar::Integer(22)),
-            )
-            .unwrap();
+        first.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([2; 32]),
+            |editor| editor.put(&Object::root(), "left", Scalar::Integer(11)),
+        )?;
+        second.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([3; 32]),
+            |editor| editor.put(&Object::root(), "right", Scalar::Integer(22)),
+        )?;
 
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         second
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
 
         for database in [&first, &second] {
-            assert_converged(database, document, index);
+            assert_converged(database, document, index)?;
         }
 
         drop((first, second));
-        fs::remove_file(first_path).unwrap();
-        fs::remove_file(second_path).unwrap();
+        fs::remove_file(first_path)?;
+        fs::remove_file(second_path)?;
         server.abort();
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real() {
+    fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real()
+    -> Result<(), Box<dyn std::error::Error>> {
         let application = format!("com.logicaldb.windows.{}", uuid::Uuid::now_v7());
         let local = std::env::var_os("LOCALAPPDATA").expect("Windows defines LOCALAPPDATA");
         let directory = std::path::PathBuf::from(local)
@@ -203,36 +198,34 @@ mod tests {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let document = DocumentId::new();
-        let database = Database::open_default(&application, scope, replica).unwrap();
-        database
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([0x77; 32]),
-                |editor| {
-                    editor.put(
-                        &Object::root(),
-                        "windows",
-                        Scalar::String("Renée ∕ 状態".into()),
-                    )
-                },
-            )
-            .unwrap();
+        let database = Database::open_default(&application, scope, replica)?;
+        database.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([0x77; 32]),
+            |editor| {
+                editor.put(
+                    &Object::root(),
+                    "windows",
+                    Scalar::String("Renée ∕ 状態".into()),
+                )
+            },
+        )?;
         assert!(Database::open_default(&application, scope, replica).is_err());
         drop(database);
-        let reopened = Database::open_default(&application, scope, replica).unwrap();
+        let reopened = Database::open_default(&application, scope, replica)?;
         assert!(matches!(
             reopened
                 .read(document, |reader| reader.get(&Object::root(), "windows"))
-                .unwrap(),
+                ?,
             Some(Some(Item::Scalar(Scalar::String(value)))) if value == "Renée ∕ 状態"
         ));
         drop(reopened);
 
-        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let original_permissions = fs::metadata(&path)?.permissions();
         let mut permissions = original_permissions.clone();
         permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions).unwrap();
+        fs::set_permissions(&path, permissions)?;
         if let Ok(read_only) = Database::open(&path, scope, replica) {
             assert!(
                 read_only
@@ -246,22 +239,26 @@ mod tests {
             );
             drop(read_only);
         }
-        fs::set_permissions(&path, original_permissions).unwrap();
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(directory).unwrap();
+        fs::set_permissions(&path, original_permissions)?;
+        fs::remove_file(path)?;
+        fs::remove_dir(directory)?;
+        Ok(())
     }
 
-    async fn seal_consume_and_prune(store: &MemoryServiceStore, scope: Scope) {
-        seal_consume_and_prune_through(store, scope, 1).await;
+    async fn seal_consume_and_prune(
+        store: &MemoryServiceStore,
+        scope: Scope,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        seal_consume_and_prune_through(store, scope, 1).await
     }
 
     async fn seal_consume_and_prune_through(
         store: &MemoryServiceStore,
         scope: Scope,
         through: u64,
-    ) {
-        let artifact = store.build_snapshot(scope, through).await.unwrap();
-        let frontier = store.frontier(scope).await.unwrap();
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let artifact = store.build_snapshot(scope, through).await?;
+        let frontier = store.frontier(scope).await?;
         let seal_request = OperationDigest::new([0x52; 32]);
         assert!(matches!(
             store
@@ -277,7 +274,7 @@ mod tests {
                     },
                 )
                 .await
-                .unwrap(),
+                ?,
             SealResult::Sealed { position } if position == through
         ));
         let consumed_request = OperationDigest::new([0x53; 32]);
@@ -295,7 +292,7 @@ mod tests {
                     },
                 )
                 .await
-                .unwrap(),
+                ?,
             ConsumedResult::Advanced { consumed_through } if consumed_through == through
         ));
         let prune_request = OperationDigest::new([0x54; 32]);
@@ -314,39 +311,36 @@ mod tests {
                     },
                 )
                 .await
-                .unwrap(),
-            PruneResult::Pruned(PruneReceipt { pruned_through, floor })
+                ?,
+            PruneResult::Pruned(PruneReceipt { pruned_through, floor, .. })
                 if pruned_through == through && floor == through
         ));
+        Ok(())
     }
 
     #[test]
-    fn fresh_replica_recovers_a_pruned_document_through_real_http() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(fresh_replica_recovers_a_pruned_document_body());
+    fn fresh_replica_recovers_a_pruned_document_through_real_http()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(fresh_replica_recovers_a_pruned_document_body())
     }
 
-    async fn fresh_replica_recovers_a_pruned_document_body() {
+    async fn fresh_replica_recovers_a_pruned_document_body()
+    -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([23; 32], 60_000).unwrap(),
+            CheckpointCodec::new([23; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let document = DocumentId::new();
@@ -354,69 +348,60 @@ mod tests {
         let first_path = path("recovery-first");
         let second_path = path("recovery-second");
 
-        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
-        first
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([0x51; 32]),
-                |editor| editor.put(&Object::root(), "state", Scalar::String("sealed".into())),
-            )
-            .unwrap();
+        let first = Database::open(&first_path, scope, ReplicaId::new())?;
+        first.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([0x51; 32]),
+            |editor| editor.put(&Object::root(), "state", Scalar::String("sealed".into())),
+        )?;
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
-        assert_eq!(store.frontier(scope).await.unwrap(), 1);
+            .await?;
+        assert_eq!(store.frontier(scope).await?, 1);
 
-        seal_consume_and_prune(&store, scope).await;
+        seal_consume_and_prune(&store, scope).await?;
 
-        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let second = Database::open(&second_path, scope, ReplicaId::new())?;
         let report = second
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         assert!(report.recovered);
         assert_eq!(
-            second
-                .read(document, |reader| reader.get(&Object::root(), "state"))
-                .unwrap(),
+            second.read(document, |reader| reader.get(&Object::root(), "state"))?,
             Some(Some(Item::Scalar(Scalar::String("sealed".into()))))
         );
 
         drop((first, second));
-        fs::remove_file(first_path).unwrap();
-        fs::remove_file(second_path).unwrap();
+        fs::remove_file(first_path)?;
+        fs::remove_file(second_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn a_baseline_larger_than_one_page_recovers_through_real_http() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(a_baseline_larger_than_one_page_recovers_body());
+    fn a_baseline_larger_than_one_page_recovers_through_real_http()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(a_baseline_larger_than_one_page_recovers_body())
     }
 
-    async fn a_baseline_larger_than_one_page_recovers_body() {
+    async fn a_baseline_larger_than_one_page_recovers_body()
+    -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([25; 32], 60_000).unwrap(),
+            CheckpointCodec::new([25; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let peer = PeerId::new();
@@ -428,63 +413,59 @@ mod tests {
         // its tombstone crosses the page boundary inside the sealed baseline.
         let tombstoned = documents[MAX_BASELINE_PAGE_DOCUMENTS];
 
-        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        let first = Database::open(&first_path, scope, ReplicaId::new())?;
         for (batch, chunk) in documents.chunks(150).enumerate() {
             let edits = chunk
                 .iter()
                 .enumerate()
                 .map(|(offset, document)| {
-                    let index = batch * 150 + offset;
-                    let value = i64::try_from(index % 1_000).unwrap();
+                    let index = batch.saturating_mul(150).saturating_add(offset);
+                    let value = i64::try_from(index.checked_rem(1_000).unwrap_or(0)).unwrap_or(0);
                     BatchEdit::new(
                         *document,
                         OperationId::new(),
-                        OperationDigest::new([u8::try_from(index % 256).unwrap(); 32]),
+                        OperationDigest::new(
+                            [u8::try_from(index.checked_rem(256).unwrap_or(0)).unwrap_or(0); 32],
+                        ),
                         move |editor| editor.put(&Object::root(), "page", Scalar::Integer(value)),
                     )
                 })
                 .collect::<Vec<_>>();
-            first.edit_many(edits).unwrap();
+            first.edit_many(edits)?;
         }
-        first
-            .delete(
-                tombstoned,
-                OperationId::new(),
-                OperationDigest::new([0x7a; 32]),
-            )
-            .unwrap();
-        let seeded = u64::try_from(total + 1).unwrap();
+        first.delete(
+            tombstoned,
+            OperationId::new(),
+            OperationDigest::new([0x7a; 32]),
+        )?;
+        let seeded = u64::try_from(total + 1)?;
         for _round in 0..8 {
             first
                 .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-                .await
-                .unwrap();
-            if store.frontier(scope).await.unwrap() == seeded {
+                .await?;
+            if store.frontier(scope).await? == seeded {
                 break;
             }
         }
-        assert_eq!(store.frontier(scope).await.unwrap(), seeded);
+        assert_eq!(store.frontier(scope).await?, seeded);
 
-        seal_consume_and_prune_through(&store, scope, seeded).await;
+        seal_consume_and_prune_through(&store, scope, seeded).await?;
 
-        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let second = Database::open(&second_path, scope, ReplicaId::new())?;
         let report = second
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         assert!(report.recovered, "a >256-document baseline must recover");
         assert!(
-            second.is_deleted(tombstoned).unwrap(),
+            second.is_deleted(tombstoned)?,
             "a tombstone crossing the page boundary must survive recovery"
         );
         for (index, document) in documents.iter().enumerate() {
-            let observed = second
-                .read(*document, |reader| reader.get(&Object::root(), "page"))
-                .unwrap();
+            let observed = second.read(*document, |reader| reader.get(&Object::root(), "page"))?;
             if *document == tombstoned {
                 assert_eq!(observed, None, "the boundary tombstone must not resurrect");
             } else {
-                let expected = i64::try_from(index % 1_000).unwrap();
+                let expected = i64::try_from(index.checked_rem(1_000).unwrap_or(0))?;
                 assert_eq!(
                     observed,
                     Some(Some(Item::Scalar(Scalar::Integer(expected)))),
@@ -494,39 +475,38 @@ mod tests {
         }
 
         drop((first, second));
-        fs::remove_file(first_path).unwrap();
-        fs::remove_file(second_path).unwrap();
+        fs::remove_file(first_path)?;
+        fs::remove_file(second_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn a_local_edit_landing_between_recovery_pages_survives_the_install() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(local_edit_between_pages_body());
+    fn a_local_edit_landing_between_recovery_pages_survives_the_install()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(local_edit_between_pages_body())
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn local_edit_between_pages_body() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the local-edit-between-pages journey is one linear interleaving narrative; splitting it would hide the page-boundary interleaving that the test exists to prove"
+    )]
+    async fn local_edit_between_pages_body() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([27; 32], 60_000).unwrap(),
+            CheckpointCodec::new([27; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let peer = PeerId::new();
@@ -535,72 +515,86 @@ mod tests {
         let total = MAX_BASELINE_PAGE_DOCUMENTS + 1;
         let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
 
-        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
+        let first = Database::open(&first_path, scope, ReplicaId::new())?;
         for (batch, chunk) in documents.chunks(150).enumerate() {
             let edits = chunk
                 .iter()
                 .enumerate()
                 .map(|(offset, document)| {
-                    let index = batch * 150 + offset;
+                    let index = batch.saturating_mul(150).saturating_add(offset);
                     BatchEdit::new(
                         *document,
                         OperationId::new(),
-                        OperationDigest::new([u8::try_from(index % 256).unwrap(); 32]),
+                        OperationDigest::new(
+                            [u8::try_from(index.checked_rem(256).unwrap_or(0)).unwrap_or(0); 32],
+                        ),
                         move |editor| {
                             editor.put(
                                 &Object::root(),
                                 "page",
-                                Scalar::Integer(i64::try_from(index).unwrap()),
+                                Scalar::Integer(i64::try_from(index).unwrap_or(0)),
                             )
                         },
                     )
                 })
                 .collect::<Vec<_>>();
-            first.edit_many(edits).unwrap();
+            first.edit_many(edits)?;
         }
-        let seeded = u64::try_from(total).unwrap();
+        let seeded = u64::try_from(total)?;
         for _round in 0..8 {
             first
                 .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-                .await
-                .unwrap();
-            if store.frontier(scope).await.unwrap() == seeded {
+                .await?;
+            if store.frontier(scope).await? == seeded {
                 break;
             }
         }
-        assert_eq!(store.frontier(scope).await.unwrap(), seeded);
-        seal_consume_and_prune_through(&store, scope, seeded).await;
+        assert_eq!(store.frontier(scope).await?, seeded);
+        seal_consume_and_prune_through(&store, scope, seeded).await?;
 
-        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let second = Database::open(&second_path, scope, ReplicaId::new())?;
         let local_document = DocumentId::new();
         let local_operation = OperationId::new();
         let mut calls = 0usize;
         let mut landed = false;
+        let mut seam_error: Option<Box<dyn std::error::Error>> = None;
         let report = second
             .synchronize(peer, &mut transport, SyncLimits::default(), || {
-                calls += 1;
+                calls = calls.saturating_add(1);
                 if calls == 2 {
-                    assert!(
-                        second
-                            .read(documents[0], |reader| reader.get(&Object::root(), "page"))
-                            .unwrap()
-                            .is_none(),
-                        "the edit must land after the first page and before any install"
-                    );
-                    second
-                        .edit(
-                            local_document,
-                            local_operation,
-                            OperationDigest::new([0xb7; 32]),
-                            |editor| editor.put(&Object::root(), "local", Scalar::Integer(7)),
-                        )
-                        .unwrap();
-                    landed = true;
+                    match second.read(documents[0], |reader| reader.get(&Object::root(), "page")) {
+                        Ok(Some(_)) => {
+                            seam_error = Some(
+                                "the edit must land after the first page and before any install"
+                                    .into(),
+                            );
+                        }
+                        Ok(None) => {
+                            match second.edit(
+                                local_document,
+                                local_operation,
+                                OperationDigest::new([0xb7; 32]),
+                                |editor| editor.put(&Object::root(), "local", Scalar::Integer(7)),
+                            ) {
+                                Ok(_) => {
+                                    landed = true;
+                                }
+                                Err(error) => {
+                                    seam_error = Some(error.into());
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            seam_error = Some(error.into());
+                        }
+                    }
                 }
                 false
             })
-            .await
-            .unwrap();
+            .await?;
+        if let Some(error) = seam_error {
+            return Err(error);
+        }
 
         assert!(
             landed,
@@ -608,25 +602,19 @@ mod tests {
         );
         assert!(report.recovered, "the replica must still take the baseline");
         assert_eq!(
-            second
-                .read(local_document, |reader| reader
-                    .get(&Object::root(), "local"))
-                .unwrap(),
+            second.read(local_document, |reader| reader
+                .get(&Object::root(), "local"))?,
             Some(Some(Item::Scalar(Scalar::Integer(7)))),
             "an edit that lands mid-recovery must survive the install"
         );
         for (index, document) in documents.iter().enumerate() {
             assert_eq!(
-                second
-                    .read(*document, |reader| reader.get(&Object::root(), "page"))
-                    .unwrap(),
-                Some(Some(Item::Scalar(Scalar::Integer(
-                    i64::try_from(index).unwrap()
-                )))),
+                second.read(*document, |reader| reader.get(&Object::root(), "page"))?,
+                Some(Some(Item::Scalar(Scalar::Integer(i64::try_from(index)?)))),
                 "baseline document {index} must still install around a concurrent edit"
             );
         }
-        let pending = second.pending_changes(0, 8).unwrap();
+        let pending = second.pending_changes(0, 8)?;
         assert!(
             pending
                 .iter()
@@ -635,38 +623,34 @@ mod tests {
         );
 
         drop((first, second));
-        fs::remove_file(first_path).unwrap();
-        fs::remove_file(second_path).unwrap();
+        fs::remove_file(first_path)?;
+        fs::remove_file(second_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn tombstone_survives_baseline_recovery_and_cannot_resurrect() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(tombstone_baseline_recovery_body());
+    fn tombstone_survives_baseline_recovery_and_cannot_resurrect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(tombstone_baseline_recovery_body())
     }
 
-    async fn tombstone_baseline_recovery_body() {
+    async fn tombstone_baseline_recovery_body() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([24; 32], 60_000).unwrap(),
+            CheckpointCodec::new([24; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let document = DocumentId::new();
@@ -674,133 +658,109 @@ mod tests {
         let first_path = path("tombstone-first");
         let second_path = path("tombstone-second");
 
-        let first = Database::open(&first_path, scope, ReplicaId::new()).unwrap();
-        first
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([0x61; 32]),
-                |editor| editor.put(&Object::root(), "state", Scalar::String("v1".into())),
-            )
-            .unwrap();
+        let first = Database::open(&first_path, scope, ReplicaId::new())?;
+        first.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([0x61; 32]),
+            |editor| editor.put(&Object::root(), "state", Scalar::String("v1".into())),
+        )?;
         // The edit below the delete is the resurrection candidate: once the
         // recovered baseline carries the tombstone it must never bring the
         // document back, even if the service re-delivers that older change.
-        let pre_floor = first.pending_changes(0, 10).unwrap();
+        let pre_floor = first.pending_changes(0, 10)?;
         assert_eq!(pre_floor.len(), 1);
-        first
-            .delete(
-                document,
-                OperationId::new(),
-                OperationDigest::new([0x62; 32]),
-            )
-            .unwrap();
+        first.delete(
+            document,
+            OperationId::new(),
+            OperationDigest::new([0x62; 32]),
+        )?;
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
-        assert_eq!(store.frontier(scope).await.unwrap(), 2);
+            .await?;
+        assert_eq!(store.frontier(scope).await?, 2);
 
-        seal_consume_and_prune_through(&store, scope, 2).await;
+        seal_consume_and_prune_through(&store, scope, 2).await?;
 
-        let second = Database::open(&second_path, scope, ReplicaId::new()).unwrap();
+        let second = Database::open(&second_path, scope, ReplicaId::new())?;
         let report = second
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         assert!(report.recovered);
-        assert!(second.is_deleted(document).unwrap());
+        assert!(second.is_deleted(document)?);
         assert!(
             second
-                .read(document, |reader| reader.get(&Object::root(), "state"))
-                .unwrap()
+                .read(document, |reader| reader.get(&Object::root(), "state"))?
                 .is_none()
         );
 
         let resurrection = pre_floor
             .iter()
-            .map(|change| RemoteChange {
-                document: change.document,
-                digest: change.digest,
-                bytes: change.bytes.clone(),
-            })
+            .map(|change| RemoteChange::new(change.document, change.digest, change.bytes.clone()))
             .collect::<Vec<_>>();
-        second
-            .install_remote_page(peer, &resurrection, b"resurrection-attempt")
-            .unwrap();
-        assert!(second.is_deleted(document).unwrap());
+        second.install_remote_page(peer, &resurrection, b"resurrection-attempt")?;
+        assert!(second.is_deleted(document)?);
         assert!(
             second
-                .read(document, |reader| reader.get(&Object::root(), "state"))
-                .unwrap()
+                .read(document, |reader| reader.get(&Object::root(), "state"))?
                 .is_none()
         );
 
         drop((first, second));
-        fs::remove_file(first_path).unwrap();
-        fs::remove_file(second_path).unwrap();
+        fs::remove_file(first_path)?;
+        fs::remove_file(second_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn corrupt_or_incomplete_baseline_leaves_state_and_checkpoint_unchanged() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(corrupt_baseline_refusal_body());
+    fn corrupt_or_incomplete_baseline_leaves_state_and_checkpoint_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(corrupt_baseline_refusal_body())
     }
 
-    async fn corrupt_baseline_refusal_body() {
+    async fn corrupt_baseline_refusal_body() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([25; 32], 60_000).unwrap(),
+            CheckpointCodec::new([25; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let document = DocumentId::new();
         let peer = PeerId::new();
         let victim_path = path("corrupt-victim");
 
-        let victim = Database::open(&victim_path, scope, ReplicaId::new()).unwrap();
-        victim
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([0x71; 32]),
-                |editor| editor.put(&Object::root(), "state", Scalar::String("keep".into())),
-            )
-            .unwrap();
+        let victim = Database::open(&victim_path, scope, ReplicaId::new())?;
+        victim.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([0x71; 32]),
+            |editor| editor.put(&Object::root(), "state", Scalar::String("keep".into())),
+        )?;
         victim
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
         let checkpoint_before = victim
-            .checkpoint(peer)
-            .unwrap()
-            .expect("the replica accepted a durable checkpoint");
-        assert!(!victim.is_deleted(document).unwrap());
+            .checkpoint(peer)?
+            .ok_or("a synchronized replica must hold a checkpoint")?;
+        assert!(!victim.is_deleted(document)?);
         assert_eq!(
-            victim
-                .read(document, |reader| reader.get(&Object::root(), "state"))
-                .unwrap(),
+            victim.read(document, |reader| reader.get(&Object::root(), "state"))?,
             Some(Some(Item::Scalar(Scalar::String("keep".into()))))
         );
 
-        let genuine = store.build_snapshot(scope, 1).await.unwrap();
+        let genuine = store.build_snapshot(scope, 1).await?;
         assert_eq!(genuine.documents.len(), 1);
 
         let mut substituted = genuine.clone();
@@ -814,119 +774,103 @@ mod tests {
         // Recomputing the descriptor keeps the artifact internally consistent,
         // so only the tombstone-versus-document check can refuse it.
         let mismatched =
-            SnapshotArtifact::new(scope, genuine.baseline.position(), mismatched.documents)
-                .unwrap();
+            SnapshotArtifact::new(scope, genuine.baseline.position(), mismatched.documents)?;
 
         for (label, artifact) in [
             ("substituted snapshot payload", substituted),
             ("truncated document list", truncated),
             ("mismatched tombstone flag", mismatched),
         ] {
-            let error = victim
-                .install_baseline(peer, &artifact, b"corrupt-checkpoint")
-                .unwrap_err();
+            let Err(error) = victim.install_baseline(peer, &artifact, b"corrupt-checkpoint") else {
+                return Err("a corrupt checkpoint must be refused".into());
+            };
             assert!(
                 matches!(&error, DatabaseError::InvalidBaseline),
                 "{label} must be refused with a typed failure, got {error:?}"
             );
             assert_eq!(error.kind(), DatabaseErrorKind::Other, "{label} kind");
             assert_eq!(
-                victim.checkpoint(peer).unwrap().as_deref(),
+                victim.checkpoint(peer)?.as_deref(),
                 Some(checkpoint_before.as_slice()),
                 "{label} must leave the checkpoint byte-for-byte unchanged"
             );
             assert!(
-                !victim.is_deleted(document).unwrap(),
+                !victim.is_deleted(document)?,
                 "{label} must not tombstone the existing document"
             );
             assert_eq!(
-                victim
-                    .read(document, |reader| reader.get(&Object::root(), "state"))
-                    .unwrap(),
+                victim.read(document, |reader| reader.get(&Object::root(), "state"))?,
                 Some(Some(Item::Scalar(Scalar::String("keep".into())))),
                 "{label} must leave the readable state unchanged"
             );
         }
 
         drop(victim);
-        fs::remove_file(victim_path).unwrap();
+        fs::remove_file(victim_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn recovery_merges_a_local_edit_the_baseline_predates() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(recovery_merges_a_local_edit_body());
+    fn recovery_merges_a_local_edit_the_baseline_predates() -> Result<(), Box<dyn std::error::Error>>
+    {
+        test_runtime()?.block_on(recovery_merges_a_local_edit_body())
     }
 
-    async fn recovery_merges_a_local_edit_body() {
+    async fn recovery_merges_a_local_edit_body() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([26; 32], 60_000).unwrap(),
+            CheckpointCodec::new([26; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let document = DocumentId::new();
         let peer = PeerId::new();
         let victim_path = path("merge-victim");
         let replica = ReplicaId::new();
-        let victim = Database::open(&victim_path, scope, replica).unwrap();
+        let victim = Database::open(&victim_path, scope, replica)?;
 
-        victim
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([0x81; 32]),
-                |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
-            )
-            .unwrap();
+        victim.edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([0x81; 32]),
+            |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
+        )?;
         victim
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
+            .await?;
 
-        let baseline = store.build_snapshot(scope, 1).await.unwrap();
+        let baseline = store.build_snapshot(scope, 1).await?;
         assert_eq!(baseline.documents.len(), 1);
 
         let local_operation = OperationId::new();
-        victim
-            .edit(
-                document,
-                local_operation,
-                OperationDigest::new([0x82; 32]),
-                |editor| editor.put(&Object::root(), "state", Scalar::Integer(2)),
-            )
-            .unwrap();
-        assert_eq!(victim.pending_changes(0, 10).unwrap().len(), 1);
+        victim.edit(
+            document,
+            local_operation,
+            OperationDigest::new([0x82; 32]),
+            |editor| editor.put(&Object::root(), "state", Scalar::Integer(2)),
+        )?;
+        assert_eq!(victim.pending_changes(0, 10)?.len(), 1);
 
-        victim
-            .install_baseline(peer, &baseline, b"merge-checkpoint")
-            .unwrap();
+        victim.install_baseline(peer, &baseline, b"merge-checkpoint")?;
 
         assert_eq!(
-            victim
-                .read(document, |reader| reader.get(&Object::root(), "state"))
-                .unwrap(),
+            victim.read(document, |reader| reader.get(&Object::root(), "state"))?,
             Some(Some(Item::Scalar(Scalar::Integer(2)))),
             "the baseline predates the local edit, so the merged value must keep it"
         );
-        let pending = victim.pending_changes(0, 10).unwrap();
+        let pending = victim.pending_changes(0, 10)?;
         assert_eq!(
             pending.len(),
             1,
@@ -935,68 +879,62 @@ mod tests {
         assert_eq!(pending[0].operation, local_operation);
         drop(victim);
 
-        let reopened = Database::open(&victim_path, scope, replica).unwrap();
+        let reopened = Database::open(&victim_path, scope, replica)?;
         assert_eq!(
-            reopened
-                .read(document, |reader| reader.get(&Object::root(), "state"))
-                .unwrap(),
+            reopened.read(document, |reader| reader.get(&Object::root(), "state"))?,
             Some(Some(Item::Scalar(Scalar::Integer(2)))),
             "the merged local edit must survive reopen"
         );
         drop(reopened);
-        fs::remove_file(victim_path).unwrap();
+        fs::remove_file(victim_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn recovery_preserves_a_local_backlog_larger_than_one_upload_batch() {
-        lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
-            .block_on(recovery_preserves_a_large_backlog_body());
+    fn recovery_preserves_a_local_backlog_larger_than_one_upload_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(recovery_preserves_a_large_backlog_body())
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn recovery_preserves_a_large_backlog_body() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the large-backlog recovery journey is one linear fill/drain narrative; splitting it would hide the backlog depth that the test exists to prove"
+    )]
+    async fn recovery_preserves_a_large_backlog_body() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(
             Arc::clone(&store),
             TestAuthentication,
-            CheckpointCodec::new([26; 32], 60_000).unwrap(),
+            CheckpointCodec::new([26; 32], 60_000)?,
             FixedClock,
         );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         let server = lgwks_bot::rt::task::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
         });
-        let endpoint = format!("http://{address}/").parse().unwrap();
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+        let endpoint = format!("http://{address}/").parse()?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let peer = PeerId::new();
         let replica = ReplicaId::new();
         let backlog_path = path("backlog-victim");
-        let victim = Database::open(&backlog_path, scope, replica).unwrap();
+        let victim = Database::open(&backlog_path, scope, replica)?;
 
         let seeded = DocumentId::new();
-        victim
-            .edit(
-                seeded,
-                OperationId::new(),
-                OperationDigest::new([0x81; 32]),
-                |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
-            )
-            .unwrap();
+        victim.edit(
+            seeded,
+            OperationId::new(),
+            OperationDigest::new([0x81; 32]),
+            |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
+        )?;
         victim
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await
-            .unwrap();
-        let baseline = store.build_snapshot(scope, 1).await.unwrap();
+            .await?;
+        let baseline = store.build_snapshot(scope, 1).await?;
 
         let batch = usize::from(SyncLimits::default().changes_per_page);
         let backlog = batch + 2;
@@ -1007,38 +945,29 @@ mod tests {
             let operation = OperationId::new();
             let mut digest = [0u8; 32];
             digest[0] = 0x90;
-            digest[1] = u8::try_from(index & 0xff).expect("fixture index fits");
-            digest[2] = u8::try_from((index >> 8) & 0xff).expect("fixture index fits");
-            victim
-                .edit(
-                    document,
-                    operation,
-                    OperationDigest::new(digest),
-                    |editor| {
-                        editor.put(
-                            &Object::root(),
-                            "state",
-                            Scalar::Integer(i64::try_from(index).unwrap() + 10),
-                        )
-                    },
-                )
-                .unwrap();
+            digest[1] = u8::try_from(index & 0xff)?;
+            digest[2] = u8::try_from((index >> 8) & 0xff)?;
+            let sequence_value = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(10);
+            victim.edit(
+                document,
+                operation,
+                OperationDigest::new(digest),
+                |editor| editor.put(&Object::root(), "state", Scalar::Integer(sequence_value)),
+            )?;
             documents.push(document);
             operations.push(operation);
         }
 
-        let before = victim.pending_changes(0, backlog + 8).unwrap();
+        let before = victim.pending_changes(0, backlog.saturating_add(8))?;
         assert!(
             before.len() > batch,
             "the fixture backlog must exceed one upload batch, saw {} of {batch}",
             before.len()
         );
 
-        victim
-            .install_baseline(peer, &baseline, b"backlog-checkpoint")
-            .unwrap();
+        victim.install_baseline(peer, &baseline, b"backlog-checkpoint")?;
 
-        let after = victim.pending_changes(0, backlog + 8).unwrap();
+        let after = victim.pending_changes(0, backlog.saturating_add(8))?;
         assert_eq!(
             after.len(),
             backlog,
@@ -1048,94 +977,89 @@ mod tests {
         assert_eq!(kept, operations, "the backlog must keep its exact order");
         for (index, document) in documents.iter().enumerate() {
             assert_eq!(
-                victim
-                    .read(*document, |reader| reader.get(&Object::root(), "state"))
-                    .unwrap(),
+                victim.read(*document, |reader| reader.get(&Object::root(), "state"))?,
                 Some(Some(Item::Scalar(Scalar::Integer(
-                    i64::try_from(index).unwrap() + 10
+                    i64::try_from(index)?.saturating_add(10)
                 )))),
                 "local change {index} of a multi-batch backlog must survive recovery"
             );
         }
         assert_eq!(
-            victim
-                .read(seeded, |reader| reader.get(&Object::root(), "state"))
-                .unwrap(),
+            victim.read(seeded, |reader| reader.get(&Object::root(), "state"))?,
             Some(Some(Item::Scalar(Scalar::Integer(1)))),
             "the acknowledged seed change must not regress"
         );
         drop(victim);
-        let reopened = Database::open(&backlog_path, scope, replica).unwrap();
+        let reopened = Database::open(&backlog_path, scope, replica)?;
         assert_eq!(
-            reopened.pending_changes(0, backlog + 8).unwrap().len(),
+            reopened
+                .pending_changes(0, backlog.saturating_add(8))?
+                .len(),
             backlog,
             "the preserved backlog must be durable, not in-memory only"
         );
         drop(reopened);
-        fs::remove_file(backlog_path).unwrap();
+        fs::remove_file(backlog_path)?;
         server.abort();
+        Ok(())
     }
 
     #[test]
-    fn recovery_publishes_a_durable_invalidation_for_a_held_cursor() {
+    fn recovery_publishes_a_durable_invalidation_for_a_held_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
         lgwks_bot::Builder::new()
             .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .unwrap()
+            .build()?
             .block_on(async {
                 let store = Arc::new(MemoryServiceStore::default());
                 let app = router(
                     Arc::clone(&store),
                     TestAuthentication,
-                    CheckpointCodec::new([27; 32], 60_000).unwrap(),
+                    CheckpointCodec::new([27; 32], 60_000)?,
                     FixedClock,
                 );
-                let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .unwrap();
-                let address = listener.local_addr().unwrap();
+                let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+                let address = listener.local_addr()?;
                 let server = lgwks_bot::rt::task::spawn(async move {
-                    axum::serve(listener, app).await.unwrap();
+                    let serve_result = axum::serve(listener, app).await;
+                    drop(serve_result);
                 });
-                let endpoint = format!("http://{address}/").parse().unwrap();
-                let mut transport =
-                    HttpTransport::new(endpoint, StaticBearer::new("black-box").unwrap()).unwrap();
+                let endpoint = format!("http://{address}/").parse()?;
+                let mut transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
 
                 let scope = Scope::new(AccountId::new(), SpaceId::new());
                 let document = DocumentId::new();
                 let peer = PeerId::new();
                 let victim_path = path("invalidate-victim");
                 let replica = ReplicaId::new();
-                let victim = Database::open(&victim_path, scope, replica).unwrap();
+                let victim = Database::open(&victim_path, scope, replica)?;
 
-                victim
-                    .edit(
-                        document,
-                        OperationId::new(),
-                        OperationDigest::new([0x91; 32]),
-                        |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
-                    )
-                    .unwrap();
+                victim.edit(
+                    document,
+                    OperationId::new(),
+                    OperationDigest::new([0x91; 32]),
+                    |editor| editor.put(&Object::root(), "state", Scalar::Integer(1)),
+                )?;
                 victim
                     .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-                    .await
-                    .unwrap();
+                    .await?;
 
                 // A subscriber holds a cursor immediately before recovery.
-                let held = victim.changes_since(0, 256).unwrap();
-                let cursor = held.last().unwrap().sequence();
-                assert_eq!(victim.baseline_generation().unwrap(), 0);
+                let held = victim.changes_since(0, 256)?;
+                let cursor = held
+                    .last()
+                    .ok_or("the held cursor must observe at least one change")?
+                    .sequence();
+                assert_eq!(victim.baseline_generation()?, 0);
 
-                let baseline = store.build_snapshot(scope, 1).await.unwrap();
-                victim
-                    .install_baseline(peer, &baseline, b"invalidate-checkpoint")
-                    .unwrap();
+                let baseline = store.build_snapshot(scope, 1).await?;
+                victim.install_baseline(peer, &baseline, b"invalidate-checkpoint")?;
 
                 // The install carries no change of its own, so nothing in the
                 // pre-recovery stream reveals it; the committed invalidation
                 // must still be exposed to the held cursor and be durable.
-                assert_eq!(victim.baseline_generation().unwrap(), 1);
-                let page = victim.changes_since(cursor, 256).unwrap();
+                assert_eq!(victim.baseline_generation()?, 1);
+                let page = victim.changes_since(cursor, 256)?;
                 assert_eq!(page.len(), 1, "the baseline install must be visible");
                 assert!(matches!(
                     page[0],
@@ -1144,9 +1068,9 @@ mod tests {
                 assert!(page[0].digest().is_none());
                 drop(victim);
 
-                let reopened = Database::open(&victim_path, scope, replica).unwrap();
-                assert_eq!(reopened.baseline_generation().unwrap(), 1);
-                let replayed = reopened.changes_since(cursor, 256).unwrap();
+                let reopened = Database::open(&victim_path, scope, replica)?;
+                assert_eq!(reopened.baseline_generation()?, 1);
+                let replayed = reopened.changes_since(cursor, 256)?;
                 assert!(
                     matches!(
                         replayed.as_slice(),
@@ -1156,29 +1080,27 @@ mod tests {
                 );
                 // The consumer rebuilds its view from the recovered state.
                 assert_eq!(
-                    reopened
-                        .read(document, |reader| reader.get(&Object::root(), "state"))
-                        .unwrap(),
+                    reopened.read(document, |reader| reader.get(&Object::root(), "state"))?,
                     Some(Some(Item::Scalar(Scalar::Integer(1))))
                 );
                 // A recovered replica's backup must round-trip through restore
                 // even though its baseline marker carries no change of its own.
-                let exported = reopened.export().unwrap();
+                let exported = reopened.export()?;
                 drop(reopened);
-                fs::remove_file(victim_path).unwrap();
+                fs::remove_file(victim_path)?;
 
                 let restored_path = path("invalidate-restored");
-                let restored = Database::open(&restored_path, scope, ReplicaId::new()).unwrap();
-                restored.restore(&exported).unwrap();
+                let restored = Database::open(&restored_path, scope, ReplicaId::new())?;
+                restored.restore(&exported)?;
                 assert_eq!(
-                    restored
-                        .read(document, |reader| reader.get(&Object::root(), "state"))
-                        .unwrap(),
+                    restored.read(document, |reader| reader.get(&Object::root(), "state"))?,
                     Some(Some(Item::Scalar(Scalar::Integer(1))))
                 );
                 drop(restored);
-                fs::remove_file(restored_path).unwrap();
+                fs::remove_file(restored_path)?;
                 server.abort();
-            });
+
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
     }
 }

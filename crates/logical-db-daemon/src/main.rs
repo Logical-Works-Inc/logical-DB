@@ -4,6 +4,14 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 use std::{error::Error, io, net::SocketAddr};
 
 use axum::http::HeaderValue;
@@ -210,7 +218,10 @@ async fn service_main() -> Result<(), Box<dyn Error>> {
         )?),
     );
 
-    #[allow(unsafe_code)]
+    #[expect(
+        unsafe_code,
+        reason = "FoundationDB network-boot FFI is the one reviewed unsafe leaf in this binary; the safe surface forbids unsafe_code at the crate root"
+    )]
     // SAFETY: FoundationDB requires exactly one network bootstrap per process.
     // This composition root calls it once, retains the returned guard until the
     // listener and all database-owning router state have been dropped, and does

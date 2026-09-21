@@ -27,6 +27,7 @@ use thiserror::Error;
 
 /// Current wire protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Maximum opaque checkpoint token length accepted from the wire.
 const MAX_CHECKPOINT_BYTES: usize = 4_096;
 
 /// Opaque server-issued progress position for exactly one account and space.
@@ -50,7 +51,6 @@ impl Checkpoint {
     /// exceeds the opaque-token bound.
     pub fn from_wire(bytes: Vec<u8>) -> Result<Self, ProtocolError> {
         if bytes.is_empty() || bytes.len() > MAX_CHECKPOINT_BYTES {
-            eprintln!("logical-db-protocol: from_wire: InvalidCheckpoint");
             return Err(ProtocolError::InvalidCheckpoint);
         }
         Ok(Self(bytes))
@@ -89,6 +89,31 @@ pub struct ChangeEnvelope {
 }
 
 impl ChangeEnvelope {
+    /// Builds one immutable change from its identities and canonical CRDT bytes.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose envelopes exclusively through here.
+    #[must_use]
+    pub fn new(
+        scope: Scope,
+        document: DocumentId,
+        replica: ReplicaId,
+        operation: OperationId,
+        request: OperationDigest,
+        digest: ChangeDigest,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            scope,
+            document,
+            replica,
+            operation,
+            request,
+            digest,
+            bytes,
+        }
+    }
+
     /// Validates an untrusted envelope before storage or CRDT decoding.
     ///
     /// # Errors
@@ -97,7 +122,6 @@ impl ChangeEnvelope {
     /// empty or exceeds the per-change bound.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.bytes.is_empty() || self.bytes.len() > MAX_CHANGE_BYTES {
-            eprintln!("logical-db-protocol: validate: InvalidChangeSize");
             return Err(ProtocolError::InvalidChangeSize(self.bytes.len()));
         }
         Ok(())
@@ -119,6 +143,19 @@ pub struct PushRequest {
 }
 
 impl PushRequest {
+    /// Builds a bounded upload request from its version, sender, and changes.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose requests exclusively through here.
+    #[must_use]
+    pub fn new(protocol: u16, replica: ReplicaId, changes: Vec<ChangeEnvelope>) -> Self {
+        Self {
+            protocol,
+            replica,
+            changes,
+        }
+    }
+
     /// Enforces count, byte, version, and sender invariants.
     ///
     /// # Errors
@@ -133,7 +170,6 @@ impl PushRequest {
             .iter()
             .any(|change| change.replica != self.replica)
         {
-            eprintln!("logical-db-protocol: validate: ReplicaMismatch");
             return Err(ProtocolError::ReplicaMismatch);
         }
         Ok(())
@@ -198,6 +234,15 @@ pub struct PushResponse {
 }
 
 impl PushResponse {
+    /// Builds a service response from its version and ordered outcomes.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose responses exclusively through here.
+    #[must_use]
+    pub fn new(protocol: u16, outcomes: Vec<PushOutcome>) -> Self {
+        Self { protocol, outcomes }
+    }
+
     /// Verifies version, cardinality, and request-order operation correlation.
     ///
     /// # Errors
@@ -207,17 +252,15 @@ impl PushResponse {
     pub fn validate(&self, request: &PushRequest) -> Result<(), ProtocolError> {
         validate_protocol(self.protocol)?;
         if self.outcomes.len() != request.changes.len() {
-            eprintln!("logical-db-protocol: validate: OutcomeMismatch");
             return Err(ProtocolError::OutcomeMismatch);
         }
         for (outcome, change) in self.outcomes.iter().zip(&request.changes) {
-            let operation = match outcome {
+            let operation = match *outcome {
                 PushOutcome::Accepted { operation }
                 | PushOutcome::Duplicate { operation }
                 | PushOutcome::Rejected { operation, .. } => operation,
             };
-            if *operation != change.operation {
-                eprintln!("logical-db-protocol: validate: OutcomeMismatch");
+            if operation != change.operation {
                 return Err(ProtocolError::OutcomeMismatch);
             }
         }
@@ -247,6 +290,31 @@ pub struct PullRequest {
 }
 
 impl PullRequest {
+    /// Builds a bounded pull request from its version, scope, and page limits.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose requests exclusively through here.
+    #[must_use]
+    pub fn new(
+        protocol: u16,
+        scope: Scope,
+        replica: ReplicaId,
+        request: OperationDigest,
+        after: Option<Checkpoint>,
+        max_changes: u16,
+        max_bytes: u32,
+    ) -> Self {
+        Self {
+            protocol,
+            scope,
+            replica,
+            request,
+            after,
+            max_changes,
+            max_bytes,
+        }
+    }
+
     /// Validates bounds and protocol version before service work begins.
     ///
     /// # Errors
@@ -256,11 +324,11 @@ impl PullRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_protocol(self.protocol)?;
         if self.max_changes == 0 || usize::from(self.max_changes) > MAX_CHANGES_PER_PAGE {
-            eprintln!("logical-db-protocol: validate: PageLimit");
             return Err(ProtocolError::PageLimit);
         }
-        if self.max_bytes == 0 || self.max_bytes as usize > MAX_PAGE_BYTES {
-            eprintln!("logical-db-protocol: validate: PageLimit");
+        let max_bytes =
+            usize::try_from(self.max_bytes).map_err(|_error| ProtocolError::PageLimit)?;
+        if self.max_bytes == 0 || max_bytes > MAX_PAGE_BYTES {
             return Err(ProtocolError::PageLimit);
         }
         Ok(())
@@ -284,6 +352,25 @@ pub struct PullPage {
 }
 
 impl PullPage {
+    /// Builds one bounded service-to-client page from its changes and checkpoint.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose pages exclusively through here.
+    #[must_use]
+    pub fn new(
+        protocol: u16,
+        changes: Vec<ChangeEnvelope>,
+        checkpoint: Checkpoint,
+        more: bool,
+    ) -> Self {
+        Self {
+            protocol,
+            changes,
+            checkpoint,
+            more,
+        }
+    }
+
     /// Validates a page before any durable local mutation starts.
     ///
     /// # Errors
@@ -294,7 +381,6 @@ impl PullPage {
         validate_protocol(self.protocol)?;
         validate_page(&self.changes)?;
         if self.more && self.changes.is_empty() {
-            eprintln!("logical-db-protocol: validate: NonProgressPage");
             return Err(ProtocolError::NonProgressPage);
         }
         if self
@@ -302,7 +388,6 @@ impl PullPage {
             .iter()
             .any(|change| change.scope != expected_scope)
         {
-            eprintln!("logical-db-protocol: validate: ScopeMismatch");
             return Err(ProtocolError::ScopeMismatch);
         }
         Ok(())
@@ -334,6 +419,29 @@ pub struct BaselineRequest {
 }
 
 impl BaselineRequest {
+    /// Builds a bounded recovery request from its scope, replica, and cursors.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose requests exclusively through here.
+    #[must_use]
+    pub fn new(
+        protocol: u16,
+        scope: Scope,
+        replica: ReplicaId,
+        request: OperationDigest,
+        after: Option<Checkpoint>,
+        after_document: Option<DocumentId>,
+    ) -> Self {
+        Self {
+            protocol,
+            scope,
+            replica,
+            request,
+            after,
+            after_document,
+        }
+    }
+
     /// Validates the protocol version before service work begins.
     ///
     /// # Errors
@@ -359,6 +467,21 @@ pub struct BaselineDocument {
         deserialize_with = "deserialize_baseline_snapshot"
     )]
     pub snapshot: Vec<u8>,
+}
+
+impl BaselineDocument {
+    /// Builds one document state from its identity, tombstone flag, and bytes.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose document states through here.
+    #[must_use]
+    pub fn new(document: DocumentId, tombstone: bool, snapshot: Vec<u8>) -> Self {
+        Self {
+            document,
+            tombstone,
+            snapshot,
+        }
+    }
 }
 
 /// One bounded, versioned page of a state-bearing recovery baseline.
@@ -394,6 +517,29 @@ pub struct BaselinePage {
 }
 
 impl BaselinePage {
+    /// Builds one bounded baseline page from its descriptor, documents, and cursor.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose pages exclusively through here.
+    #[must_use]
+    pub fn new(
+        protocol: u16,
+        descriptor: Vec<u8>,
+        documents: Vec<BaselineDocument>,
+        checkpoint: Checkpoint,
+        more: bool,
+        next_document: Option<DocumentId>,
+    ) -> Self {
+        Self {
+            protocol,
+            descriptor,
+            documents,
+            checkpoint,
+            more,
+            next_document,
+        }
+    }
+
     /// Validates one page of a paged baseline and returns its descriptor.
     ///
     /// Enforces the protocol version, a decodable state-bearing descriptor,
@@ -410,9 +556,6 @@ impl BaselinePage {
     pub fn validate_page(&self, expected_scope: Scope) -> Result<SnapshotBaseline, ProtocolError> {
         validate_protocol(self.protocol)?;
         if self.documents.len() > MAX_BASELINE_PAGE_DOCUMENTS {
-            eprintln!(
-                "logical-db-protocol: BaselinePage::validate_page: document count over limit"
-            );
             return Err(ProtocolError::InvalidBaselineDocuments);
         }
         let page_bytes = self
@@ -423,7 +566,6 @@ impl BaselinePage {
             })
             .ok_or(ProtocolError::InvalidBaselineDocuments)?;
         if page_bytes > MAX_BASELINE_BYTES {
-            eprintln!("logical-db-protocol: BaselinePage::validate_page: page bytes over limit");
             return Err(ProtocolError::InvalidBaselineDocuments);
         }
         let descriptor = match SnapshotBaseline::decode(&self.descriptor) {
@@ -449,10 +591,9 @@ impl BaselinePage {
                 document.snapshot.clone(),
                 document.tombstone,
             );
-            builder.push(&state).map_err(|error| {
-                eprintln!("logical-db-protocol: BaselinePage::validate_page documents: {error}");
-                ProtocolError::InvalidBaselineDocuments
-            })?;
+            builder
+                .push(&state)
+                .map_err(|_error| ProtocolError::InvalidBaselineDocuments)?;
         }
         let continues = match (self.more, self.next_document) {
             (true, Some(cursor)) => self.documents.last().map(|last| last.document) == Some(cursor),
@@ -460,7 +601,6 @@ impl BaselinePage {
             (true, None) | (false, Some(_)) => false,
         };
         if !continues {
-            eprintln!("logical-db-protocol: BaselinePage::validate_page: NonProgressPage");
             return Err(ProtocolError::NonProgressPage);
         }
         Ok(descriptor)
@@ -478,11 +618,11 @@ impl BaselinePage {
     pub fn validate(&self, expected_scope: Scope) -> Result<SnapshotArtifact, ProtocolError> {
         let descriptor = self.validate_page(expected_scope)?;
         if self.more {
-            eprintln!("logical-db-protocol: BaselinePage::validate: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
-        if descriptor.document_count() as usize != self.documents.len() {
-            eprintln!("logical-db-protocol: BaselinePage::validate: BaselineMismatch");
+        let document_count = usize::try_from(descriptor.document_count())
+            .map_err(|_error| ProtocolError::BaselineMismatch)?;
+        if document_count != self.documents.len() {
             return Err(ProtocolError::BaselineMismatch);
         }
         let documents = self
@@ -497,12 +637,8 @@ impl BaselinePage {
             })
             .collect::<Vec<_>>();
         let artifact = SnapshotArtifact::new(expected_scope, descriptor.position(), documents)
-            .map_err(|error| {
-                eprintln!("logical-db-protocol: BaselinePage::validate documents: {error}");
-                ProtocolError::InvalidBaselineDocuments
-            })?;
+            .map_err(|_error| ProtocolError::InvalidBaselineDocuments)?;
         if artifact.baseline != descriptor {
-            eprintln!("logical-db-protocol: BaselinePage::validate: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
         Ok(artifact)
@@ -518,11 +654,17 @@ impl BaselinePage {
 /// descriptor's document count and digest exactly.
 #[derive(Debug)]
 pub struct BaselineAccumulator {
+    /// Scope every folded page must match.
     scope: Scope,
+    /// Descriptor each folded page must reproduce.
     descriptor: SnapshotBaseline,
+    /// Documents accumulated in strictly ascending order.
     documents: Vec<SnapshotDocument>,
+    /// Aggregate snapshot bytes accumulated so far.
     byte_len: usize,
+    /// Exclusive identity of the last accepted document.
     last: Option<DocumentId>,
+    /// Whether a terminal page has completed the artifact.
     complete: bool,
 }
 
@@ -555,11 +697,9 @@ impl BaselineAccumulator {
     /// the aggregate bounds, or arrives after completion.
     pub fn push(&mut self, page: &BaselinePage) -> Result<bool, ProtocolError> {
         if self.complete {
-            eprintln!("logical-db-protocol: BaselineAccumulator::push: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
         if page.validate_page(self.scope)? != self.descriptor {
-            eprintln!("logical-db-protocol: BaselineAccumulator::push: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
         if self
@@ -568,24 +708,17 @@ impl BaselineAccumulator {
             .checked_add(page.documents.len())
             .is_none_or(|total| total > MAX_BASELINE_DOCUMENTS)
         {
-            eprintln!("logical-db-protocol: BaselineAccumulator::push: InvalidBaselineDocuments");
             return Err(ProtocolError::InvalidBaselineDocuments);
         }
         for document in &page.documents {
             if self.last.is_some_and(|last| last >= document.document) {
-                eprintln!("logical-db-protocol: BaselineAccumulator::push: BaselineMismatch");
                 return Err(ProtocolError::BaselineMismatch);
             }
             self.byte_len = self
                 .byte_len
                 .checked_add(document.snapshot.len())
                 .filter(|total| *total <= MAX_BASELINE_BYTES)
-                .ok_or_else(|| {
-                    eprintln!(
-                        "logical-db-protocol: BaselineAccumulator::push: InvalidBaselineDocuments"
-                    );
-                    ProtocolError::InvalidBaselineDocuments
-                })?;
+                .ok_or(ProtocolError::InvalidBaselineDocuments)?;
             self.last = Some(document.document);
             self.documents.push(SnapshotDocument::new(
                 document.document,
@@ -605,20 +738,12 @@ impl BaselineAccumulator {
     /// not reproduce the descriptor exactly.
     pub fn finish(self) -> Result<SnapshotArtifact, ProtocolError> {
         if !self.complete {
-            eprintln!("logical-db-protocol: BaselineAccumulator::finish: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
-        let artifact = SnapshotArtifact::new(
-            self.scope,
-            self.descriptor.position(),
-            self.documents,
-        )
-        .map_err(|error| {
-            eprintln!("logical-db-protocol: BaselineAccumulator::finish documents: {error}");
-            ProtocolError::InvalidBaselineDocuments
-        })?;
+        let artifact =
+            SnapshotArtifact::new(self.scope, self.descriptor.position(), self.documents)
+                .map_err(|_error| ProtocolError::InvalidBaselineDocuments)?;
         if artifact.baseline != self.descriptor {
-            eprintln!("logical-db-protocol: BaselineAccumulator::finish: BaselineMismatch");
             return Err(ProtocolError::BaselineMismatch);
         }
         Ok(artifact)
@@ -669,6 +794,7 @@ pub enum ProtocolError {
     BaselineMismatch,
 }
 
+/// Refuses any wire version other than [`PROTOCOL_VERSION`].
 fn validate_protocol(version: u16) -> Result<(), ProtocolError> {
     if version == PROTOCOL_VERSION {
         Ok(())
@@ -680,9 +806,9 @@ fn validate_protocol(version: u16) -> Result<(), ProtocolError> {
     }
 }
 
+/// Enforces per-change validity plus the page count and aggregate byte bounds.
 fn validate_page(changes: &[ChangeEnvelope]) -> Result<(), ProtocolError> {
     if changes.len() > MAX_CHANGES_PER_PAGE {
-        eprintln!("logical-db-protocol: validate_page: PageLimit");
         return Err(ProtocolError::PageLimit);
     }
     let mut bytes = 0usize;
@@ -690,49 +816,49 @@ fn validate_page(changes: &[ChangeEnvelope]) -> Result<(), ProtocolError> {
         change.validate()?;
         bytes = bytes.saturating_add(change.bytes.len());
         if bytes > MAX_PAGE_BYTES {
-            eprintln!("logical-db-protocol: validate_page: PageLimit");
             return Err(ProtocolError::PageLimit);
         }
     }
     Ok(())
 }
 
+/// Decodes opaque checkpoint bytes, bounding length and refusing emptiness.
 fn deserialize_checkpoint_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let bytes = deserialize_bounded_bytes(deserializer, MAX_CHECKPOINT_BYTES, "checkpoint bytes")?;
     if bytes.is_empty() {
-        eprintln!("logical-db-protocol: deserialize_checkpoint_bytes: custom");
         return Err(D::Error::custom("checkpoint must not be empty"));
     }
     Ok(bytes)
 }
 
+/// Decodes change bytes, bounding length and refusing emptiness.
 fn deserialize_change_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let bytes = deserialize_bounded_bytes(deserializer, MAX_CHANGE_BYTES, "change bytes")?;
     if bytes.is_empty() {
-        eprintln!("logical-db-protocol: deserialize_change_bytes: custom");
         return Err(D::Error::custom("change bytes must not be empty"));
     }
     Ok(bytes)
 }
 
+/// Decodes one baseline document snapshot, bounding and refusing emptiness.
 fn deserialize_baseline_snapshot<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let bytes = deserialize_bounded_bytes(deserializer, MAX_BASELINE_BYTES, "baseline document")?;
     if bytes.is_empty() {
-        eprintln!("logical-db-protocol: deserialize_baseline_snapshot: custom");
         return Err(D::Error::custom("baseline document must not be empty"));
     }
     Ok(bytes)
 }
 
+/// Decodes a fixed baseline descriptor, bounding and refusing emptiness.
 fn deserialize_baseline_descriptor<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
@@ -740,18 +866,19 @@ where
     let bytes =
         deserialize_bounded_bytes(deserializer, SNAPSHOT_BASELINE_BYTES, "baseline descriptor")?;
     if bytes.is_empty() {
-        eprintln!("logical-db-protocol: deserialize_baseline_descriptor: custom");
         return Err(D::Error::custom("baseline descriptor must not be empty"));
     }
     Ok(bytes)
 }
 
+/// Decodes a page of baseline documents, capping count and aggregate bytes.
 fn deserialize_baseline_documents<'de, D>(
     deserializer: D,
 ) -> Result<Vec<BaselineDocument>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    /// Visitor that caps the baseline document page at its count and byte bounds.
     struct BaselineDocumentsVisitor;
 
     impl<'de> Visitor<'de> for BaselineDocumentsVisitor {
@@ -773,14 +900,12 @@ where
             let mut aggregate_bytes = 0usize;
             while let Some(document) = sequence.next_element::<BaselineDocument>()? {
                 if documents.len() == MAX_BASELINE_PAGE_DOCUMENTS {
-                    eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("baseline document count exceeds limit"));
                 }
                 aggregate_bytes = aggregate_bytes
                     .checked_add(document.snapshot.len())
                     .ok_or_else(|| A::Error::custom("baseline byte count overflow"))?;
                 if aggregate_bytes > MAX_BASELINE_BYTES {
-                    eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("baseline bytes exceed limit"));
                 }
                 documents.push(document);
@@ -792,10 +917,12 @@ where
     deserializer.deserialize_seq(BaselineDocumentsVisitor)
 }
 
+/// Decodes a page of change envelopes, capping count and aggregate bytes.
 fn deserialize_changes<'de, D>(deserializer: D) -> Result<Vec<ChangeEnvelope>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    /// Visitor that caps the change page at its count and byte bounds.
     struct ChangesVisitor;
 
     impl<'de> Visitor<'de> for ChangesVisitor {
@@ -814,14 +941,12 @@ where
             let mut aggregate_bytes = 0usize;
             while let Some(change) = sequence.next_element::<ChangeEnvelope>()? {
                 if changes.len() == MAX_CHANGES_PER_PAGE {
-                    eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("change page count exceeds limit"));
                 }
                 aggregate_bytes = aggregate_bytes
                     .checked_add(change.bytes.len())
                     .ok_or_else(|| A::Error::custom("change page byte count overflow"))?;
                 if aggregate_bytes > MAX_PAGE_BYTES {
-                    eprintln!("logical-db-protocol: visit_seq: custom");
                     return Err(A::Error::custom("change page bytes exceed limit"));
                 }
                 changes.push(change);
@@ -833,6 +958,7 @@ where
     deserializer.deserialize_seq(ChangesVisitor)
 }
 
+/// Decodes a bounded push-outcome list.
 fn deserialize_outcomes<'de, D>(deserializer: D) -> Result<Vec<PushOutcome>, D::Error>
 where
     D: Deserializer<'de>,
@@ -840,6 +966,8 @@ where
     deserialize_bounded_vec(deserializer, MAX_CHANGES_PER_PAGE, "push outcomes")
 }
 
+/// Decodes byte content through any serde byte representation, bounding it to
+/// `maximum`.
 fn deserialize_bounded_bytes<'de, D>(
     deserializer: D,
     maximum: usize,
@@ -848,8 +976,11 @@ fn deserialize_bounded_bytes<'de, D>(
 where
     D: Deserializer<'de>,
 {
+    /// Visitor that bounds every byte representation to the configured maximum.
     struct BytesVisitor {
+        /// Maximum byte length the visitor will accept.
         maximum: usize,
+        /// Human-readable description used in decode errors.
         expecting: &'static str,
     }
 
@@ -865,10 +996,6 @@ where
             E: serde::de::Error,
         {
             if value.len() > self.maximum {
-                eprintln!(
-                    "logical-db-protocol: borrowed bytes exceed {}",
-                    self.maximum
-                );
                 return Err(E::invalid_length(value.len(), &self));
             }
             Ok(value.to_vec())
@@ -886,7 +1013,6 @@ where
             E: serde::de::Error,
         {
             if value.len() > self.maximum {
-                eprintln!("logical-db-protocol: visit_byte_buf: invalid_length");
                 return Err(E::invalid_length(value.len(), &self));
             }
             Ok(value)
@@ -900,7 +1026,6 @@ where
             let mut values = Vec::with_capacity(capacity);
             while let Some(value) = sequence.next_element()? {
                 if values.len() == self.maximum {
-                    eprintln!("logical-db-protocol: visit_seq: invalid_length");
                     return Err(A::Error::invalid_length(
                         self.maximum.saturating_add(1),
                         &self,
@@ -916,6 +1041,7 @@ where
     deserializer.deserialize_byte_buf(visitor)
 }
 
+/// Collects at most `maximum` sequence items, refusing the first excess item.
 fn deserialize_bounded_vec<'de, D, T>(
     deserializer: D,
     maximum: usize,
@@ -925,9 +1051,13 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
+    /// Visitor that caps a sequence at its configured item bound.
     struct BoundedVecVisitor<T> {
+        /// Maximum number of items the sequence may yield.
         maximum: usize,
+        /// Human-readable description used in decode errors.
         expecting: &'static str,
+        /// Type marker for the deserialized element.
         marker: std::marker::PhantomData<T>,
     }
 
@@ -949,7 +1079,6 @@ where
             let mut values = Vec::with_capacity(capacity);
             while let Some(value) = sequence.next_element()? {
                 if values.len() == self.maximum {
-                    eprintln!("logical-db-protocol: visit_seq: invalid_length");
                     return Err(A::Error::invalid_length(
                         self.maximum.saturating_add(1),
                         &self,
@@ -970,9 +1099,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use logical_db_model::{AccountId, SNAPSHOT_BASELINE_LEGACY_VERSION, SpaceId};
 
     use super::*;
+
+    /// Builds one valid change envelope for the given sender and scope.
+    fn envelope(replica: ReplicaId, scope: Scope) -> ChangeEnvelope {
+        ChangeEnvelope {
+            scope,
+            document: DocumentId::new(),
+            replica,
+            operation: OperationId::new(),
+            request: OperationDigest::new([3; 32]),
+            digest: ChangeDigest::new([7; 32]),
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    /// Decodes a valid one-byte checkpoint for fixtures.
+    fn checkpoint() -> Result<Checkpoint, Box<dyn Error>> {
+        Ok(Checkpoint::from_wire(vec![1])?)
+    }
 
     #[test]
     fn mixed_push_outcomes_preserve_operation_correlation() {
@@ -994,24 +1143,17 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             outcomes: vec![duplicate, rejected],
         };
-        assert_eq!(response.validate(&request), Ok(()));
+        assert_eq!(
+            response.validate(&request),
+            Ok(()),
+            "correlated outcomes must validate"
+        );
         response.outcomes.swap(0, 1);
         assert_eq!(
             response.validate(&request),
-            Err(ProtocolError::OutcomeMismatch)
+            Err(ProtocolError::OutcomeMismatch),
+            "swapped outcomes must be refused"
         );
-    }
-
-    fn envelope(replica: ReplicaId, scope: Scope) -> ChangeEnvelope {
-        ChangeEnvelope {
-            scope,
-            document: DocumentId::new(),
-            replica,
-            operation: OperationId::new(),
-            request: OperationDigest::new([3; 32]),
-            digest: ChangeDigest::new([7; 32]),
-            bytes: vec![1, 2, 3],
-        }
     }
 
     #[test]
@@ -1023,32 +1165,46 @@ mod tests {
             replica: sender,
             changes: vec![envelope(ReplicaId::new(), scope)],
         };
-        assert_eq!(request.validate(), Err(ProtocolError::ReplicaMismatch));
+        assert_eq!(
+            request.validate(),
+            Err(ProtocolError::ReplicaMismatch),
+            "a foreign sender must be refused"
+        );
     }
 
     #[test]
-    fn pull_rejects_cross_scope_material() {
+    fn pull_rejects_cross_scope_material() -> Result<(), Box<dyn Error>> {
         let first = Scope::new(AccountId::new(), SpaceId::new());
         let second = Scope::new(AccountId::new(), SpaceId::new());
         let page = PullPage {
             protocol: PROTOCOL_VERSION,
             changes: vec![envelope(ReplicaId::new(), second)],
-            checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+            checkpoint: checkpoint()?,
             more: false,
         };
-        assert_eq!(page.validate(first), Err(ProtocolError::ScopeMismatch));
+        assert_eq!(
+            page.validate(first),
+            Err(ProtocolError::ScopeMismatch),
+            "material from another scope must be refused"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pull_rejects_a_non_progress_page() {
+    fn pull_rejects_a_non_progress_page() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let page = PullPage {
             protocol: PROTOCOL_VERSION,
             changes: Vec::new(),
-            checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+            checkpoint: checkpoint()?,
             more: true,
         };
-        assert_eq!(page.validate(scope), Err(ProtocolError::NonProgressPage));
+        assert_eq!(
+            page.validate(scope),
+            Err(ProtocolError::NonProgressPage),
+            "a more=true empty page must be refused"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1070,7 +1226,8 @@ mod tests {
         };
         assert_eq!(
             missing.validate(&request),
-            Err(ProtocolError::OutcomeMismatch)
+            Err(ProtocolError::OutcomeMismatch),
+            "an omitted outcome must be refused"
         );
         let reordered = PushResponse {
             protocol: PROTOCOL_VERSION,
@@ -1085,7 +1242,8 @@ mod tests {
         };
         assert_eq!(
             reordered.validate(&request),
-            Err(ProtocolError::OutcomeMismatch)
+            Err(ProtocolError::OutcomeMismatch),
+            "reordered outcomes must be refused"
         );
     }
 
@@ -1093,9 +1251,12 @@ mod tests {
     fn hostile_sequence_hint_cannot_preallocate_past_change_limit() {
         use lgwks_std::json::serde::de::value::{Error as ValueError, SeqDeserializer};
 
-        let oversized = std::iter::repeat_n(0u8, MAX_CHANGE_BYTES + 1);
+        let oversized = std::iter::repeat_n(0u8, MAX_CHANGE_BYTES.saturating_add(1));
         let deserializer = SeqDeserializer::<_, ValueError>::new(oversized);
-        assert!(deserialize_change_bytes(deserializer).is_err());
+        assert!(
+            deserialize_change_bytes(deserializer).is_err(),
+            "a sequence above the change bound must be refused"
+        );
     }
 
     #[test]
@@ -1103,54 +1264,75 @@ mod tests {
         use lgwks_std::json::serde::de::value::{Error as ValueError, SeqDeserializer};
 
         let empty = SeqDeserializer::<_, ValueError>::new(std::iter::empty::<u8>());
-        assert!(Checkpoint::deserialize(empty).is_err());
+        assert!(
+            Checkpoint::deserialize(empty).is_err(),
+            "an empty checkpoint must be refused"
+        );
         let oversized = SeqDeserializer::<_, ValueError>::new(std::iter::repeat_n(
             0u8,
-            MAX_CHECKPOINT_BYTES + 1,
+            MAX_CHECKPOINT_BYTES.saturating_add(1),
         ));
-        assert!(Checkpoint::deserialize(oversized).is_err());
+        assert!(
+            Checkpoint::deserialize(oversized).is_err(),
+            "an oversized checkpoint must be refused"
+        );
     }
 
     #[test]
-    fn checkpoint_and_change_bounds_accept_exact_edges_only() {
+    fn checkpoint_and_change_bounds_accept_exact_edges_only() -> Result<(), Box<dyn Error>> {
         assert_eq!(
             Checkpoint::from_wire(Vec::new()),
-            Err(ProtocolError::InvalidCheckpoint)
+            Err(ProtocolError::InvalidCheckpoint),
+            "an empty checkpoint must be refused"
         );
-        let one = Checkpoint::from_wire(vec![9]).unwrap();
-        assert_eq!(one.as_wire(), &[9]);
+        let one = Checkpoint::from_wire(vec![9])?;
+        assert_eq!(one.as_wire(), &[9], "the checkpoint must round-trip");
         let maximum = vec![7; MAX_CHECKPOINT_BYTES];
         assert_eq!(
-            Checkpoint::from_wire(maximum.clone()).unwrap().as_wire(),
-            maximum
+            Checkpoint::from_wire(maximum.clone())?.as_wire(),
+            maximum,
+            "a maximum-length checkpoint must round-trip"
         );
         assert_eq!(
-            Checkpoint::from_wire(vec![0; MAX_CHECKPOINT_BYTES + 1]),
-            Err(ProtocolError::InvalidCheckpoint)
+            Checkpoint::from_wire(vec![0; MAX_CHECKPOINT_BYTES.saturating_add(1)]),
+            Err(ProtocolError::InvalidCheckpoint),
+            "one byte above the checkpoint bound must be refused"
         );
 
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let mut change = envelope(replica, scope);
         change.bytes.clear();
-        assert_eq!(change.validate(), Err(ProtocolError::InvalidChangeSize(0)));
+        assert_eq!(
+            change.validate(),
+            Err(ProtocolError::InvalidChangeSize(0)),
+            "an empty change must be refused"
+        );
         change.bytes = vec![1];
-        assert_eq!(change.validate(), Ok(()));
+        assert_eq!(change.validate(), Ok(()), "a one-byte change is valid");
         change.bytes = vec![1; MAX_CHANGE_BYTES];
-        assert_eq!(change.validate(), Ok(()));
+        assert_eq!(
+            change.validate(),
+            Ok(()),
+            "a maximum-length change is valid"
+        );
         change.bytes.push(1);
         assert_eq!(
             change.validate(),
-            Err(ProtocolError::InvalidChangeSize(MAX_CHANGE_BYTES + 1))
+            Err(ProtocolError::InvalidChangeSize(
+                MAX_CHANGE_BYTES.saturating_add(1)
+            )),
+            "one byte above the change bound must be refused"
         );
+        Ok(())
     }
 
     #[test]
     fn every_protocol_and_page_boundary_has_an_exact_rejection_edge() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
-        let max_changes = u16::try_from(MAX_CHANGES_PER_PAGE).unwrap();
-        let max_bytes = u32::try_from(MAX_PAGE_BYTES).unwrap();
+        let max_changes = u16::try_from(MAX_CHANGES_PER_PAGE).unwrap_or(u16::MAX);
+        let max_bytes = u32::try_from(MAX_PAGE_BYTES).unwrap_or(u32::MAX);
         let pull = |protocol, max_changes, max_bytes| PullRequest {
             protocol,
             scope,
@@ -1160,60 +1342,90 @@ mod tests {
             max_changes,
             max_bytes,
         };
-        assert!(matches!(
-            pull(PROTOCOL_VERSION + 1, 1, 1).validate(),
-            Err(ProtocolError::UnsupportedVersion { .. })
-        ));
+        assert!(
+            matches!(
+                pull(PROTOCOL_VERSION.saturating_add(1), 1, 1).validate(),
+                Err(ProtocolError::UnsupportedVersion { .. })
+            ),
+            "a future protocol version must be refused"
+        );
         assert_eq!(
             pull(PROTOCOL_VERSION, 0, 1).validate(),
-            Err(ProtocolError::PageLimit)
+            Err(ProtocolError::PageLimit),
+            "a zero count limit must be refused"
         );
-        assert_eq!(pull(PROTOCOL_VERSION, 1, 1).validate(), Ok(()));
+        assert_eq!(
+            pull(PROTOCOL_VERSION, 1, 1).validate(),
+            Ok(()),
+            "a one/one limit is valid"
+        );
         assert_eq!(
             pull(PROTOCOL_VERSION, max_changes, max_bytes).validate(),
-            Ok(())
+            Ok(()),
+            "the exact maximum limits are valid"
         );
         assert_eq!(
-            pull(PROTOCOL_VERSION, max_changes + 1, 1).validate(),
-            Err(ProtocolError::PageLimit)
+            pull(PROTOCOL_VERSION, max_changes.saturating_add(1), 1).validate(),
+            Err(ProtocolError::PageLimit),
+            "one above the count limit must be refused"
         );
         assert_eq!(
             pull(PROTOCOL_VERSION, 1, 0).validate(),
-            Err(ProtocolError::PageLimit)
+            Err(ProtocolError::PageLimit),
+            "a zero byte limit must be refused"
         );
         assert_eq!(
-            pull(PROTOCOL_VERSION, 1, max_bytes + 1).validate(),
-            Err(ProtocolError::PageLimit)
+            pull(PROTOCOL_VERSION, 1, max_bytes.saturating_add(1)).validate(),
+            Err(ProtocolError::PageLimit),
+            "one above the byte limit must be refused"
         );
 
+        let capacity = MAX_PAGE_BYTES.div_euclid(MAX_CHANGE_BYTES);
         let mut exact_bytes = envelope(replica, scope);
         exact_bytes.bytes = vec![1; MAX_CHANGE_BYTES];
         let exact_page = PushRequest {
             protocol: PROTOCOL_VERSION,
             replica,
-            changes: vec![exact_bytes; MAX_PAGE_BYTES / MAX_CHANGE_BYTES],
+            changes: vec![exact_bytes; capacity],
         };
-        assert_eq!(exact_page.validate(), Ok(()));
+        assert_eq!(
+            exact_page.validate(),
+            Ok(()),
+            "the exact aggregate byte maximum is valid"
+        );
         let mut oversized_page = exact_page;
         oversized_page.changes.push(envelope(replica, scope));
-        assert_eq!(oversized_page.validate(), Err(ProtocolError::PageLimit));
+        assert_eq!(
+            oversized_page.validate(),
+            Err(ProtocolError::PageLimit),
+            "one change above the byte maximum must be refused"
+        );
 
         let count_page = PushRequest {
             protocol: PROTOCOL_VERSION,
             replica,
-            changes: vec![envelope(replica, scope); MAX_CHANGES_PER_PAGE + 1],
+            changes: vec![envelope(replica, scope); MAX_CHANGES_PER_PAGE.saturating_add(1)],
         };
-        assert_eq!(count_page.validate(), Err(ProtocolError::PageLimit));
+        assert_eq!(
+            count_page.validate(),
+            Err(ProtocolError::PageLimit),
+            "one above the count maximum must be refused"
+        );
         let exact_count = PushRequest {
             protocol: PROTOCOL_VERSION,
             replica,
             changes: vec![envelope(replica, scope); MAX_CHANGES_PER_PAGE],
         };
-        assert_eq!(exact_count.validate(), Ok(()));
+        assert_eq!(
+            exact_count.validate(),
+            Ok(()),
+            "the exact count maximum is valid"
+        );
     }
 
     #[test]
-    fn bounded_deserializers_preserve_values_and_reject_the_first_excess_item() {
+    fn bounded_deserializers_preserve_values_and_reject_the_first_excess_item()
+    -> Result<(), Box<dyn Error>> {
         use lgwks_std::json::serde::de::value::{
             BorrowedBytesDeserializer, Error as ValueError, SeqDeserializer,
         };
@@ -1223,34 +1435,44 @@ mod tests {
             BorrowedBytesDeserializer::<ValueError>::new(&source),
             source.len(),
             "test bytes",
-        )
-        .unwrap();
-        assert_eq!(bytes, source);
+        )?;
+        assert_eq!(bytes, source, "borrowed bytes must pass through unchanged");
 
         let exact = SeqDeserializer::<_, ValueError>::new(0_u8..4);
         assert_eq!(
-            deserialize_bounded_vec::<_, u8>(exact, 4, "test values").unwrap(),
-            vec![0, 1, 2, 3]
+            deserialize_bounded_vec::<_, u8>(exact, 4, "test values")?,
+            vec![0, 1, 2, 3],
+            "an exact-length sequence must pass through unchanged"
         );
         let excessive = SeqDeserializer::<_, ValueError>::new(0_u8..5);
-        assert!(deserialize_bounded_vec::<_, u8>(excessive, 4, "test values").is_err());
+        assert!(
+            deserialize_bounded_vec::<_, u8>(excessive, 4, "test values").is_err(),
+            "one item above the bound must be refused"
+        );
 
         let exact_bytes = SeqDeserializer::<_, ValueError>::new(0_u8..4);
         assert_eq!(
-            deserialize_bounded_bytes(exact_bytes, 4, "test bytes").unwrap(),
-            vec![0, 1, 2, 3]
+            deserialize_bounded_bytes(exact_bytes, 4, "test bytes")?,
+            vec![0, 1, 2, 3],
+            "an exact-length byte sequence must pass through unchanged"
         );
         let shorter_bytes = SeqDeserializer::<_, ValueError>::new(0_u8..3);
         assert_eq!(
-            deserialize_bounded_bytes(shorter_bytes, 4, "test bytes").unwrap(),
-            vec![0, 1, 2]
+            deserialize_bounded_bytes(shorter_bytes, 4, "test bytes")?,
+            vec![0, 1, 2],
+            "a shorter byte sequence must pass through unchanged"
         );
         let excessive_bytes = SeqDeserializer::<_, ValueError>::new(0_u8..5);
-        assert!(deserialize_bounded_bytes(excessive_bytes, 4, "test bytes").is_err());
+        assert!(
+            deserialize_bounded_bytes(excessive_bytes, 4, "test bytes").is_err(),
+            "one byte above the bound must be refused"
+        );
+        Ok(())
     }
 
     #[test]
-    fn cbor_wire_visitors_preserve_exact_pages_and_reject_first_excess() {
+    fn cbor_wire_visitors_preserve_exact_pages_and_reject_first_excess()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let request = PushRequest {
@@ -1259,16 +1481,19 @@ mod tests {
             changes: vec![envelope(replica, scope); MAX_CHANGES_PER_PAGE],
         };
         let mut wire = Vec::new();
-        ciborium::into_writer(&request, &mut wire).unwrap();
-        let decoded: PushRequest = ciborium::from_reader(wire.as_slice()).unwrap();
-        assert_eq!(decoded, request);
-        assert_eq!(decoded.validate(), Ok(()));
+        ciborium::into_writer(&request, &mut wire)?;
+        let decoded: PushRequest = ciborium::from_reader(wire.as_slice())?;
+        assert_eq!(decoded, request, "a full push page must round-trip");
+        assert_eq!(decoded.validate(), Ok(()), "the decoded page must validate");
 
         let mut excessive = request.clone();
         excessive.changes.push(envelope(replica, scope));
         wire.clear();
-        ciborium::into_writer(&excessive, &mut wire).unwrap();
-        assert!(ciborium::from_reader::<PushRequest, _>(wire.as_slice()).is_err());
+        ciborium::into_writer(&excessive, &mut wire)?;
+        assert!(
+            ciborium::from_reader::<PushRequest, _>(wire.as_slice()).is_err(),
+            "a push page above the count bound must be refused"
+        );
 
         let response = PushResponse {
             protocol: PROTOCOL_VERSION,
@@ -1281,38 +1506,51 @@ mod tests {
                 .collect(),
         };
         wire.clear();
-        ciborium::into_writer(&response, &mut wire).unwrap();
-        let decoded: PushResponse = ciborium::from_reader(wire.as_slice()).unwrap();
-        assert_eq!(decoded, response);
+        ciborium::into_writer(&response, &mut wire)?;
+        let decoded: PushResponse = ciborium::from_reader(wire.as_slice())?;
+        assert_eq!(decoded, response, "a full response page must round-trip");
 
         let mut excessive = response;
         excessive.outcomes.push(PushOutcome::Accepted {
             operation: OperationId::new(),
         });
         wire.clear();
-        ciborium::into_writer(&excessive, &mut wire).unwrap();
-        assert!(ciborium::from_reader::<PushResponse, _>(wire.as_slice()).is_err());
+        ciborium::into_writer(&excessive, &mut wire)?;
+        assert!(
+            ciborium::from_reader::<PushResponse, _>(wire.as_slice()).is_err(),
+            "a response page above the count bound must be refused"
+        );
 
+        let capacity = MAX_PAGE_BYTES.div_euclid(MAX_CHANGE_BYTES);
         let mut exact_bytes = envelope(replica, scope);
         exact_bytes.bytes = vec![1; MAX_CHANGE_BYTES];
         let exact = PushRequest {
             protocol: PROTOCOL_VERSION,
             replica,
-            changes: vec![exact_bytes; MAX_PAGE_BYTES / MAX_CHANGE_BYTES],
+            changes: vec![exact_bytes; capacity],
         };
         wire.clear();
-        ciborium::into_writer(&exact, &mut wire).unwrap();
-        let decoded: PushRequest = ciborium::from_reader(wire.as_slice()).unwrap();
-        assert_eq!(decoded.changes.len(), exact.changes.len());
+        ciborium::into_writer(&exact, &mut wire)?;
+        let decoded: PushRequest = ciborium::from_reader(wire.as_slice())?;
+        assert_eq!(
+            decoded.changes.len(),
+            exact.changes.len(),
+            "an exact aggregate-byte page must round-trip"
+        );
         let mut excessive = exact;
         excessive.changes.push(envelope(replica, scope));
         wire.clear();
-        ciborium::into_writer(&excessive, &mut wire).unwrap();
-        assert!(ciborium::from_reader::<PushRequest, _>(wire.as_slice()).is_err());
+        ciborium::into_writer(&excessive, &mut wire)?;
+        assert!(
+            ciborium::from_reader::<PushRequest, _>(wire.as_slice()).is_err(),
+            "a page above the byte bound must be refused"
+        );
+        Ok(())
     }
 
     #[test]
-    fn valid_push_response_and_pull_page_still_validate_their_versions() {
+    fn valid_push_response_and_pull_page_still_validate_their_versions()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let change = envelope(replica, scope);
@@ -1327,45 +1565,57 @@ mod tests {
                 operation: change.operation,
             }],
         };
-        assert_eq!(valid.validate(&request), Ok(()));
-        assert!(matches!(
-            PushResponse {
-                protocol: PROTOCOL_VERSION + 1,
-                ..valid
-            }
-            .validate(&request),
-            Err(ProtocolError::UnsupportedVersion { .. })
-        ));
+        assert_eq!(
+            valid.validate(&request),
+            Ok(()),
+            "a matching response must validate"
+        );
+        assert!(
+            matches!(
+                PushResponse {
+                    protocol: PROTOCOL_VERSION.saturating_add(1),
+                    ..valid
+                }
+                .validate(&request),
+                Err(ProtocolError::UnsupportedVersion { .. })
+            ),
+            "a future response version must be refused"
+        );
         let page = PullPage {
-            protocol: PROTOCOL_VERSION + 1,
+            protocol: PROTOCOL_VERSION.saturating_add(1),
             changes: vec![change],
-            checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+            checkpoint: checkpoint()?,
             more: false,
         };
-        assert!(matches!(
-            page.validate(scope),
-            Err(ProtocolError::UnsupportedVersion { .. })
-        ));
+        assert!(
+            matches!(
+                page.validate(scope),
+                Err(ProtocolError::UnsupportedVersion { .. })
+            ),
+            "a future page version must be refused"
+        );
+        Ok(())
     }
 
+    /// Builds ordered state documents from `(snapshot, tombstone)` fixtures,
+    /// sorting by document identity so ordering is deterministic.
     fn ordered_documents(snapshots: &[(Vec<u8>, bool)]) -> Vec<SnapshotDocument> {
         let mut documents = snapshots
             .iter()
-            .map(|(snapshot, tombstone)| {
-                SnapshotDocument::new(DocumentId::new(), snapshot.clone(), *tombstone)
-            })
+            .map(|entry| SnapshotDocument::new(DocumentId::new(), entry.0.clone(), entry.1))
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
         documents
     }
 
+    /// Builds a valid single-page baseline carrying the supplied documents.
     fn baseline_page(
         scope: Scope,
         position: u64,
         documents: Vec<SnapshotDocument>,
-    ) -> BaselinePage {
-        let artifact = SnapshotArtifact::new(scope, position, documents).unwrap();
-        BaselinePage {
+    ) -> Result<BaselinePage, Box<dyn Error>> {
+        let artifact = SnapshotArtifact::new(scope, position, documents)?;
+        Ok(BaselinePage {
             protocol: PROTOCOL_VERSION,
             descriptor: artifact.baseline.encode().to_vec(),
             documents: artifact
@@ -1377,59 +1627,71 @@ mod tests {
                     snapshot: document.snapshot.clone(),
                 })
                 .collect(),
-            checkpoint: Checkpoint::from_wire(vec![7; 8]).unwrap(),
+            checkpoint: Checkpoint::from_wire(vec![7; 8])?,
             more: false,
             next_document: None,
-        }
+        })
     }
 
     #[test]
-    fn baseline_page_round_trips_and_reproduces_its_descriptor() {
+    fn baseline_page_round_trips_and_reproduces_its_descriptor() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let artifact = SnapshotArtifact::new(
             scope,
             7,
             ordered_documents(&[(vec![1, 2, 3], false), (vec![9], true)]),
-        )
-        .unwrap();
-        let page = baseline_page(scope, 7, artifact.documents.clone());
-        let encoded = lgwks_std::json::to_vec(&page).unwrap();
-        let decoded: BaselinePage = lgwks_std::json::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.validate(scope), Ok(artifact.clone()));
+        )?;
+        let page = baseline_page(scope, 7, artifact.documents.clone())?;
+        let encoded = lgwks_std::json::to_vec(&page)?;
+        let decoded: BaselinePage = lgwks_std::json::from_slice(&encoded)?;
+        assert_eq!(
+            decoded.validate(scope),
+            Ok(artifact.clone()),
+            "a JSON round-trip must reproduce the artifact"
+        );
         let mut wire = Vec::new();
-        ciborium::into_writer(&page, &mut wire).unwrap();
-        let decoded: BaselinePage = ciborium::from_reader(wire.as_slice()).unwrap();
-        assert_eq!(decoded.validate(scope), Ok(artifact));
+        ciborium::into_writer(&page, &mut wire)?;
+        let decoded: BaselinePage = ciborium::from_reader(wire.as_slice())?;
+        assert_eq!(
+            decoded.validate(scope),
+            Ok(artifact),
+            "a CBOR round-trip must reproduce the artifact"
+        );
+        Ok(())
     }
 
     #[test]
-    fn baseline_page_refuses_substituted_truncated_reordered_and_legacy_artifacts() {
+    fn baseline_page_refuses_substituted_truncated_reordered_and_legacy_artifacts()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let page = baseline_page(
             scope,
             3,
             ordered_documents(&[(vec![1, 2, 3], false), (vec![4], false)]),
-        );
+        )?;
 
         let mut substituted = page.clone();
         substituted.documents[0].snapshot = vec![9, 9, 9];
         assert_eq!(
             substituted.validate(scope),
-            Err(ProtocolError::BaselineMismatch)
+            Err(ProtocolError::BaselineMismatch),
+            "substituted content must be refused"
         );
 
         let mut truncated = page.clone();
         truncated.documents.pop();
         assert_eq!(
             truncated.validate(scope),
-            Err(ProtocolError::BaselineMismatch)
+            Err(ProtocolError::BaselineMismatch),
+            "a truncated artifact must be refused"
         );
 
         let mut reordered = page.clone();
         reordered.documents.reverse();
         assert_eq!(
             reordered.validate(scope),
-            Err(ProtocolError::InvalidBaselineDocuments)
+            Err(ProtocolError::InvalidBaselineDocuments),
+            "a reordered artifact must be refused"
         );
 
         let mut legacy = page;
@@ -1440,12 +1702,14 @@ mod tests {
         .concat();
         assert_eq!(
             legacy.validate(scope),
-            Err(ProtocolError::InvalidBaselineDescriptor)
+            Err(ProtocolError::InvalidBaselineDescriptor),
+            "a legacy descriptor must be refused"
         );
+        Ok(())
     }
 
     #[test]
-    fn baseline_document_count_is_bounded_during_decode() {
+    fn baseline_document_count_is_bounded_during_decode() -> Result<(), Box<dyn Error>> {
         let mut documents = Vec::new();
         for _ in 0..=MAX_BASELINE_PAGE_DOCUMENTS {
             documents.push(BaselineDocument {
@@ -1465,22 +1729,26 @@ mod tests {
             .encode()
             .to_vec(),
             documents,
-            checkpoint: Checkpoint::from_wire(vec![1]).unwrap(),
+            checkpoint: Checkpoint::from_wire(vec![1])?,
             more: false,
             next_document: None,
         };
-        let encoded = lgwks_std::json::to_vec(&page).unwrap();
-        assert!(lgwks_std::json::from_slice::<BaselinePage>(&encoded).is_err());
+        let encoded = lgwks_std::json::to_vec(&page)?;
+        assert!(
+            lgwks_std::json::from_slice::<BaselinePage>(&encoded).is_err(),
+            "a page above the per-page document bound must fail during decode"
+        );
+        Ok(())
     }
 
     #[test]
-    fn baseline_page_validator_refuses_typed_pages_over_its_bounds() {
+    fn baseline_page_validator_refuses_typed_pages_over_its_bounds() -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let descriptor =
             SnapshotBaseline::new(0, logical_db_model::BaselineDigest::new([0; 32]), 0, 0)
                 .encode()
                 .to_vec();
-        let checkpoint = Checkpoint::from_wire(vec![1]).unwrap();
+        let checkpoint = Checkpoint::from_wire(vec![1])?;
         let counted = BaselinePage {
             protocol: PROTOCOL_VERSION,
             descriptor: descriptor.clone(),
@@ -1497,8 +1765,10 @@ mod tests {
         };
         assert_eq!(
             counted.validate_page(scope),
-            Err(ProtocolError::InvalidBaselineDocuments)
+            Err(ProtocolError::InvalidBaselineDocuments),
+            "a page above the document count bound must be refused"
         );
+        let half = MAX_BASELINE_BYTES.div_euclid(2).saturating_add(1);
         let oversized = BaselinePage {
             protocol: PROTOCOL_VERSION,
             descriptor,
@@ -1506,12 +1776,12 @@ mod tests {
                 BaselineDocument {
                     document: DocumentId::new(),
                     tombstone: false,
-                    snapshot: vec![0; MAX_BASELINE_BYTES / 2 + 1],
+                    snapshot: vec![0; half],
                 },
                 BaselineDocument {
                     document: DocumentId::new(),
                     tombstone: false,
-                    snapshot: vec![0; MAX_BASELINE_BYTES / 2 + 1],
+                    snapshot: vec![0; half],
                 },
             ],
             checkpoint,
@@ -1520,30 +1790,36 @@ mod tests {
         };
         assert_eq!(
             oversized.validate_page(scope),
-            Err(ProtocolError::InvalidBaselineDocuments)
+            Err(ProtocolError::InvalidBaselineDocuments),
+            "a page above the aggregate byte bound must be refused"
         );
+        Ok(())
     }
 
-    fn ordered_states(count: usize) -> Vec<SnapshotDocument> {
+    /// Builds `count` distinct, ascending state documents via the model
+    /// constructor so the descriptor can be reproduced.
+    fn ordered_states(count: usize) -> Result<Vec<SnapshotDocument>, Box<dyn Error>> {
         let mut documents = (0..count)
             .map(|index| {
-                SnapshotDocument::new(
+                let payload = u8::try_from(index.rem_euclid(251))?.saturating_add(1);
+                Ok(SnapshotDocument::new(
                     DocumentId::new(),
-                    vec![u8::try_from(index % 251).unwrap() + 1],
+                    vec![payload],
                     false,
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
         documents.sort_by_key(|document| *document.document.as_uuid().as_bytes());
-        documents
+        Ok(documents)
     }
 
+    /// Builds one page of an artifact from `slice`, advertising continuation.
     fn paged_page(
         artifact: &SnapshotArtifact,
         slice: &[SnapshotDocument],
         more: bool,
-    ) -> BaselinePage {
-        BaselinePage {
+    ) -> Result<BaselinePage, Box<dyn Error>> {
+        Ok(BaselinePage {
             protocol: PROTOCOL_VERSION,
             descriptor: artifact.baseline.encode().to_vec(),
             documents: slice
@@ -1554,35 +1830,61 @@ mod tests {
                     snapshot: document.snapshot.clone(),
                 })
                 .collect(),
-            checkpoint: Checkpoint::from_wire(vec![9; 8]).unwrap(),
+            checkpoint: Checkpoint::from_wire(vec![9; 8])?,
             more,
             next_document: if more {
                 slice.last().map(|document| document.document)
             } else {
                 None
             },
-        }
+        })
     }
 
     #[test]
-    fn accumulator_folds_a_multi_page_baseline_and_refuses_gaps_and_shortfalls() {
+    fn accumulator_folds_a_multi_page_baseline_and_refuses_gaps_and_shortfalls()
+    -> Result<(), Box<dyn Error>> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let documents = ordered_states(MAX_BASELINE_PAGE_DOCUMENTS + 44);
-        let artifact = SnapshotArtifact::new(scope, 11, documents.clone()).unwrap();
+        let documents = ordered_states(MAX_BASELINE_PAGE_DOCUMENTS.saturating_add(44))?;
+        let artifact = SnapshotArtifact::new(scope, 11, documents.clone())?;
         let (first, rest) = documents.split_at(MAX_BASELINE_PAGE_DOCUMENTS);
-        let first_page = paged_page(&artifact, first, true);
-        let second_page = paged_page(&artifact, rest, false);
+        let first_page = paged_page(&artifact, first, true)?;
+        let second_page = paged_page(&artifact, rest, false)?;
         let mut accumulator = BaselineAccumulator::new(scope, artifact.baseline.clone());
-        assert!(!accumulator.push(&first_page).unwrap());
-        assert!(accumulator.push(&second_page).unwrap());
-        assert_eq!(accumulator.finish().unwrap(), artifact);
+        assert!(
+            !accumulator.push(&first_page)?,
+            "a non-terminal page must report incomplete"
+        );
+        assert!(
+            accumulator.push(&second_page)?,
+            "the terminal page must report complete"
+        );
+        assert_eq!(
+            accumulator.finish()?,
+            artifact,
+            "the folded artifact must match the original"
+        );
 
         let mut gap = BaselineAccumulator::new(scope, artifact.baseline.clone());
-        assert!(!gap.push(&first_page).unwrap());
-        assert_eq!(gap.push(&first_page), Err(ProtocolError::BaselineMismatch));
+        assert!(
+            !gap.push(&first_page)?,
+            "the first page must still be accepted"
+        );
+        assert_eq!(
+            gap.push(&first_page),
+            Err(ProtocolError::BaselineMismatch),
+            "a replayed page must be refused"
+        );
 
         let mut short = BaselineAccumulator::new(scope, artifact.baseline);
-        assert!(!short.push(&first_page).unwrap());
-        assert_eq!(short.finish(), Err(ProtocolError::BaselineMismatch));
+        assert!(
+            !short.push(&first_page)?,
+            "the first page must still be accepted"
+        );
+        assert_eq!(
+            short.finish(),
+            Err(ProtocolError::BaselineMismatch),
+            "an incomplete fold must be refused at finish"
+        );
+        Ok(())
     }
 }
