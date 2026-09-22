@@ -11,5 +11,5 @@ may_depend_on = ["kernel"]
 forbidden_domains = ["cairn", "lem", "forge"]
 durable_state_owner = "Cloud Plane"
 release_lane = "cloud"
-evidence = ["state-bearing recovery", "bounded sync", "routing epochs", "authorized views"]
+evidence = ["state-bearing recovery", "bounded sync", "routing epochs", "authorized views", "sovereign archive receipts"]
 blocked_claims = ["partitioned service complete", "million-client scale", "multi-region recovery"]
