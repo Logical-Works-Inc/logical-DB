@@ -1,5 +1,8 @@
 //! Versioned, fail-closed Cloud partition-routing contracts.
 //!
+//! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+//! S16 S17 S18 S19 S20. Source URLs are in `evidence/SOURCES.md`.
+//!
 //! The current FDB relay remains a scope-wide baseline. This crate deliberately
 //! owns no database handle and selects no physical endpoint: a Cloud authority
 //! publishes a bounded route map, while callers can only present the epoch they
