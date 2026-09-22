@@ -1513,6 +1513,7 @@ dependencies = [
 name = "logical-db-cloud-contract"
 version = "0.1.0"
 dependencies = [
+ "lgwks_std",
  "logical-db-model",
  "thiserror",
  "uuid",

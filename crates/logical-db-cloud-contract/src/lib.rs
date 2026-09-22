@@ -15,7 +15,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use logical_db_model::{DocumentId, OperationDigest, OperationId, Scope};
 use thiserror::Error;
 
+mod sovereignty;
 mod view;
+pub use sovereignty::{
+    ArchiveError, ArchiveKind, ArchiveObject, ArchiveObjectId, ArchiveObjectStore, ArchiveReceipt,
+    ArchiveRestore, ArchiveWrite, CustomerKeyId, CustomerKeyVersion, Region, SovereignArchive,
+};
 pub use view::{
     AuthorizedView, ViewCursor, ViewError, ViewGrant, ViewId, ViewLimits, ViewRequest, ViewVersion,
 };

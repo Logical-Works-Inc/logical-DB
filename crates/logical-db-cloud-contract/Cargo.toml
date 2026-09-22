@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 logical-db-model = { path = "../logical-db-model" }
+lgwks_std.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
