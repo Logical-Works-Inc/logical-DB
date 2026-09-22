@@ -12,6 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use logical_db_model::{DocumentId, OperationDigest, OperationId, Scope};
 use thiserror::Error;
 
+mod view;
+pub use view::{
+    AuthorizedView, ViewCursor, ViewError, ViewGrant, ViewId, ViewLimits, ViewRequest, ViewVersion,
+};
+
 /// Maximum UTF-8 bytes in a stable routing or recovery authority identity.
 const MAX_ROUTING_ID_BYTES: usize = 128;
 /// Maximum transfer receipts accepted for one bounded route-map transition.
