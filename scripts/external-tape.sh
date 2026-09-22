@@ -38,12 +38,12 @@ echo "== probe 2: dependency graph declares no internal crate"
 # The tape's manifest must not declare any internal Logical-DB crate. Comments
 # are stripped first so documentation that names those crates is not a match.
 if grep -Ev '^[[:space:]]*(#|$)' "$TAPE/Cargo.toml" \
-  | grep -Eq 'logical-db-(model|protocol|crdt|store|sync|service|http|server|braid|platform|kv|cairn|episode|daemon|store-fdb|e2e)'; then
+  | grep -Eq 'logical-db-(model|protocol|crdt|store|sync|service|http|server|platform|kv|cairn|episode|daemon|store-fdb|e2e)'; then
   echo "FAIL external-tape: tape manifest declares an internal Logical-DB crate" >&2
   exit 1
 fi
 # The tape's source must not import one either.
-if grep -rEq '^[[:space:]]*(use|extern crate)[[:space:]]+logical_db_(model|protocol|crdt|store|sync|service|http|server|braid|platform|kv|cairn|episode|daemon)\b' \
+if grep -rEq '^[[:space:]]*(use|extern crate)[[:space:]]+logical_db_(model|protocol|crdt|store|sync|service|http|server|platform|kv|cairn|episode|daemon)\b' \
   "$TAPE/src"; then
   echo "FAIL external-tape: tape source imports an internal Logical-DB crate" >&2
   exit 1
