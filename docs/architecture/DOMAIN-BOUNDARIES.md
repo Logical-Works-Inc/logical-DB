@@ -48,7 +48,7 @@ crates/
     logical-db-store-fdb/
     logical-db-server/
     logical-db-daemon/
-    logical-db-cloud-contract/        # future: partition/view/placement ports
+    logical-db-cloud-contract/        # partition routing contract; views/placement ports follow
     logical-db-cloud-e2e/             # future: Cloud-only integration harness
 
   cairn/

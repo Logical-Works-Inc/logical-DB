@@ -1510,6 +1510,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "logical-db-cloud-contract"
+version = "0.1.0"
+dependencies = [
+ "logical-db-model",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "logical-db-crdt"
 version = "0.1.0"
 dependencies = [
