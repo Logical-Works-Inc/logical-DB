@@ -161,7 +161,8 @@ pub trait ExecutionGrant: Send + Sync {
     fn invocation_id(&self) -> [u8; 32];
 }
 
-/// Host authority boundary. Production composition uses a Braid runnable invocation.
+/// Host authority boundary. Production composition supplies an [`ExecutionGrant`]
+/// through this trait; no verifier runtime type crosses it.
 pub trait Authority {
     /// Concrete opaque proof forwarded into the durable transaction.
     type Grant: ExecutionGrant;
@@ -175,6 +176,135 @@ pub trait Authority {
         frontier: u64,
         now_unix_ms: u64,
     ) -> Option<Self::Grant>;
+}
+
+/// Host-local execution proof for one authenticated read or scan.
+///
+/// The invocation identity is the keyed digest of scope, effect, action,
+/// frontier, and expiry. Any change to those facts changes the identity and
+/// therefore the idempotency key of a write that consumes it.
+#[derive(Clone, Debug)]
+pub struct LocalGrant {
+    /// Scope the grant authorizes.
+    scope: Scope,
+    /// Strongest effect the grant authorizes.
+    effect: Effect,
+    /// Canonical action digest bound into the grant.
+    action: ActionDigest,
+    /// Durable scope frontier observed when the grant was issued.
+    frontier: u64,
+    /// Stable content identity of the bound facts.
+    invocation_id: [u8; 32],
+}
+
+impl LocalGrant {
+    /// Binds one grant to the exact request facts and observed frontier.
+    #[must_use]
+    pub fn new(
+        scope: Scope,
+        effect: Effect,
+        action: ActionDigest,
+        frontier: u64,
+        expires_at_unix_ms: u64,
+    ) -> Self {
+        let mut digest = lgwks_std::hash::Hasher::new();
+        digest.update(b"logical-db/local-grant/v1\0");
+        digest.update(scope.account().as_uuid().as_bytes());
+        digest.update(scope.space().as_uuid().as_bytes());
+        digest.update(&[match effect {
+            Effect::Read => 1,
+            Effect::Scan => 2,
+            Effect::Write => 3,
+            Effect::Sync => 4,
+            // `Effect` is non-exhaustive at the model boundary; an unknown
+            // variant must still get a distinct invocation identity.
+            _ => 0,
+        }]);
+        digest.update(&action.into_bytes());
+        digest.update(&frontier.to_be_bytes());
+        digest.update(&expires_at_unix_ms.to_be_bytes());
+        Self {
+            scope,
+            effect,
+            action,
+            frontier,
+            invocation_id: *digest.finalize().as_bytes(),
+        }
+    }
+}
+
+impl ExecutionGrant for LocalGrant {
+    fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    fn effect(&self) -> Effect {
+        self.effect
+    }
+
+    fn action(&self) -> ActionDigest {
+        self.action
+    }
+
+    fn frontier(&self) -> u64 {
+        self.frontier
+    }
+
+    fn invocation_id(&self) -> [u8; 32] {
+        self.invocation_id
+    }
+}
+
+/// Host-local authority for non-egress operations inside one authenticated scope.
+///
+/// Refuses [`Effect::Write`] and [`Effect::Sync`] and every request outside the
+/// bound scope or past the exclusive expiry. Hosts that must write or
+/// synchronize supply an externally prepared [`Authority`] instead; this type
+/// is the one local implementation and never admits those effects.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalScopeAuthority {
+    /// Exact account and application space this authority may authorize.
+    scope: Scope,
+    /// Exclusive expiry in Unix milliseconds.
+    expires_at_unix_ms: u64,
+}
+
+impl LocalScopeAuthority {
+    /// Limits locally generated grants to one authenticated scope and expiry.
+    #[must_use]
+    pub const fn new(scope: Scope, expires_at_unix_ms: u64) -> Self {
+        Self {
+            scope,
+            expires_at_unix_ms,
+        }
+    }
+}
+
+impl Authority for LocalScopeAuthority {
+    type Grant = LocalGrant;
+
+    fn authorize(
+        &self,
+        scope: Scope,
+        effect: Effect,
+        action: ActionDigest,
+        frontier: u64,
+        now_unix_ms: u64,
+    ) -> Option<Self::Grant> {
+        if scope != self.scope
+            || !matches!(effect, Effect::Read | Effect::Scan)
+            || now_unix_ms >= self.expires_at_unix_ms
+        {
+            return None;
+        }
+        Some(LocalGrant::new(
+            scope,
+            effect,
+            action,
+            frontier,
+            self.expires_at_unix_ms,
+        ))
+    }
 }
 
 /// Durable outcome of accepting one immutable change.
@@ -271,7 +401,7 @@ pub trait ServiceStore: Send + Sync {
         grant: &impl ExecutionGrant,
     ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send;
 
-    /// Reads the current monotonic scoped frontier used for Braid justification.
+    /// Reads the current monotonic scoped frontier used for authority justification.
     fn frontier(&self, scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
     /// Reads the durable retention floor below which log history is pruned.

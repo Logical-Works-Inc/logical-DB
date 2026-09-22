@@ -14,11 +14,12 @@ mutation defines atomicity, idempotency, concurrency, retry, bounds, and crash
 behavior. Untrusted bytes are bounded before allocation and validated before
 commit. Persisted formats and wire protocols are versioned and fail closed on
 unknown versions. No lower storage or CRDT crate may depend on transport, HTTP,
-Braid, application, or service types.
+application, or service types.
 
-Local CRUD must work without a daemon, network, FoundationDB, or Braid. Sync is
-an independently resumable push/pull state machine. Braid is an optional
-authority adapter. FoundationDB is a service-side adapter only. Notifications
+Local CRUD must work without a daemon, network, or FoundationDB. Sync is
+an independently resumable push/pull state machine. Host authority is the
+`logical_db_service::Authority` seam; its one local implementation is
+`LocalScopeAuthority`. FoundationDB is a service-side adapter only. Notifications
 are hints to pull, never state transfer. Checkpoints advance atomically with
 the changes they cover.
 

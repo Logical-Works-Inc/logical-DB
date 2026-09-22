@@ -404,91 +404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "braid-capability"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "braid-flow-ir"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "braid-ir",
-]
-
-[[package]]
-name = "braid-flow-plan"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "braid-flow-ir",
- "braid-flow-verify",
- "braid-ir",
-]
-
-[[package]]
-name = "braid-flow-verify"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "braid-flow-ir",
- "braid-ir",
-]
-
-[[package]]
-name = "braid-ir"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "blake3",
- "braid-capability",
-]
-
-[[package]]
-name = "braid-run"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "braid-capability",
- "braid-flow-ir",
- "braid-flow-plan",
- "braid-ir",
- "braid-verify",
- "lgwks_std 0.5.1",
-]
-
-[[package]]
-name = "braid-sdk"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "braid-capability",
- "braid-ir",
-]
-
-[[package]]
-name = "braid-verify"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "blake3",
- "braid-capability",
- "braid-ir",
-]
-
-[[package]]
-name = "braid-vocab-cms"
-version = "0.1.0"
-source = "git+https://github.com/srinji-kaggss/Braid.git?rev=4b1b3e93a6b930bac9533722a212a126cd8e3632#4b1b3e93a6b930bac9533722a212a126cd8e3632"
-dependencies = [
- "braid-capability",
- "braid-ir",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1511,7 +1426,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9a65b6511b46d7c32af69e6fc15d7cb4400c136cb3c74a8a58a05eae9d6991"
 dependencies = [
  "lgwks_deps",
- "lgwks_std 0.6.6",
+ "lgwks_std",
 ]
 
 [[package]]
@@ -1521,15 +1436,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "723ef46c3ba251a6fe66a27ce3e90abe3afed9f2b279b10ff722967058d36600"
 dependencies = [
  "bevy_ecs",
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "tokio",
 ]
-
-[[package]]
-name = "lgwks_std"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a0efb0e7bb1bab681311540040d80a2d9fae5a1c4a1ef4af8f916774c039c44"
 
 [[package]]
 name = "lgwks_std"
@@ -1577,7 +1486,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "logical-db"
 version = "0.1.0"
 dependencies = [
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-cairn",
  "logical-db-crdt",
  "logical-db-episode",
@@ -1592,28 +1501,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "logical-db-braid"
-version = "0.1.0"
-dependencies = [
- "braid-capability",
- "braid-flow-ir",
- "braid-flow-plan",
- "braid-ir",
- "braid-run",
- "braid-sdk",
- "braid-verify",
- "braid-vocab-cms",
- "lgwks_std 0.6.6",
- "logical-db-model",
- "logical-db-service",
- "thiserror",
-]
-
-[[package]]
 name = "logical-db-cairn"
 version = "0.1.0"
 dependencies = [
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "thiserror",
  "uuid",
 ]
@@ -1636,8 +1527,7 @@ dependencies = [
  "foundationdb",
  "foundationdb-tuple",
  "lgwks_bot",
- "lgwks_std 0.6.6",
- "logical-db-braid",
+ "lgwks_std",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1673,7 +1563,7 @@ name = "logical-db-episode"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-cairn",
  "thiserror",
  "uuid",
@@ -1686,7 +1576,7 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-sync",
@@ -1699,7 +1589,7 @@ dependencies = [
 name = "logical-db-kv"
 version = "0.1.0"
 dependencies = [
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db",
  "logical-db-model",
  "thiserror",
@@ -1710,7 +1600,7 @@ dependencies = [
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "thiserror",
  "uuid",
 ]
@@ -1727,7 +1617,7 @@ name = "logical-db-protocol"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-model",
  "serde_bytes",
  "thiserror",
@@ -1740,7 +1630,7 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1753,7 +1643,7 @@ dependencies = [
 name = "logical-db-service"
 version = "0.1.0"
 dependencies = [
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1776,7 +1666,7 @@ version = "0.1.0"
 dependencies = [
  "foundationdb",
  "foundationdb-tuple",
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-service",
@@ -1788,7 +1678,7 @@ dependencies = [
 name = "logical-db-sync"
 version = "0.1.0"
 dependencies = [
- "lgwks_std 0.6.6",
+ "lgwks_std",
  "logical-db-model",
  "logical-db-protocol",
 ]

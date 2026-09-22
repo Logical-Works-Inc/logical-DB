@@ -14,7 +14,7 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
 - [x] Every surviving tracked text file cites at least twenty unique ledger IDs.
 - [x] The dependency verifier enforces the implemented one-way crate DAG.
 - [x] Embedded edits, reads, exact retries, schema indexes, change cursors, and
-  restart work without Braid or a network.
+  restart work without a daemon, host authority, or a network.
 - [x] Two offline replicas converge through both in-process and real HTTP paths.
 - [x] Push correlation, duplicates, rejection, forged/expired checkpoints, and
   explicit full resync have typed tests.
@@ -26,9 +26,8 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   reconstruct/recheck/seal the artifact and validate it in the prune
   transaction. This establishes the prune gate; it is not hosted
   full-recovery evidence.
-- [x] Externally prepared Braid material produces a real pinned
-  `RunnableInvocation` bound to exact scoped request facts and the durable
-  frontier; FDB consumes it atomically.
+- [x] Host authority produces a real `ExecutionGrant` bound to exact scoped
+  request facts and the durable frontier; FDB consumes it atomically.
 - [x] A committed edit survives subprocess exit without destructor execution.
 - [x] Windows-native data placement is represented without POSIX assumptions.
 - [x] Schema/index migration is bounded, revision checked, durably resumable,
@@ -49,7 +48,7 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   adapter reports recovered ambiguity, advances once, and rejects invocation reuse.
 - [x] HTTP ingress bounds complete in-flight requests before body extraction,
   applies a deadline, and local materialization is bounded per document/page.
-- [x] Braid proof identity includes expiry and distinguishes scan from point
+- [x] Authority grant identity includes expiry and distinguishes scan from point
   read authority; sync preserves rejection reasons and never reports completion
   while upload backlog remains.
 - [x] One global upload cursor is durably bound to one upstream, so unsupported
@@ -88,9 +87,9 @@ Baseline: `7cffbc07b6f312854986ae306b583ef891623b2d`.
   embedded database function.
 - [ ] Package and consume the facade from LEM in an external-repository tape
   journey without importing internal crates.
-- [ ] Integrate independently verifiable, exact-request Braid confirmation
-  evidence before enabling daemon write or synchronization authority. Pinned
-  Braid's capsule flag alone is not treated as runtime evidence.
+- [ ] Integrate independently verifiable, exact-request host-authority
+  confirmation evidence before enabling daemon write or synchronization
+  authority. `LocalScopeAuthority` deliberately refuses both effects.
 - [x] Close server recovery before pruning: expose paged HTTP baseline recovery
   and install the recovered document state plus checkpoint atomically in the
   client. The v2 server baseline, retention floor, and transactional prune gate

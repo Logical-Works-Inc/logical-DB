@@ -18,10 +18,9 @@ use axum::http::HeaderValue;
 use foundationdb::directory::{Directory, DirectoryLayer};
 use foundationdb_tuple::Subspace;
 use lgwks_std::hash::keyed;
-use logical_db_braid::LocalBraidAuthority;
 use logical_db_model::{AccountId, Scope, SpaceId};
 use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
-use logical_db_service::CheckpointCodec;
+use logical_db_service::{CheckpointCodec, LocalScopeAuthority};
 use logical_db_store_fdb::FdbServiceStore;
 use uuid::Uuid;
 
@@ -43,7 +42,7 @@ impl BearerAuthenticator {
 }
 
 impl Authenticator for BearerAuthenticator {
-    type Policy = LocalBraidAuthority;
+    type Policy = LocalScopeAuthority;
 
     fn authenticate(
         &self,
@@ -67,7 +66,7 @@ impl Authenticator for BearerAuthenticator {
         let expires_at = now_unix_ms
             .checked_add(60_000)
             .ok_or(AuthenticationError::Forbidden)?;
-        Ok(LocalBraidAuthority::new(self.scope, expires_at))
+        Ok(LocalScopeAuthority::new(self.scope, expires_at))
     }
 }
 

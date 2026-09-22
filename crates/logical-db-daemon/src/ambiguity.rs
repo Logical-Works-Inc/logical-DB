@@ -704,7 +704,7 @@ async fn verify_http_action_binding(
 
     let replacement = ambiguity_probe_change(scope, replica, 601)?;
     // This fixture proves the HTTP/service/store action seam. It is deliberately
-    // not presented as runtime human confirmation or independent Braid admission.
+    // not presented as runtime human confirmation or independent authority admission.
     let account_scope = Scope::new(AccountId::new(), scope.space());
     let space_scope = Scope::new(scope.account(), SpaceId::new());
     let mut variants = vec![original.clone(); 8];

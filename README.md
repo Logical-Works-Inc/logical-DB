@@ -34,7 +34,7 @@ logical-db = { git = "https://github.com/srinji-kaggss/logical-DB", rev = "ae502
 
 This is the embedded local-replica surface exercised by
 [`experience/journeys/embedded-git-consumer-v1.yaml`](experience/journeys/embedded-git-consumer-v1.yaml).
-It needs no daemon, network connection, FoundationDB, or Braid at runtime.
+It needs no daemon, network connection, or FoundationDB at runtime.
 Crates.io installation is not supported yet: the facade depends on unpublished
 workspace crates, and an ordered release is a separate production gate rather
 than a fallback the installer can guess. The quickstart below starts with the
@@ -44,8 +44,8 @@ same public facade.
 
 The `logical-db` facade exposes typed account/space/document identities,
 transactional CRDT edits, read projections, schema-bound secondary indexes, a
-durable change feed, and bounded synchronization. It needs neither Braid nor a
-network for local reads and writes.
+durable change feed, and bounded synchronization. It needs neither a
+network nor any host authority for local reads and writes.
 
 The read boundary exposes map discovery, list access, collaborative text, and
 all causally concurrent values; the editor exposes map/list/object operations,
@@ -120,23 +120,22 @@ round-trips through a document with its evidence-subset guard intact. See
 ## Deployment shapes
 
 - **Embedded only:** app → `logical-db` → Automerge + redb. No daemon, network,
-  FDB, or Braid.
+  or FDB.
 - **Thin client:** the same embedded API plus `logical-db-http`; sync is bounded,
   resumable, idempotent, and driven by a durable service checkpoint. A local
   scope is durably bound to one upstream because v1 has one upload cursor;
   attempting a second upstream fails instead of suppressing undelivered writes.
 - **Standalone service:** the `logical-db-daemon` binary composes a loopback-only
   Axum listener, bounded request admission, HMAC checkpoints, a Directory Layer
-  subspace, and the FDB adapter. Its local Braid authority deliberately refuses
-  writes and sync because pinned Braid has no independently verifiable runtime
-  confirmation evidence. It is not a usable sync service until an ecosystem
-  host supplies externally prepared grants; it also refuses a non-loopback
-  plaintext bind.
-- **Ecosystem host:** Logic OS or another host nests the same router and uses
-  `logical-db-braid` to admit exact account/space/action capabilities computed
-  after native validation. Application request digests remain retry identities.
-  The host
-  does not own embedded CRUD.
+  subspace, and the FDB adapter. Its `LocalScopeAuthority` deliberately refuses
+  writes and sync: a bearer-authenticated local grant admits only Read and Scan
+  inside one scope and expiry. It is not a usable sync service until an
+  ecosystem host supplies an `Authority` that admits those effects; it also
+  refuses a non-loopback plaintext bind.
+- **Ecosystem host:** Logic OS or another host nests the same router and supplies
+  its own `logical_db_service::Authority` implementation admitting exact
+  account/space/action facts computed after native validation. Application
+  request digests remain retry identities. The host does not own embedded CRUD.
 
 The wire boundary is two versioned CBOR operations:
 `POST /v1/changes:push` and `POST /v1/changes:pull`, media type

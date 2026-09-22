@@ -59,14 +59,40 @@ no production-completion claim and no nine-axis receipt claim.
 A git pin cannot witness that it still matches a published estate release, and
 this one was five `lgwks_std` releases and one `lgwks_bot` minor behind
 crates.io. `deny.toml` no longer git-allowlists `logicalworks-crates` (nothing
-depends on it as a git edge any more); `Braid` stays the sole approved git
-source.
+depends on it as a git edge any more).
 
-Residual, stated accurately: the lockfile still carries **two** `lgwks_std`
-versions (`0.5.1` through `braid-run`, `0.6.6` as this workspace's estate
-edge). They are separate crate identities and never share types. Collapsing the
-pair is a Braid-side change — Braid `main` at `30c5d3a` still declares
-`lgwks_std = "0.5.2"`, so bumping the Braid pin here would not do it.
+Braid is removed. The `logical-db-braid` crate, its eight `braid-*` git edges,
+and the `allow-git` entry for `https://github.com/srinji-kaggss/Braid` are gone;
+`deny.toml` now declares `allow-git = []`. Host authority is
+`logical_db_service::Authority` with the one local implementation
+`LocalScopeAuthority` / `LocalGrant`, which refuses `Write` and `Sync` and every
+request outside one authenticated scope and exclusive expiry. This also
+collapses the dual `lgwks_std` residual: `braid-run` was the only remaining
+source of `lgwks_std` 0.5.1, so the lockfile now carries exactly one estate
+`lgwks_std` (0.6.6).
+
+### Braid removal and authority seam (this change)
+
+`logical-db-braid` and its eight `braid-*` git edges are deleted (directory
+moved to Trash, not `rm`). The `Authenticator::Policy` in `logical-db-daemon`
+is `logical_db_service::LocalScopeAuthority`, whose grant is `LocalGrant`.
+`LocalScopeAuthority` keeps the previous local-authority policy exactly: only
+`Effect::Read` and `Effect::Scan`, one authenticated scope, exclusive expiry,
+and a keyed invocation identity over scope/effect/action/frontier/expiry via
+`lgwks_std::hash::Hasher`. `deny.toml` declares `allow-git = []`. Live docs
+(`README.md`, `ARCHITECTURE.md`, `AGENTS.md`, `REWRITE_MANIFEST.md`,
+`docs/API_BOUNDARY.md`, `docs/ALLOC-VISION.md`, `docs/MONOREPO.md`,
+`docs/architecture/DOMAIN-BOUNDARIES.md`) now name the host `Authority` seam
+consistently; dated `docs/plans/`, `docs/ideation/`, and
+`experience/EXPERIENCE_TEST_REPORT.md` keep their historical wording and are
+not current architecture claims.
+
+Receipts after removal: `cargo deny check` sources **ok** with empty
+`allow-git`; `test-domain-contract.py` 8/8; `test-access-graph.py` 6/6;
+`dependency_contract` 10/10 including the registry-pin row; `verify-rewrite.py`
+PASS (`citation_failures=0 dependency_failures=0 domain_contract_failures=0`);
+`Cargo.lock` carries exactly one `lgwks_std` (`0.6.6`,
+`registry+https://github.com/rust-lang/crates.io-index`).
 
 ### Contract receipts repaired this change
 
@@ -119,7 +145,7 @@ the execution contract. Honest state after this cleanup:
 | Hyperscale | Not established | Program is #66/#67/#70/#72. No >1M concurrent evidence. Current scope is embedded + one FDB cluster. |
 | Idiomatic | Improving to sound | This change. Compiler/lint contract is the receipt; failure-path tests exist for the bound crates. |
 | Generalized | Partial | Wire round-trips, bounds, and mutation campaigns exist. Declared tenant/region/topology families are Cloud work (#67–#69) and unbuilt. |
-| Decoupled | Strong internally, one residual | `domain_contract` 8 owners / 32 edges is green. Residual: dual `lgwks_std` across the Braid adapter (above). Frozen boundaries (`reqwest`, `axum`) stay registered. |
+| Decoupled | Strong internally | `domain_contract` 8 owners / 32 edges is green. Braid is removed and the dual `lgwks_std` residual is closed. Frozen boundaries (`reqwest`, `axum`) stay registered. |
 | Ephemeral | Strong at local/FDB scope | `crash_recovery`, `kill_recovery`, `fdb_process_kill_restore`, `fdb_recovery_composition`. #28 stays open for item-by-item acceptance. Multi-region DR (#71) unbuilt. |
 | Portable | Partial | `logical-db-platform` covers Windows/macOS/Linux placement; CI has macos + ubuntu + windows guests. No per-target e2e receipt matrix in `evidence/`. |
 | Multi-tenant | Partial at embedded scope | Account+space scoping is first-class in the model. Cross-tenant/cross-region negatives for Cloud views (#68) unbuilt. |
@@ -279,7 +305,7 @@ implementation's correctness dependencies.
 
 | Priority | Work | Observed gap and completion evidence |
 |---|---|---|
-| Closed | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | The action-binding stack validates native CRDT bytes before authorization, computes a versioned canonical `ActionDigest`, and makes FDB recompute it. Unit HTTP tests and the recorded FDB journey hold a grant fixed across field mutations and preserve exact retry. Independent runtime Braid confirmation remains a separate release requirement |
+| Closed | [#27: action authorization](https://github.com/srinji-kaggss/logical-DB/issues/27) | The action-binding stack validates native CRDT bytes before authorization, computes a versioned canonical `ActionDigest`, and makes FDB recompute it. Unit HTTP tests and the recorded FDB journey hold a grant fixed across field mutations and preserve exact retry. Independent runtime host-authority confirmation remains a separate release requirement |
 | P0 | [#28: recovery before pruning](https://github.com/srinji-kaggss/logical-DB/issues/28) | PRs #49–#53 delivered the state-bearing snapshot artifact, the paged HTTP baseline protocol, and one atomic client install; the local live-cluster lane now proves `fdb_recovery_composition` and the process-kill restore journey pass. The issue stays open until its acceptance checklist is verified item-by-item against that evidence — in particular expired-checkpoint recovery through the public transport and the position-1 prune/fresh-replica counterexample — and the runnable hosted or self-hosted lane reproduces it |
 | Delivered in stack | [#29: projection semantics](https://github.com/srinji-kaggss/logical-DB/issues/29) | Every `Projection` now requires an application-supplied `ProjectionSemantics` (nonzero version or opaque digest) hashed with its `IndexId` into the v2 durable schema digest. The same index identity and schema version with changed semantics returns migration-required; `Database::migrate_schema` rebuilds the rows in bounded revision-checked pages. The facade test `changed_projection_semantics_requires_migration_and_rebuilds_rows` proves refusal, duplicate-identity refusal, and atomic rebuild |
 | P1 | [#25: checked access graph](https://github.com/srinji-kaggss/logical-DB/issues/25) | Audit migration, sync, and service transition coverage against the issue's graph contract after the action and recovery boundaries are settled |

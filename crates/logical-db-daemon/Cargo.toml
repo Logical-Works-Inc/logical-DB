@@ -30,7 +30,6 @@ ciborium.workspace = true
 foundationdb = { workspace = true, optional = true }
 foundationdb-tuple = { workspace = true, optional = true }
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
-logical-db-braid = { version = "0.1.0", path = "../logical-db-braid" }
 logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server" }

@@ -12,7 +12,6 @@ members = [
   "crates/logical-db-store",
   "crates/logical-db-sync",
   "crates/logical-db-service",
-  "crates/logical-db-braid",
   "crates/logical-db-store-fdb",
   "crates/logical-db-http",
   "crates/logical-db-server",
@@ -55,13 +54,8 @@ tower = { version = "=0.5.3", features = ["util"] }
 # estate's own published surface; `Cargo.lock` plus `cargo deny` now pin the
 # exact resolved version of each registry edge.
 #
-# Transitive boundary, not one unified identity: the lockfile may still carry
-# TWO `lgwks_std` versions if the git-pinned `braid-run` authority adapter
-# declares its own older estate edge. They are separate crate identities that
-# coexist in one binary and never share types, so a `lgwks_std` type crossing
-# the Braid boundary must be converted at the adapter, not assumed compatible.
-# Upgrading Braid's estate edge is what collapses this to one version; until
-# then the pair is the accurate state.
+# Braid is removed. The host authority seam is `logical_db_service::Authority`;
+# its one local implementation is `LocalScopeAuthority`. No git edges remain.
 #
 # `json` re-exports the serde crate the estate owns, so logical-db derives
 # through `lgwks_std::json::{Serialize, Deserialize}` and never declares serde.

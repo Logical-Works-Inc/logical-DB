@@ -717,8 +717,8 @@ pub enum Effect {
 
 /// Minimal authority result accepted by the core.
 ///
-/// A Braid adapter may produce this value, but Braid runtime types never cross
-/// the model or storage boundary.
+/// A host authority adapter may produce this value, but no verifier runtime
+/// type crosses the model or storage boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(crate = "lgwks_std::json::serde")]
 pub struct AuthorityDecision {

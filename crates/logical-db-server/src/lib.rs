@@ -656,7 +656,7 @@ mod tests {
 
     /// Test double with the default composition's exact posture: one bound
     /// scope, a short expiry, and read/scan effects only. Write and sync
-    /// authorization always fails, mirroring `LocalBraidAuthority`.
+    /// authorization always fails, mirroring `LocalScopeAuthority`.
     struct DefaultComposition {
         scope: Scope,
         /// Expires at unix ms
