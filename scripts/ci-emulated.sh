@@ -92,7 +92,8 @@ if docker container inspect "$worker" >/dev/null 2>&1; then
     recorded=$(docker container inspect "$worker" --format '{{index .Config.Labels "logical-db.configuration"}}')
     [[ "$recorded" == "$configuration" ]] || replace_retained_worker "had a different image or mount configuration"
   fi
-else
+fi
+if ! docker container inspect "$worker" >/dev/null 2>&1; then
   docker create --name "$worker" --platform linux/amd64 --cpus 4 --memory 6g --pids-limit 512 \
     --network bridge --log-opt max-size=10m --log-opt max-file=2 \
     --label logical-db.owner=ci --label "logical-db.configuration=$configuration" \
