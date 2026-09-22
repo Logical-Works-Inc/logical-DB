@@ -32,10 +32,10 @@ fn forced_termination_never_exposes_a_partial_embedded_transition()
             child.try_wait()?.is_none(),
             "kill writer must still be running while waiting for ready"
         );
-        thread::sleep(Duration::from_millis(10));
+        thread::park_timeout(Duration::from_millis(10));
     }
     assert!(ready.exists(), "kill writer must create the ready file");
-    thread::sleep(Duration::from_millis(20));
+    thread::park_timeout(Duration::from_millis(20));
     child.kill()?;
     let status = child.wait()?;
     assert!(!status.success(), "kill writer must not exit cleanly");

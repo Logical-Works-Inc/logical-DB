@@ -1,4 +1,4 @@
-//! Retained black-box journey: public facade -> HTTP -> Braid -> `FoundationDB`.
+//! Retained black-box journey: public facade -> HTTP -> host authority -> `FoundationDB`.
 //!
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
@@ -64,7 +64,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             editor.put(
                 &Object::root(),
                 "verified",
-                Scalar::String("facade-http-braid-fdb".into()),
+                Scalar::String("facade-http-authority-fdb".into()),
             )
         },
     )?;
@@ -77,7 +77,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let observed = second.read(document, |reader| reader.get(&Object::root(), "verified"))?;
     if observed
         != Some(Some(Item::Scalar(Scalar::String(
-            "facade-http-braid-fdb".into(),
+            "facade-http-authority-fdb".into(),
         ))))
     {
         eprintln!("facade-fdb-journey: replica did not materialize verified state");
@@ -98,7 +98,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     fs::remove_file(&first_path)?;
     fs::remove_file(&second_path)?;
     println!(
-        "PASS facade-http-braid-fdb pushed={} pulled={} retry={}",
+        "PASS facade-http-authority-fdb pushed={} pulled={} retry={}",
         upload.pushed, download.pulled, retry.pushed
     );
     Ok(())

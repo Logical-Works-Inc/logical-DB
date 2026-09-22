@@ -79,7 +79,13 @@ improper_ctypes_definitions = "forbid"
 # FoundationDB network-boot FFI call that has to carry a scoped, documented
 # attribute; `deny` is what lets that scoped exception exist. This is rustc's own
 # pattern: `forbid` on the safe surface, one reasoned exception at the FFI leaf.
-unsafe_code = "forbid"
+#
+# `deny`, not `forbid`, for the same reason as the print/exit pair below: the
+# FFI leaf must be able to carry `#[expect(unsafe_code, reason = "...")]`, and
+# `forbid` cannot be lowered even there (E0453). Every other crate states
+# `#![forbid(unsafe_code)]` at its own root and is therefore stricter than this
+# table.
+unsafe_code = "deny"
 unused_must_use = "forbid"
 
 # 66 clippy lints, all `forbid` — a `deny` is defeated by any single

@@ -3135,7 +3135,7 @@ mod tests {
                             )?;
                             editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(size))?;
                         }
-                        _ => unreachable!(),
+                        _ => return Err(CrdtError::InvalidChangeSize(0)),
                     }
                     Ok(())
                 },
@@ -3304,7 +3304,7 @@ mod tests {
         let workers: Vec<_> = (0..6)
             .map(|index| {
                 let cache = std::sync::Arc::clone(&cache);
-                std::thread::spawn(move || {
+                std::thread::Builder::new().spawn(move || {
                     let value = deterministic_bytes(TIER_THRESHOLD_BYTES + index + 1);
                     let mut result = cache.put("race", &value, None);
                     for _ in 0..8 {
@@ -3320,7 +3320,7 @@ mod tests {
                     result
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         for worker in workers {
             match worker.join() {
                 Ok(result) => result?,

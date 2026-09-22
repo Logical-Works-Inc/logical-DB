@@ -134,6 +134,40 @@ states its exemption with `#[expect(..., reason = "...")]`, which
 concrete reason. Library crates carry zero prints and zero `process::exit`
 under that `deny`. Every other lint remains `forbid`.
 
+### Rust anti-pattern and fdb-lane pass (this change)
+
+The deep anti-pattern sweep closed the remaining lint-contract debt that the
+earlier pass had left in fdb-gated and binary code:
+
+- `unwrap`/`expect`/`panic`/`unreachable!` cleared from `logical-db-daemon`
+  (both bins) and the `logical-db-kv`/`logical-db-sync` test seams. Tests
+  return `Result<(), Box<dyn Error>>` and use `?`.
+- `std::thread::spawn` replaced by `std::thread::Builder::spawn` with a
+  joined `RawServerHandle` guard in `logical-db-http` (shutdown flag + accept
+  poke + unpark, so stall fixtures cannot deadlock the join) and joined
+  worker handles in `logical-db-kv`.
+- `std::thread::sleep` replaced by `std::thread::park_timeout` everywhere.
+- `unreachable!` replaced by typed `Err` values; the `NsReplica` test port's
+  `Error` moved off `Infallible` so a refusal can be expressed at all.
+- `unsafe_code` moved `forbid` → `deny` in the workspace table, matching the
+  table's own documented design and the `print_stderr`/`print_stdout`/`exit`
+  pair: the FoundationDB network-boot leaf must carry
+  `#[expect(unsafe_code, reason = "...")]`, and `forbid` cannot be lowered
+  (E0453). Every safe crate still states `#![forbid(unsafe_code)]` at its
+  root and is therefore stricter than the table.
+- `AuthenticationError` now implements `std::error::Error` + `Display`, so
+  authentication failures propagate with `?` instead of being unwrapped.
+- `logical-db-store-fdb` and `logical-db-daemon` fdb lanes now compile under
+  `--features fdb` at **zero errors** (previously unverified here): private
+  items documented, `#[non_exhaustive]` on `FdbStoreError`, explicit
+  reference patterns, `PruneReceipt::new` / `BaselineRequest::new` /
+  `SystemClock::new` instead of forbidden struct expressions.
+
+Coverage ceiling, stated once: 25 of 75 catalogued anti-patterns name an
+enforceable lint. The other 50 need Miri, hardware perf counters, allocation
+profiling, or human review and are not lint-expressible. This pass claims
+only the lint-expressible subset plus the specific structural fixes above.
+
 ### Nine-axis reassessment (posture only — no axis is claimed)
 
 Against `docs/adr/0003-sovereign-hyperscale-data-plane.md` and the SLO matrix in
@@ -143,7 +177,7 @@ the execution contract. Honest state after this cleanup:
 |---|---|---|
 | Frontier | Not established | Director ruled 2026-09-14: #33–#35 stay open until a measurement environment exists. No corpus, baseline, or workload is committed. |
 | Hyperscale | Not established | Program is #66/#67/#70/#72. No >1M concurrent evidence. Current scope is embedded + one FDB cluster. |
-| Idiomatic | Improving to sound | This change. Compiler/lint contract is the receipt; failure-path tests exist for the bound crates. |
+| Idiomatic | Sound at the lint-expressible ceiling | Compiler/lint contract is the receipt; fdb lanes compile at zero errors; failure-path tests exist for the bound crates. 50/75 catalogued anti-patterns are not lint-expressible (Miri / perf / review) and are not claimed. |
 | Generalized | Partial | Wire round-trips, bounds, and mutation campaigns exist. Declared tenant/region/topology families are Cloud work (#67–#69) and unbuilt. |
 | Decoupled | Strong internally | `domain_contract` 8 owners / 32 edges is green. Braid is removed and the dual `lgwks_std` residual is closed. Frozen boundaries (`reqwest`, `axum`) stay registered. |
 | Ephemeral | Strong at local/FDB scope | `crash_recovery`, `kill_recovery`, `fdb_process_kill_restore`, `fdb_recovery_composition`. #28 stays open for item-by-item acceptance. Multi-region DR (#71) unbuilt. |

@@ -4,6 +4,15 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
 //! S33 S34 S35 S36 S37 S38 S39 S42 S43. Source URLs are in `evidence/SOURCES.md`.
 
+#![expect(
+    clippy::print_stderr,
+    reason = "this journey binary owns the PRINTS-exempt report surface via src/bin/journey_report"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "this journey binary owns the PRINTS-exempt report surface via src/bin/journey_report"
+)]
+
 use std::{collections::HashSet, error::Error, io};
 
 use foundationdb::{Database, api::FdbApiBuilder, options::NetworkOption};
@@ -31,27 +40,39 @@ use logical_db_store_fdb::{FdbDataError, FdbServiceStore, FdbStoreError};
 #[path = "bin/journey_report/mod.rs"]
 mod journey_report;
 
+/// FULL_FDB_CHUNK_PROBE_BYTES
 const FULL_FDB_CHUNK_PROBE_BYTES: usize = 65_536;
+/// MAX_VERIFIED_PAGES
 const MAX_VERIFIED_PAGES: usize = 1_024;
 
 #[derive(Clone, Copy)]
+/// ForgedGrant
 struct ForgedGrant {
+    /// scope
     scope: Scope,
+    /// effect
     effect: Effect,
+    /// action
     action: ActionDigest,
+    /// frontier
     frontier: u64,
+    /// invocation
     invocation: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
+/// FixedActionAuthority
 struct FixedActionAuthority {
+    /// scope
     scope: Scope,
+    /// action
     action: ActionDigest,
 }
 
 impl Authority for FixedActionAuthority {
     type Grant = ForgedGrant;
 
+    /// Runs `authorize`.
     fn authorize(
         &self,
         scope: Scope,
@@ -66,11 +87,13 @@ impl Authority for FixedActionAuthority {
 }
 
 #[derive(Clone, Copy)]
+/// FixedActionAuthenticator(FixedActionAuthority);
 struct FixedActionAuthenticator(FixedActionAuthority);
 
 impl Authenticator for FixedActionAuthenticator {
     type Policy = FixedActionAuthority;
 
+    /// Runs `authenticate`.
     fn authenticate(
         &self,
         authorization: &axum::http::HeaderValue,
@@ -85,27 +108,33 @@ impl Authenticator for FixedActionAuthenticator {
 }
 
 impl ExecutionGrant for ForgedGrant {
+    /// Runs `scope`.
     fn scope(&self) -> Scope {
         self.scope
     }
 
+    /// Runs `effect`.
     fn effect(&self) -> Effect {
         self.effect
     }
 
+    /// Runs `action`.
     fn action(&self) -> ActionDigest {
         self.action
     }
 
+    /// Runs `frontier`.
     fn frontier(&self) -> u64 {
         self.frontier
     }
 
+    /// Runs `invocation_id`.
     fn invocation_id(&self) -> [u8; 32] {
         self.invocation
     }
 }
 
+/// Runs `fixture_grant`.
 fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u64) -> ForgedGrant {
     let mut digest = Hasher::new();
     digest.update(b"logical-db/fdb-ambiguity-fixture/v1\0");
@@ -116,6 +145,9 @@ fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u
         Effect::Scan => 2,
         Effect::Write => 3,
         Effect::Sync => 4,
+        // A future effect class must not collide with a known tag in the
+        // fixture digest; tag it distinctly so identity stays injective.
+        _ => u8::MAX,
     }]);
     digest.update(&action.into_bytes());
     digest.update(&frontier.to_be_bytes());
@@ -128,6 +160,7 @@ fn fixture_grant(scope: Scope, effect: Effect, action: ActionDigest, frontier: u
     }
 }
 
+/// Runs `main`.
 fn main() -> Result<(), Box<dyn Error>> {
     let reports = lgwks_bot::Runtime::new()?.block_on(run())?;
     for line in &reports {
@@ -136,6 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Runs `run`.
 async fn run() -> Result<Vec<String>, Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     let network_builder = FdbApiBuilder::default().build()?;
@@ -207,10 +241,12 @@ async fn run() -> Result<Vec<String>, Box<dyn Error>> {
     Err(io::Error::other("FDB buggify did not exercise a post-commit unknown result").into())
 }
 
+/// Runs `probe_result_is_nonterminal`.
 fn probe_result_is_nonterminal(result: AcceptResult) -> bool {
     matches!(result, AcceptResult::Accepted | AcceptResult::Duplicate)
 }
 
+/// Runs `verify_live_baseline_retention`.
 async fn verify_live_baseline_retention(
     store: &FdbServiceStore,
     replica: ReplicaId,
@@ -221,6 +257,7 @@ async fn verify_live_baseline_retention(
     finish_baseline_retention(store, scope, replica, &artifact_one).await
 }
 
+/// Runs `seed_and_build_first`.
 async fn seed_and_build_first(
     store: &FdbServiceStore,
     scope: Scope,
@@ -303,6 +340,7 @@ async fn seed_and_build_first(
     Ok(artifact_one)
 }
 
+/// Runs `seal_first_baseline`.
 async fn seal_first_baseline(
     store: &FdbServiceStore,
     scope: Scope,
@@ -363,6 +401,7 @@ async fn seal_first_baseline(
     Ok(())
 }
 
+/// Runs `finish_baseline_retention`.
 async fn finish_baseline_retention(
     store: &FdbServiceStore,
     scope: Scope,
@@ -417,12 +456,7 @@ async fn finish_baseline_retention(
     let prune_action_value = prune_action(scope, prune_request, 2, None);
     let prune_grant = fixture_grant(scope, Effect::Sync, prune_action_value, 2);
     let pruned = prune_with_retry(store, scope, prune_request, &prune_grant).await?;
-    if pruned
-        != PruneResult::Pruned(PruneReceipt {
-            pruned_through: 2,
-            floor: 2,
-        })
-    {
+    if pruned != PruneResult::Pruned(PruneReceipt::new(2, 2)) {
         return Err(io::Error::other(format!("state-bearing prune result was {pruned:?}")).into());
     }
     let final_frontier = read_frontier_with_retry(store, scope).await?;
@@ -443,6 +477,7 @@ async fn finish_baseline_retention(
     ))
 }
 
+/// Runs `read_frontier_with_retry`.
 async fn read_frontier_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -457,6 +492,7 @@ async fn read_frontier_with_retry(
     Err(io::Error::other(format!("frontier retry budget exhausted: {last_error:?}")).into())
 }
 
+/// Runs `read_consumed_with_retry`.
 async fn read_consumed_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -474,6 +510,7 @@ async fn read_consumed_with_retry(
     .into())
 }
 
+/// Runs `read_floor_with_retry`.
 async fn read_floor_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -491,6 +528,7 @@ async fn read_floor_with_retry(
     .into())
 }
 
+/// Runs `read_snapshot_with_retry`.
 async fn read_snapshot_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -508,6 +546,7 @@ async fn read_snapshot_with_retry(
     .into())
 }
 
+/// Runs `build_snapshot_with_retry`.
 async fn build_snapshot_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -526,6 +565,7 @@ async fn build_snapshot_with_retry(
     .into())
 }
 
+/// Runs `page_behind_floor_with_retry`.
 async fn page_behind_floor_with_retry(
     store: &FdbServiceStore,
     action: PageAction,
@@ -544,6 +584,7 @@ async fn page_behind_floor_with_retry(
     .into())
 }
 
+/// Runs `accept_seed_with_retry`.
 async fn accept_seed_with_retry(
     store: &FdbServiceStore,
     change: &ChangeEnvelope,
@@ -563,8 +604,10 @@ async fn accept_seed_with_retry(
                 | AcceptResult::Duplicate
                 | AcceptResult::RecoveredUnknownCommit,
             ) => match store.frontier(change.scope).await {
-                Ok(frontier) if frontier == expected_frontier + 1 => return Ok(frontier),
-                Ok(frontier) if frontier > expected_frontier + 1 => {
+                Ok(frontier) if frontier == expected_frontier.saturating_add(1) => {
+                    return Ok(frontier);
+                }
+                Ok(frontier) if frontier > expected_frontier.saturating_add(1) => {
                     return Err(io::Error::other(format!(
                         "seed frontier advanced past expected position: {frontier}"
                     ))
@@ -584,6 +627,7 @@ async fn accept_seed_with_retry(
     Err(io::Error::other(format!("seed exact retry budget exhausted: {last_error:?}")).into())
 }
 
+/// Runs `mark_consumed_with_retry`.
 async fn mark_consumed_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -617,6 +661,7 @@ async fn mark_consumed_with_retry(
     .into())
 }
 
+/// Runs `seal_snapshot_with_retry`.
 async fn seal_snapshot_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -640,6 +685,7 @@ async fn seal_snapshot_with_retry(
     .into())
 }
 
+/// Runs `prune_with_retry`.
 async fn prune_with_retry(
     store: &FdbServiceStore,
     scope: Scope,
@@ -655,12 +701,15 @@ async fn prune_with_retry(
             Ok(PruneResult::StaleAuthority) => {
                 return Err(io::Error::other("prune authority became stale").into());
             }
+            // A future prune outcome is not a terminal success; retry then fail.
+            Ok(_) => {}
             Err(error) => last_error = Some(error),
         }
     }
     Err(io::Error::other(format!("prune retry budget exhausted: {last_error:?}")).into())
 }
 
+/// Runs `verify_http_action_binding`.
 async fn verify_http_action_binding(
     store: FdbServiceStore,
     observer: &FdbServiceStore,
@@ -676,7 +725,7 @@ async fn verify_http_action_binding(
         store,
         FixedActionAuthenticator(authority),
         CheckpointCodec::new([0x27; 32], 60_000)?,
-        SystemClock,
+        SystemClock::new(),
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -694,7 +743,7 @@ async fn verify_http_action_binding(
         return Err(io::Error::other(format!("canonical HTTP write was {first:?}")).into());
     }
     let after_first = read_frontier_with_retry(observer, scope).await?;
-    if after_first != before + 1 {
+    if after_first != before.saturating_add(1) {
         return Err(io::Error::other("canonical HTTP write did not advance once").into());
     }
     let replay = push_over_http(&client, &endpoint, &original).await?;
@@ -737,9 +786,10 @@ async fn verify_http_action_binding(
         return Err(io::Error::other("rejected HTTP scope mutation created state").into());
     }
     server.abort();
-    Ok("PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated".to_string())
+    Ok("PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated".to_owned())
 }
 
+/// Runs `push_over_http`.
 async fn push_over_http(
     client: &reqwest::Client,
     endpoint: &str,
@@ -775,6 +825,7 @@ async fn push_over_http(
     Err(io::Error::other("HTTP push exhausted bounded exact retries").into())
 }
 
+/// Runs `complete_recovery_path`.
 async fn complete_recovery_path(
     store: &FdbServiceStore,
     scope: Scope,
@@ -788,6 +839,7 @@ async fn complete_recovery_path(
     Ok(observed)
 }
 
+/// Runs `ambiguity_probe_change`.
 fn ambiguity_probe_change(
     scope: Scope,
     replica: ReplicaId,
@@ -822,6 +874,7 @@ fn ambiguity_probe_change(
     ))
 }
 
+/// Runs `tombstone_probe_change`.
 fn tombstone_probe_change(
     scope: Scope,
     replica: ReplicaId,
@@ -846,6 +899,7 @@ fn tombstone_probe_change(
     ))
 }
 
+/// Runs `append_continuation_record`.
 async fn append_continuation_record(
     store: &FdbServiceStore,
     scope: Scope,
@@ -893,6 +947,7 @@ async fn append_continuation_record(
     Err(io::Error::other("could not append a known continuation record").into())
 }
 
+/// Runs `continuation_fixture_request`.
 fn continuation_fixture_request(scope: Scope, frontier: u64, attempt: u16) -> OperationDigest {
     let mut digest = Hasher::new();
     digest.update(b"logical-db/fdb-continuation-fixture/v1\0");
@@ -903,6 +958,7 @@ fn continuation_fixture_request(scope: Scope, frontier: u64, attempt: u16) -> Op
     OperationDigest::new(*digest.finalize().as_bytes())
 }
 
+/// Runs `verify_recovered_write`.
 async fn verify_recovered_write(
     store: &FdbServiceStore,
     scope: Scope,
@@ -918,7 +974,7 @@ async fn verify_recovered_write(
         }
     }
     let observed = observed.ok_or_else(|| io::Error::other("frontier retry budget exhausted"))?;
-    if observed != frontier + 1 {
+    if observed != frontier.saturating_add(1) {
         return Err(io::Error::other("unknown recovery advanced more than once").into());
     }
     let mut exact_retry = None;
@@ -970,6 +1026,7 @@ async fn verify_recovered_write(
     Ok((observed, rebound))
 }
 
+/// Runs `verify_page`.
 async fn verify_page(
     store: &FdbServiceStore,
     scope: Scope,
@@ -1015,8 +1072,10 @@ async fn verify_page(
             if !operations.insert(returned_change.operation) {
                 return Err(io::Error::other("ordered FDB pages repeated an operation").into());
             }
-            recovered_change_count += usize::from(returned_change == change);
-            continuation_change_count += usize::from(returned_change == continuation);
+            recovered_change_count =
+                recovered_change_count.saturating_add(usize::from(returned_change == change));
+            continuation_change_count = continuation_change_count
+                .saturating_add(usize::from(returned_change == continuation));
         }
         after = page.position;
         if !page.more {
@@ -1056,6 +1115,7 @@ async fn verify_page(
     verify_rebound_grants(store, observed, rebound_action, rebound).await
 }
 
+/// Runs `read_page_with_retry`.
 async fn read_page_with_retry(
     store: &FdbServiceStore,
     action: PageAction,
@@ -1081,6 +1141,8 @@ async fn read_page_with_retry(
                 ))
                 .into());
             }
+            // A future page outcome is not a terminal page; retry then fail.
+            Ok(_) => {}
             Err(error) => last_error = Some(error),
         }
     }
@@ -1092,6 +1154,7 @@ async fn read_page_with_retry(
     .into())
 }
 
+/// Runs `page_action`.
 fn page_action(
     scope: Scope,
     replica: ReplicaId,
@@ -1109,6 +1172,7 @@ fn page_action(
     )
 }
 
+/// Runs `verify_rebound_grants`.
 async fn verify_rebound_grants(
     store: &FdbServiceStore,
     observed: u64,
@@ -1171,12 +1235,15 @@ async fn verify_rebound_grants(
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use logical_db_model::{AccountId, Scope, SpaceId};
 
     use super::{page_action, probe_result_is_nonterminal, run};
     use logical_db_service::AcceptResult;
 
     #[test]
+    /// Runs `ambiguity_probe_continues_after_durable_duplicate`.
     fn ambiguity_probe_continues_after_durable_duplicate() {
         assert!(probe_result_is_nonterminal(AcceptResult::Accepted));
         assert!(probe_result_is_nonterminal(AcceptResult::Duplicate));
@@ -1187,6 +1254,7 @@ mod tests {
     }
 
     #[test]
+    /// Runs `page_fixture_identity_binds_scope_position_and_limits`.
     fn page_fixture_identity_binds_scope_position_and_limits() {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = logical_db_model::ReplicaId::new();
@@ -1212,13 +1280,12 @@ mod tests {
     }
 
     #[test]
-    fn live_fdb_recovers_unknown_commit_and_preserves_all_axes() {
+    /// Runs `live_fdb_recovers_unknown_commit_and_preserves_all_axes`.
+    fn live_fdb_recovers_unknown_commit_and_preserves_all_axes() -> Result<(), Box<dyn Error>> {
         if std::env::var_os("LOGICAL_DB_FDB_CLUSTER_FILE").is_none() {
-            return;
+            return Ok(());
         }
-        lgwks_bot::Runtime::new()
-            .expect("test runtime")
-            .block_on(run())
-            .expect("live FDB ambiguity proof");
+        lgwks_bot::Runtime::new()?.block_on(run())?;
+        Ok(())
     }
 }

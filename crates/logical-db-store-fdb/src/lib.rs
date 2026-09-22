@@ -69,10 +69,13 @@ const BASELINE_DOCUMENT_MANIFEST_BYTES: usize = 41;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// BaselineDocumentManifest
 struct BaselineDocumentManifest {
+    /// tombstone
     tombstone: bool,
     /// Byte len
     byte_len: usize,
+    /// chunks
     chunks: u16,
+    /// digest
     digest: [u8; 32],
 }
 
@@ -121,6 +124,7 @@ fn decode_baseline_document(bytes: &[u8]) -> Result<BaselineDocumentManifest, Fd
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// PageReadPlan
 struct PageReadPlan {
+    /// limit
     limit: usize,
     /// Target bytes
     target_bytes: usize,
@@ -166,14 +170,21 @@ fn logical_page_more(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Record
 struct Record {
+    /// document
     document: DocumentId,
     /// Replica
     replica: ReplicaId,
+    /// operation
     operation: OperationId,
+    /// request
     request: OperationDigest,
+    /// digest
     digest: ChangeDigest,
+    /// byte_len
     byte_len: usize,
+    /// chunks
     chunks: u16,
+    /// sequence
     sequence: u64,
 }
 
@@ -181,6 +192,7 @@ struct Record {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// OperationRecord
 struct OperationRecord {
+    /// record
     record: Record,
     /// Invocation id
     invocation_id: [u8; 32],
@@ -309,6 +321,7 @@ struct CollectionView<'a> {
 #[cfg(test)]
 /// BaselineAtlas
 struct BaselineAtlas {
+    /// manifests
     manifests: BTreeMap<([u8; 32], DocumentId), Vec<u8>>,
     /// Chunks
     chunks: BTreeMap<([u8; 32], DocumentId, u16), Vec<u8>>,
@@ -561,6 +574,7 @@ pub enum FdbDataError {
 type DataError = FdbDataError;
 
 #[cfg(feature = "fdb")]
+/// runtime internals.
 mod runtime {
     use super::{
         BaselineDocumentManifest, CHUNK_BYTES, DataError, FORMAT_VERSION, KIND_LOG, MANIFEST_BYTES,
@@ -613,34 +627,47 @@ mod runtime {
     #[derive(Clone)]
     /// PageSpaces
     struct PageSpaces {
+        /// scope
         scope: Subspace,
         /// Sequence key
         sequence_key: Vec<u8>,
+        /// retention_key
         retention_key: Vec<u8>,
+        /// log
         log: Subspace,
+        /// chunk
         chunk: Subspace,
     }
 
     #[derive(Clone, Copy)]
     /// PageQuery
     struct PageQuery {
+        /// scope
         scope: Scope,
         /// Frontier
         frontier: u64,
+        /// after
         after: u64,
+        /// max_changes
         max_changes: u16,
+        /// max_bytes
         max_bytes: u32,
     }
 
     #[derive(Clone)]
     /// BaselineSpaces
     struct BaselineSpaces {
+        /// scope
         scope: Subspace,
         /// Pointer key
         pointer_key: Vec<u8>,
+        /// log
         log: Subspace,
+        /// change_chunk
         change_chunk: Subspace,
+        /// document
         document: Subspace,
+        /// snapshot_chunk
         snapshot_chunk: Subspace,
     }
 
@@ -649,6 +676,7 @@ mod runtime {
     /// The host allocates `root` through the directory layer and owns the network
     /// lifecycle. Logical-DB never exposes physical tuple bytes to applications.
     pub struct FdbServiceStore {
+        /// database
         database: Database,
         /// Root
         root: Subspace,
@@ -677,17 +705,13 @@ mod runtime {
         }
     }
 
-    #[expect(
-        async_fn_in_trait,
-        reason = "ServiceStore mirrors the estate trait that declares async fns; APIT is the contract and suppressing it here keeps the impl matching without splitting the trait"
-    )]
     impl ServiceStore for FdbServiceStore {
         /// Error
         type Error = FdbStoreError;
 
         /// Classify error
         fn classify_error(error: &Self::Error) -> StoreFailureClass {
-            match error {
+            match *error {
                 FdbStoreError::CommitMayHaveSucceeded { .. }
                 | FdbStoreError::Cancelled { .. }
                 | FdbStoreError::VersionSkew { .. }
@@ -702,6 +726,7 @@ mod runtime {
             }
         }
 
+        /// Runs `accept`.
         async fn accept(
             &self,
             change: &ChangeEnvelope,
@@ -757,6 +782,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `frontier`.
         async fn frontier(&self, scope: Scope) -> Result<u64, Self::Error> {
             let sequence_key = self.scope_space(scope).pack(&(KIND_SEQUENCE,));
             self.database
@@ -776,6 +802,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `retention_floor`.
         async fn retention_floor(&self, scope: Scope) -> Result<u64, Self::Error> {
             let retention_key = self.scope_space(scope).pack(&(KIND_RETENTION,));
             self.database
@@ -799,6 +826,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `page`.
         async fn page(
             &self,
             action: PageAction,
@@ -842,11 +870,8 @@ mod runtime {
         }
     }
 
-    #[expect(
-        async_fn_in_trait,
-        reason = "RetentionStore mirrors the estate trait that declares async fns; APIT is the contract and suppressing it here keeps the impl matching without splitting the trait"
-    )]
     impl RetentionStore for FdbServiceStore {
+        /// Runs `consumed_through`.
         async fn consumed_through(&self, scope: Scope) -> Result<u64, Self::Error> {
             let retention_key = self.scope_space(scope).pack(&(KIND_RETENTION,));
             self.database
@@ -870,6 +895,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `snapshot_baseline`.
         async fn snapshot_baseline(
             &self,
             scope: Scope,
@@ -891,6 +917,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `build_snapshot`.
         async fn build_snapshot(
             &self,
             scope: Scope,
@@ -917,6 +944,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `read_baseline_page`.
         async fn read_baseline_page(
             &self,
             action: &RecoveryAction,
@@ -954,6 +982,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `seal_snapshot`.
         async fn seal_snapshot(
             &self,
             scope: Scope,
@@ -998,6 +1027,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `mark_consumed`.
         async fn mark_consumed(
             &self,
             scope: Scope,
@@ -1045,6 +1075,7 @@ mod runtime {
                 .map_err(classify_transaction)
         }
 
+        /// Runs `prune`.
         async fn prune(
             &self,
             scope: Scope,
@@ -1095,20 +1126,31 @@ mod runtime {
 
     /// AcceptOperation
     struct AcceptOperation {
+        /// expected_frontier
         expected_frontier: u64,
         /// Invocation id
         invocation_id: [u8; 32],
+        /// change
         change: ChangeEnvelope,
+        /// maybe_committed
         maybe_committed: bool,
+        /// operation_key
         operation_key: Vec<u8>,
+        /// sequence_key
         sequence_key: Vec<u8>,
+        /// retention_key
         retention_key: Vec<u8>,
+        /// invocation_key
         invocation_key: Vec<u8>,
+        /// scope_space
         scope_space: Subspace,
+        /// log_space
         log_space: Subspace,
+        /// chunk_space
         chunk_space: Subspace,
     }
 
+    /// Runs `accept_transaction`.
     async fn accept_transaction(
         transaction: &foundationdb::RetryableTransaction,
         operation: AcceptOperation,
@@ -1171,29 +1213,43 @@ mod runtime {
 
     /// PruneOperation
     struct PruneOperation {
+        /// scope
         scope: Scope,
         /// Expected frontier
         expected_frontier: u64,
+        /// up_to
         up_to: u64,
+        /// min_live
         min_live: Option<u64>,
+        /// sequence_key
         sequence_key: Vec<u8>,
+        /// retention_key
         retention_key: Vec<u8>,
+        /// log_space
         log_space: Subspace,
+        /// chunk_space
         chunk_space: Subspace,
+        /// baseline
         baseline: BaselineSpaces,
     }
 
     /// SealOperation
     struct SealOperation {
+        /// scope
         scope: Scope,
         /// Expected frontier
         expected_frontier: u64,
+        /// position
         position: u64,
+        /// sequence_key
         sequence_key: Vec<u8>,
+        /// spaces
         spaces: BaselineSpaces,
+        /// artifact
         artifact: SnapshotArtifact,
     }
 
+    /// Runs `seal_transaction`.
     async fn seal_transaction(
         transaction: &foundationdb::RetryableTransaction,
         operation: SealOperation,
@@ -1207,10 +1263,13 @@ mod runtime {
             return Ok(SealResult::BeyondFrontier { frontier });
         }
         let existing = read_snapshot_record(transaction, &operation.spaces.pointer_key).await?;
-        let existing_position = match &existing {
-            Some(SnapshotRecord::LegacyPosition(position)) => *position,
-            Some(SnapshotRecord::State(state)) => state.position(),
+        let existing_position = match existing.as_ref() {
+            Some(&SnapshotRecord::LegacyPosition(position)) => position,
+            Some(&SnapshotRecord::State(ref state)) => state.position(),
             None => 0,
+            // A future descriptor class cannot authorize a seal; fail closed
+            // as corrupt rather than guessing its coverage position.
+            Some(_) => return Err(binding(DataError::BaselineCorrupt)),
         };
         if existing_position > operation.position {
             return Err(binding(DataError::BaselineCoverage));
@@ -1289,6 +1348,7 @@ mod runtime {
         }
     }
 
+    /// Runs `reconstruct_artifact`.
     async fn reconstruct_artifact(
         transaction: &foundationdb::RetryableTransaction,
         scope: Scope,
@@ -1339,7 +1399,7 @@ mod runtime {
             if !more {
                 break;
             }
-            let Some((last, _)) = manifests.last() else {
+            let Some(&(ref last, _)) = manifests.last() else {
                 return Err(binding(DataError::BaselineResourceLimit));
             };
             let (sequence,) = spaces.log.unpack::<(u64,)>(last).map_err(binding_invalid)?;
@@ -1374,11 +1434,15 @@ mod runtime {
                 SnapshotMaterializationError::InvalidBase { context: _ }
                 | SnapshotMaterializationError::ScopeMismatch
                 | SnapshotMaterializationError::InvalidChange => DataError::BaselineCorrupt,
+                // Unknown materialization classes fail closed as corrupt
+                // rather than being assumed benign outside the defining crate.
+                _ => DataError::BaselineCorrupt,
             };
             binding(data)
         })
     }
 
+    /// Runs `load_baseline_change`.
     async fn load_baseline_change(
         transaction: &foundationdb::RetryableTransaction,
         spaces: &BaselineSpaces,
@@ -1402,6 +1466,7 @@ mod runtime {
         Ok((sequence, record.envelope(scope, bytes), next_bytes))
     }
 
+    /// Runs `read_snapshot_record`.
     async fn read_snapshot_record(
         transaction: &foundationdb::RetryableTransaction,
         pointer_key: &[u8],
@@ -1413,6 +1478,7 @@ mod runtime {
             .transpose()
     }
 
+    /// Runs `scan_baseline_manifests`.
     async fn scan_baseline_manifests(
         transaction: &foundationdb::RetryableTransaction,
         space_begin: &[u8],
@@ -1467,6 +1533,7 @@ mod runtime {
         Ok(manifests)
     }
 
+    /// Runs `load_baseline_documents`.
     async fn load_baseline_documents(
         transaction: &foundationdb::RetryableTransaction,
         document_space: &foundationdb_tuple::Subspace,
@@ -1516,6 +1583,7 @@ mod runtime {
         Ok(artifact)
     }
 
+    /// Runs `load_artifact`.
     async fn load_artifact(
         transaction: &foundationdb::RetryableTransaction,
         scope: Scope,
@@ -1525,7 +1593,7 @@ mod runtime {
         let digest = baseline.digest().into_bytes();
         let document_space = spaces.document.subspace(&(digest.as_slice(),));
         let (space_begin, space_end) = document_space.range();
-        let expected_count = baseline.document_count() as usize;
+        let expected_count = usize::try_from(baseline.document_count()).map_err(binding_invalid)?;
         let expected_bytes = usize::try_from(baseline.byte_len()).map_err(binding_invalid)?;
 
         let manifests = scan_baseline_manifests(
@@ -1549,6 +1617,7 @@ mod runtime {
         verify_baseline_artifact(scope, baseline, documents)
     }
 
+    /// Runs `read_baseline_page_transaction`.
     async fn read_baseline_page_transaction(
         transaction: &foundationdb::RetryableTransaction,
         spaces: &BaselineSpaces,
@@ -1597,9 +1666,10 @@ mod runtime {
                 .await?,
             );
         }
-        Ok(BaselinePageSlice { documents, more })
+        Ok(BaselinePageSlice::new(documents, more))
     }
 
+    /// Runs `load_artifact_document`.
     async fn load_artifact_document(
         transaction: &foundationdb::RetryableTransaction,
         document_space: &Subspace,
@@ -1631,6 +1701,7 @@ mod runtime {
         ))
     }
 
+    /// Runs `load_snapshot_bytes`.
     async fn load_snapshot_bytes(
         transaction: &foundationdb::RetryableTransaction,
         chunk_space: &Subspace,
@@ -1656,6 +1727,7 @@ mod runtime {
         Ok(bytes)
     }
 
+    /// Runs `prune_transaction`.
     async fn prune_transaction(
         transaction: &foundationdb::RetryableTransaction,
         operation: PruneOperation,
@@ -1682,10 +1754,7 @@ mod runtime {
             Err(refusal) => return Ok(PruneResult::Refused(refusal)),
         };
         if through <= floor {
-            return Ok(PruneResult::Pruned(PruneReceipt {
-                pruned_through: floor,
-                floor,
-            }));
+            return Ok(PruneResult::Pruned(PruneReceipt::new(floor, floor)));
         }
         let baseline_record = read_snapshot_record(transaction, &baseline.pointer_key).await?;
         let state = match baseline_record {
@@ -1696,6 +1765,11 @@ mod runtime {
                 }));
             }
             Some(SnapshotRecord::LegacyPosition(_)) | None => {
+                return Ok(PruneResult::Refused(PruneRefusal::MissingBaseline));
+            }
+            // A future descriptor class cannot prove coverage of the prunable
+            // prefix; refuse collection as if no state-bearing baseline exists.
+            Some(_) => {
                 return Ok(PruneResult::Refused(PruneRefusal::MissingBaseline));
             }
         };
@@ -1713,12 +1787,13 @@ mod runtime {
             transaction.clear_range(&chunk_begin, &chunk_end);
             transaction.set(&retention_key, &encode_retention(through, consumed));
         }
-        Ok(PruneResult::Pruned(PruneReceipt {
-            pruned_through: through,
-            floor: through.max(floor),
-        }))
+        Ok(PruneResult::Pruned(PruneReceipt::new(
+            through,
+            through.max(floor),
+        )))
     }
 
+    /// Runs `existing_accept_result`.
     async fn existing_accept_result(
         transaction: &foundationdb::RetryableTransaction,
         scope_space: &Subspace,
@@ -1774,6 +1849,7 @@ mod runtime {
         }))
     }
 
+    /// Runs `load_page`.
     async fn load_page(
         transaction: &foundationdb::RetryableTransaction,
         spaces: &PageSpaces,
@@ -1829,6 +1905,7 @@ mod runtime {
         Ok(())
     }
 
+    /// Runs `read_frontier`.
     async fn read_frontier(
         transaction: &foundationdb::RetryableTransaction,
         key: &[u8],
@@ -1840,6 +1917,7 @@ mod runtime {
         Ok(decoded.unwrap_or(0))
     }
 
+    /// Runs `read_retention`.
     async fn read_retention(
         transaction: &foundationdb::RetryableTransaction,
         key: &[u8],
@@ -1851,6 +1929,7 @@ mod runtime {
         Ok(decoded.unwrap_or((0, 0)))
     }
 
+    /// Runs `materialize_page`.
     async fn materialize_page(
         transaction: &foundationdb::RetryableTransaction,
         spaces: &PageSpaces,
@@ -1884,7 +1963,8 @@ mod runtime {
             let Some(next_bytes) = aggregate.checked_add(record.byte_len) else {
                 return Err(binding(DataError::InvalidManifest { at: "manifest" }));
             };
-            if next_bytes > query.max_bytes as usize {
+            let max_bytes = usize::try_from(query.max_bytes).unwrap_or(usize::MAX);
+            if next_bytes > max_bytes {
                 if changes.is_empty() {
                     return Err(binding(DataError::ChangeExceedsPage));
                 }
@@ -1919,13 +1999,10 @@ mod runtime {
                 return Err(error);
             }
         };
-        Ok(PageResult::Page(StoredPage {
-            changes,
-            position,
-            more,
-        }))
+        Ok(PageResult::Page(StoredPage::new(changes, position, more)))
     }
 
+    /// Runs `log_has_entry_after`.
     async fn log_has_entry_after(
         transaction: &foundationdb::RetryableTransaction,
         log: &Subspace,
@@ -1943,6 +2020,7 @@ mod runtime {
         Ok(!transaction.get_range(&options, 1, false).await?.is_empty())
     }
 
+    /// Runs `verify_operation`.
     async fn verify_operation(
         transaction: &foundationdb::RetryableTransaction,
         scope_space: &Subspace,
@@ -1969,6 +2047,7 @@ mod runtime {
         Ok(())
     }
 
+    /// Runs `load_change_bytes`.
     async fn load_change_bytes(
         transaction: &foundationdb::RetryableTransaction,
         chunk_space: &Subspace,
@@ -2009,7 +2088,7 @@ mod runtime {
 
     /// Classify transaction
     fn classify_transaction(error: FdbBindingError) -> FdbStoreError {
-        if let FdbBindingError::CustomError(custom) = &error
+        if let FdbBindingError::CustomError(ref custom) = error
             && let Some(data) = custom.downcast_ref::<DataError>()
         {
             return FdbStoreError::Corruption(*data);
@@ -2038,6 +2117,7 @@ mod runtime {
 
     /// `FoundationDB` adapter initialization or transaction failure.
     #[derive(Debug, Error)]
+    #[non_exhaustive]
     pub enum FdbStoreError {
         /// Database option or client call failed before a retryable transaction.
         #[error("FoundationDB client rejected configuration: {0}")]
@@ -2479,10 +2559,13 @@ mod tests {
 
     /// CollectionAtlas
     struct CollectionAtlas {
+        /// manifests
         manifests: BTreeMap<u64, Vec<u8>>,
         /// Chunks
         chunks: BTreeMap<(u64, u16), Vec<u8>>,
+        /// operations
         operations: BTreeMap<OperationId, Vec<u8>>,
+        /// invocations
         invocations: BTreeMap<[u8; 32], Vec<u8>>,
     }
 

@@ -62,7 +62,7 @@ impl Transport for PausingTransport {
             if let Err(error) = std::fs::write(&self.ready, b"accumulated\n") {
                 eprintln!("recovery-consumer: ready signal: {error}");
             }
-            std::thread::sleep(self.pause);
+            std::thread::park_timeout(self.pause);
         }
         Ok(result)
     }
@@ -121,7 +121,7 @@ async fn recover() -> Result<(), Box<dyn Error>> {
         if let Err(error) = std::fs::write(&path, b"committed\n") {
             eprintln!("recovery-consumer: committed signal: {error}");
         }
-        std::thread::sleep(post_pause);
+        std::thread::park_timeout(post_pause);
     }
     println!(
         "PASS recovery-consumer recovered={} pushed={} pulled={}",

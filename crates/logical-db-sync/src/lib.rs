@@ -2926,7 +2926,7 @@ mod tests {
     }
 
     impl ReplicaPort for NsReplica {
-        type Error = Infallible;
+        type Error = MissingScriptedResponse;
         fn scope(&self) -> Scope {
             self.scope
         }
@@ -2970,7 +2970,8 @@ mod tests {
             _artifact: &SnapshotArtifact,
             _checkpoint: &[u8],
         ) -> Result<(), Self::Error> {
-            unreachable!("namespace synchronization fails closed before baseline installation")
+            // Namespace synchronization fails closed before baseline installation.
+            Err(MissingScriptedResponse)
         }
     }
 

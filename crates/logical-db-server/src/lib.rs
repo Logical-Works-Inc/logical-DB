@@ -14,7 +14,7 @@ use std::{
 
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -84,6 +84,15 @@ pub trait Clock: Send + Sync {
 #[non_exhaustive]
 pub struct SystemClock;
 
+impl SystemClock {
+    /// Builds the production wall clock (the only way outside this crate, since
+    /// the unit struct is `#[non_exhaustive]`).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
 impl Clock for SystemClock {
     /// Now unix ms
     fn now_unix_ms(&self) -> Option<u64> {
@@ -109,6 +118,20 @@ pub enum AuthenticationError {
         context: &'static str,
     },
 }
+
+impl std::fmt::Display for AuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            &Self::Unauthorized => write!(formatter, "authentication failed"),
+            &Self::Forbidden => write!(formatter, "credential is forbidden"),
+            &Self::Malformed { context } => {
+                write!(formatter, "malformed credential at {context}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuthenticationError {}
 
 /// ApiState
 struct ApiState<Store, Authentication, Time> {
@@ -401,22 +424,22 @@ fn map_service_error<Store>(error: &ServiceError<Store::Error>) -> ApiError
 where
     Store: ServiceStore,
 {
-    match error {
-        &ServiceError::Protocol(_) | &ServiceError::Checkpoint(_) => ApiError::Malformed {
+    match *error {
+        ServiceError::Protocol(_) | ServiceError::Checkpoint(_) => ApiError::Malformed {
             context: "service protocol or checkpoint",
         },
-        &ServiceError::Forbidden => ApiError::Forbidden,
-        &ServiceError::StaleAuthority => ApiError::Unavailable,
-        &ServiceError::Store(ref store_error) => match Store::classify_error(store_error) {
+        ServiceError::Forbidden => ApiError::Forbidden,
+        ServiceError::StaleAuthority => ApiError::Unavailable,
+        ServiceError::Store(ref store_error) => match Store::classify_error(store_error) {
             StoreFailureClass::Transient => ApiError::Unavailable,
             StoreFailureClass::Permanent => ApiError::Internal,
             // Unclassified store failures fail closed as internal rather than
             // being assumed permanent or transient outside the crate.
             _ => ApiError::Internal,
         },
-        &ServiceError::CrossScopeStoreData
-        | &ServiceError::CorruptStoreData
-        | &ServiceError::Model(_) => ApiError::Internal,
+        ServiceError::CrossScopeStoreData
+        | ServiceError::CorruptStoreData
+        | ServiceError::Model(_) => ApiError::Internal,
         // Unknown service failures map to an internal error rather than being
         // assumed absent outside the defining crate.
         _ => ApiError::Internal,
@@ -465,7 +488,7 @@ impl IntoResponse for ApiError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
-            Self::Malformed { context: _ } => StatusCode::BAD_REQUEST,
+            Self::Malformed { .. } => StatusCode::BAD_REQUEST,
             Self::CheckpointExpired => StatusCode::GONE,
             Self::BaselineRequired => StatusCode::CONFLICT,
             Self::BaselineUnavailable => StatusCode::NOT_FOUND,
@@ -474,6 +497,11 @@ impl IntoResponse for ApiError {
             Self::Clock | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let mut response = status.into_response();
+        if let Self::Malformed { context } = self {
+            let mut message = context.to_owned();
+            message.push('\n');
+            *response.body_mut() = Body::from(message);
+        }
         response
             .headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1064,7 +1092,7 @@ mod tests {
 
     /// Request
     fn request(path: &str, body: Vec<u8>) -> Result<Request<Body>, Box<dyn std::error::Error>> {
-        Ok(request_as(path, body, "Bearer integration-test")?)
+        request_as(path, body, "Bearer integration-test")
     }
 
     /// Request as
@@ -1111,9 +1139,13 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES).await?;
-        let mut decoded: PushResponse = ciborium::from_reader(body.as_ref())?;
+        let decoded: PushResponse = ciborium::from_reader(body.as_ref())?;
         assert_eq!(decoded.outcomes.len(), 1);
-        Ok(decoded.outcomes.remove(0))
+        decoded
+            .outcomes
+            .into_iter()
+            .next()
+            .ok_or_else(|| "expected exactly one push outcome".into())
     }
 
     /// Test runtime

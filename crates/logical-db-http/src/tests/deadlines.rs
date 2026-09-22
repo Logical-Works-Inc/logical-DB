@@ -118,7 +118,9 @@ fn assert_undispatched(listener: &TcpListener) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn successful_endpoint(operation: Operation) -> Result<Url, Box<dyn std::error::Error>> {
+fn successful_endpoint(
+    operation: Operation,
+) -> Result<(Url, super::RawServerHandle), Box<dyn std::error::Error>> {
     let (status, body) = match operation {
         Operation::Push => (
             "200 OK",
@@ -176,7 +178,7 @@ fn refresh_and_http_headers_or_body_share_one_budget() -> Result<(), Box<dyn std
     test_runtime()?.block_on(async {
         for operation in OPERATIONS {
             for stall_body in [false, true] {
-                let endpoint = spawn_raw_server(move |stream| {
+                let (endpoint, _server) = spawn_raw_server(move |stream| {
                     if !stall_body {
                         std::thread::park_timeout(Duration::from_millis(300));
                     }
@@ -225,7 +227,8 @@ fn cancelling_refresh_drops_it_and_reuses_the_same_transport()
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 1);
             assert_undispatched(&listener)?;
             transport.credentials.delay = Some(Duration::ZERO);
-            transport.endpoint = successful_endpoint(operation)?;
+            let (endpoint, _server) = successful_endpoint(operation)?;
+            transport.endpoint = endpoint;
             timeout(Duration::from_secs(2), invoke(&mut transport, operation)).await??;
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 2);
         }
@@ -271,15 +274,12 @@ fn static_and_refreshed_credentials_keep_all_routes_working()
 -> Result<(), Box<dyn std::error::Error>> {
     test_runtime()?.block_on(async {
         for operation in OPERATIONS {
-            let mut transport = HttpTransport::new(
-                successful_endpoint(operation)?,
-                StaticBearer::new("integration")?,
-            )?;
+            let (endpoint, _server) = successful_endpoint(operation)?;
+            let mut transport = HttpTransport::new(endpoint, StaticBearer::new("integration")?)?;
             invoke(&mut transport, operation).await?;
-            let mut transport = HttpTransport::new(
-                successful_endpoint(operation)?,
-                Refresh::new(Some(Duration::from_millis(10))),
-            )?;
+            let (endpoint, _refresh_server) = successful_endpoint(operation)?;
+            let mut transport =
+                HttpTransport::new(endpoint, Refresh::new(Some(Duration::from_millis(10))))?;
             invoke(&mut transport, operation).await?;
         }
 

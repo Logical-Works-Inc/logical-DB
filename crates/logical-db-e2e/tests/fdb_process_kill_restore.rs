@@ -411,7 +411,7 @@ fn await_ready(child: &mut ConsumerChild, ready: &Path, stage: &str) -> Result<(
             ))
             .into());
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::park_timeout(Duration::from_millis(10));
     }
     Err(io::Error::other(format!(
         "the consumer never signalled the kill seam before {stage}"

@@ -753,49 +753,99 @@ mod tests {
 
     /// Serves one hand-written HTTP/1.1 response on a loopback port so a test
     /// controls the exact framing bytes rather than a framework's defaults.
-    fn spawn_raw_server<F>(responder: F) -> Result<Url, Box<dyn std::error::Error>>
+    /// Joins its fixture thread on drop so no OS thread is left unjoined.
+    struct RawServerHandle {
+        /// Loopback address the fixture thread is bound to.
+        address: std::net::SocketAddr,
+        /// Fixture thread; joined on drop after a shutdown poke.
+        handle: Option<std::thread::JoinHandle<()>>,
+        /// Cooperative stop flag checked around `accept`.
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for RawServerHandle {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                // Unblock `accept` and any `park_timeout` stall so the fixture
+                // thread can observe shutdown and exit before the join.
+                drop(std::net::TcpStream::connect(self.address));
+                handle.thread().unpark();
+                drop(handle.join());
+            }
+        }
+    }
+
+    fn spawn_raw_server<F>(
+        responder: F,
+    ) -> Result<(Url, RawServerHandle), Box<dyn std::error::Error>>
     where
         F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
     {
         use std::{
             io::{Read, Write},
             net::TcpListener,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
         };
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read(&mut byte).unwrap_or(0) == 1 {
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_flag = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
+            .name("logical-db-http-raw-fixture".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).unwrap_or_else(|_error| ());
+                loop {
+                    if thread_flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::park_timeout(std::time::Duration::from_millis(10));
+                        continue;
+                    };
+                    drop(stream.set_nonblocking(false));
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let declared: usize = String::from_utf8_lossy(&head)
+                        .lines()
+                        .find_map(|line| {
+                            let lowered = line.to_ascii_lowercase();
+                            let (_, value) = lowered.split_once("content-length:")?;
+                            value.trim().parse().ok()
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; declared];
+                    let mut read = 0;
+                    while read < declared {
+                        match stream.read(&mut body[read..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(got) => read = read.saturating_add(got),
+                        }
+                    }
+                    responder(&mut stream);
+                    drop(stream.flush());
+                    drop(stream.shutdown(std::net::Shutdown::Both));
+                    return;
                 }
-            }
-            let declared: usize = String::from_utf8_lossy(&head)
-                .lines()
-                .find_map(|line| {
-                    let lowered = line.to_ascii_lowercase();
-                    let (_, value) = lowered.split_once("content-length:")?;
-                    value.trim().parse().ok()
-                })
-                .unwrap_or(0);
-            let mut body = vec![0u8; declared];
-            let mut read = 0;
-            while read < declared {
-                match stream.read(&mut body[read..]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(got) => read = read.saturating_add(got),
-                }
-            }
-            responder(&mut stream);
-            drop(stream.flush());
-            drop(stream.shutdown(std::net::Shutdown::Both));
-        });
-        Ok(format!("http://{address}/").parse()?)
+            })?;
+        Ok((
+            format!("http://{address}/").parse()?,
+            RawServerHandle {
+                address,
+                handle: Some(handle),
+                shutdown,
+            },
+        ))
     }
 
     fn write_bytes(stream: &mut std::net::TcpStream, bytes: &[u8]) {
@@ -831,7 +881,7 @@ mod tests {
     #[test]
     fn a_chunked_response_without_a_content_length_is_decoded()
     -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = spawn_raw_server(|stream| {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
             write_bytes(&mut *stream, &chunked_head());
             chunk(&mut *stream, CBOR_FORTY_TWO);
             write_bytes(&mut *stream, b"0\r\n\r\n");
@@ -857,7 +907,7 @@ mod tests {
     #[test]
     fn a_chunked_body_crossing_the_ceiling_fails_closed_without_a_content_length()
     -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = spawn_raw_server(|stream| {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
             write_bytes(&mut *stream, &chunked_head());
             let filler = vec![0u8; 64 * 1024];
             let mut sent = 0;
@@ -886,7 +936,7 @@ mod tests {
     #[test]
     fn a_declared_length_above_the_ceiling_is_refused_before_the_body_is_read()
     -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = spawn_raw_server(|stream| {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
             write_bytes(
                 &mut *stream,
                 format!(
@@ -907,7 +957,7 @@ mod tests {
     #[test]
     fn a_body_shorter_than_its_declared_length_is_an_error_never_a_hang()
     -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = spawn_raw_server(|stream| {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
             write_bytes(
                 &mut *stream,
                 format!(
@@ -945,13 +995,13 @@ mod tests {
         };
         let followed = Arc::new(AtomicBool::new(false));
         let marker = Arc::clone(&followed);
-        let target = spawn_raw_server(move |stream| {
+        let (target, _target_server) = spawn_raw_server(move |stream| {
             marker.store(true, Ordering::SeqCst);
             write_bytes(&mut *stream, &chunked_head());
             chunk(&mut *stream, CBOR_FORTY_TWO);
             write_bytes(&mut *stream, b"0\r\n\r\n");
         })?;
-        let redirect = spawn_raw_server(move |stream| {
+        let (redirect, _redirect_server) = spawn_raw_server(move |stream| {
             write_bytes(&mut *stream,
                 format!(
                     "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}\r\ncontent-length: 0\r\n\r\n"
@@ -990,9 +1040,9 @@ mod tests {
     #[test]
     fn a_stalled_response_is_released_by_the_request_timeout()
     -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = spawn_raw_server(|stream| {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
             write_bytes(&mut *stream, &chunked_head());
-            std::thread::sleep(Duration::from_secs(45));
+            std::thread::park_timeout(Duration::from_secs(45));
         })?;
         let started = std::time::Instant::now();
         let outcome = test_runtime()?.block_on(pull_from(endpoint));
@@ -1008,12 +1058,12 @@ mod tests {
     #[test]
     fn cancelling_an_in_flight_request_leaves_the_transport_usable()
     -> Result<(), Box<dyn std::error::Error>> {
-        let slow = spawn_raw_server(|stream| {
+        let (slow, _slow_server) = spawn_raw_server(|stream| {
             write_bytes(&mut *stream, &chunked_head());
             chunk(&mut *stream, &[0x18]);
-            std::thread::sleep(Duration::from_secs(20));
+            std::thread::park_timeout(Duration::from_secs(20));
         })?;
-        let fast = spawn_raw_server(|stream| {
+        let (fast, _fast_server) = spawn_raw_server(|stream| {
             write_bytes(&mut *stream, &chunked_head());
             chunk(&mut *stream, CBOR_FORTY_TWO);
             write_bytes(&mut *stream, b"0\r\n\r\n");
