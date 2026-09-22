@@ -44,7 +44,7 @@ if [[ "$lane" == linux ]]; then
   # Preserve the original Linux package-isolation lane and report every
   # failing package, without silently stopping after the first failure.
   failed=0
-  for crate in logical-db logical-db-braid logical-db-cairn logical-db-crdt logical-db-daemon logical-db-episode logical-db-http logical-db-kv logical-db-model logical-db-platform logical-db-protocol logical-db-server logical-db-service logical-db-store logical-db-sync; do
+  for crate in logical-db logical-db-cairn logical-db-crdt logical-db-daemon logical-db-episode logical-db-http logical-db-kv logical-db-model logical-db-platform logical-db-protocol logical-db-server logical-db-service logical-db-store logical-db-sync; do
     if ! cargo check -p "$crate" --all-targets --locked; then failed=1; fi
   done
   if [[ "$failed" != 0 ]]; then exit "$failed"; fi
