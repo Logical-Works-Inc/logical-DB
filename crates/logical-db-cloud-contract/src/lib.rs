@@ -14,6 +14,8 @@ use thiserror::Error;
 
 /// Maximum UTF-8 bytes in a stable routing or recovery authority identity.
 const MAX_ROUTING_ID_BYTES: usize = 128;
+/// Maximum transfer receipts accepted for one bounded route-map transition.
+const MAX_HANDOFFS_PER_TRANSITION: usize = 4_096;
 
 /// Identifies one logical partition inside a [`Scope`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -175,6 +177,58 @@ impl PartitionRoute {
     #[must_use]
     pub const fn recovery(&self) -> &RecoveryAuthority {
         &self.recovery
+    }
+}
+
+/// Immutable receipt that authorizes one predecessor-to-successor range handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteHandoff {
+    /// Partition that released a contiguous key range.
+    predecessor: PartitionId,
+    /// Partition that accepted that range in the next epoch.
+    successor: PartitionId,
+    /// Durable operation receipt for the state transfer through its watermark.
+    receipt: OperationDigest,
+}
+
+impl RouteHandoff {
+    /// Creates one authority-issued route handoff receipt.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "handoff construction is reserved for in-crate authority adapters; external callers consume RoutingAuthority"
+        )
+    )]
+    pub(crate) const fn new(
+        predecessor: PartitionId,
+        successor: PartitionId,
+        receipt: OperationDigest,
+    ) -> Self {
+        Self {
+            predecessor,
+            successor,
+            receipt,
+        }
+    }
+
+    /// Returns the partition that released the range.
+    #[must_use]
+    pub const fn predecessor(&self) -> PartitionId {
+        self.predecessor
+    }
+
+    /// Returns the partition that accepted the range.
+    #[must_use]
+    pub const fn successor(&self) -> PartitionId {
+        self.successor
+    }
+
+    /// Returns the durable transfer receipt digest.
+    #[must_use]
+    pub const fn receipt(&self) -> OperationDigest {
+        self.receipt
     }
 }
 
@@ -342,6 +396,7 @@ impl PartitionMap {
         if indexed.is_empty() {
             return Err(RoutingError::EmptyMap);
         }
+        validate_complete_ranges(&indexed)?;
         Ok(Self {
             scope,
             epoch,
@@ -405,7 +460,11 @@ impl PartitionMap {
     /// Returns a typed refusal when the replacement is for another scope, does
     /// not advance the epoch, or weakens the ordering entitlement of a retained
     /// partition.
-    pub fn replace_with(&self, replacement: Self) -> Result<Self, RoutingError> {
+    pub fn replace_with(
+        &self,
+        replacement: Self,
+        handoffs: &[RouteHandoff],
+    ) -> Result<Self, RoutingError> {
         if replacement.scope != self.scope {
             return Err(RoutingError::ScopeMismatch);
         }
@@ -415,15 +474,7 @@ impl PartitionMap {
                 replacement: replacement.epoch,
             });
         }
-        for (partition, existing) in &self.routes {
-            if let Some(next) = replacement.routes.get(partition)
-                && next.ordering != existing.ordering
-            {
-                return Err(RoutingError::OrderingChanged {
-                    partition: *partition,
-                });
-            }
-        }
+        validate_handoffs(&self.routes, &replacement.routes, handoffs)?;
         Ok(replacement)
     }
 
@@ -492,6 +543,26 @@ pub enum RoutingError {
     /// No authority-declared range covered the request document.
     #[error("no authoritative partition range covers the document")]
     UnroutableDocument,
+    /// A map leaves a UUID key gap or contains overlapping route ranges.
+    #[error("partition routes must cover the UUID keyspace exactly once")]
+    IncompleteRouteMap,
+    /// A transition supplied more receipts than its bounded contract permits.
+    #[error("route transition has {actual} handoffs, above maximum {maximum}")]
+    TooManyHandoffs {
+        /// Observed receipt count.
+        actual: usize,
+        /// Fixed maximum receipt count.
+        maximum: usize,
+    },
+    /// A handoff referred to a predecessor or successor absent from its maps.
+    #[error("route handoff refers to an unknown partition")]
+    UnknownHandoffPartition,
+    /// A handoff did not cover an overlapping predecessor/successor range.
+    #[error("route handoff does not cover an overlapping range")]
+    InvalidHandoffRange,
+    /// A transition omitted the receipt required to transfer one route range.
+    #[error("route transition lacks a handoff receipt for an overlapping range")]
+    MissingHandoff,
     /// A replacement did not advance the map version.
     #[error("replacement epoch {replacement:?} must exceed current epoch {current:?}")]
     EpochNotAdvanced {
@@ -525,6 +596,79 @@ fn validate_identity(value: &str, kind: &'static str) -> Result<(), RoutingError
     Ok(())
 }
 
+/// Proves that a map partitions every UUID key exactly once.
+fn validate_complete_ranges(
+    routes: &BTreeMap<PartitionId, PartitionRoute>,
+) -> Result<(), RoutingError> {
+    let mut ordered: Vec<&PartitionRoute> = routes.values().collect();
+    ordered.sort_by_key(|route| route.start());
+    let Some(first) = ordered.first() else {
+        return Err(RoutingError::EmptyMap);
+    };
+    if first.start() != 0 {
+        return Err(RoutingError::IncompleteRouteMap);
+    }
+    let mut previous_end = first.end();
+    for route in ordered.into_iter().skip(1) {
+        if previous_end.checked_add(1) != Some(route.start()) {
+            return Err(RoutingError::IncompleteRouteMap);
+        }
+        previous_end = route.end();
+    }
+    if previous_end != u128::MAX {
+        return Err(RoutingError::IncompleteRouteMap);
+    }
+    Ok(())
+}
+
+/// Proves every overlapping old/new range has a typed transfer receipt.
+fn validate_handoffs(
+    previous: &BTreeMap<PartitionId, PartitionRoute>,
+    next: &BTreeMap<PartitionId, PartitionRoute>,
+    handoffs: &[RouteHandoff],
+) -> Result<(), RoutingError> {
+    if handoffs.len() > MAX_HANDOFFS_PER_TRANSITION {
+        return Err(RoutingError::TooManyHandoffs {
+            actual: handoffs.len(),
+            maximum: MAX_HANDOFFS_PER_TRANSITION,
+        });
+    }
+    for handoff in handoffs {
+        let old = previous
+            .get(&handoff.predecessor())
+            .ok_or(RoutingError::UnknownHandoffPartition)?;
+        let replacement = next
+            .get(&handoff.successor())
+            .ok_or(RoutingError::UnknownHandoffPartition)?;
+        if !ranges_overlap(old, replacement) {
+            return Err(RoutingError::InvalidHandoffRange);
+        }
+        if old.ordering() != replacement.ordering() {
+            return Err(RoutingError::OrderingChanged {
+                partition: old.partition(),
+            });
+        }
+    }
+    for old in previous.values() {
+        for replacement in next.values() {
+            if ranges_overlap(old, replacement)
+                && !handoffs.iter().any(|handoff| {
+                    handoff.predecessor() == old.partition()
+                        && handoff.successor() == replacement.partition()
+                })
+            {
+                return Err(RoutingError::MissingHandoff);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether two inclusive UUID ranges share at least one key.
+fn ranges_overlap(left: &PartitionRoute, right: &PartitionRoute) -> bool {
+    left.start() <= right.end() && right.start() <= left.end()
+}
+
 #[cfg(test)]
 mod tests {
     use logical_db_model::{AccountId, OperationDigest, OperationId, SpaceId};
@@ -532,7 +676,7 @@ mod tests {
 
     use super::{
         DocumentId, OrderingDomain, PartitionId, PartitionMap, PartitionRoute, RecoveryAuthority,
-        RouteRequest, RoutingEpoch, RoutingError, Scope,
+        RouteHandoff, RouteRequest, RoutingEpoch, RoutingError, Scope,
     };
 
     /// Builds a deterministic document key for routing tests.
@@ -553,6 +697,22 @@ mod tests {
             OperationDigest::new([7; 32]),
             RoutingEpoch::new(epoch)?,
         ))
+    }
+
+    /// Builds the two transfer receipts required by an unchanged two-way map.
+    fn identity_handoffs() -> Result<[RouteHandoff; 2], RoutingError> {
+        Ok([
+            RouteHandoff::new(
+                PartitionId::new(1)?,
+                PartitionId::new(1)?,
+                OperationDigest::new([1; 32]),
+            ),
+            RouteHandoff::new(
+                PartitionId::new(2)?,
+                PartitionId::new(2)?,
+                OperationDigest::new([2; 32]),
+            ),
+        ])
     }
 
     /// Builds a deterministic scope for routing tests.
@@ -668,7 +828,7 @@ mod tests {
             ],
         )?;
         assert_eq!(
-            current.replace_with(replacement),
+            current.replace_with(replacement, &identity_handoffs()?),
             Err(RoutingError::OrderingChanged {
                 partition: PartitionId::new(1)?
             })
@@ -677,15 +837,79 @@ mod tests {
     }
 
     #[test]
+    fn split_requires_receipts_for_every_predecessor_successor_overlap() -> Result<(), RoutingError>
+    {
+        let current_scope = scope(35);
+        let current = map(current_scope, 1)?;
+        let recovery = RecoveryAuthority::new("route-authority")?;
+        let replacement = PartitionMap::new(
+            current_scope,
+            RoutingEpoch::new(2)?,
+            recovery.clone(),
+            [
+                PartitionRoute::new(
+                    PartitionId::new(1)?,
+                    0,
+                    85070591730234615865843651857942052863,
+                    "ca-central",
+                    OrderingDomain::PerDocument,
+                    recovery.clone(),
+                )?,
+                PartitionRoute::new(
+                    PartitionId::new(3)?,
+                    85070591730234615865843651857942052864,
+                    170141183460469231731687303715884105727,
+                    "ca-central",
+                    OrderingDomain::PerDocument,
+                    recovery.clone(),
+                )?,
+                PartitionRoute::new(
+                    PartitionId::new(2)?,
+                    170141183460469231731687303715884105728,
+                    u128::MAX,
+                    "ca-central",
+                    OrderingDomain::PerDocument,
+                    recovery,
+                )?,
+            ],
+        )?;
+        let handoffs = [
+            RouteHandoff::new(
+                PartitionId::new(1)?,
+                PartitionId::new(1)?,
+                OperationDigest::new([1; 32]),
+            ),
+            RouteHandoff::new(
+                PartitionId::new(1)?,
+                PartitionId::new(3)?,
+                OperationDigest::new([2; 32]),
+            ),
+            RouteHandoff::new(
+                PartitionId::new(2)?,
+                PartitionId::new(2)?,
+                OperationDigest::new([3; 32]),
+            ),
+        ];
+        assert_eq!(
+            current.replace_with(replacement.clone(), &[]),
+            Err(RoutingError::MissingHandoff)
+        );
+        let advanced = current.replace_with(replacement, &handoffs)?;
+        let stale = advanced.resolve(request(current_scope, document(7), 1)?);
+        assert!(matches!(stale, Err(RoutingError::StaleEpoch { .. })));
+        Ok(())
+    }
+
+    #[test]
     fn replacement_requires_the_same_scope_and_an_advanced_epoch() -> Result<(), RoutingError> {
         let current_scope = scope(40);
         let current = map(current_scope, 2)?;
         assert_eq!(
-            current.replace_with(map(scope(50), 3)?),
+            current.replace_with(map(scope(50), 3)?, &[]),
             Err(RoutingError::ScopeMismatch)
         );
         assert_eq!(
-            current.replace_with(map(current_scope, 2)?),
+            current.replace_with(map(current_scope, 2)?, &[]),
             Err(RoutingError::EpochNotAdvanced {
                 current: RoutingEpoch::new(2)?,
                 replacement: RoutingEpoch::new(2)?,
