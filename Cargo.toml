@@ -21,6 +21,7 @@ members = [
   "crates/logical-db-kv",
   "crates/logical-db-cairn",
   "crates/logical-db-episode",
+  "crates/logical-db-cloud-contract",
 ]
 
 [workspace.package]
