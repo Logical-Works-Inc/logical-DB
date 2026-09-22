@@ -180,7 +180,7 @@ def export():
         target = output / executable
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / executable, target)
-    sdk = Path("/root/.rustup/toolchains/1.98.0-x86_64-pc-windows-gnu/bin")
+    sdk = Path("/root/.rustup/toolchains/1.98.1-x86_64-pc-windows-gnu/bin")
     shutil.copytree(sdk, control / "sdk", dirs_exist_ok=True)
     dlls = control / "dlls"
     dlls.mkdir(exist_ok=True)

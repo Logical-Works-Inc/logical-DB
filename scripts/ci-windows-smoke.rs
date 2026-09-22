@@ -24,12 +24,12 @@ fn main() {
             .arg("--version")
             .output()
             .expect("Windows subprocess must find its Windows SDK executable");
-        assert!(output.status.success(), "{program}: {output:?}");
+        assert!(output.status.success(), "{}: {:?}", program, output);
         let version = String::from_utf8(output.stdout).expect("tool version is UTF-8");
         assert!(
-            version.starts_with(&format!("{program} 1.98.0")),
-            "{version}"
+            version.starts_with(&format!("{program} 1.98.1")),
+            "{}",
+            version
         );
     }
-    println!("PASS Windows Rust runtime: random hash seed, loopback socket, thread join, native Cargo/rustc subprocesses");
 }
