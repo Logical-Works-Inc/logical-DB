@@ -3,7 +3,7 @@
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20. Source URLs are in `evidence/SOURCES.md`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use logical_db_model::Scope;
 use thiserror::Error;
@@ -212,8 +212,8 @@ pub struct AuthorizedView {
     region: String,
     /// Authority that owns revocation and cursor-expiry recovery.
     recovery: RecoveryAuthority,
-    /// Complete authorized partition membership.
-    partitions: BTreeSet<PartitionId>,
+    /// Complete server-issued cursor vector, indexed by partition.
+    cursors: BTreeMap<PartitionId, Vec<u8>>,
     /// Fixed serving bounds.
     limits: ViewLimits,
     /// Revocation is explicit and fail-closed.
@@ -243,13 +243,21 @@ impl AuthorizedView {
         grant: ViewGrant,
         region: impl Into<String>,
         recovery: RecoveryAuthority,
-        partitions: impl IntoIterator<Item = PartitionId>,
+        cursors: impl IntoIterator<Item = ViewCursor>,
         limits: ViewLimits,
     ) -> Result<Self, ViewError> {
         let region = region.into();
         validate_identity(&region, "region")?;
-        let partitions: BTreeSet<_> = partitions.into_iter().collect();
-        if partitions.is_empty() || partitions.len() > MAX_VIEW_PARTITIONS {
+        let mut issued_cursors = BTreeMap::new();
+        for cursor in cursors {
+            if issued_cursors
+                .insert(cursor.partition(), cursor.cursor)
+                .is_some()
+            {
+                return Err(ViewError::DuplicateCursor);
+            }
+        }
+        if issued_cursors.is_empty() || issued_cursors.len() > MAX_VIEW_PARTITIONS {
             return Err(ViewError::TooManyPartitions);
         }
         Ok(Self {
@@ -259,7 +267,7 @@ impl AuthorizedView {
             grant,
             region,
             recovery,
-            partitions,
+            cursors: issued_cursors,
             limits,
             revoked: false,
         })
@@ -297,13 +305,22 @@ impl AuthorizedView {
                 return Err(ViewError::DuplicateCursor);
             }
         }
-        if cursors.len() != self.partitions.len()
+        if cursors.len() != self.cursors.len()
             || !self
-                .partitions
+                .cursors
                 .iter()
-                .all(|partition| cursors.contains_key(partition))
+                .all(|(partition, _issued)| cursors.contains_key(partition))
         {
             return Err(ViewError::IncompleteCursorVector {
+                recovery: self.recovery.clone(),
+            });
+        }
+        if !self.cursors.iter().all(|(partition, issued)| {
+            cursors
+                .get(partition)
+                .is_some_and(|cursor| cursor.bytes() == issued)
+        }) {
+            return Err(ViewError::InvalidCursorVector {
                 recovery: self.recovery.clone(),
             });
         }
@@ -360,6 +377,12 @@ pub enum ViewError {
         /// Recovery authority for a renewed view.
         recovery: RecoveryAuthority,
     },
+    /// A cursor was not issued for this exact view and requires renewal.
+    #[error("view cursor vector is invalid; recover through {recovery:?}")]
+    InvalidCursorVector {
+        /// Recovery authority for a renewed view.
+        recovery: RecoveryAuthority,
+    },
     /// The server revoked this exact view.
     #[error("view is revoked; recover through {recovery:?}")]
     Revoked {
@@ -407,8 +430,14 @@ mod tests {
                 kind: "recovery authority",
             })?,
             [
-                PartitionId::new(1).map_err(|_| ViewError::InvalidLimits)?,
-                PartitionId::new(2).map_err(|_| ViewError::InvalidLimits)?,
+                ViewCursor::new(
+                    PartitionId::new(1).map_err(|_| ViewError::InvalidLimits)?,
+                    vec![1],
+                )?,
+                ViewCursor::new(
+                    PartitionId::new(2).map_err(|_| ViewError::InvalidLimits)?,
+                    vec![2],
+                )?,
             ],
             ViewLimits::new(64, 4096)?,
         )
@@ -459,6 +488,31 @@ mod tests {
         assert!(matches!(
             view()?.revoke().validate(&request()?),
             Err(ViewError::Revoked { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unissued_cursor_vector_requires_recovery() -> Result<(), ViewError> {
+        let forged = ViewRequest::new(
+            scope(),
+            ViewId::new("team-view")?,
+            ViewVersion::new(1)?,
+            ViewGrant::new("grant-1")?,
+            vec![
+                ViewCursor::new(
+                    PartitionId::new(1).map_err(|_| ViewError::InvalidLimits)?,
+                    vec![9],
+                )?,
+                ViewCursor::new(
+                    PartitionId::new(2).map_err(|_| ViewError::InvalidLimits)?,
+                    vec![2],
+                )?,
+            ],
+        )?;
+        assert!(matches!(
+            view()?.validate(&forged),
+            Err(ViewError::InvalidCursorVector { .. })
         ));
         Ok(())
     }
