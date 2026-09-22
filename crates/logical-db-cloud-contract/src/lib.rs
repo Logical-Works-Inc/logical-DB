@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use logical_db_model::{DocumentId, Scope};
+use logical_db_model::{DocumentId, OperationDigest, OperationId, Scope};
 use thiserror::Error;
 
 /// Maximum UTF-8 bytes in a stable routing or recovery authority identity.
@@ -101,6 +101,10 @@ impl RecoveryAuthority {
 pub struct PartitionRoute {
     /// Logical partition being routed.
     partition: PartitionId,
+    /// Inclusive lower UUID key boundary owned by this partition.
+    start: u128,
+    /// Inclusive upper UUID key boundary owned by this partition.
+    end: u128,
     /// Region placement label asserted by the routing authority.
     region: String,
     /// Ordering domain preserved by every transition of this partition.
@@ -116,14 +120,21 @@ impl PartitionRoute {
     /// Returns [`RoutingError::InvalidIdentity`] for an invalid region label.
     pub fn new(
         partition: PartitionId,
+        start: u128,
+        end: u128,
         region: impl Into<String>,
         ordering: OrderingDomain,
         recovery: RecoveryAuthority,
     ) -> Result<Self, RoutingError> {
+        if start > end {
+            return Err(RoutingError::InvalidRange { start, end });
+        }
         let region = region.into();
         validate_identity(&region, "region")?;
         Ok(Self {
             partition,
+            start,
+            end,
             region,
             ordering,
             recovery,
@@ -134,6 +145,18 @@ impl PartitionRoute {
     #[must_use]
     pub const fn partition(&self) -> PartitionId {
         self.partition
+    }
+
+    /// Returns this route's inclusive lower UUID key boundary.
+    #[must_use]
+    pub const fn start(&self) -> u128 {
+        self.start
+    }
+
+    /// Returns this route's inclusive upper UUID key boundary.
+    #[must_use]
+    pub const fn end(&self) -> u128 {
+        self.end
     }
 
     /// Returns the authority-declared placement label.
@@ -155,11 +178,29 @@ impl PartitionRoute {
     }
 }
 
+/// Narrow server-side authority boundary for resolving Cloud routes.
+///
+/// Callers receive a resolution or a typed stale-map transition. They never
+/// receive authority to construct a map or select a physical partition.
+pub trait RoutingAuthority {
+    /// Resolves a scope-bound retry against the authority's current map.
+    ///
+    /// # Errors
+    /// Returns a typed refusal for wrong scope, stale epoch, or absent route.
+    fn resolve_route(&self, request: RouteRequest) -> Result<RouteResolution, RoutingError>;
+}
+
 /// A caller's stable document key and the epoch it used to route an operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteRequest {
+    /// Tenant/application scope the downstream executor must recheck.
+    scope: Scope,
     /// Document whose partition must be chosen by the authoritative map.
     document: DocumentId,
+    /// Retry-stable operation identity.
+    operation: OperationId,
+    /// Canonical digest of the operation authorized for this retry.
+    action: OperationDigest,
     /// Complete-map epoch the caller observed before issuing the operation.
     epoch: RoutingEpoch,
 }
@@ -167,8 +208,26 @@ pub struct RouteRequest {
 impl RouteRequest {
     /// Creates a route request without accepting a client-selected partition.
     #[must_use]
-    pub const fn new(document: DocumentId, epoch: RoutingEpoch) -> Self {
-        Self { document, epoch }
+    pub const fn new(
+        scope: Scope,
+        document: DocumentId,
+        operation: OperationId,
+        action: OperationDigest,
+        epoch: RoutingEpoch,
+    ) -> Self {
+        Self {
+            scope,
+            document,
+            operation,
+            action,
+            epoch,
+        }
+    }
+
+    /// Returns the tenant/application scope bound to this request.
+    #[must_use]
+    pub const fn scope(&self) -> Scope {
+        self.scope
     }
 }
 
@@ -198,6 +257,12 @@ impl RoutingTransition {
 /// Result of one current-epoch route resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteResolution {
+    /// Scope carried through to the downstream executor.
+    scope: Scope,
+    /// Retry-stable operation identity carried through resolution.
+    operation: OperationId,
+    /// Authorized action digest carried through resolution.
+    action: OperationDigest,
     /// Epoch whose membership was checked before returning this route.
     epoch: RoutingEpoch,
     /// Route selected by the server-owned deterministic partition map.
@@ -205,6 +270,23 @@ pub struct RouteResolution {
 }
 
 impl RouteResolution {
+    /// Returns the scope the downstream executor must recheck.
+    #[must_use]
+    pub const fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// Returns the retry-stable operation identity.
+    #[must_use]
+    pub const fn operation(&self) -> OperationId {
+        self.operation
+    }
+
+    /// Returns the action digest bound to this resolution.
+    #[must_use]
+    pub const fn action(&self) -> OperationDigest {
+        self.action
+    }
     /// Returns the verified route-map epoch.
     #[must_use]
     pub const fn epoch(&self) -> RoutingEpoch {
@@ -237,7 +319,14 @@ impl PartitionMap {
     /// # Errors
     /// Returns [`RoutingError::EmptyMap`] for no routes and
     /// [`RoutingError::DuplicatePartition`] for duplicate identities.
-    pub fn new(
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "construction is reserved for in-crate authority adapters; external callers use RoutingAuthority"
+        )
+    )]
+    pub(crate) fn new(
         scope: Scope,
         epoch: RoutingEpoch,
         recovery: RecoveryAuthority,
@@ -285,19 +374,25 @@ impl PartitionMap {
     /// recovery transition and no route, preventing a stale write from being
     /// silently redirected into a newly split, merged, or evacuated partition.
     pub fn resolve(&self, request: RouteRequest) -> Result<RouteResolution, RoutingError> {
+        if request.scope != self.scope {
+            return Err(RoutingError::RequestScopeMismatch);
+        }
         if request.epoch != self.epoch {
             return Err(RoutingError::StaleEpoch {
                 transition: self.transition(),
             });
         }
-        let index = document_index(request.document, self.routes.len())?;
+        let key = u128::from_be_bytes(request.document.as_uuid().into_bytes());
         let route = self
             .routes
             .values()
-            .nth(index)
+            .find(|route| route.start <= key && key <= route.end)
             .cloned()
-            .ok_or(RoutingError::EmptyMap)?;
+            .ok_or(RoutingError::UnroutableDocument)?;
         Ok(RouteResolution {
+            scope: request.scope,
+            operation: request.operation,
+            action: request.action,
             epoch: self.epoch,
             route,
         })
@@ -347,10 +442,24 @@ impl PartitionMap {
     }
 }
 
+impl RoutingAuthority for PartitionMap {
+    fn resolve_route(&self, request: RouteRequest) -> Result<RouteResolution, RoutingError> {
+        self.resolve(request)
+    }
+}
+
 /// Errors from validating or resolving routing contracts.
 #[derive(Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RoutingError {
+    /// A route's inclusive UUID key boundaries are inverted.
+    #[error("partition key range {start}..={end} is inverted")]
+    InvalidRange {
+        /// Inclusive lower boundary supplied by the authority.
+        start: u128,
+        /// Inclusive upper boundary supplied by the authority.
+        end: u128,
+    },
     /// A partition identity used the reserved zero sentinel.
     #[error("partition identity zero is reserved")]
     ReservedPartition,
@@ -377,6 +486,12 @@ pub enum RoutingError {
     /// A replacement map crossed tenant/application scope.
     #[error("replacement partition map belongs to another scope")]
     ScopeMismatch,
+    /// A request tried to resolve against another tenant/application scope.
+    #[error("route request scope does not match the authoritative map")]
+    RequestScopeMismatch,
+    /// No authority-declared range covered the request document.
+    #[error("no authoritative partition range covers the document")]
+    UnroutableDocument,
     /// A replacement did not advance the map version.
     #[error("replacement epoch {replacement:?} must exceed current epoch {current:?}")]
     EpochNotAdvanced {
@@ -410,18 +525,9 @@ fn validate_identity(value: &str, kind: &'static str) -> Result<(), RoutingError
     Ok(())
 }
 
-/// Selects a stable route index from a document UUID without client control.
-fn document_index(document: DocumentId, route_count: usize) -> Result<usize, RoutingError> {
-    let bytes = document.as_uuid().into_bytes();
-    let mut prefix = [0; 4];
-    prefix.copy_from_slice(&bytes[..4]);
-    let value = usize::try_from(u32::from_be_bytes(prefix)).map_err(|_| RoutingError::EmptyMap)?;
-    value.checked_rem(route_count).ok_or(RoutingError::EmptyMap)
-}
-
 #[cfg(test)]
 mod tests {
-    use logical_db_model::{AccountId, SpaceId};
+    use logical_db_model::{AccountId, OperationDigest, OperationId, SpaceId};
     use uuid::Uuid;
 
     use super::{
@@ -432,6 +538,21 @@ mod tests {
     /// Builds a deterministic document key for routing tests.
     fn document(value: u128) -> DocumentId {
         DocumentId::from_uuid(Uuid::from_u128(value))
+    }
+
+    /// Builds a scope-bound retry request with deterministic operation identity.
+    fn request(
+        scope: Scope,
+        document: DocumentId,
+        epoch: u64,
+    ) -> Result<RouteRequest, RoutingError> {
+        Ok(RouteRequest::new(
+            scope,
+            document,
+            OperationId::from_uuid(Uuid::from_u128(99)),
+            OperationDigest::new([7; 32]),
+            RoutingEpoch::new(epoch)?,
+        ))
     }
 
     /// Builds a deterministic scope for routing tests.
@@ -456,12 +577,16 @@ mod tests {
             [
                 PartitionRoute::new(
                     PartitionId::new(1)?,
+                    0,
+                    170141183460469231731687303715884105727,
                     "ca-central",
                     OrderingDomain::PerDocument,
                     recovery.clone(),
                 )?,
                 PartitionRoute::new(
                     PartitionId::new(2)?,
+                    170141183460469231731687303715884105728,
+                    u128::MAX,
                     "ca-central",
                     OrderingDomain::PerDocument,
                     recovery,
@@ -473,7 +598,7 @@ mod tests {
     #[test]
     fn stale_epoch_fails_closed_with_a_recovery_transition() -> Result<(), RoutingError> {
         let routes = map(scope(10), 2)?;
-        let result = routes.resolve(RouteRequest::new(document(4), RoutingEpoch::new(1)?));
+        let result = routes.resolve(request(scope(10), document(4), 1)?);
         assert!(
             matches!(&result, Err(RoutingError::StaleEpoch { .. })),
             "a stale map must not receive a route"
@@ -489,11 +614,28 @@ mod tests {
 
     #[test]
     fn retry_with_the_same_epoch_selects_the_same_partition() -> Result<(), RoutingError> {
-        let routes = map(scope(20), 1)?;
-        let request = RouteRequest::new(document(7), RoutingEpoch::new(1)?);
+        let current_scope = scope(20);
+        let routes = map(current_scope, 1)?;
+        let request = request(current_scope, document(7), 1)?;
         let first = routes.resolve(request)?;
         let retry = routes.resolve(request)?;
         assert_eq!(first, retry, "exact retry must retain its partition");
+        assert_eq!(
+            first.scope(),
+            current_scope,
+            "resolution must retain tenant scope"
+        );
+        assert_eq!(first.action(), OperationDigest::new([7; 32]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_cross_tenant_request_cannot_use_another_scope_map() -> Result<(), RoutingError> {
+        let routes = map(scope(21), 1)?;
+        assert_eq!(
+            routes.resolve(request(scope(22), document(7), 1)?),
+            Err(RoutingError::RequestScopeMismatch)
+        );
         Ok(())
     }
 
@@ -509,12 +651,16 @@ mod tests {
             [
                 PartitionRoute::new(
                     PartitionId::new(1)?,
+                    0,
+                    170141183460469231731687303715884105727,
                     "eu-central",
                     OrderingDomain::PerPartition,
                     recovery.clone(),
                 )?,
                 PartitionRoute::new(
                     PartitionId::new(2)?,
+                    170141183460469231731687303715884105728,
+                    u128::MAX,
                     "ca-central",
                     OrderingDomain::PerDocument,
                     recovery,
