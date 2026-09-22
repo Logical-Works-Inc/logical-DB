@@ -73,6 +73,12 @@ matches the workspace. Do not hand-edit the JSON block.
       "dependency_owner": "cloud"
     },
     {
+      "consumer": "logical-db-cloud-contract",
+      "consumer_owner": "cloud",
+      "dependency": "logical-db-model",
+      "dependency_owner": "kernel"
+    },
+    {
       "consumer": "logical-db-crdt",
       "consumer_owner": "cloud",
       "dependency": "logical-db-model",
@@ -237,6 +243,7 @@ matches the workspace. Do not hand-edit the JSON block.
       "logical-db-cairn"
     ],
     "cloud": [
+      "logical-db-cloud-contract",
       "logical-db-crdt",
       "logical-db-daemon",
       "logical-db-http",
