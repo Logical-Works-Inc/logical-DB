@@ -214,9 +214,35 @@ pub const FIELD_SEQUENCE: &str = "kv_seq";
 #[non_exhaustive]
 pub struct CacheEntry {
     /// Original cache key.
-    pub key: String,
+    key: String,
     /// Opaque value bytes as stored.
-    pub value: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl CacheEntry {
+    /// Builds one live cache entry from its key and stored value bytes.
+    #[must_use]
+    pub fn new(key: String, value: Vec<u8>) -> Self {
+        Self { key, value }
+    }
+
+    /// Original cache key. Immutable entry data.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Opaque value bytes as stored. Immutable entry data.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Consumes this entry, returning its key and value bytes.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<u8>) {
+        (self.key, self.value)
+    }
 }
 
 /// Content address of a tiered value, returned by
@@ -235,11 +261,43 @@ pub struct BlobReference {
 #[non_exhaustive]
 pub struct BatchPut {
     /// Cache key, validated exactly like [`KvCache::put`].
-    pub key: String,
+    key: String,
     /// Opaque value bytes, bounded exactly like [`KvCache::put`].
-    pub value: Vec<u8>,
+    value: Vec<u8>,
     /// Optional time-to-live; `None` never expires.
-    pub ttl: Option<Duration>,
+    ttl: Option<Duration>,
+}
+
+impl BatchPut {
+    /// Builds one batch entry from its key, value bytes, and optional TTL.
+    #[must_use]
+    pub fn new(key: String, value: Vec<u8>, ttl: Option<Duration>) -> Self {
+        Self { key, value, ttl }
+    }
+
+    /// Cache key. Immutable batch-entry data.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Opaque value bytes. Immutable batch-entry data.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Optional time-to-live; `None` never expires.
+    #[must_use]
+    pub fn ttl(&self) -> Option<Duration> {
+        self.ttl
+    }
+
+    /// Consumes this entry, returning its key, value bytes, and optional TTL.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<u8>, Option<Duration>) {
+        (self.key, self.value, self.ttl)
+    }
 }
 
 /// Stable failures exposed by the cache facade.
@@ -2658,7 +2716,11 @@ mod tests {
             let remote: Vec<logical_db::RemoteChange> = pending
                 .into_iter()
                 .map(|change| {
-                    logical_db::RemoteChange::new(change.document, change.digest, change.bytes)
+                    logical_db::RemoteChange::new(
+                        change.document,
+                        change.digest,
+                        change.into_bytes(),
+                    )
                 })
                 .collect();
             assert_eq!(remote.len(), 5);
@@ -2769,7 +2831,7 @@ mod tests {
         let remote: Vec<logical_db::RemoteChange> = pending
             .into_iter()
             .map(|change| {
-                logical_db::RemoteChange::new(change.document, change.digest, change.bytes)
+                logical_db::RemoteChange::new(change.document, change.digest, change.into_bytes())
             })
             .collect();
         let count = remote.len();
@@ -2795,7 +2857,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         for change in &pending {
             assert!(
-                change.bytes.len() < TIER_THRESHOLD_BYTES,
+                change.as_bytes().len() < TIER_THRESHOLD_BYTES,
                 "sidecar reference must stay inside the bounded change"
             );
         }

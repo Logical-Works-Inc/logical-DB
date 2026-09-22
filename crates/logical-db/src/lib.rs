@@ -85,6 +85,22 @@ pub mod transport {
     pub use logical_db_sync::{BaselineResult, PullResult, Transport};
 }
 
+/// Sync orchestration surface for hosts that persist orchestrator state and
+/// enqueue work instead of reimplementing the push-then-pull state machine.
+///
+/// The orchestrator wraps [`Database::synchronize`]; it never forks it. Apps
+/// bind one upstream peer, persist [`OrchestratorState::encode`] bytes across
+/// launches, and resume with [`SyncOrchestrator::restore`].
+pub mod sync {
+    pub use logical_db_sync::{
+        InboundChange, NamespaceDomain, NamespaceRunReport, NamespaceSendReport,
+        NamespaceSyncError, NamespaceSyncReport, ORCHESTRATOR_STATE_BYTES,
+        ORCHESTRATOR_STATE_VERSION, OrchestratorPolicy, OrchestratorState, OrchestratorStateError,
+        OutboundChange, ReplicaPort, RetrySignal, RunReport, SyncError, SyncLimits,
+        SyncOrchestrator, SyncReport, Transport, send_namespace_now, synchronize_namespace,
+    };
+}
+
 /// Application-owned embedded replica handle.
 #[non_exhaustive]
 pub struct Database {
@@ -1697,7 +1713,7 @@ impl ReplicaPort for Database {
             .map(|change| RemoteChange {
                 document: change.document,
                 digest: change.digest,
-                bytes: change.bytes.clone(),
+                bytes: change.as_bytes().to_vec(),
             })
             .collect::<Vec<_>>();
         Database::install_remote_page(self, peer, &changes, checkpoint)
@@ -1723,7 +1739,7 @@ pub struct RemoteChange {
     /// Claimed native CRDT identity, verified before commit.
     pub digest: ChangeDigest,
     /// Canonical CRDT change bytes, bounded before decoding.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl RemoteChange {
@@ -1738,6 +1754,18 @@ impl RemoteChange {
             digest,
             bytes,
         }
+    }
+
+    /// Canonical CRDT change bytes. Immutable so the digest binding holds.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this change, returning its canonical bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
@@ -1760,7 +1788,22 @@ pub struct PendingChange {
     /// Immutable CRDT change identity.
     pub digest: ChangeDigest,
     /// Verified canonical Automerge change bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl PendingChange {
+    /// Verified canonical Automerge change bytes. Immutable so the digest
+    /// binding holds.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this pending change, returning its canonical bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Idempotent result of one embedded edit request.
@@ -1784,7 +1827,15 @@ pub struct EditReceipt<T> {
     /// Immutable CRDT change identity.
     pub digest: ChangeDigest,
     /// Causal document frontier after the edit.
-    pub heads: Vec<ChangeDigest>,
+    heads: Vec<ChangeDigest>,
+}
+
+impl<T> EditReceipt<T> {
+    /// Causal document frontier after the edit. Immutable receipt data.
+    #[must_use]
+    pub fn heads(&self) -> &[ChangeDigest] {
+        &self.heads
+    }
 }
 
 /// Durable receipt returned for an exact retry without rerunning app code.
@@ -1816,7 +1867,15 @@ pub struct DeleteReceipt {
     /// Immutable CRDT tombstone change identity.
     pub digest: ChangeDigest,
     /// Causal document frontier after the delete.
-    pub heads: Vec<ChangeDigest>,
+    heads: Vec<ChangeDigest>,
+}
+
+impl DeleteReceipt {
+    /// Causal document frontier after the delete. Immutable receipt data.
+    #[must_use]
+    pub fn heads(&self) -> &[ChangeDigest] {
+        &self.heads
+    }
 }
 
 /// Work durably completed by one schema migration or exact resumption.
@@ -2338,7 +2397,7 @@ mod tests {
             .map(|change| RemoteChange {
                 document: change.document,
                 digest: change.digest,
-                bytes: change.bytes.clone(),
+                bytes: change.as_bytes().to_vec(),
             })
             .collect()
     }

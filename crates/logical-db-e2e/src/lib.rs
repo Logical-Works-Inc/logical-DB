@@ -701,7 +701,9 @@ mod tests {
 
         let resurrection = pre_floor
             .iter()
-            .map(|change| RemoteChange::new(change.document, change.digest, change.bytes.clone()))
+            .map(|change| {
+                RemoteChange::new(change.document, change.digest, change.as_bytes().to_vec())
+            })
             .collect::<Vec<_>>();
         second.install_remote_page(peer, &resurrection, b"resurrection-attempt")?;
         assert!(second.is_deleted(document)?);

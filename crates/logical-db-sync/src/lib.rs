@@ -45,7 +45,7 @@ pub struct OutboundChange {
     /// Native CRDT change identity.
     pub digest: ChangeDigest,
     /// Verified canonical CRDT bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl OutboundChange {
@@ -71,6 +71,18 @@ impl OutboundChange {
             bytes,
         }
     }
+
+    /// Verified canonical CRDT bytes. Immutable so the digest binding holds.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this change, returning its canonical bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// One verified remote change handed to a replica for atomic installation.
@@ -82,7 +94,34 @@ pub struct InboundChange {
     /// Native CRDT change identity.
     pub digest: ChangeDigest,
     /// Canonical CRDT bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl InboundChange {
+    /// Builds one verified remote change from its claimed identity and bytes.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose inbound changes through here.
+    #[must_use]
+    pub fn new(document: DocumentId, digest: ChangeDigest, bytes: Vec<u8>) -> Self {
+        Self {
+            document,
+            digest,
+            bytes,
+        }
+    }
+
+    /// Canonical CRDT change bytes. Immutable so the digest binding holds.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this change, returning its canonical bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Embedded-replica surface required by synchronization.
@@ -910,7 +949,7 @@ impl NamespaceDomain {
 #[non_exhaustive]
 pub struct NamespaceSyncReport {
     /// Namespace this cycle drove.
-    pub namespace: String,
+    namespace: String,
     /// Remote changes for this namespace installed locally.
     pub pulled: usize,
     /// Pull pages installed, including pages carrying only foreign changes.
@@ -923,18 +962,32 @@ pub struct NamespaceSyncReport {
     pub deferred: bool,
 }
 
-/// Observable result of one namespace upload page.
+impl NamespaceSyncReport {
+    /// Namespace this cycle drove. Immutable report data.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+}
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct NamespaceSendReport {
     /// Namespace whose pending changes were offered.
-    pub namespace: String,
+    namespace: String,
     /// Changes for this namespace accepted or already present remotely.
     pub uploaded: usize,
     /// Whether unacknowledged local changes remain after this page.
     pub more: bool,
     /// Whether the network condition deferred all work.
     pub deferred: bool,
+}
+
+impl NamespaceSendReport {
+    /// Namespace whose pending changes were offered. Immutable report data.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
 }
 
 /// Typed namespace synchronization failure preserving every boundary.
@@ -1590,7 +1643,7 @@ pub struct RunReport {
 #[non_exhaustive]
 pub struct NamespaceRunReport {
     /// Namespace this run drove.
-    pub namespace: String,
+    namespace: String,
     /// Pull cycles issued (the upload page is offered once per run).
     pub cycles: usize,
     /// The single delivery-only upload page offered before the pull drain.
@@ -1605,6 +1658,14 @@ pub struct NamespaceRunReport {
     pub more: bool,
     /// Whether a backoff window or an offline policy deferred the run.
     pub deferred: bool,
+}
+
+impl NamespaceRunReport {
+    /// Namespace this run drove. Immutable report data.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
 }
 
 /// Application-facing sync engine wrapping the sync functions.
