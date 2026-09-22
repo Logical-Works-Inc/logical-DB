@@ -42,6 +42,21 @@ image_tag="logical-db-ci-${lane}:${source_tree}"
 docker build --pull=false --platform linux/amd64 -f "scripts/ci-${lane}.Dockerfile" -t "$image_tag" .
 image_id=$(docker image inspect "$image_tag" --format '{{.Id}}')
 
+# Docker may collect an image while retaining its stopped container. Preserve
+# that worker's complete filesystem before replacement; otherwise the later
+# image inspection fails with an opaque "No such image" and the CI lane cannot
+# recover on its own.
+if docker container inspect "$worker" >/dev/null 2>&1; then
+  worker_image=$(docker container inspect "$worker" --format '{{.Image}}')
+  if ! docker image inspect "$worker_image" >/dev/null 2>&1; then
+    archived_worker="$HOME/.Trash/logical-db-ci-worker-${lane}-${checkout_id}-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar"
+    docker export "$worker" -o "$archived_worker"
+    [[ -s "$archived_worker" ]] || { echo "worker export was empty: $archived_worker" >&2; exit 1; }
+    docker rm "$worker" >/dev/null
+    echo "Retained worker image was unavailable; exported worker to $archived_worker before replacement"
+  fi
+fi
+
 # One reusable, normally stopped worker per checkout/lane. The frozen source
 # mount excludes .git (checkout credentials), host caches and sockets.
 # Build/Wine caches belong to this worker; logs rotate at 2 x 10 MiB.
