@@ -121,10 +121,10 @@ pub enum AuthenticationError {
 
 impl std::fmt::Display for AuthenticationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            &Self::Unauthorized => write!(formatter, "authentication failed"),
-            &Self::Forbidden => write!(formatter, "credential is forbidden"),
-            &Self::Malformed { context } => {
+        match *self {
+            Self::Unauthorized => write!(formatter, "authentication failed"),
+            Self::Forbidden => write!(formatter, "credential is forbidden"),
+            Self::Malformed { context } => {
                 write!(formatter, "malformed credential at {context}")
             }
         }

@@ -15,10 +15,6 @@
 
 #![forbid(unsafe_code)]
 #![expect(
-    clippy::print_stderr,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
-#![expect(
     clippy::print_stdout,
     reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
 )]

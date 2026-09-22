@@ -798,7 +798,7 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("logical-db-http-raw-fixture".into())
             .spawn(move || {
-                listener.set_nonblocking(true).unwrap_or_else(|_error| ());
+                listener.set_nonblocking(true).unwrap_or(());
                 loop {
                     if thread_flag.load(Ordering::SeqCst) {
                         return;
@@ -871,11 +871,11 @@ mod tests {
     const CBOR_FORTY_TWO: &[u8] = &[0x18, 0x2a];
 
     fn raw_client() -> Result<Client, HttpError> {
-        Ok(Client::builder()
+        Client::builder()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(HttpError::Network)?)
+            .map_err(HttpError::Network)
     }
 
     #[test]

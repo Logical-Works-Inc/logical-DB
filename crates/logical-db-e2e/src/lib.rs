@@ -897,10 +897,10 @@ mod tests {
         test_runtime()?.block_on(recovery_preserves_a_large_backlog_body())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the large-backlog recovery journey is one linear fill/drain narrative; splitting it would hide the backlog depth that the test exists to prove"
-    )]
+    // One linear fill/drain narrative: splitting it would hide the backlog depth
+    // that the test exists to prove. Kept whole rather than suppressed, because
+    // `clippy::too_many_lines` no longer fires here and an unfulfilled `expect`
+    // is itself a defect.
     async fn recovery_preserves_a_large_backlog_body() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(MemoryServiceStore::default());
         let app = router(

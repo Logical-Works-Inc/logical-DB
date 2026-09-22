@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use std::{error::Error, fmt, time::Duration};
+use std::{error::Error, fmt, future::Future, time::Duration};
 
 use lgwks_std::hash::Hasher;
 use logical_db_model::{
@@ -178,19 +178,42 @@ pub trait Transport {
     /// # Errors
     ///
     /// Returns a transport-specific failure without implying commit status.
-    async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error>;
+    fn push(
+        &mut self,
+        request: PushRequest,
+    ) -> impl Future<Output = Result<PushResponse, Self::Error>>;
     /// Downloads one bounded page or reports explicit checkpoint expiry.
     ///
     /// # Errors
     ///
     /// Returns a transport-specific request or response failure.
-    async fn pull(&mut self, request: PullRequest) -> Result<PullResult, Self::Error>;
+    fn pull(
+        &mut self,
+        request: PullRequest,
+    ) -> impl Future<Output = Result<PullResult, Self::Error>>;
     /// Downloads the state-bearing baseline a recovering replica must install.
     ///
     /// # Errors
     ///
     /// Returns a transport-specific request or response failure.
-    async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error>;
+    fn baseline(
+        &mut self,
+        request: BaselineRequest,
+    ) -> impl Future<Output = Result<BaselineResult, Self::Error>>;
+}
+
+/// Where one recovery attempt has gotten to, and whether it has already started.
+///
+/// `after` and `restarted` only make sense together: a recovery that has already
+/// started may not start again on the same cycle, and the cursor it advances is
+/// the one it must carry. Keeping them in one value keeps that coupling in the
+/// type instead of in the call site's argument list.
+#[derive(Clone, Debug, Default)]
+struct RecoveryCursor {
+    /// The durable position already covered by a page, if any.
+    after: Option<Checkpoint>,
+    /// Whether a recovery attempt has already begun on this cycle.
+    restarted: bool,
 }
 
 /// Resource ceilings for one synchronization cycle.
@@ -366,20 +389,26 @@ where
         return Err(SyncError::Cancelled);
     }
     let durable_checkpoint = replica.checkpoint(peer).map_err(SyncError::Replica)?;
-    let mut after = durable_checkpoint
-        .map(Checkpoint::from_wire)
-        .transpose()
-        .map_err(SyncError::Protocol)?;
-    let mut restarted_after_expiry = false;
+    // One cursor for the whole cycle: `recovery.after` is what `pull_and_install`
+    // resumes from and what a baseline install advances. Splitting them leaves
+    // the pull loop on the pre-recovery position, which re-enters recovery and
+    // trips `restarted` on the same cycle.
+    let mut recovery = RecoveryCursor {
+        after: durable_checkpoint
+            .map(Checkpoint::from_wire)
+            .transpose()
+            .map_err(SyncError::Protocol)?,
+        restarted: false,
+    };
     while report.pages < usize::from(limits.pages_per_cycle) {
-        let Some(page) = pull_and_install(replica, peer, transport, limits, &mut after).await?
+        let Some(page) =
+            pull_and_install(replica, peer, transport, limits, &mut recovery.after).await?
         else {
             if install_recovery(
                 replica,
                 peer,
                 transport,
-                &mut after,
-                &mut restarted_after_expiry,
+                &mut recovery,
                 limits,
                 &mut cancelled,
                 &mut report,
@@ -397,7 +426,7 @@ where
         report.pages = report.pages.saturating_add(1);
         let download_more = page.more;
         report.more = upload_more || download_more;
-        after = Some(page.checkpoint);
+        recovery.after = Some(page.checkpoint);
         if !download_more {
             return Ok(report);
         }
@@ -466,15 +495,8 @@ where
         .map_err(SyncError::Transport)?;
     response.validate(&request).map_err(SyncError::Protocol)?;
     for outcome in &response.outcomes {
-        if let &PushOutcome::Rejected {
-            ref operation,
-            ref code,
-        } = outcome
-        {
-            return Err(SyncError::Rejected {
-                operation: *operation,
-                code: *code,
-            });
+        if let PushOutcome::Rejected { operation, code } = *outcome {
+            return Err(SyncError::Rejected { operation, code });
         }
     }
     let through = pending.last().map_or(0, |change| change.sequence);
@@ -581,8 +603,7 @@ async fn install_recovery<R, T>(
     replica: &R,
     peer: PeerId,
     transport: &mut T,
-    after: &mut Option<Checkpoint>,
-    restarted: &mut bool,
+    recovery: &mut RecoveryCursor,
     limits: SyncLimits,
     cancelled: &mut impl FnMut() -> bool,
     report: &mut SyncReport,
@@ -591,17 +612,17 @@ where
     R: ReplicaPort,
     T: Transport,
 {
-    if *restarted {
+    if recovery.restarted {
         return Err(SyncError::Protocol(ProtocolError::InvalidCheckpoint));
     }
-    *restarted = true;
+    recovery.restarted = true;
     if cancelled() {
         return Err(SyncError::Cancelled);
     }
     let BaselineResult::Artifact(page) =
-        request_baseline_page(transport, replica, after.as_ref(), None).await?
+        request_baseline_page(transport, replica, recovery.after.as_ref(), None).await?
     else {
-        *after = None;
+        recovery.after = None;
         return Ok(false);
     };
     let descriptor = page
@@ -629,7 +650,7 @@ where
             return Err(SyncError::RecoveryBudgetExhausted);
         }
         let BaselineResult::Artifact(page) =
-            request_baseline_page(transport, replica, after.as_ref(), Some(next)).await?
+            request_baseline_page(transport, replica, recovery.after.as_ref(), Some(next)).await?
         else {
             return Err(SyncError::Protocol(ProtocolError::BaselineMismatch));
         };
@@ -654,7 +675,7 @@ where
     replica
         .install_baseline(peer, &artifact, checkpoint.as_wire())
         .map_err(SyncError::Replica)?;
-    *after = Some(checkpoint);
+    recovery.after = Some(checkpoint);
     report.pages = report.pages.saturating_add(fetched);
     Ok(true)
 }
@@ -1146,15 +1167,8 @@ where
         .validate(&request)
         .map_err(NamespaceSyncError::Protocol)?;
     for outcome in &response.outcomes {
-        if let &PushOutcome::Rejected {
-            ref operation,
-            ref code,
-        } = outcome
-        {
-            return Err(NamespaceSyncError::Rejected {
-                operation: *operation,
-                code: *code,
-            });
+        if let PushOutcome::Rejected { operation, code } = *outcome {
+            return Err(NamespaceSyncError::Rejected { operation, code });
         }
     }
     report.uploaded = pending.len();

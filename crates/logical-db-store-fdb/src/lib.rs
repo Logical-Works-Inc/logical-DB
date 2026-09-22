@@ -1264,12 +1264,14 @@ mod runtime {
         }
         let existing = read_snapshot_record(transaction, &operation.spaces.pointer_key).await?;
         let existing_position = match existing.as_ref() {
-            Some(&SnapshotRecord::LegacyPosition(position)) => position,
-            Some(&SnapshotRecord::State(ref state)) => state.position(),
+            Some(record) => match *record {
+                SnapshotRecord::LegacyPosition(position) => position,
+                SnapshotRecord::State(ref state) => state.position(),
+                // A future descriptor class cannot authorize a seal; fail closed
+                // as corrupt rather than guessing its coverage position.
+                _ => return Err(binding(DataError::BaselineCorrupt)),
+            },
             None => 0,
-            // A future descriptor class cannot authorize a seal; fail closed
-            // as corrupt rather than guessing its coverage position.
-            Some(_) => return Err(binding(DataError::BaselineCorrupt)),
         };
         if existing_position > operation.position {
             return Err(binding(DataError::BaselineCoverage));
@@ -1399,9 +1401,10 @@ mod runtime {
             if !more {
                 break;
             }
-            let Some(&(ref last, _)) = manifests.last() else {
+            let Some(last_pair) = manifests.last() else {
                 return Err(binding(DataError::BaselineResourceLimit));
             };
+            let last = &last_pair.0;
             let (sequence,) = spaces.log.unpack::<(u64,)>(last).map_err(binding_invalid)?;
             next_sequence = sequence.saturating_add(1);
         }
@@ -1957,9 +1960,7 @@ mod runtime {
                     return Err(error);
                 }
             };
-            if let Err(error) = verify_operation(transaction, &spaces.scope, &record).await {
-                return Err(error);
-            }
+            verify_operation(transaction, &spaces.scope, &record).await?;
             let Some(next_bytes) = aggregate.checked_add(record.byte_len) else {
                 return Err(binding(DataError::InvalidManifest { at: "manifest" }));
             };

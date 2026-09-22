@@ -183,14 +183,14 @@ impl ProjectionSemantics {
 
     /// Writes the canonical identity bytes into a schema digest.
     fn encode_into(&self, digest: &mut Hasher) {
-        match self {
-            &Self::Version(version) => {
+        match *self {
+            Self::Version(version) => {
                 digest.update(b"version-v1");
                 digest.update(&version.get().to_be_bytes());
             }
-            &Self::Digest(ref fingerprint) => {
+            Self::Digest(fingerprint) => {
                 digest.update(b"digest-v1");
-                digest.update(fingerprint);
+                digest.update(&fingerprint);
             }
         }
     }
@@ -1957,10 +1957,10 @@ impl DatabaseError {
     /// Classifies recovery without leaking the embedded store's error types.
     #[must_use]
     pub const fn kind(&self) -> DatabaseErrorKind {
-        match self {
-            &Self::Store(StoreError::OperationConflict) => DatabaseErrorKind::OperationConflict,
-            &Self::Store(StoreError::StaleDocument) => DatabaseErrorKind::ConcurrentWrite,
-            &Self::Store(StoreError::CommitOutcomeUnknown(_)) => {
+        match *self {
+            Self::Store(StoreError::OperationConflict) => DatabaseErrorKind::OperationConflict,
+            Self::Store(StoreError::StaleDocument) => DatabaseErrorKind::ConcurrentWrite,
+            Self::Store(StoreError::CommitOutcomeUnknown(_)) => {
                 DatabaseErrorKind::RetryExactRequest
             }
             _ => DatabaseErrorKind::Other,
@@ -2052,47 +2052,47 @@ fn canonical_value_bytes(document: DocumentId, key: &str, value: &Scalar) -> Vec
     let mut bytes = Vec::new();
     bytes.extend_from_slice(document.as_uuid().as_bytes());
     push_bounded_field(&mut bytes, key.as_bytes());
-    match value {
-        &Scalar::Null => bytes.push(0),
-        &Scalar::Boolean(inner) => {
+    match *value {
+        Scalar::Null => bytes.push(0),
+        Scalar::Boolean(inner) => {
             bytes.push(1);
             bytes.push(u8::from(inner));
         }
-        &Scalar::Integer(inner) => {
+        Scalar::Integer(inner) => {
             bytes.push(2);
             bytes.extend_from_slice(&inner.to_be_bytes());
         }
-        &Scalar::Unsigned(inner) => {
+        Scalar::Unsigned(inner) => {
             bytes.push(3);
             bytes.extend_from_slice(&inner.to_be_bytes());
         }
-        &Scalar::Number(inner) => {
+        Scalar::Number(inner) => {
             bytes.push(4);
             bytes.extend_from_slice(&inner.to_bits().to_be_bytes());
         }
-        &Scalar::String(ref inner) => {
+        Scalar::String(ref inner) => {
             bytes.push(5);
             push_bounded_field(&mut bytes, inner.as_bytes());
         }
-        &Scalar::Bytes(ref inner) => {
+        Scalar::Bytes(ref inner) => {
             bytes.push(6);
-            push_bounded_field(&mut bytes, &inner);
+            push_bounded_field(&mut bytes, inner);
         }
-        &Scalar::Counter(inner) => {
+        Scalar::Counter(inner) => {
             bytes.push(7);
             bytes.extend_from_slice(&inner.to_be_bytes());
         }
-        &Scalar::Timestamp(inner) => {
+        Scalar::Timestamp(inner) => {
             bytes.push(8);
             bytes.extend_from_slice(&inner.to_be_bytes());
         }
-        &Scalar::Unknown {
+        Scalar::Unknown {
             type_code,
             bytes: ref inner,
         } => {
             bytes.push(9);
             bytes.push(type_code);
-            push_bounded_field(&mut bytes, &inner);
+            push_bounded_field(&mut bytes, inner);
         }
         // Non_exhaustive scalar: an unrecognized form cannot contribute to a
         // content digest under an existing tag, so fail closed with a distinct
@@ -2437,10 +2437,9 @@ mod tests {
         }
         fs::write(local_sidecar(&path), b"garbage")?;
         let Err(error) = Database::open_local(&path) else {
-            return Err(std::io::Error::other(format!(
-                "a corrupt identity sidecar must refuse to open"
-            ))
-            .into());
+            return Err(
+                std::io::Error::other("a corrupt identity sidecar must refuse to open").into(),
+            );
         };
         assert!(matches!(
             error,
@@ -2512,7 +2511,7 @@ mod tests {
                 )
             })?;
             let EditOutcome::Applied(receipt) = outcome else {
-                return Err(std::io::Error::other(format!("first edit must apply")).into());
+                return Err(std::io::Error::other("first edit must apply").into());
             };
             assert_eq!(receipt.sequence, 1);
             assert_eq!(database.pending_changes(0, 10)?.len(), 1);
@@ -2543,7 +2542,7 @@ mod tests {
             editor.put(&Object::root(), "value", Scalar::Integer(1))
         })?;
         let EditOutcome::Applied(receipt) = applied else {
-            return Err(std::io::Error::other(format!("first request must apply")).into());
+            return Err(std::io::Error::other("first request must apply").into());
         };
         let duplicate = database.edit(document, operation, request, |_editor| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3558,7 +3557,7 @@ mod tests {
 
         let outcome = first.delete(document, OperationId::new(), OperationDigest::new([2; 32]))?;
         let DeleteOutcome::Applied(receipt) = outcome else {
-            return Err(std::io::Error::other(format!("first delete must apply")).into());
+            return Err(std::io::Error::other("first delete must apply").into());
         };
         assert_eq!(receipt.sequence, 2);
         assert!(!receipt.heads.is_empty());
@@ -3663,7 +3662,7 @@ mod tests {
         let operation = OperationId::new();
         let request = OperationDigest::new([2; 32]);
         let DeleteOutcome::Applied(applied) = database.delete(document, operation, request)? else {
-            return Err(std::io::Error::other(format!("first delete must apply")).into());
+            return Err(std::io::Error::other("first delete must apply").into());
         };
         let duplicate = database.delete(document, operation, request)?;
         assert!(matches!(
@@ -4456,7 +4455,7 @@ mod tests {
         )?;
         let applied = source.delete(document, OperationId::new(), OperationDigest::new([2; 32]))?;
         let DeleteOutcome::Applied(receipt) = applied else {
-            return Err(std::io::Error::other(format!("delete must apply")).into());
+            return Err(std::io::Error::other("delete must apply").into());
         };
         let payload = source.export()?;
         let (_, entries, documents) = decode_export(&payload)?;

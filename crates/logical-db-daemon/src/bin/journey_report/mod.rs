@@ -9,6 +9,10 @@
 //! module is the only place that writes them to stdout for CI to parse.
 
 /// Writes one journey report line to stdout for the CI PASS parser.
+#[expect(
+    clippy::print_stdout,
+    reason = "this module is the journey binary's PRINTS-exempt report surface"
+)]
 pub fn emit(line: &str) {
     println!("{line}");
 }

@@ -132,8 +132,7 @@ pub use logical_db::{
     BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
 };
 use logical_db::{
-    ChangeEvent, CrdtError, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange,
-    Scalar,
+    ChangeEvent, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar,
 };
 use logical_db_model::MAX_CHANGE_BYTES;
 pub use logical_db_model::{
@@ -1143,8 +1142,8 @@ impl KvCache {
             SlotValue::Inline(entry.value.clone())
         };
         let operation = batch_member_operation(batch_operation, index);
-        let request = match &slot {
-            &SlotValue::Inline(ref value) => put_digest(
+        let request = match slot {
+            SlotValue::Inline(ref value) => put_digest(
                 &operation,
                 &self.namespace,
                 &entry.key,
@@ -1152,7 +1151,7 @@ impl KvCache {
                 expires_at_ms,
                 sequence,
             ),
-            &SlotValue::Tiered { ref digest, size } => tiered_put_digest(
+            SlotValue::Tiered { ref digest, size } => tiered_put_digest(
                 &operation,
                 &self.namespace,
                 &entry.key,
@@ -1171,12 +1170,12 @@ impl KvCache {
             editor.delete(&Object::root(), FIELD_VALUE)?;
             editor.delete(&Object::root(), FIELD_BLOB)?;
             editor.delete(&Object::root(), FIELD_SIZE)?;
-            match &stored_slot {
-                &SlotValue::Inline(ref value) => {
+            match stored_slot {
+                SlotValue::Inline(ref value) => {
                     editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(1))?;
                     editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(value.clone()))?;
                 }
-                &SlotValue::Tiered { ref digest, size } => {
+                SlotValue::Tiered { ref digest, size } => {
                     editor.put(
                         &Object::root(),
                         FIELD_VERSION,
@@ -1250,8 +1249,8 @@ impl KvCache {
             }
         }
         let operation = OperationId::new();
-        let digest = match slot {
-            &SlotValue::Inline(ref value) => put_digest(
+        let digest = match *slot {
+            SlotValue::Inline(ref value) => put_digest(
                 &operation,
                 &self.namespace,
                 key,
@@ -1259,7 +1258,7 @@ impl KvCache {
                 expires_at_ms,
                 sequence,
             ),
-            &SlotValue::Tiered { ref digest, size } => tiered_put_digest(
+            SlotValue::Tiered { ref digest, size } => tiered_put_digest(
                 &operation,
                 &self.namespace,
                 key,
@@ -1276,12 +1275,12 @@ impl KvCache {
             editor.delete(&Object::root(), FIELD_VALUE)?;
             editor.delete(&Object::root(), FIELD_BLOB)?;
             editor.delete(&Object::root(), FIELD_SIZE)?;
-            match &stored_slot {
-                &SlotValue::Inline(ref value) => {
+            match stored_slot {
+                SlotValue::Inline(ref value) => {
                     editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(1))?;
                     editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(value.clone()))?;
                 }
-                &SlotValue::Tiered { ref digest, size } => {
+                SlotValue::Tiered { ref digest, size } => {
                     editor.put(
                         &Object::root(),
                         FIELD_VERSION,
@@ -1891,11 +1890,11 @@ fn validate_namespace(namespace: &str) -> Result<(), KvError> {
 
 /// Maps model checkpoint-map errors onto the KV error surface.
 fn checkpoint_map_error(error: &logical_db_model::ModelError) -> KvError {
-    match error {
-        &logical_db_model::ModelError::UnsupportedNamespaceCheckpointVersion { actual } => {
+    match *error {
+        logical_db_model::ModelError::UnsupportedNamespaceCheckpointVersion { actual } => {
             KvError::UnsupportedCheckpointMapVersion { actual }
         }
-        &logical_db_model::ModelError::NamespaceCheckpointMapTooLarge { actual, maximum } => {
+        logical_db_model::ModelError::NamespaceCheckpointMapTooLarge { actual, maximum } => {
             KvError::CheckpointMapTooLarge { actual, maximum }
         }
         _ => KvError::CorruptCheckpointMap,
@@ -2138,6 +2137,7 @@ fn document_for(namespace: &str, key: &str) -> DocumentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logical_db::CrdtError;
 
     fn scope() -> Scope {
         Scope::new(AccountId::new(), SpaceId::new())
@@ -2238,7 +2238,7 @@ mod tests {
             let document = document_for("sessions", "key");
             let revision = match first.decode_slot(document)? {
                 Decoded::Found(envelope) => envelope.revision,
-                _ => return Err(std::io::Error::other(format!("expected stored envelope")).into()),
+                _ => return Err(std::io::Error::other("expected stored envelope").into()),
             };
             (document, revision)
         };
@@ -2606,18 +2606,14 @@ mod tests {
         let batch_sequence = match cache.decode_slot(document_for("sessions", "batch"))? {
             Decoded::Found(envelope) => envelope.sequence,
             _ => {
-                return Err(
-                    std::io::Error::other(format!("batch envelope must be present")).into(),
-                );
+                return Err(std::io::Error::other("batch envelope must be present").into());
             }
         };
         cache.put("following", b"following-value", None)?;
         let following_sequence = match cache.decode_slot(document_for("sessions", "following"))? {
             Decoded::Found(envelope) => envelope.sequence,
             _ => {
-                return Err(
-                    std::io::Error::other(format!("following envelope must be present")).into(),
-                );
+                return Err(std::io::Error::other("following envelope must be present").into());
             }
         };
         assert!(following_sequence > batch_sequence);
