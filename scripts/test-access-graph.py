@@ -28,15 +28,25 @@ class AccessGraphContract(unittest.TestCase):
     def test_registry_is_source_anchored_and_deterministic(self):
         document = access_graph.load()
         self.assertEqual(document["version"], 2)
-        self.assertEqual(len(document["system"]), 11)
+        self.assertEqual(len(document["system"]), 16)
         self.assertEqual(access_graph.render(), access_graph.render())
         self.assertEqual(access_graph.render_dot(), access_graph.render_dot())
+        self.assertIn('"embedded.remote-page" -> "replica.state" [label="write"];', access_graph.render_dot())
 
     def test_unknown_resource_is_refused(self):
         self.assert_refused(self.source_with('reads = ["replica.state", "replica.outbox"]', 'reads = ["unknown.resource"]'), "unknown resource")
 
     def test_absent_source_anchor_is_refused(self):
-        self.assert_refused(self.source_with("Database::edit", "Database::absent"), "anchor is absent")
+        self.assert_refused(
+            self.source_with(
+                'source = "crates/logical-db/src/lib.rs#Database::edit"',
+                'source = "crates/logical-db/src/lib.rs#Database::absent"',
+            ),
+            "anchor is absent",
+        )
+
+    def test_missing_required_source_is_refused(self):
+        self.assert_refused(self.source_with('  "crates/logical-db/src/lib.rs#Database::edit",\n', ""), "source inventory mismatch")
 
     def test_unknown_predecessor_is_refused(self):
         self.assert_refused(self.source_with("predecessors = []", 'predecessors = ["missing"]'), "unknown predecessor")

@@ -76,6 +76,9 @@ def load(path: Path = GRAPH_PATH) -> dict:
         raise AccessGraphError(f"cannot read access graph {path}: {error}") from error
     if document.get("version") != 2:
         raise AccessGraphError("access graph version must be 2")
+    required_sources = _strings(document, "required_source", "document")
+    if len(set(required_sources)) != len(required_sources):
+        raise AccessGraphError("document.required_source must not contain duplicates")
     resources = document.get("resource", [])
     systems = document.get("system", [])
     if not isinstance(resources, list) or not resources or not isinstance(systems, list) or not systems:
@@ -122,6 +125,17 @@ def load(path: Path = GRAPH_PATH) -> dict:
             if predecessor not in systems_by_name:
                 raise AccessGraphError(f"system {name} has unknown predecessor {predecessor!r}")
     _acyclic(systems_by_name)
+    declared_sources = {system["source"] for system in systems}
+    required_sources = set(required_sources)
+    missing_sources = sorted(required_sources - declared_sources)
+    unexpected_sources = sorted(declared_sources - required_sources)
+    if missing_sources or unexpected_sources:
+        details = []
+        if missing_sources:
+            details.append(f"missing {missing_sources}")
+        if unexpected_sources:
+            details.append(f"unexpected {unexpected_sources}")
+        raise AccessGraphError(f"source inventory mismatch: {'; '.join(details)}")
     writers = {resource: sorted(system["name"] for system in systems if resource in system["writes"]) for resource in sorted(names)}
     missing = [resource for resource, writers_for_resource in writers.items() if not writers_for_resource]
     if missing:
@@ -144,6 +158,10 @@ def render_dot(path: Path = GRAPH_PATH) -> str:
         lines.append(f'  "{system["name"]}" [shape=box];')
         for predecessor in sorted(system["predecessors"]):
             lines.append(f'  "{predecessor}" -> "{system["name"]}" [label="receipt"];')
+        for resource in sorted(system["reads"]):
+            lines.append(f'  "{resource}" -> "{system["name"]}" [label="read"];')
+        for resource in sorted(system["writes"]):
+            lines.append(f'  "{system["name"]}" -> "{resource}" [label="write"];')
     for resource in sorted(document["resource"], key=lambda item: item["name"]):
         lines.append(f'  "{resource["name"]}" [shape=ellipse];')
     lines.append("}")
