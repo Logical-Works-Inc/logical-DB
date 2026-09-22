@@ -20,9 +20,10 @@ for path in /workspace/target /root/.cargo /root/.wine /tmp; do
   if [[ -d "$path" ]]; then cache_paths+=("$path"); fi
 done
 used_kib=$(du -sk "${cache_paths[@]}" | awk '{sum += $1} END {print sum+0}')
-# Linux's measured ordinary/FDB-linked targets plus Cargo caches total 9.66 GiB.
-# Windows retains both its compiled target and checksummed runtime export.
-cache_limit_kib=12582912
+# The retained Linux cache reached 12,844,708 KiB after the Rust 1.98.1
+# rebuild. Keep a finite 16 GiB worker budget for subsequent test artifacts;
+# Windows also retains its checksummed runtime export in this bound.
+cache_limit_kib=16777216
 echo "CACHE lane=$lane used_kib=$used_kib limit_kib=$cache_limit_kib"
 [[ "$used_kib" -le "$cache_limit_kib" ]] || { echo "worker cache budget reached; maintenance required" >&2; exit 1; }
 }
