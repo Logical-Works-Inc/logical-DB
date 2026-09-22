@@ -589,9 +589,9 @@ fn run_distributed(config: &Config) -> TraceReport {
     #[cfg(feature = "fdb")]
     {
         report.status = "unavailable";
-        report.detail = "FDB arm requires a staged cluster and prepared grants; \
+        "FDB arm requires a staged cluster and prepared grants; \
             run it against the live cluster and attach the receipt"
-            .to_owned();
+            .clone_into(&mut report.detail);
     }
     #[cfg(not(feature = "fdb"))]
     {

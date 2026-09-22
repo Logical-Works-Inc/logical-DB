@@ -13,10 +13,6 @@
 //! S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![cfg(feature = "fdb")]
-#![expect(
-    unsafe_code,
-    reason = "the FDB network boot is this journey's FFI seam"
-)]
 
 #[path = "support/fdb_harness.rs"]
 mod fdb_harness;
@@ -78,7 +74,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         service_store,
         FixtureAuthenticator,
         CheckpointCodec::new([0x28; 32], 60_000)?,
-        SystemClock,
+        SystemClock::new(),
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -203,14 +199,14 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 
     drop((first, transport));
     server.abort();
-    let _ = server.await;
+    drop(server.await);
     drop(prune_store);
     drop(network);
-    let _ = fs::remove_file(&first_path);
-    let _ = fs::remove_file(&consumer_path);
-    let _ = fs::remove_file(&ready);
-    let _ = fs::remove_file(&committed_ready);
-    let _ = fs::remove_file(&committed_path);
+    fs::remove_file(&first_path)?;
+    fs::remove_file(&consumer_path)?;
+    fs::remove_file(&ready)?;
+    fs::remove_file(&committed_ready)?;
+    fs::remove_file(&committed_path)?;
     Ok(())
 }
 
@@ -362,8 +358,8 @@ impl ConsumerChild {
 
 impl Drop for ConsumerChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.child.kill());
+        drop(self.child.wait());
     }
 }
 

@@ -141,7 +141,7 @@ else
     # fixtures — and a scanner that cannot tell them apart fails the gate on
     # its own fixtures. This narrows the match to actual attributes; the rule
     # itself is unchanged.
-    done < <(grep -RIn --include="*.rs" -E "^[[:space:]]*#!?\[(allow|expect)\(" crates/ 2>/dev/null || true)
+    done < <(grep -RIn --include="*.rs" --exclude-dir=target -E "^[[:space:]]*#!?\[(allow|expect)\(" crates/ 2>/dev/null || true)
     exit "$bad"
   '
 

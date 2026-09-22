@@ -133,7 +133,6 @@ pub async fn seal_consume_and_prune(
         .await?
         != (SealResult::Sealed { position: through })
     {
-        eprintln!("fdb-recovery-fixture: baseline did not seal");
         return Err(std::io::Error::other("baseline did not seal").into());
     }
     let consumed_request = OperationDigest::new([0x53; 32]);
@@ -154,7 +153,6 @@ pub async fn seal_consume_and_prune(
             consumed_through: through,
         })
     {
-        eprintln!("fdb-recovery-fixture: consumption did not advance");
         return Err(std::io::Error::other("consumption did not advance").into());
     }
     let prune_request = OperationDigest::new([0x54; 32]);
@@ -172,12 +170,8 @@ pub async fn seal_consume_and_prune(
             ),
         )
         .await?
-        != (PruneResult::Pruned(PruneReceipt {
-            pruned_through: through,
-            floor: through,
-        }))
+        != (PruneResult::Pruned(PruneReceipt::new(through, through)))
     {
-        eprintln!("fdb-recovery-fixture: prune did not collect the log prefix");
         return Err(std::io::Error::other("prune did not collect the log prefix").into());
     }
     Ok(())

@@ -11,10 +11,6 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![cfg(feature = "fdb")]
-#![expect(
-    unsafe_code,
-    reason = "the FDB network boot is this journey's FFI seam"
-)]
 
 #[path = "support/fdb_harness.rs"]
 mod fdb_harness;
@@ -170,15 +166,15 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     // Expire a real server-issued checkpoint without sleeping or changing the
     // production codec. This client last pulled before the pruned log existed.
     now.store(61_001, Ordering::SeqCst);
-    let pull = PullRequest {
-        protocol: logical_db_protocol::PROTOCOL_VERSION,
+    let pull = PullRequest::new(
+        logical_db_protocol::PROTOCOL_VERSION,
         scope,
-        replica: expired_id,
-        request: OperationDigest::new([0x6e; 32]),
-        after: Some(Checkpoint::from_wire(old_checkpoint.clone())?),
-        max_changes: 1,
-        max_bytes: 1_048_576,
-    };
+        expired_id,
+        OperationDigest::new([0x6e; 32]),
+        Some(Checkpoint::from_wire(old_checkpoint.clone())?),
+        1,
+        1_048_576,
+    );
     assert!(
         matches!(
             transport.pull(pull.clone()).await?,
@@ -210,10 +206,15 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     assert!(
         matches!(
             transport
-                .pull(PullRequest {
-                    after: Some(Checkpoint::from_wire(replacement)?),
-                    ..pull
-                })
+                .pull(PullRequest::new(
+                    pull.protocol,
+                    pull.scope,
+                    pull.replica,
+                    pull.request,
+                    Some(Checkpoint::from_wire(replacement)?),
+                    pull.max_changes,
+                    pull.max_bytes,
+                ))
                 .await?,
             PullResult::Page(_)
         ),
@@ -271,14 +272,14 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let mut cursor: Option<DocumentId> = None;
     let mut pages = 0usize;
     loop {
-        let request = BaselineRequest {
-            protocol: logical_db_protocol::PROTOCOL_VERSION,
+        let request = BaselineRequest::new(
+            logical_db_protocol::PROTOCOL_VERSION,
             scope,
-            replica: ReplicaId::new(),
-            request: OperationDigest::new([0x11; 32]),
-            after: None,
-            after_document: cursor,
-        };
+            ReplicaId::new(),
+            OperationDigest::new([0x11; 32]),
+            None,
+            cursor,
+        );
         let BaselineResult::Artifact(page) = transport.baseline(request).await? else {
             return Err(io::Error::other("range walk lost the sealed baseline").into());
         };
@@ -333,11 +334,11 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 
     drop((first, second, expired));
     server.abort();
-    let _ = server.await;
+    drop(server.await);
     drop(prune_store);
     drop(network);
-    let _ = fs::remove_file(&first_path);
-    let _ = fs::remove_file(&second_path);
-    let _ = fs::remove_file(&expired_path);
+    fs::remove_file(&first_path)?;
+    fs::remove_file(&second_path)?;
+    fs::remove_file(&expired_path)?;
     Ok(())
 }
