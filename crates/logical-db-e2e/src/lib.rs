@@ -190,7 +190,12 @@ mod tests {
     fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real()
     -> Result<(), Box<dyn std::error::Error>> {
         let application = format!("com.logicaldb.windows.{}", uuid::Uuid::now_v7());
-        let local = std::env::var_os("LOCALAPPDATA").expect("Windows defines LOCALAPPDATA");
+        let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Windows runtime did not define LOCALAPPDATA",
+            )
+        })?;
         let directory = std::path::PathBuf::from(local)
             .join("LogicalDB")
             .join(&application);
