@@ -135,7 +135,13 @@ else
         printf "reasonless suppression: %s\n" "$hit" >&2
         bad=1
       fi
-    done < <(grep -RIn --include="*.rs" -E "#\[(allow|expect)\(" crates/ 2>/dev/null || true)
+    # Line-anchored: a real attribute starts a line (optionally indented, and
+    # optionally an inner `#!`). A comment or string that *mentions* `#[allow(`
+    # is not a suppression — lgwks-deps/scan.rs is full of those as test
+    # fixtures — and a scanner that cannot tell them apart fails the gate on
+    # its own fixtures. This narrows the match to actual attributes; the rule
+    # itself is unchanged.
+    done < <(grep -RIn --include="*.rs" -E "^[[:space:]]*#!?\[(allow|expect)\(" crates/ 2>/dev/null || true)
     exit "$bad"
   '
 
