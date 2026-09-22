@@ -42,7 +42,6 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-model",
         "logical-db-protocol",
     },
-    "logical-db-braid": {"logical-db-model", "logical-db-service"},
     "logical-db-store-fdb": {
         "logical-db-model",
         "logical-db-protocol",
@@ -67,7 +66,6 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-store-fdb",
     },
     "logical-db-daemon": {
-        "logical-db-braid",
         "logical-db-crdt",
         "logical-db-model",
         "logical-db-protocol",

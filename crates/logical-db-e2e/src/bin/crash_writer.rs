@@ -5,6 +5,14 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::exit,
+    reason = "the crash fixture must exit without running destructors, and a failed run must exit nonzero; this fixture never prints to stdout"
+)]
 
 use logical_db::{
     AccountId, Database, DocumentId, Object, OperationDigest, OperationId, ReplicaId, Scalar,
@@ -13,6 +21,7 @@ use logical_db::{
 use std::error::Error;
 use uuid::Uuid;
 
+/// Reports a failed fixture run on stderr and exits nonzero.
 fn main() {
     if let Err(error) = run() {
         eprintln!("crash_writer: {error}");
@@ -20,18 +29,19 @@ fn main() {
     }
 }
 
+/// Commits one edit, then exits without running destructors.
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let [path, account, space, replica, document] = arguments.as_slice() else {
-        return Err("expected path, account, space, replica, and document arguments".into());
-    };
+    let [path, account, space, replica, document]: [String; 5] = arguments
+        .try_into()
+        .map_err(|_| "expected path, account, space, replica, and document arguments")?;
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(account)?),
-        SpaceId::from_uuid(Uuid::parse_str(space)?),
+        AccountId::from_uuid(Uuid::parse_str(&account)?),
+        SpaceId::from_uuid(Uuid::parse_str(&space)?),
     );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(replica)?);
-    let document = DocumentId::from_uuid(Uuid::parse_str(document)?);
-    let database = Database::open(path, scope, replica)?;
+    let replica = ReplicaId::from_uuid(Uuid::parse_str(&replica)?);
+    let document = DocumentId::from_uuid(Uuid::parse_str(&document)?);
+    let database = Database::open(&path, scope, replica)?;
     database.edit(
         document,
         OperationId::new(),

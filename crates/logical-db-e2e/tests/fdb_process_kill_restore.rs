@@ -13,7 +13,6 @@
 //! S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![cfg(feature = "fdb")]
-#![allow(unsafe_code)]
 
 #[path = "support/fdb_harness.rs"]
 mod fdb_harness;
@@ -41,6 +40,7 @@ const KILL_PAUSE_MS: u64 = 30_000;
 /// Documents seeded into the covering baseline.
 const BASELINE_DOCUMENTS: usize = MAX_BASELINE_PAGE_DOCUMENTS + 44;
 
+/// A kill during restore commits nothing; a clean rerun recovers the baseline.
 #[test]
 fn killed_restore_commits_nothing_and_a_clean_rerun_recovers() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Builder::new()
@@ -49,10 +49,17 @@ fn killed_restore_commits_nothing_and_a_clean_rerun_recovers() -> Result<(), Box
         .block_on(journey())
 }
 
-#[allow(clippy::too_many_lines)]
+/// Drives the process-kill recovery journey against a real FDB cluster.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one ordered end-to-end journey; splitting hides the ordering"
+)]
 async fn journey() -> Result<(), Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
-    #[allow(unsafe_code)]
+    #[expect(
+        unsafe_code,
+        reason = "the FDB network boot is this journey's FFI seam"
+    )]
     // SAFETY: this dedicated process boots exactly one FDB network and retains
     // the auto-stop guard beyond every database, store, future, and child.
     let network = unsafe { FdbApiBuilder::default().build()?.boot()? };
@@ -67,7 +74,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         service_store,
         FixtureAuthenticator,
         CheckpointCodec::new([0x28; 32], 60_000)?,
-        SystemClock,
+        SystemClock::new(),
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -114,12 +121,13 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         KILL_PAUSE_MS,
         &committed_ready,
         0,
-    );
+    )?;
     await_ready(&mut killed, &ready, "page two")?;
     killed.kill()?;
     if killed.wait()?.success() {
-        eprintln!("fdb-process-kill-restore: the consumer exited before it could be killed");
-        return Err(io::Error::other("the consumer was not terminated mid-restore").into());
+        return Err(
+            io::Error::other("the consumer exited cleanly before it could be killed").into(),
+        );
     }
     assert_nothing_committed(
         &consumer_path,
@@ -139,11 +147,13 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         0,
         &committed_ready,
         0,
-    );
+    )?;
     let status = rerun.wait()?;
     if !status.success() {
-        eprintln!("fdb-process-kill-restore: the recovery rerun failed: {status:?}");
-        return Err(io::Error::other("the recovery rerun did not succeed").into());
+        return Err(io::Error::other(format!(
+            "the recovery rerun did not succeed (status={status:?})"
+        ))
+        .into());
     }
     assert_recovered(
         &consumer_path,
@@ -165,14 +175,14 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         0,
         &committed_ready,
         KILL_PAUSE_MS,
-    );
+    )?;
     await_ready(&mut post_commit, &committed_ready, "the durable commit")?;
     post_commit.kill()?;
     if post_commit.wait()?.success() {
-        eprintln!(
-            "fdb-process-kill-restore: the consumer exited after committing before it could be killed"
-        );
-        return Err(io::Error::other("the post-commit consumer was not terminated").into());
+        return Err(io::Error::other(
+            "the consumer exited after committing before it could be killed",
+        )
+        .into());
     }
     assert_recovered(
         &committed_path,
@@ -182,26 +192,21 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         &documents,
     )
     .map_err(|error| {
-        eprintln!(
-            "fdb-process-kill-restore: the state after a post-commit kill was not durable: {error}"
-        );
-        error
+        io::Error::other(format!(
+            "state after a post-commit kill was not durable: {error}"
+        ))
     })?;
-
-    println!(
-        "PASS fdb-process-kill-restore killed_before_commit=true killed_after_commit=true documents={total} checkpoint_advanced=true store=real-fdb"
-    );
 
     drop((first, transport));
     server.abort();
-    let _ = server.await;
+    drop(server.await);
     drop(prune_store);
     drop(network);
-    let _ = fs::remove_file(&first_path);
-    let _ = fs::remove_file(&consumer_path);
-    let _ = fs::remove_file(&ready);
-    let _ = fs::remove_file(&committed_ready);
-    let _ = fs::remove_file(&committed_path);
+    fs::remove_file(&first_path)?;
+    fs::remove_file(&consumer_path)?;
+    fs::remove_file(&ready)?;
+    fs::remove_file(&committed_ready)?;
+    fs::remove_file(&committed_path)?;
     Ok(())
 }
 
@@ -221,12 +226,22 @@ async fn seed_and_prune(
             .iter()
             .enumerate()
             .map(|(offset, document)| {
-                let index = batch * 150 + offset;
-                let value = i64::try_from(index % 1_000)?;
+                let index = batch.saturating_mul(150).saturating_add(offset);
+                let value = i64::try_from(
+                    index
+                        .checked_rem(1_000)
+                        .ok_or("seed modulus must be non-zero")?,
+                )?;
                 Ok(BatchEdit::new(
                     *document,
                     OperationId::new(),
-                    OperationDigest::new([u8::try_from(index % 256)?; 32]),
+                    OperationDigest::new(
+                        [u8::try_from(
+                            index
+                                .checked_rem(256)
+                                .ok_or("digest modulus must be non-zero")?,
+                        )?; 32],
+                    ),
                     move |editor| editor.put(&Object::root(), "state", Scalar::Integer(value)),
                 ))
             })
@@ -243,14 +258,18 @@ async fn seed_and_prune(
     }
     let seeded = read_frontier(prune_store, scope).await?;
     if seeded != total {
-        eprintln!("fdb-process-kill-restore: seeding stopped at frontier={seeded}");
-        return Err(io::Error::other("the service did not retain every document").into());
+        return Err(io::Error::other(format!(
+            "the service did not retain every document (frontier={seeded} target={total})"
+        ))
+        .into());
     }
     seal_consume_and_prune(prune_store, scope, total).await?;
     let floor = read_floor(prune_store, scope).await?;
     if floor != total {
-        eprintln!("fdb-process-kill-restore: the retained floor is {floor}");
-        return Err(io::Error::other("the baseline was not retained at the floor").into());
+        return Err(io::Error::other(format!(
+            "the baseline was not retained at the floor (floor={floor})"
+        ))
+        .into());
     }
     Ok(first)
 }
@@ -265,13 +284,11 @@ fn assert_nothing_committed(
 ) -> Result<(), Box<dyn Error>> {
     let interrupted = Database::open(consumer_path, scope, replica)?;
     if interrupted.checkpoint(peer)?.is_some() {
-        eprintln!("fdb-process-kill-restore: a killed restore advanced the checkpoint");
         return Err(io::Error::other("a killed restore committed a checkpoint").into());
     }
     if !interrupted.pending_changes(0, 256)?.is_empty()
         || !interrupted.changes_since(0, 256)?.is_empty()
     {
-        eprintln!("fdb-process-kill-restore: a killed restore wrote local state");
         return Err(io::Error::other("a killed restore wrote local state").into());
     }
     for document in documents {
@@ -279,7 +296,6 @@ fn assert_nothing_committed(
             .read(*document, |reader| reader.get(&Object::root(), "state"))?
             .is_some()
         {
-            eprintln!("fdb-process-kill-restore: a killed restore materialized a document");
             return Err(io::Error::other("a killed restore materialized a document").into());
         }
     }
@@ -296,20 +312,22 @@ fn assert_recovered(
 ) -> Result<(), Box<dyn Error>> {
     let recovered = Database::open(consumer_path, scope, replica)?;
     if recovered.checkpoint(peer)?.is_none() {
-        eprintln!("fdb-process-kill-restore: the recovered consumer has no checkpoint");
         return Err(io::Error::other("the recovered consumer has no checkpoint").into());
     }
     for (index, document) in documents.iter().enumerate() {
         let expected = Some(Some(Item::Scalar(Scalar::Integer(i64::try_from(
-            index % 1_000,
+            index
+                .checked_rem(1_000)
+                .ok_or("observation modulus must be non-zero")?,
         )?))));
         if recovered.read(*document, |reader| reader.get(&Object::root(), "state"))? != expected {
-            eprintln!("fdb-process-kill-restore: recovered document {index} diverged");
-            return Err(io::Error::other("a recovered document diverged").into());
+            return Err(io::Error::other(format!(
+                "a recovered document diverged at index={index}"
+            ))
+            .into());
         }
     }
     if !recovered.pending_changes(0, 256)?.is_empty() {
-        eprintln!("fdb-process-kill-restore: recovery invented local changes");
         return Err(io::Error::other("recovery invented local changes").into());
     }
     Ok(())
@@ -322,14 +340,17 @@ struct ConsumerChild {
 }
 
 impl ConsumerChild {
+    /// Signals the consumer child to terminate.
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
 
+    /// Waits for the consumer child's exit status.
     fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         self.child.wait()
     }
 
+    /// Polls whether the consumer child has exited.
     fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
@@ -337,12 +358,16 @@ impl ConsumerChild {
 
 impl Drop for ConsumerChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.child.kill());
+        drop(self.child.wait());
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Spawns one recovery-consumer child wired to the public HTTP fixture.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the consumer binary's positional CLI one-for-one"
+)]
 fn spawn_consumer(
     path: &Path,
     scope: Scope,
@@ -353,7 +378,7 @@ fn spawn_consumer(
     pause_ms: u64,
     committed: &Path,
     post_pause_ms: u64,
-) -> ConsumerChild {
+) -> Result<ConsumerChild, Box<dyn Error>> {
     let child = Command::new(env!("CARGO_BIN_EXE_recovery_consumer"))
         .arg(path)
         .arg(scope.account().to_string())
@@ -366,22 +391,26 @@ fn spawn_consumer(
         .arg(pause_ms.to_string())
         .arg(committed)
         .arg(post_pause_ms.to_string())
-        .spawn()
-        .expect("the recovery consumer must spawn");
-    ConsumerChild { child }
+        .spawn()?;
+    Ok(ConsumerChild { child })
 }
 
+/// Waits until the consumer writes its `ready` file, failing if it dies first.
 fn await_ready(child: &mut ConsumerChild, ready: &Path, stage: &str) -> Result<(), Box<dyn Error>> {
     for _poll in 0..2_000 {
         if ready.exists() {
             return Ok(());
         }
         if child.try_wait()?.is_some() {
-            eprintln!("fdb-process-kill-restore: the consumer exited before {stage}");
-            return Err(io::Error::other("the consumer exited before the kill seam").into());
+            return Err(io::Error::other(format!(
+                "the consumer exited before {stage} (kill seam never reached)"
+            ))
+            .into());
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::park_timeout(Duration::from_millis(10));
     }
-    eprintln!("fdb-process-kill-restore: the consumer never reached the kill seam");
-    Err(io::Error::other("the consumer never signalled the kill seam").into())
+    Err(io::Error::other(format!(
+        "the consumer never signalled the kill seam before {stage}"
+    ))
+    .into())
 }

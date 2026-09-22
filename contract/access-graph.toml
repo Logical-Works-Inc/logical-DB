@@ -3,9 +3,31 @@
 # S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in
 # `evidence/SOURCES.md`.
 
-# Checked execution-access contract for issue #25.
-# This registry describes ownership and causal access; it is not a storage authority.
-version = 1
+# Checked execution-access contract for issue #25. This is a source-anchored
+# transition registry, not a grant of storage or host authority.
+version = 2
+
+# Every source anchor below is mandatory. The validator refuses both a missing
+# transition and an unreviewed extra transition, so this cannot become a
+# hand-maintained partial diagram.
+required_source = [
+  "crates/logical-db/src/lib.rs#Database::edit",
+  "crates/logical-db/src/lib.rs#Database::migrate_schema",
+  "crates/logical-db/src/lib.rs#Database::install_remote_page",
+  "crates/logical-db/src/lib.rs#Database::install_baseline",
+  "crates/logical-db-store/src/lib.rs#pub fn commit_local",
+  "crates/logical-db-store/src/lib.rs#pub fn apply_migration_page",
+  "crates/logical-db-store/src/lib.rs#pub fn install_remote_page",
+  "crates/logical-db-sync/src/lib.rs#synchronize",
+  "crates/logical-db-sync/src/lib.rs#install_recovery",
+  "crates/logical-db-server/src/lib.rs#admit_request",
+  "crates/logical-db-server/src/lib.rs#async fn push",
+  "crates/logical-db-server/src/lib.rs#async fn pull",
+  "crates/logical-db-server/src/lib.rs#async fn recover",
+  "crates/logical-db-service/src/lib.rs#pub async fn prune",
+  "crates/logical-db-store-fdb/src/lib.rs#async fn accept",
+  "crates/logical-db-daemon/src/main.rs#async fn service_main",
+]
 
 [[resource]]
 name = "replica.state"
@@ -19,12 +41,12 @@ durability = "durable"
 
 [[resource]]
 name = "sync.checkpoint"
-owner = "logical-db-sync"
+owner = "logical-db-store"
 durability = "durable"
 
 [[resource]]
 name = "sync.session"
-owner = "logical-db-sync"
+owner = "logical-db-server"
 durability = "ephemeral"
 
 [[resource]]
@@ -48,41 +70,209 @@ owner = "logical-db-service"
 durability = "ephemeral"
 
 [[system]]
-name = "store.commit"
-owner = "logical-db-store"
+name = "embedded.edit"
+owner = "logical-db"
+source = "crates/logical-db/src/lib.rs#Database::edit"
+kind = "commit"
 reads = ["replica.state", "replica.outbox"]
 writes = ["replica.state", "replica.outbox"]
 receipt = "operation"
-continuation = "bounded batch"
+predecessors = []
+limit = "one document and MAX_CHANGE_BYTES"
+atomicity = "state and outbox commit together"
+failure = "typed error leaves durable state unchanged"
 
 [[system]]
-name = "store.migrate"
+name = "redb.commit"
 owner = "logical-db-store"
-reads = ["replica.state", "schema.generation"]
+source = "crates/logical-db-store/src/lib.rs#pub fn commit_local"
+kind = "commit"
+reads = ["replica.state", "replica.outbox"]
+writes = ["replica.state", "replica.outbox"]
+receipt = "durable commit outcome"
+predecessors = []
+limit = "validated LocalCommit batch"
+atomicity = "redb state, outbox, and operation binding commit together"
+failure = "typed error publishes no partial local transition"
+
+[[system]]
+name = "embedded.migrate"
+owner = "logical-db"
+source = "crates/logical-db/src/lib.rs#Database::migrate_schema"
+kind = "migration"
+reads = ["replica.state", "schema.generation", "migration.state"]
+writes = ["schema.generation", "migration.state"]
+receipt = "migration page"
+predecessors = ["embedded.edit"]
+limit = "revision-checked bounded page"
+atomicity = "page and durable cursor commit together"
+failure = "typed error preserves the prior cursor"
+
+[[system]]
+name = "redb.migration-page"
+owner = "logical-db-store"
+source = "crates/logical-db-store/src/lib.rs#pub fn apply_migration_page"
+kind = "migration"
+reads = ["replica.state", "migration.state", "schema.generation"]
 writes = ["migration.state", "schema.generation"]
-receipt = "migration"
-continuation = "revision-checked page"
+receipt = "durable migration cursor"
+predecessors = ["embedded.migrate"]
+limit = "MIGRATION_PAGE_LIMIT bounded page"
+atomicity = "index rows and migration cursor commit together"
+failure = "typed error retains the prior migration cursor"
+
+[[system]]
+name = "embedded.remote-page"
+owner = "logical-db"
+source = "crates/logical-db/src/lib.rs#Database::install_remote_page"
+kind = "replication"
+reads = ["replica.state", "sync.checkpoint"]
+writes = ["replica.state", "sync.checkpoint"]
+receipt = "remote page checkpoint"
+predecessors = ["sync.push-pull"]
+limit = "MAX_MATERIALIZED_PAGE_BYTES"
+atomicity = "remote documents and checkpoint commit together"
+failure = "typed error leaves documents and checkpoint unchanged"
+
+[[system]]
+name = "redb.remote-page"
+owner = "logical-db-store"
+source = "crates/logical-db-store/src/lib.rs#pub fn install_remote_page"
+kind = "replication"
+reads = ["replica.state", "sync.checkpoint"]
+writes = ["replica.state", "sync.checkpoint"]
+receipt = "durable remote page checkpoint"
+predecessors = ["embedded.remote-page"]
+limit = "validated remote page and materialized byte budget"
+atomicity = "remote documents and checkpoint commit together"
+failure = "typed error publishes no partial remote page"
+
+[[system]]
+name = "embedded.baseline-install"
+owner = "logical-db"
+source = "crates/logical-db/src/lib.rs#Database::install_baseline"
+kind = "recovery"
+reads = ["replica.state", "sync.checkpoint"]
+writes = ["replica.state", "sync.checkpoint"]
+receipt = "baseline checkpoint"
+predecessors = ["sync.recovery"]
+limit = "validated bounded baseline artifact"
+atomicity = "baseline state and checkpoint commit together"
+failure = "typed error leaves state and checkpoint unchanged"
 
 [[system]]
 name = "sync.push-pull"
 owner = "logical-db-sync"
+source = "crates/logical-db-sync/src/lib.rs#synchronize"
+kind = "synchronization"
 reads = ["replica.outbox", "sync.checkpoint", "sync.session"]
-writes = ["sync.checkpoint", "sync.session"]
+writes = ["sync.checkpoint"]
 receipt = "sync report"
-continuation = "bounded page and cycle"
+predecessors = ["http.push", "http.pull"]
+limit = "SyncLimits bounded page and cycle"
+atomicity = "each accepted pull page installs atomically"
+failure = "typed error preserves the prior checkpoint"
 
 [[system]]
-name = "service.admit"
-owner = "logical-db-service"
-reads = ["service.retention", "service.request"]
+name = "sync.recovery"
+owner = "logical-db-sync"
+source = "crates/logical-db-sync/src/lib.rs#install_recovery"
+kind = "recovery"
+reads = ["sync.checkpoint", "sync.session"]
+writes = ["sync.checkpoint"]
+receipt = "recovery report"
+predecessors = ["http.recovery"]
+limit = "SyncLimits recovery_pages and recovery_bytes"
+atomicity = "only the final baseline install advances the checkpoint"
+failure = "typed error preserves the prior checkpoint"
+
+[[system]]
+name = "http.admission"
+owner = "logical-db-server"
+source = "crates/logical-db-server/src/lib.rs#admit_request"
+kind = "admission"
+reads = ["service.request"]
+writes = ["sync.session"]
+receipt = "admission response"
+predecessors = []
+limit = "MAX_IN_FLIGHT_REQUESTS and deadline"
+atomicity = "permit lifetime encloses one request"
+failure = "busy or deadline response has no service mutation"
+
+[[system]]
+name = "http.push"
+owner = "logical-db-server"
+source = "crates/logical-db-server/src/lib.rs#async fn push"
+kind = "http"
+reads = ["service.request", "service.retention"]
 writes = ["service.request"]
-receipt = "protocol response"
-continuation = "deadline"
+receipt = "push response"
+predecessors = ["http.admission"]
+limit = "MAX_HTTP_BODY_BYTES and deadline"
+atomicity = "service admission is one request transaction"
+failure = "typed response exposes no partial admission"
 
 [[system]]
-name = "service.retention-recovery"
+name = "http.pull"
+owner = "logical-db-server"
+source = "crates/logical-db-server/src/lib.rs#async fn pull"
+kind = "http"
+reads = ["service.request", "service.retention"]
+writes = ["service.request"]
+receipt = "pull response"
+predecessors = ["http.admission"]
+limit = "MAX_HTTP_BODY_BYTES and deadline"
+atomicity = "response is derived from one validated request"
+failure = "typed response exposes no partial page"
+
+[[system]]
+name = "http.recovery"
+owner = "logical-db-server"
+source = "crates/logical-db-server/src/lib.rs#async fn recover"
+kind = "http"
+reads = ["service.request", "service.retention"]
+writes = ["service.request"]
+receipt = "baseline response"
+predecessors = ["http.admission"]
+limit = "MAX_HTTP_BODY_BYTES and deadline"
+atomicity = "response is derived from one sealed baseline page"
+failure = "typed response exposes no partial baseline"
+
+[[system]]
+name = "service.retention"
 owner = "logical-db-service"
+source = "crates/logical-db-service/src/lib.rs#pub async fn prune"
+kind = "recovery"
 reads = ["service.retention", "service.request"]
 writes = ["service.retention"]
 receipt = "prune receipt"
-continuation = "bounded baseline page"
+predecessors = ["http.recovery"]
+limit = "validated bounded baseline page"
+atomicity = "baseline validation and history deletion share one transaction"
+failure = "typed error retains the history prefix"
+
+[[system]]
+name = "fdb.accept"
+owner = "logical-db-store-fdb"
+source = "crates/logical-db-store-fdb/src/lib.rs#async fn accept"
+kind = "replication"
+reads = ["service.request", "service.retention"]
+writes = ["service.request", "service.retention"]
+receipt = "idempotent FDB accept result"
+predecessors = ["http.push"]
+limit = "FDB transaction timeout and retry ceiling"
+atomicity = "change, invocation, sequence, and retention commit together"
+failure = "typed result distinguishes retryable uncertainty from refusal"
+
+[[system]]
+name = "daemon.composition"
+owner = "logical-db-daemon"
+source = "crates/logical-db-daemon/src/main.rs#async fn service_main"
+kind = "admission"
+reads = ["sync.session", "service.request"]
+writes = ["sync.session"]
+receipt = "daemon lifecycle result"
+predecessors = []
+limit = "loopback listener and shutdown signal"
+atomicity = "FDB network guard outlives the service router"
+failure = "startup failure publishes no serving listener"

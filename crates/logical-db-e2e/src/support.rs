@@ -13,7 +13,6 @@
 
 use std::{
     collections::HashMap,
-    convert::Infallible,
     future::{Future, ready},
     sync::Mutex,
 };
@@ -36,6 +35,7 @@ use logical_db_service::{
 /// A grant that authorizes exactly the scope, effect, action, and frontier it
 /// was minted for.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Grant {
     /// Authorized scope.
     pub scope: Scope,
@@ -70,6 +70,7 @@ impl ExecutionGrant for Grant {
 }
 
 /// Authority that mints a grant for any justified request.
+#[non_exhaustive]
 pub struct Allow;
 
 impl Authority for Allow {
@@ -93,6 +94,7 @@ impl Authority for Allow {
 }
 
 /// Bearer authentication for the loopback journey host.
+#[non_exhaustive]
 pub struct TestAuthentication;
 
 impl Authenticator for TestAuthentication {
@@ -112,6 +114,7 @@ impl Authenticator for TestAuthentication {
 }
 
 /// Clock pinned to one instant so checkpoint expiry is deterministic.
+#[non_exhaustive]
 pub struct FixedClock;
 
 impl Clock for FixedClock {
@@ -122,6 +125,7 @@ impl Clock for FixedClock {
 
 /// Retention bookkeeping for one scope.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct RetentionState {
     /// Retention floor: the first position that is still addressable.
     pub floor: u64,
@@ -133,34 +137,50 @@ pub struct RetentionState {
 
 /// In-memory service store implementing the full retention contract.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct MemoryServiceStore {
+    /// Durable change log for every scope served by this store.
     changes: Mutex<Vec<ChangeEnvelope>>,
+    /// Idempotency map binding each operation to its request and change.
     operations: Mutex<HashMap<OperationId, (OperationDigest, ChangeDigest)>>,
+    /// Per-scope retention floor, consumed position, and sealed baseline.
     retention: Mutex<HashMap<Scope, RetentionState>>,
 }
 
 impl MemoryServiceStore {
+    /// Returns the durable frontier for one scope: floor plus retained changes.
     fn scope_frontier(&self, scope: Scope) -> u64 {
-        let changes = self.changes.lock().unwrap();
-        self.retention_state(scope).floor + Self::retained_count(&changes, scope)
+        let changes = self
+            .changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.retention_state(scope)
+            .floor
+            .saturating_add(Self::retained_count(&changes, scope))
     }
 
+    /// Counts the retained changes belonging to one scope.
     fn retained_count(changes: &[ChangeEnvelope], scope: Scope) -> u64 {
-        changes
-            .iter()
-            .filter(|change| change.scope == scope)
-            .count() as u64
+        u64::try_from(
+            changes
+                .iter()
+                .filter(|change| change.scope == scope)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
     }
 
+    /// Returns a copy of one scope's retention state, or its default.
     fn retention_state(&self, scope: Scope) -> RetentionState {
         self.retention
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&scope)
             .cloned()
             .unwrap_or_default()
     }
 
+    /// Validates one retention grant against the observed frontier.
     fn check_retention_grant(
         &self,
         scope: Scope,
@@ -180,7 +200,7 @@ impl MemoryServiceStore {
 }
 
 impl ServiceStore for MemoryServiceStore {
-    type Error = Infallible;
+    type Error = logical_db_model::ModelError;
 
     fn accept(
         &self,
@@ -193,7 +213,10 @@ impl ServiceStore for MemoryServiceStore {
         {
             return ready(Ok(AcceptResult::StaleAuthority));
         }
-        let mut operations = self.operations.lock().unwrap();
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let outcome = match operations.get(&change.operation) {
             Some(existing) if *existing == (change.request, change.digest) => {
                 AcceptResult::Duplicate
@@ -201,7 +224,10 @@ impl ServiceStore for MemoryServiceStore {
             Some(_) => AcceptResult::Conflict,
             None => {
                 operations.insert(change.operation, (change.request, change.digest));
-                self.changes.lock().unwrap().push(change.clone());
+                self.changes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(change.clone());
                 AcceptResult::Accepted
             }
         };
@@ -235,7 +261,10 @@ impl ServiceStore for MemoryServiceStore {
         if after < floor {
             return ready(Ok(PageResult::BehindFloor));
         }
-        let changes = self.changes.lock().unwrap();
+        let changes = self
+            .changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scoped = changes
             .iter()
             .filter(|change| change.scope == scope)
@@ -243,27 +272,28 @@ impl ServiceStore for MemoryServiceStore {
         if grant.scope() != scope
             || grant.effect() != Effect::Sync
             || grant.action() != action.digest()
-            || grant.frontier() != floor + scoped.len() as u64
+            || grant.frontier()
+                != floor.saturating_add(u64::try_from(scoped.len()).unwrap_or(u64::MAX))
         {
             return ready(Ok(PageResult::StaleAuthority));
         }
         let mut bytes = 0usize;
         let page = scoped
             .iter()
-            .skip(usize::try_from(after - floor).unwrap_or(usize::MAX))
+            .skip(usize::try_from(after.saturating_sub(floor)).unwrap_or(usize::MAX))
             .take(usize::from(max_changes))
             .take_while(|change| {
                 bytes = bytes.saturating_add(change.bytes.len());
-                bytes <= max_bytes as usize
+                bytes <= usize::try_from(max_bytes).unwrap_or(usize::MAX)
             })
             .map(|change| (*change).clone())
             .collect::<Vec<_>>();
-        let position = after + page.len() as u64;
-        ready(Ok(PageResult::Page(StoredPage {
-            changes: page,
+        let position = after.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
+        ready(Ok(PageResult::Page(StoredPage::new(
+            page,
             position,
-            more: floor + scoped.len() as u64 > position,
-        })))
+            floor.saturating_add(u64::try_from(scoped.len()).unwrap_or(u64::MAX)) > position,
+        ))))
     }
 }
 
@@ -299,7 +329,10 @@ impl RetentionStore for MemoryServiceStore {
             .map_or(state.floor, |artifact| artifact.baseline.position());
         let skip = usize::try_from(base_position.saturating_sub(state.floor)).unwrap_or(usize::MAX);
         let retained = usize::try_from(through.saturating_sub(base_position)).unwrap_or(usize::MAX);
-        let changes = self.changes.lock().unwrap();
+        let changes = self
+            .changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let retained_changes = changes
             .iter()
             .filter(|change| change.scope == scope)
@@ -307,9 +340,14 @@ impl RetentionStore for MemoryServiceStore {
             .take(retained)
             .cloned()
             .collect::<Vec<_>>();
-        let artifact = materialize_snapshot(scope, through, base.as_ref(), &retained_changes)
-            .expect("the journey store materializes bounded validated artifacts");
-        ready(Ok(artifact))
+        ready(
+            materialize_snapshot(scope, through, base.as_ref(), &retained_changes).map_err(
+                |error| {
+                    let _ = error;
+                    logical_db_model::ModelError::PageTooLarge
+                },
+            ),
+        )
     }
 
     fn read_baseline_page(
@@ -325,10 +363,10 @@ impl RetentionStore for MemoryServiceStore {
             return ready(Ok(BaselinePageResult::StaleAuthority));
         }
         let Some(artifact) = self.retention_state(action.scope).baseline else {
-            return ready(Ok(BaselinePageResult::Page(BaselinePageSlice {
-                documents: Vec::new(),
-                more: false,
-            })));
+            return ready(Ok(BaselinePageResult::Page(BaselinePageSlice::new(
+                Vec::new(),
+                false,
+            ))));
         };
         assert_eq!(
             &artifact.baseline, descriptor,
@@ -347,10 +385,9 @@ impl RetentionStore for MemoryServiceStore {
             .collect::<Vec<_>>();
         let more = documents.len() > MAX_BASELINE_PAGE_DOCUMENTS;
         documents.truncate(MAX_BASELINE_PAGE_DOCUMENTS);
-        ready(Ok(BaselinePageResult::Page(BaselinePageSlice {
-            documents,
-            more,
-        })))
+        ready(Ok(BaselinePageResult::Page(BaselinePageSlice::new(
+            documents, more,
+        ))))
     }
 
     fn seal_snapshot(
@@ -373,7 +410,7 @@ impl RetentionStore for MemoryServiceStore {
         }
         self.retention
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(scope)
             .or_default()
             .baseline = Some(artifact.clone());
@@ -397,7 +434,10 @@ impl RetentionStore for MemoryServiceStore {
         if through > frontier {
             return ready(Ok(ConsumedResult::BeyondFrontier { frontier }));
         }
-        let mut retention = self.retention.lock().unwrap();
+        let mut retention = self
+            .retention
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = retention.entry(scope).or_default();
         if through <= state.consumed {
             return ready(Ok(ConsumedResult::Unchanged {
@@ -439,24 +479,27 @@ impl RetentionStore for MemoryServiceStore {
             }
             let floor = state.floor;
             let mut position = floor;
-            self.changes.lock().unwrap().retain(|change| {
-                if change.scope != scope {
-                    return true;
-                }
-                position += 1;
-                position > through
-            });
+            self.changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|change| {
+                    if change.scope != scope {
+                        return true;
+                    }
+                    position = position.saturating_add(1);
+                    position > through
+                });
             self.retention
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(scope)
                 .or_default()
                 .floor = through;
         }
-        ready(Ok(PruneResult::Pruned(PruneReceipt {
-            pruned_through: through,
-            floor: through.max(state.floor),
-        })))
+        ready(Ok(PruneResult::Pruned(PruneReceipt::new(
+            through,
+            through.max(state.floor),
+        ))))
     }
 }
 
@@ -482,13 +525,14 @@ pub async fn serve_journey(
         std::sync::Arc::clone(&store),
         TestAuthentication,
         CheckpointCodec::new([23; 32], 60_000)
-            .expect("the journey checkpoint codec uses a nonzero bounded key"),
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
         FixedClock,
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = lgwks_bot::rt::task::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let serve_result = axum::serve(listener, app).await;
+        drop(serve_result);
     });
     Ok((address, server))
 }

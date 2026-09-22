@@ -14,6 +14,14 @@
 //! S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 
 use std::{error::Error, io, path::PathBuf, time::Duration};
 
@@ -28,8 +36,11 @@ use uuid::Uuid;
 
 /// HTTP transport wrapper that signals the recovery seam and can stall there.
 struct PausingTransport {
+    /// Real HTTP transport every call delegates to.
     inner: HttpTransport<StaticBearer>,
+    /// File the orchestrator watches for the recovery-seam signal.
     ready: PathBuf,
+    /// How long to stall once the seam has been signalled.
     pause: Duration,
 }
 
@@ -51,12 +62,13 @@ impl Transport for PausingTransport {
             if let Err(error) = std::fs::write(&self.ready, b"accumulated\n") {
                 eprintln!("recovery-consumer: ready signal: {error}");
             }
-            std::thread::sleep(self.pause);
+            std::thread::park_timeout(self.pause);
         }
         Ok(result)
     }
 }
 
+/// Fetches one positional CLI argument, naming it when the slot is missing.
 fn required(arguments: &[String], index: usize, name: &str) -> Result<String, io::Error> {
     arguments.get(index).cloned().ok_or_else(|| {
         io::Error::new(
@@ -66,10 +78,12 @@ fn required(arguments: &[String], index: usize, name: &str) -> Result<String, io
     })
 }
 
+/// Boots the async runtime and runs the recovery-consumer journey.
 fn main() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Runtime::new()?.block_on(recover())
 }
 
+/// Recovers the baseline over HTTP, pauses at the seam, then commits.
 async fn recover() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
     let path = PathBuf::from(required(&arguments, 1, "redb path")?);
@@ -107,7 +121,7 @@ async fn recover() -> Result<(), Box<dyn Error>> {
         if let Err(error) = std::fs::write(&path, b"committed\n") {
             eprintln!("recovery-consumer: committed signal: {error}");
         }
-        std::thread::sleep(post_pause);
+        std::thread::park_timeout(post_pause);
     }
     println!(
         "PASS recovery-consumer recovered={} pushed={} pulled={}",

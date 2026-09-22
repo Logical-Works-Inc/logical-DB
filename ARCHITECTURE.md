@@ -47,21 +47,19 @@ standalone or nested service
   |-- logical-db-daemon                  deployable composition root
   |     |-- logical-db-server            bounded Axum router + auth ingress
   |     |-- logical-db-service           protocol/authority orchestration
-  |     |-- logical-db-braid             runnable request/frontier proofs
   |     `-- logical-db-store-fdb         async FDB ServiceStore adapter
   |-- logical-db-server
   |     `-- logical-db-service
   |           |-- logical-db-crdt        native change validation
   |           |-- logical-db-model
   |           `-- logical-db-protocol
-  |-- logical-db-store-fdb
-  `-- logical-db-braid                   real Braid admission adapter
+  `-- logical-db-store-fdb
 ```
 
 `logical-db-e2e` is a non-published black-box harness. Its in-memory service
 journey checks offline convergence, indexes, cursors, and restart. Its retained
 `facade_fdb_journey` imports only the public facade and crosses real HTTP,
-Braid, and an official FDB cluster. `fdb-ambiguity-journey` enables official
+host authority, and an official FDB cluster. `fdb-ambiguity-journey` enables official
 client fault injection and proves a post-commit unknown result, exact replay,
 single frontier advance, and invocation consumption. The evidence verifier's
 allowed-dependency map must additionally declare the semantic edges
@@ -95,15 +93,15 @@ present in the current scope-wide FDB frontier.
 | HTTP service | `logical_db_server::router`, `Authenticator`, `Clock` | listener/TLS/process lifecycle, authorization headers |
 | Durable service | `ServiceStore::{frontier,accept,page}`, `RetentionStore::{build_snapshot,seal_snapshot,prune}`, `ExecutionGrant` | FDB database and transaction handles |
 | Standalone process | `logical-db-daemon` environment contract | FDB network guard, directory transaction, listener lifecycle |
-| Braid | `prepare_request`, `prepare_local_request`, `BraidGrant`, `BraidAuthority`, `LocalBraidAuthority` | grant construction fields and proof fabrication |
+| Host authority | `Authority`, `ExecutionGrant`, `LocalScopeAuthority`, `LocalGrant` | grant fabrication internals and verifier runtime types |
 
 An application mutation supplies `OperationId` and an intent
 `OperationDigest`. After native CRDT validation, trusted service code computes
 an `ActionDigest` over a versioned length-framed encoding of scope, document,
-operation, replica, intent, change digest, and exact change bytes. Braid and the
-store bind the computed action. Exact retries return the original durable
-receipt without rerunning application code. Reusing an operation identity for
-different intent/change bytes fails closed.
+operation, replica, intent, change digest, and exact change bytes. The host
+authority and the store bind the computed action. Exact retries return the
+original durable receipt without rerunning application code. Reusing an
+operation identity for different intent/change bytes fails closed.
 
 ## Local transaction and subscription contract
 
@@ -146,8 +144,8 @@ Database outbox
   -> server authenticates credential
   -> validate native change bytes and compute canonical action identity
   -> read scoped FDB frontier
-  -> Braid admits capsule + proves exact scope/action/frontier predicate
-  -> RunnableInvocation becomes an opaque ExecutionGrant
+  -> host authority proves exact scope/action/frontier predicate
+  -> that proof is an opaque ExecutionGrant
   -> FDB recomputes action, rechecks frontier, and consumes invocation
   -> exact operation returns accepted / duplicate / recovered-unknown / conflict
 
@@ -217,7 +215,7 @@ root / (3, account UUID, space UUID) /
   (2)                                 scoped sequence
   (3, sequence)                       ordered change manifest
   (4, sequence, chunk)                64 KiB canonical-change chunks
-  (5, invocation digest)              single-use Braid execution marker
+  (5, invocation digest)              single-use authority execution marker
   (6)                                 retention floor and peer-consumption watermark
   (7)                                 v2 snapshot baseline descriptor
   (8, baseline digest, document UUID) state document manifest
@@ -233,28 +231,28 @@ and a commit that may have succeeded. On an FDB retry marked may-have-committed,
 the transaction first reads the exact operation manifest and chunks; equality
 returns `RecoveredUnknownCommit` without a second append.
 
-## Braid and deployment separation
+## Authority and deployment separation
 
-Core CRUD never imports Braid. `logical-db-braid` pins real Braid crates at
-commit `4b1b3e9`; it admits canonical capsule bytes, evaluates an exact predicate
-over a content-addressed `FlowSnapshot`, and calls `RunnableInvocation::prepare`.
-The adapter additionally refuses a capsule unless vault-classified request
-material flows into the exact scoped capability: reads remain `Read`, durable
-writes are `Irreversible`, and synchronization is `Egress` with a vault ceiling.
-Write and sync capsules must carry Braid's dangerous-operation confirmation
-policy; a capability string alone is insufficient.
-The snapshot commits to account, space, exact DB effect (point read and scan are
-distinct), canonical action digest, current durable frontier, and exclusive
-expiry. The caller's intent digest remains a separate idempotency field.
-`BraidGrant` retains that verifier-owned runnable;
-the service passes it unchanged to FDB, which atomically consumes its combined
-capsule/registry/authority/snapshot/predicate identity with a new operation.
-The same invocation cannot authorize another operation, and a proof prepared
-against an old frontier cannot execute.
+Core CRUD never imports a verifier runtime. Host authority is the
+`logical_db_service::Authority` trait: it returns an `ExecutionGrant` binding
+account, space, exact DB effect (point read and scan are distinct), canonical
+action digest, current durable frontier, exclusive expiry, and a stable
+invocation identity. The caller's intent digest remains a separate idempotency
+field. The store atomically consumes that invocation identity with a new
+operation: the same grant cannot authorize another operation, and a grant
+prepared against an old frontier cannot execute.
+
+`LocalScopeAuthority` is the one local implementation. It refuses irreversible
+writes and egress synchronization and every request outside one authenticated
+scope and exclusive expiry, so a bearer-authenticated daemon can read and scan
+but cannot write or sync. A host that must exercise those effects supplies its
+own `Authority` implementation together with independently verified admission
+evidence. Until that composition exists, the standalone daemon is a fail-closed
+shell for writes and sync, not a consumable sync service.
 
 Embedded and service deployment share protocol semantics, not storage handles:
 redb is the app’s offline replica; FDB is the multi-tenant ordered server log.
-Logic OS may provide authentication, Braid ambient authority, scheduling, and
+Logic OS may provide authentication, ambient authority, scheduling, and
 notifications, but Logical-DB remains independently embeddable and independently
 deployable.
 
@@ -264,15 +262,7 @@ Directory Layer, builds a scope-bound `FdbServiceStore`, and retains the FDB gua
 through graceful listener shutdown. It accepts only loopback plaintext;
 public ingress requires an external TLS terminator and credential issuer. The
 reusable router remains listener-neutral so Logic OS can supply its own
-lifecycle and Braid-derived authenticator.
-
-`LocalBraidAuthority` refuses irreversible writes and egress synchronization.
-Pinned Braid records `HumanConfirm` in the capsule but exposes no independently
-verifiable runtime confirmation evidence, so the daemon does not fabricate that
-field after bearer authentication. A host supplies `BraidAuthority` or its own
-`Authenticator` and separately prepared Braid material. Until that composition
-exists, the standalone daemon is a fail-closed shell, not a consumable sync
-service.
+lifecycle and authenticator.
 
 ## Windows contract
 
@@ -301,6 +291,6 @@ export/restore contract; its direct process-kill-during-restore receipt remains
 outstanding. This implementation does not treat the server prune gate as proof
 of end-to-end recovery.
 The standalone service is additionally blocked on externally verifiable,
-request-bound Braid confirmation evidence for irreversible and egress effects.
+request-bound authority confirmation evidence for irreversible and egress effects.
 Multi-node FDB failover/restore, public ingress, mobile sandboxing, and sustained
 load remain system tests rather than inferred properties.

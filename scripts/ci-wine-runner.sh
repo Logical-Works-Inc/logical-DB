@@ -4,7 +4,7 @@
 set -euo pipefail
 # Windows tests spawn Cargo for the real dependency gate. Give Wine actual
 # Windows executables; do not substitute cached or synthetic metadata.
-sdk=/root/.rustup/toolchains/1.98.0-x86_64-pc-windows-gnu/bin
+sdk=/root/.rustup/toolchains/1.98.1-x86_64-pc-windows-gnu/bin
 pthread_dll=$(x86_64-w64-mingw32-gcc-posix -print-file-name=libwinpthread-1.dll)
 cpp_dll=$(x86_64-w64-mingw32-g++-posix -print-file-name=libstdc++-6.dll)
 WINEPATH="$sdk;$(dirname "$pthread_dll");$(dirname "$cpp_dll")"

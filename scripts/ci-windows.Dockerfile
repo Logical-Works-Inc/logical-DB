@@ -4,8 +4,8 @@ FROM logical-db-act:local AS toolchain
 FROM ghcr.io/cross-rs/x86_64-pc-windows-gnu@sha256:7dbfe2c497a798ee3798fecf4b262c0ea12d1d02a6331bdc05ce76c9ad90fd70
 COPY --from=toolchain /root/.cargo/bin/ /root/.cargo/bin/
 ENV PATH=/root/.cargo/bin:$PATH
-RUN rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-gnu
-RUN rustup toolchain install 1.98.0-x86_64-pc-windows-gnu --profile minimal --force-non-host --no-self-update
+RUN rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-gnu
+RUN rustup toolchain install 1.98.1-x86_64-pc-windows-gnu --profile minimal --force-non-host --no-self-update
 RUN apt-get update && apt-get install -y --no-install-recommends python3
 ENV CARGO_BUILD_TARGET=x86_64-pc-windows-gnu CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 RUST_BACKTRACE=1 WINEDEBUG=-fixme
 # This selects a fresh Cargo fingerprint after the incompatible old MinGW

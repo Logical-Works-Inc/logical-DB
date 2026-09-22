@@ -42,7 +42,7 @@ logical-db facade
   ├── model / CRDT / embedded store / sync / protocol / platform
   └── optional semantic ports: episode → cairn
 
-service composition: HTTP/server/daemon + service contract + FDB adapter + Braid
+service composition: HTTP/server/daemon + service contract + FDB adapter
 ```
 
 `logical-db-cairn` and `logical-db-episode` remain optional, bounded migration

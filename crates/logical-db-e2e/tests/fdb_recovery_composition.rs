@@ -11,7 +11,6 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![cfg(feature = "fdb")]
-#![allow(unsafe_code)]
 
 #[path = "support/fdb_harness.rs"]
 mod fdb_harness;
@@ -49,15 +48,23 @@ impl Clock for RecoveryClock {
     }
 }
 
+/// The composition entry that drives the FDB recovery journey.
 #[test]
 fn fdb_recovery_composition() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Runtime::new()?.block_on(journey())
 }
 
-#[allow(clippy::too_many_lines)]
+/// Drives the expired-checkpoint recovery journey against a real FDB cluster.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one ordered end-to-end journey; splitting hides the ordering"
+)]
 async fn journey() -> Result<(), Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
-    #[allow(unsafe_code)]
+    #[expect(
+        unsafe_code,
+        reason = "the FDB network boot is this journey's FFI seam"
+    )]
     // SAFETY: this dedicated process boots exactly one FDB network and retains
     // the auto-stop guard beyond every database, store, and future.
     let network = unsafe { FdbApiBuilder::default().build()?.boot()? };
@@ -97,8 +104,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         .await?;
     let old_checkpoint = expired
         .checkpoint(peer)?
-        .expect("initial HTTP pull issues a checkpoint");
-    let total = MAX_BASELINE_PAGE_DOCUMENTS + 44;
+        .ok_or("initial HTTP pull issues a checkpoint")?;
+    let total = MAX_BASELINE_PAGE_DOCUMENTS.saturating_add(44);
     let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
     // The first document of page two is deleted on the seeding replica, so its
     // tombstone crosses the page boundary inside the sealed baseline.
@@ -110,26 +117,34 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             .iter()
             .enumerate()
             .map(|(offset, document)| {
-                let index = batch * 150 + offset;
-                let value = i64::try_from(index % 1_000)?;
+                let index = batch.saturating_mul(150).saturating_add(offset);
+                let value = i64::try_from(
+                    index
+                        .checked_rem(1_000)
+                        .ok_or("seed modulus must be non-zero")?,
+                )?;
                 Ok(BatchEdit::new(
                     *document,
                     OperationId::new(),
-                    logical_db::OperationDigest::new([u8::try_from(index % 256)?; 32]),
+                    logical_db::OperationDigest::new(
+                        [u8::try_from(
+                            index
+                                .checked_rem(256)
+                                .ok_or("digest modulus must be non-zero")?,
+                        )?; 32],
+                    ),
                     move |editor| editor.put(&Object::root(), "state", Scalar::Integer(value)),
                 ))
             })
             .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
         first.edit_many(edits)?;
     }
-    first
-        .delete(
-            tombstoned,
-            OperationId::new(),
-            OperationDigest::new([0x7a; 32]),
-        )
-        .unwrap();
-    let seeded_target = u64::try_from(total + 1)?;
+    first.delete(
+        tombstoned,
+        OperationId::new(),
+        OperationDigest::new([0x7a; 32]),
+    )?;
+    let seeded_target = u64::try_from(total.saturating_add(1))?;
     for _round in 0..8 {
         first
             .synchronize(peer, &mut transport, SyncLimits::default(), || false)
@@ -140,8 +155,10 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     }
     let seeded = read_frontier(&prune_store, scope).await?;
     if seeded != seeded_target {
-        eprintln!("fdb-recovery-composition: first replica seeded frontier={seeded}");
-        return Err(io::Error::other("first replica did not seed every document").into());
+        return Err(io::Error::other(format!(
+            "first replica did not seed every document (frontier={seeded} target={seeded_target})"
+        ))
+        .into());
     }
 
     seal_consume_and_prune(&prune_store, scope, seeded_target).await?;
@@ -149,19 +166,22 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     // Expire a real server-issued checkpoint without sleeping or changing the
     // production codec. This client last pulled before the pruned log existed.
     now.store(61_001, Ordering::SeqCst);
-    let pull = PullRequest {
-        protocol: logical_db_protocol::PROTOCOL_VERSION,
+    let pull = PullRequest::new(
+        logical_db_protocol::PROTOCOL_VERSION,
         scope,
-        replica: expired_id,
-        request: OperationDigest::new([0x6e; 32]),
-        after: Some(Checkpoint::from_wire(old_checkpoint.clone())?),
-        max_changes: 1,
-        max_bytes: 1_048_576,
-    };
-    assert!(matches!(
-        transport.pull(pull.clone()).await?,
-        PullResult::BaselineRequired
-    ));
+        expired_id,
+        OperationDigest::new([0x6e; 32]),
+        Some(Checkpoint::from_wire(old_checkpoint.clone())?),
+        1,
+        1_048_576,
+    );
+    assert!(
+        matches!(
+            transport.pull(pull.clone()).await?,
+            PullResult::BaselineRequired
+        ),
+        "an expired checkpoint pull must demand a baseline"
+    );
     let recovered = expired
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
         .await?;
@@ -171,34 +191,53 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     );
     let replacement = expired
         .checkpoint(peer)?
-        .expect("recovery persists a checkpoint");
-    assert_ne!(replacement, old_checkpoint);
+        .ok_or("recovery persists a checkpoint")?;
+    assert_ne!(
+        replacement, old_checkpoint,
+        "a recovery must publish a fresh checkpoint id"
+    );
     drop(expired);
     let expired = Database::open(&expired_path, scope, expired_id)?;
-    assert_eq!(expired.checkpoint(peer)?, Some(replacement.clone()));
-    assert!(matches!(
-        transport
-            .pull(PullRequest {
-                after: Some(Checkpoint::from_wire(replacement)?),
-                ..pull
-            })
-            .await?,
-        PullResult::Page(_)
-    ));
+    assert_eq!(
+        expired.checkpoint(peer)?,
+        Some(replacement.clone()),
+        "the reopened store must serve the recovered checkpoint"
+    );
+    assert!(
+        matches!(
+            transport
+                .pull(PullRequest::new(
+                    pull.protocol,
+                    pull.scope,
+                    pull.replica,
+                    pull.request,
+                    Some(Checkpoint::from_wire(replacement)?),
+                    pull.max_changes,
+                    pull.max_bytes,
+                ))
+                .await?,
+            PullResult::Page(_)
+        ),
+        "the replacement checkpoint must serve changes again"
+    );
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
         .await?;
     if !report.recovered {
-        eprintln!("fdb-recovery-composition: fresh replica did not install a baseline");
-        return Err(io::Error::other("fresh replica did not require recovery").into());
+        return Err(io::Error::other(
+            "fresh replica did not require recovery (no baseline installed)",
+        )
+        .into());
     }
     if !second.is_deleted(tombstoned)? {
-        eprintln!("fdb-recovery-composition: boundary tombstone did not survive recovery");
         return Err(io::Error::other("recovered replica lost a boundary tombstone").into());
     }
-    assert!(expired.is_deleted(tombstoned)?);
+    assert!(
+        expired.is_deleted(tombstoned)?,
+        "expired replica must keep the boundary tombstone"
+    );
     for (index, document) in documents.iter().enumerate() {
         let observed = second.read(*document, |reader| reader.get(&Object::root(), "state"))?;
         assert_eq!(
@@ -208,16 +247,21 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         );
         if *document == tombstoned {
             if observed.is_some() {
-                eprintln!("fdb-recovery-composition: boundary tombstone resurrected");
-                return Err(io::Error::other("recovered replica resurrected a tombstone").into());
+                return Err(
+                    io::Error::other("recovered replica resurrected a boundary tombstone").into(),
+                );
             }
         } else {
-            let expected = i64::try_from(index % 1_000)?;
+            let expected = i64::try_from(
+                index
+                    .checked_rem(1_000)
+                    .ok_or("observation modulus must be non-zero")?,
+            )?;
             if observed != Some(Some(Item::Scalar(Scalar::Integer(expected)))) {
-                eprintln!(
-                    "fdb-recovery-composition: replica state diverged at index={index} observed={observed:?}"
-                );
-                return Err(io::Error::other("recovered replica lost a seeded value").into());
+                return Err(io::Error::other(format!(
+                    "recovered replica lost a seeded value at index={index} observed={observed:?}"
+                ))
+                .into());
             }
         }
     }
@@ -228,27 +272,26 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let mut cursor: Option<DocumentId> = None;
     let mut pages = 0usize;
     loop {
-        let request = BaselineRequest {
-            protocol: logical_db_protocol::PROTOCOL_VERSION,
+        let request = BaselineRequest::new(
+            logical_db_protocol::PROTOCOL_VERSION,
             scope,
-            replica: ReplicaId::new(),
-            request: OperationDigest::new([0x11; 32]),
-            after: None,
-            after_document: cursor,
-        };
+            ReplicaId::new(),
+            OperationDigest::new([0x11; 32]),
+            None,
+            cursor,
+        );
         let BaselineResult::Artifact(page) = transport.baseline(request).await? else {
-            eprintln!("fdb-recovery-composition: range walk lost the sealed baseline");
             return Err(io::Error::other("range walk lost the sealed baseline").into());
         };
         page.validate_page(scope)?;
         if page.documents.len() > MAX_BASELINE_PAGE_DOCUMENTS {
-            eprintln!(
-                "fdb-recovery-composition: page len={} exceeded the limit",
+            return Err(io::Error::other(format!(
+                "a page exceeded the document limit (len={})",
                 page.documents.len()
-            );
-            return Err(io::Error::other("a page exceeded the document limit").into());
+            ))
+            .into());
         }
-        pages += 1;
+        pages = pages.saturating_add(1);
         for document in &page.documents {
             assert!(
                 seen.insert(document.document),
@@ -259,48 +302,43 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             break;
         };
         if !page.more {
-            eprintln!("fdb-recovery-composition: a final page carried a continuation cursor");
             return Err(io::Error::other("a final page carried a continuation cursor").into());
         }
         if cursor.is_some_and(|previous| next <= previous) {
-            eprintln!("fdb-recovery-composition: a page cursor did not strictly advance");
             return Err(io::Error::other("a page cursor did not strictly advance").into());
         }
         cursor = Some(next);
     }
     if pages < 2 {
-        eprintln!(
-            "fdb-recovery-composition: the range reader served the baseline in {pages} page(s)"
-        );
-        return Err(io::Error::other("the range reader did not split the baseline").into());
+        return Err(io::Error::other(format!(
+            "the range reader did not split the baseline (served {pages} page(s))"
+        ))
+        .into());
     }
     if seen.len() != total {
-        eprintln!(
-            "fdb-recovery-composition: range walk saw {} of {total} documents across {pages} pages",
+        return Err(io::Error::other(format!(
+            "range walk lost or duplicated a document (saw {} of {total} across {pages} pages)",
             seen.len()
-        );
-        return Err(io::Error::other("range walk lost or duplicated a document").into());
+        ))
+        .into());
     }
 
     let floor = read_floor(&prune_store, scope).await?;
     let frontier = read_frontier(&prune_store, scope).await?;
     if frontier != seeded_target || floor != seeded_target {
-        eprintln!("fdb-recovery-composition: durable retention frontier={frontier} floor={floor}");
-        return Err(io::Error::other("prune did not retain the sealed baseline").into());
+        return Err(io::Error::other(format!(
+            "prune did not retain the sealed baseline (frontier={frontier} floor={floor})"
+        ))
+        .into());
     }
 
-    println!(
-        "PASS fdb-http-recovery route=/v1/recovery:baseline recovered=true documents={total} frontier={frontier} floor={floor} store=real-fdb scope=isolated"
-    );
-
-    println!("PASS fdb-http-expired-checkpoint recovered=true reopened=true replacement=usable");
     drop((first, second, expired));
     server.abort();
-    let _ = server.await;
+    drop(server.await);
     drop(prune_store);
     drop(network);
-    let _ = fs::remove_file(&first_path);
-    let _ = fs::remove_file(&second_path);
-    let _ = fs::remove_file(&expired_path);
+    fs::remove_file(&first_path)?;
+    fs::remove_file(&second_path)?;
+    fs::remove_file(&expired_path)?;
     Ok(())
 }

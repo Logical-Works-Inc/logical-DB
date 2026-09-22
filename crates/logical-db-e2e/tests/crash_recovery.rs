@@ -12,8 +12,10 @@ use logical_db::{
     AccountId, Database, DocumentId, Item, Object, ReplicaId, Scalar, Scope, SpaceId,
 };
 
+/// The edited document is readable after the writer exits without destructors.
 #[test]
-fn committed_edit_survives_process_exit_without_destructors() {
+fn committed_edit_survives_process_exit_without_destructors()
+-> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::temp_dir().join(format!(
         "logical-db-crash-recovery-{}.redb",
         uuid::Uuid::now_v7()
@@ -27,19 +29,22 @@ fn committed_edit_survives_process_exit_without_destructors() {
         .arg(scope.space().to_string())
         .arg(replica.to_string())
         .arg(document.to_string())
-        .status()
-        .unwrap();
-    assert_eq!(status.code(), Some(71));
-
-    let database = Database::open(&path, scope, replica).unwrap();
+        .status()?;
     assert_eq!(
-        database
-            .read(document, |reader| reader.get(&Object::root(), "status"))
-            .unwrap(),
+        status.code(),
+        Some(71),
+        "crash writer must exit with code 71"
+    );
+
+    let database = Database::open(&path, scope, replica)?;
+    assert_eq!(
+        database.read(document, |reader| reader.get(&Object::root(), "status"))?,
         Some(Some(Item::Scalar(Scalar::String(
             "committed-before-exit".into()
-        ))))
+        )))),
+        "committed status must survive process exit"
     );
     drop(database);
-    fs::remove_file(path).unwrap();
+    fs::remove_file(path)?;
+    Ok(())
 }

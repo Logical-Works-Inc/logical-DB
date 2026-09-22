@@ -14,15 +14,21 @@
 //! makes no availability claim. `scripts/external-tape.sh` owns its lifetime.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 
 use std::{error::Error, sync::Arc};
 
 use logical_db_e2e::support::{MemoryServiceStore, serve_journey};
 
+/// Boots the async runtime and serves the journey composition on stdio.
 fn main() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Runtime::new()?.block_on(run())
 }
 
+/// Serves the journey composition until the orchestrator terminates it.
 async fn run() -> Result<(), Box<dyn Error>> {
     let store = Arc::new(MemoryServiceStore::default());
     let (address, _server) = serve_journey(store).await?;

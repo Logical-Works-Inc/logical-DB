@@ -9,11 +9,11 @@ status = "target; current core is implemented below existing crate paths"
 # Every workspace crate this domain owns. `logical-db-model` and
 # `logical-db-protocol` are kernel contracts, not Cloud crates, even though the
 # Cloud Plane consumes them.
-crates = ["logical-db-crdt", "logical-db-store", "logical-db-sync", "logical-db-http", "logical-db-service", "logical-db-store-fdb", "logical-db-server", "logical-db-braid", "logical-db-daemon"]
+crates = ["logical-db-crdt", "logical-db-store", "logical-db-sync", "logical-db-http", "logical-db-service", "logical-db-store-fdb", "logical-db-server", "logical-db-daemon"]
 # Importable by another domain. `logical-db-service` is the published service
 # contract; the remaining owned crates are private implementation.
 public_contracts = ["logical-db-service"]
-current_implementations = ["logical-db-crdt", "logical-db-store", "logical-db-sync", "logical-db-http", "logical-db-store-fdb", "logical-db-server", "logical-db-braid", "logical-db-daemon"]
+current_implementations = ["logical-db-crdt", "logical-db-store", "logical-db-sync", "logical-db-http", "logical-db-store-fdb", "logical-db-server", "logical-db-daemon"]
 # Canonical owner labels. `approved-estate` is external and resolves to no
 # internal crate; it records that the estate foundation is the only non-domain
 # dependency class.

@@ -7,8 +7,8 @@
 
 ## What an application is allowed to know
 
-An app imports `logical-db`, not redb, Automerge, FoundationDB, the server, or
-Braid. Its durable identity axis is:
+An app imports `logical-db`, not redb, Automerge, FoundationDB, or the
+server. Its durable identity axis is:
 
 ```text
 AccountId / SpaceId / DocumentId
@@ -73,7 +73,7 @@ app
            `-- Transport (HTTP or app-supplied)
 ```
 
-This path works offline and imports no Braid or FoundationDB code. It is the
+This path works offline and imports no host-authority or FoundationDB code. It is the
 Windows/macOS/Linux app-embedding shape.
 
 ## Thin-client and standalone call graph
@@ -87,7 +87,7 @@ Database::synchronize
                 `-- Authenticator
                      `-- validate native bytes + compute ActionDigest
                      `-- Authority::authorize(scope,effect,action,frontier,time)
-                          `-- Braid RunnableInvocation / ExecutionGrant
+                          `-- ExecutionGrant (LocalScopeAuthority or host-supplied)
                 `-- ServiceStore
                      |-- frontier(scope)
                      |-- accept(change, grant)
@@ -98,7 +98,7 @@ Database::synchronize
 The daemon is one composition shell for those ports, but its local authority
 currently refuses write and egress effects: bearer authentication is not
 independent confirmation. Logic OS can nest the same router under its own TLS,
-identity, lifecycle, observability, and externally prepared Braid authority;
+identity, lifecycle, observability, and its own host authority;
 it does not get a second database implementation and does not own local CRUD.
 
 ## Private tuple axes

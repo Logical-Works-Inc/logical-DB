@@ -37,7 +37,7 @@ through Cairn rather than silently mutating memory.
   the versioned CBOR push/pull wire with hard ceilings on bodies, pages, and
   page counts.
 - Von Neumann dodge: applications read and write the embedded replica with no
-  daemon, network, FDB, or Braid. Sync moves digests and bounded change pages
+  daemon, network, or FDB. Sync moves digests and bounded change pages
   between replicas; full scans stay local or do not happen.
 
 ## Three answers
@@ -79,7 +79,7 @@ re-implementing a proprietary runtime.
 1. Resume costs zero re-send. Kill a push mid-page and restart: bytes
    re-transmitted after the durable checkpoint equal 0. Rival: Spark shuffle
    stage retry and full-partition rescan.
-2. Local CRUD needs no network. With daemon, network, FDB, and Braid disabled,
+2. Local CRUD needs no network. With daemon, network, and FDB disabled,
    edit-then-read and index query succeed with p99 under 50 ms on the
    three-platform harness. Rival: Foundry Functions, which require the service.
 3. Conflicts survive instead of collapsing. Two causally concurrent writes to

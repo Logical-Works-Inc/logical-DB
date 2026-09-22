@@ -29,8 +29,11 @@ use reqwest::{
 };
 use thiserror::Error;
 
+/// Versioned CBOR media type used on every request and response.
 const MEDIA_TYPE: &str = "application/vnd.logical-db.v1+cbor";
+/// Hard ceiling on one encoded request or response body.
 const MAX_HTTP_BODY_BYTES: usize = 12_582_912;
+/// Wall-clock ceiling covering one complete exchange.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum server-directed retry delay accepted from an untrusted response.
 pub const MAX_RETRY_AFTER_SECONDS: u64 = 3_600;
@@ -55,6 +58,7 @@ pub trait CredentialProvider: Send {
 
 /// Static bearer credential for hosts that manage refresh externally.
 pub struct StaticBearer {
+    /// Sensitive `Authorization` header value retained by this provider.
     value: HeaderValue,
 }
 
@@ -66,15 +70,12 @@ impl StaticBearer {
     /// Refuses empty tokens or bytes invalid in an HTTP header.
     pub fn new(token: &str) -> Result<Self, CredentialError> {
         if token.is_empty() {
-            eprintln!("logical-db-http: new: Empty");
             return Err(CredentialError::Empty);
         }
         if token.len() > 4_096 || !valid_b64token(token.as_bytes()) {
-            eprintln!("logical-db-http: new: InvalidToken");
             return Err(CredentialError::InvalidToken);
         }
-        let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
-            eprintln!("logical-db-http: CredentialError::InvalidHeader: {error}");
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
             CredentialError::InvalidHeader {
                 context: "BearerCredential::new",
             }
@@ -106,9 +107,13 @@ impl CredentialProvider for StaticBearer {
 /// after dispatch, neither cancellation nor timeout implies remote rollback.
 /// Timer enforcement requires a running executor and cooperative providers.
 pub struct HttpTransport<Credentials> {
+    /// Pooled HTTP client with the transport's fixed timeouts and no redirects.
     client: Client,
+    /// Base service endpoint; relative routes are joined onto it.
     endpoint: Url,
+    /// Credential provider invoked before every dispatch.
     credentials: Credentials,
+    /// Per-exchange deadline covering encode, refresh, and body consumption.
     operation_timeout: Duration,
 }
 
@@ -129,7 +134,6 @@ where
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
         {
-            eprintln!("logical-db-http: new: InvalidEndpoint");
             return Err(HttpError::InvalidEndpoint);
         }
         let loopback = endpoint.host_str().is_some_and(|host| {
@@ -139,7 +143,6 @@ where
                     .is_ok_and(|address| address.is_loopback())
         });
         if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
-            eprintln!("logical-db-http: new: InsecureEndpoint");
             return Err(HttpError::InsecureEndpoint);
         }
         if !endpoint.path().ends_with('/') {
@@ -163,13 +166,22 @@ where
         })
     }
 
+    /// Joins a relative route onto the configured endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::InvalidEndpoint`] when the join cannot form a URL.
     fn route(&self, relative: &str) -> Result<Url, HttpError> {
-        self.endpoint.join(relative).map_err(|error| {
-            eprintln!("logical-db-http: HttpError::InvalidEndpoint: {error}");
-            HttpError::InvalidEndpoint
-        })
+        self.endpoint
+            .join(relative)
+            .map_err(|_| HttpError::InvalidEndpoint)
     }
 
+    /// Dispatches one encoded request under the operation deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed credential, network, decode, or deadline failure.
     async fn send<Request, Reply, Decode, Decoded>(
         &mut self,
         route: &str,
@@ -181,7 +193,9 @@ where
         Decode: FnOnce(Response) -> Decoded,
         Decoded: Future<Output = Result<Reply, HttpError>>,
     {
-        let deadline = Instant::now() + self.operation_timeout;
+        let deadline = Instant::now()
+            .checked_add(self.operation_timeout)
+            .ok_or(HttpError::OperationTimeout)?;
         let body = encode(request)?;
         let mut authorization = within_deadline(deadline, HttpError::CredentialTimeout, async {
             self.credentials.authorization().await
@@ -208,6 +222,11 @@ where
 // A timer may poll a ready future before checking expiry. Refuse both an
 // already-expired stage and a value returned after the deadline, so a late
 // credential cannot dispatch a request and a late page cannot be installed.
+/// Runs `future` under `deadline`, mapping expiry onto `error`.
+///
+/// # Errors
+///
+/// Returns `error` when the deadline is already past or elapses first.
 async fn within_deadline<T>(
     deadline: Instant,
     error: HttpError,
@@ -222,6 +241,7 @@ async fn within_deadline<T>(
     }
 }
 
+/// Returns whether `token` is a bounded RFC 6750 b64token.
 fn valid_b64token(token: &[u8]) -> bool {
     let mut padding = false;
     token.iter().all(|byte| {
@@ -289,17 +309,26 @@ where
     }
 }
 
+/// Encodes one CBOR request body under the body-size ceiling.
+///
+/// # Errors
+///
+/// Returns [`HttpError::Encode`] or [`HttpError::BodyTooLarge`].
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, HttpError> {
     let mut bytes = Vec::new();
     ciborium::into_writer(value, &mut bytes)
         .map_err(|error| HttpError::Encode(error.to_string()))?;
     if bytes.len() > MAX_HTTP_BODY_BYTES {
-        eprintln!("logical-db-http: encode: BodyTooLarge");
         return Err(HttpError::BodyTooLarge);
     }
     Ok(bytes)
 }
 
+/// Validates status, media type, and body bounds, then decodes one CBOR reply.
+///
+/// # Errors
+///
+/// Returns a typed status, media-type, body, network, or decode failure.
 async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, HttpError> {
     let mut response = response;
     let status = response.status();
@@ -308,7 +337,6 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
             .headers()
             .get(RETRY_AFTER)
             .and_then(parse_retry_after);
-        eprintln!("logical-db-http: decode_response: Status");
         return Err(HttpError::Status {
             code: status.as_u16(),
             retry_after,
@@ -321,7 +349,6 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
         .and_then(|value| value.split(';').next())
         != Some(MEDIA_TYPE)
     {
-        eprintln!("logical-db-http: decode_response: MediaType");
         return Err(HttpError::MediaType);
     }
     if response
@@ -331,13 +358,11 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_HTTP_BODY_BYTES)
     {
-        eprintln!("logical-db-http: decode_response: BodyTooLarge");
         return Err(HttpError::BodyTooLarge);
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(HttpError::Network)? {
         if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
-            eprintln!("logical-db-http: decode_response: BodyTooLarge");
             return Err(HttpError::BodyTooLarge);
         }
         bytes.extend_from_slice(&chunk);
@@ -345,13 +370,13 @@ async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T, H
     let mut reader = Cursor::new(bytes.as_slice());
     let value =
         ciborium::from_reader(&mut reader).map_err(|error| HttpError::Decode(error.to_string()))?;
-    if reader.position() != bytes.len() as u64 {
-        eprintln!("logical-db-http: decode_response: TrailingData");
+    if reader.position() != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
         return Err(HttpError::TrailingData);
     }
     Ok(value)
 }
 
+/// Parses a bounded `Retry-After` delta-seconds header into a duration.
 fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
     let seconds = value
         .to_str()
@@ -364,6 +389,7 @@ fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
 
 /// Credential provider failure with no secret-bearing payload.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CredentialError {
     /// Token was empty.
     #[error("credential token is empty")]
@@ -384,6 +410,7 @@ pub enum CredentialError {
 
 /// Thin-client transport failure.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HttpError {
     /// Endpoint contains forbidden URL components.
     #[error("HTTP endpoint is not a clean service base URL")]
@@ -438,8 +465,8 @@ impl HttpError {
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Network(_) | Self::CredentialTimeout | Self::OperationTimeout => true,
-            Self::Status { code, .. } => matches!(*code, 408 | 425 | 429 | 502 | 503 | 504),
+            &Self::Network(_) | &Self::CredentialTimeout | &Self::OperationTimeout => true,
+            &Self::Status { code, .. } => matches!(code, 408 | 425 | 429 | 502 | 503 | 504),
             _ => false,
         }
     }
@@ -448,7 +475,7 @@ impl HttpError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::Status { retry_after, .. } => *retry_after,
+            &Self::Status { retry_after, .. } => retry_after,
             _ => None,
         }
     }
@@ -461,19 +488,16 @@ mod tests {
         Router,
         body::Body,
         http::{Response as AxumResponse, StatusCode as AxumStatus},
+        response::IntoResponse,
         routing::{get, post},
     };
 
     mod deadlines;
 
-    async fn endpoint() -> Url {
+    async fn endpoint() -> Result<Url, Box<dyn std::error::Error>> {
         let mut exact = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
         exact.push(0x5a);
-        exact.extend_from_slice(
-            &u32::try_from(MAX_HTTP_BODY_BYTES - 5)
-                .unwrap()
-                .to_be_bytes(),
-        );
+        exact.extend_from_slice(&u32::try_from(MAX_HTTP_BODY_BYTES - 5)?.to_be_bytes());
         exact.resize(MAX_HTTP_BODY_BYTES, 0);
         let app = Router::new()
             .route(
@@ -482,7 +506,9 @@ mod tests {
                     AxumResponse::builder()
                         .header(CONTENT_TYPE, MEDIA_TYPE)
                         .body(Body::from(vec![0x18, 42]))
-                        .unwrap()
+                        .unwrap_or_else(|error| {
+                            (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        })
                 }),
             )
             .route(
@@ -491,7 +517,9 @@ mod tests {
                     AxumResponse::builder()
                         .header(CONTENT_TYPE, "application/json")
                         .body(Body::from(vec![0]))
-                        .unwrap()
+                        .unwrap_or_else(|error| {
+                            (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        })
                 }),
             )
             .route(
@@ -501,7 +529,9 @@ mod tests {
                         .status(AxumStatus::TOO_MANY_REQUESTS)
                         .header(RETRY_AFTER, "7")
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap_or_else(|error| {
+                            (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        })
                 }),
             )
             .route(
@@ -511,7 +541,9 @@ mod tests {
                         .status(AxumStatus::SERVICE_UNAVAILABLE)
                         .header(RETRY_AFTER, u64::MAX.to_string())
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap_or_else(|error| {
+                            (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        })
                 }),
             )
             .route(
@@ -520,7 +552,9 @@ mod tests {
                     AxumResponse::builder()
                         .header(CONTENT_TYPE, MEDIA_TYPE)
                         .body(Body::from(vec![0; MAX_HTTP_BODY_BYTES + 1]))
-                        .unwrap()
+                        .unwrap_or_else(|error| {
+                            (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        })
                 }),
             )
             .route(
@@ -531,7 +565,10 @@ mod tests {
                         AxumResponse::builder()
                             .header(CONTENT_TYPE, MEDIA_TYPE)
                             .body(Body::from(exact))
-                            .unwrap()
+                            .unwrap_or_else(|error| {
+                                (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string())
+                                    .into_response()
+                            })
                     }
                 }),
             )
@@ -541,58 +578,60 @@ mod tests {
                     AxumResponse::builder()
                         .header(CONTENT_TYPE, MEDIA_TYPE)
                         .body(Body::from(vec![0x18, 42, 0]))
-                        .unwrap()
+                        .unwrap_or_else(|error| {
+                            (AxumStatus::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                        })
                 }),
             )
             .route(
                 "/gone/v1/changes:pull",
                 post(|| async { (AxumStatus::GONE, Body::empty()) }),
             );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
+        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
         // Keep the server task owned by this test; dropping the handle at test
         // end aborts the loop instead of leaving a runtime task detached.
-        let _server =
-            lgwks_bot::rt::task::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{address}/").parse().unwrap()
+        let _server = lgwks_bot::rt::task::spawn(async move {
+            let serve_result = axum::serve(listener, app).await;
+            drop(serve_result);
+        });
+        Ok(format!("http://{address}/").parse()?)
     }
 
-    fn test_runtime() -> lgwks_bot::Runtime {
-        lgwks_bot::Builder::new()
+    fn test_runtime() -> Result<lgwks_bot::Runtime, Box<dyn std::error::Error>> {
+        Ok(lgwks_bot::Builder::new()
             .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()
-            .expect("test runtime")
+            .build()?)
     }
 
     #[test]
-    fn remote_plaintext_and_url_credentials_are_refused() {
-        let credential = StaticBearer::new("secret").unwrap();
+    fn remote_plaintext_and_url_credentials_are_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let credential = StaticBearer::new("secret")?;
         assert!(matches!(
-            HttpTransport::new(Url::parse("http://example.com/").unwrap(), credential),
+            HttpTransport::new(Url::parse("http://example.com/")?, credential),
             Err(HttpError::InsecureEndpoint)
         ));
-        let credential = StaticBearer::new("secret").unwrap();
+        let credential = StaticBearer::new("secret")?;
         assert!(matches!(
-            HttpTransport::new(
-                Url::parse("https://user:pass@example.com/").unwrap(),
-                credential
-            ),
+            HttpTransport::new(Url::parse("https://user:pass@example.com/")?, credential),
             Err(HttpError::InvalidEndpoint)
         ));
+        Ok(())
     }
 
     #[test]
-    fn credential_debug_output_is_redacted() {
-        let credential = StaticBearer::new("never-print-me").unwrap();
+    fn credential_debug_output_is_redacted() -> Result<(), Box<dyn std::error::Error>> {
+        let credential = StaticBearer::new("never-print-me")?;
         let rendered = format!("{credential:?}");
         assert!(!rendered.contains("never-print-me"));
         assert!(rendered.contains("REDACTED"));
+        Ok(())
     }
 
     #[test]
-    fn static_bearer_rejects_ambiguous_whitespace_padding_and_excess() {
+    fn static_bearer_rejects_ambiguous_whitespace_padding_and_excess()
+    -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             StaticBearer::new("space inside"),
             Err(CredentialError::InvalidToken)
@@ -606,21 +645,21 @@ mod tests {
             StaticBearer::new(&"a".repeat(4_097)),
             Err(CredentialError::InvalidToken)
         ));
+        Ok(())
     }
 
     #[test]
-    fn cbor_request_encoding_is_nonempty_and_enforces_exact_body_edge() {
-        let encoded = encode(&vec![1_u8, 2, 3]).unwrap();
+    fn cbor_request_encoding_is_nonempty_and_enforces_exact_body_edge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = encode(&vec![1_u8, 2, 3])?;
         assert!(!encoded.is_empty());
         assert_eq!(
-            ciborium::from_reader::<Vec<u8>, _>(encoded.as_slice()).unwrap(),
+            ciborium::from_reader::<Vec<u8>, _>(encoded.as_slice())?,
             vec![1, 2, 3]
         );
         let exact_payload = vec![1; MAX_HTTP_BODY_BYTES - 5];
         assert_eq!(
-            encode(&serde_bytes::Bytes::new(&exact_payload))
-                .unwrap()
-                .len(),
+            encode(&serde_bytes::Bytes::new(&exact_payload))?.len(),
             MAX_HTTP_BODY_BYTES
         );
         let excessive_payload = vec![1; MAX_HTTP_BODY_BYTES - 4];
@@ -628,27 +667,22 @@ mod tests {
             encode(&serde_bytes::Bytes::new(&excessive_payload)),
             Err(HttpError::BodyTooLarge)
         ));
+        Ok(())
     }
 
     #[test]
-    fn response_decoder_enforces_status_media_and_exact_stream_bounds() {
-        test_runtime().block_on(response_decoder_body());
+    fn response_decoder_enforces_status_media_and_exact_stream_bounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(response_decoder_body())?;
+        Ok(())
     }
 
-    async fn response_decoder_body() {
-        let endpoint = endpoint().await;
+    async fn response_decoder_body() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = endpoint().await?;
         let client = Client::new();
-        let response = client
-            .get(endpoint.join("ok").unwrap())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(decode_response::<u8>(response).await.unwrap(), 42);
-        let response = client
-            .get(endpoint.join("bad-status").unwrap())
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(endpoint.join("ok")?).send().await?;
+        assert_eq!(decode_response::<u8>(response).await?, 42);
+        let response = client.get(endpoint.join("bad-status")?).send().await?;
         assert!(matches!(
             decode_response::<u8>(response).await,
             Err(HttpError::Status {
@@ -656,11 +690,7 @@ mod tests {
                 retry_after: Some(delay),
             }) if delay == Duration::from_secs(7)
         ));
-        let response = client
-            .get(endpoint.join("hostile-retry").unwrap())
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(endpoint.join("hostile-retry")?).send().await?;
         assert!(matches!(
             decode_response::<u8>(response).await,
             Err(HttpError::Status {
@@ -668,127 +698,160 @@ mod tests {
                 retry_after: None,
             })
         ));
-        let response = client
-            .get(endpoint.join("wrong-media").unwrap())
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(endpoint.join("wrong-media")?).send().await?;
         assert!(matches!(
             decode_response::<u8>(response).await,
             Err(HttpError::MediaType)
         ));
-        let response = client
-            .get(endpoint.join("too-large").unwrap())
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(endpoint.join("too-large")?).send().await?;
         assert!(matches!(
             decode_response::<u8>(response).await,
             Err(HttpError::BodyTooLarge)
         ));
-        let response = client
-            .get(endpoint.join("exact").unwrap())
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(endpoint.join("exact")?).send().await?;
         assert_eq!(
             decode_response::<serde_bytes::ByteBuf>(response)
-                .await
-                .unwrap()
+                .await?
                 .len(),
             MAX_HTTP_BODY_BYTES - 5
         );
-        let response = client
-            .get(endpoint.join("trailing").unwrap())
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(endpoint.join("trailing")?).send().await?;
         assert!(matches!(
             decode_response::<u8>(response).await,
             Err(HttpError::TrailingData)
         ));
+        Ok(())
     }
 
     #[test]
-    fn pull_maps_only_http_gone_to_checkpoint_expiry() {
-        test_runtime().block_on(pull_gone_body());
+    fn pull_maps_only_http_gone_to_checkpoint_expiry() -> Result<(), Box<dyn std::error::Error>> {
+        test_runtime()?.block_on(pull_gone_body())?;
+        Ok(())
     }
 
-    async fn pull_gone_body() {
+    async fn pull_gone_body() -> Result<(), Box<dyn std::error::Error>> {
         use logical_db_model::{AccountId, OperationDigest, ReplicaId, Scope, SpaceId};
 
         let mut transport =
-            HttpTransport::new(endpoint().await, StaticBearer::new("integration").unwrap())
-                .unwrap();
-        let request = PullRequest {
-            protocol: logical_db_protocol::PROTOCOL_VERSION,
-            scope: Scope::new(AccountId::new(), SpaceId::new()),
-            replica: ReplicaId::new(),
-            request: OperationDigest::new([1; 32]),
-            after: None,
-            max_changes: 1,
-            max_bytes: 1_024,
-        };
-        transport.endpoint = transport.endpoint.join("gone/").unwrap();
+            HttpTransport::new(endpoint().await?, StaticBearer::new("integration")?)?;
+        let request = PullRequest::new(
+            logical_db_protocol::PROTOCOL_VERSION,
+            Scope::new(AccountId::new(), SpaceId::new()),
+            ReplicaId::new(),
+            OperationDigest::new([1; 32]),
+            None,
+            1,
+            1_024,
+        );
+        transport.endpoint = transport.endpoint.join("gone/")?;
         assert!(matches!(
             transport.pull(request).await,
             Ok(PullResult::CheckpointExpired)
         ));
+        Ok(())
     }
 
     /// Serves one hand-written HTTP/1.1 response on a loopback port so a test
     /// controls the exact framing bytes rather than a framework's defaults.
-    fn spawn_raw_server<F>(responder: F) -> Url
+    /// Joins its fixture thread on drop so no OS thread is left unjoined.
+    struct RawServerHandle {
+        /// Loopback address the fixture thread is bound to.
+        address: std::net::SocketAddr,
+        /// Fixture thread; joined on drop after a shutdown poke.
+        handle: Option<std::thread::JoinHandle<()>>,
+        /// Cooperative stop flag checked around `accept`.
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for RawServerHandle {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                // Unblock `accept` and any `park_timeout` stall so the fixture
+                // thread can observe shutdown and exit before the join.
+                drop(std::net::TcpStream::connect(self.address));
+                handle.thread().unpark();
+                drop(handle.join());
+            }
+        }
+    }
+
+    fn spawn_raw_server<F>(
+        responder: F,
+    ) -> Result<(Url, RawServerHandle), Box<dyn std::error::Error>>
     where
         F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
     {
         use std::{
             io::{Read, Write},
             net::TcpListener,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
         };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw server");
-        let address = listener.local_addr().expect("raw server address");
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read(&mut byte).unwrap_or(0) == 1 {
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_flag = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
+            .name("logical-db-http-raw-fixture".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).unwrap_or(());
+                loop {
+                    if thread_flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::park_timeout(std::time::Duration::from_millis(10));
+                        continue;
+                    };
+                    drop(stream.set_nonblocking(false));
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let declared: usize = String::from_utf8_lossy(&head)
+                        .lines()
+                        .find_map(|line| {
+                            let lowered = line.to_ascii_lowercase();
+                            let (_, value) = lowered.split_once("content-length:")?;
+                            value.trim().parse().ok()
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; declared];
+                    let mut read = 0;
+                    while read < declared {
+                        match stream.read(&mut body[read..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(got) => read = read.saturating_add(got),
+                        }
+                    }
+                    responder(&mut stream);
+                    drop(stream.flush());
+                    drop(stream.shutdown(std::net::Shutdown::Both));
+                    return;
                 }
-            }
-            let declared: usize = String::from_utf8_lossy(&head)
-                .lines()
-                .find_map(|line| {
-                    let lowered = line.to_ascii_lowercase();
-                    let (_, value) = lowered.split_once("content-length:")?;
-                    value.trim().parse().ok()
-                })
-                .unwrap_or(0);
-            let mut body = vec![0u8; declared];
-            let mut read = 0;
-            while read < declared {
-                match stream.read(&mut body[read..]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(got) => read += got,
-                }
-            }
-            responder(&mut stream);
-            let _ = stream.flush();
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        });
-        format!("http://{address}/")
-            .parse()
-            .expect("raw server url")
+            })?;
+        Ok((
+            format!("http://{address}/").parse()?,
+            RawServerHandle {
+                address,
+                handle: Some(handle),
+                shutdown,
+            },
+        ))
     }
 
     fn write_bytes(stream: &mut std::net::TcpStream, bytes: &[u8]) {
         use std::io::Write;
-        let _ = stream.write_all(bytes);
-        let _ = stream.flush();
+        drop(stream.write_all(bytes));
+        drop(stream.flush());
     }
 
     fn chunked_head() -> Vec<u8> {
@@ -799,115 +862,70 @@ mod tests {
     }
 
     fn chunk(stream: &mut std::net::TcpStream, data: &[u8]) {
-        write_bytes(stream, format!("{:x}\r\n", data.len()).as_bytes());
-        write_bytes(stream, data);
-        write_bytes(stream, b"\r\n");
+        write_bytes(&mut *stream, format!("{:x}\r\n", data.len()).as_bytes());
+        write_bytes(&mut *stream, data);
+        write_bytes(&mut *stream, b"\r\n");
     }
 
     /// A CBOR unsigned 42 is exactly `0x18 0x2a`.
     const CBOR_FORTY_TWO: &[u8] = &[0x18, 0x2a];
 
-    fn raw_client() -> Client {
+    fn raw_client() -> Result<Client, HttpError> {
         Client::builder()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("raw client")
+            .map_err(HttpError::Network)
     }
 
     #[test]
-    fn a_chunked_response_without_a_content_length_is_decoded() {
-        let endpoint = spawn_raw_server(|stream| {
-            write_bytes(stream, &chunked_head());
-            chunk(stream, CBOR_FORTY_TWO);
-            write_bytes(stream, b"0\r\n\r\n");
-        });
-        let decoded = test_runtime().block_on(decode_forty_two(endpoint));
-        assert_eq!(decoded, 42);
+    fn a_chunked_response_without_a_content_length_is_decoded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
+            write_bytes(&mut *stream, &chunked_head());
+            chunk(&mut *stream, CBOR_FORTY_TWO);
+            write_bytes(&mut *stream, b"0\r\n\r\n");
+        })?;
+        let decoded = test_runtime()?.block_on(decode_forty_two(endpoint))?;
+        assert_eq!(decoded, 42, "a chunked payload decodes to 42");
+        Ok(())
     }
 
-    async fn decode_forty_two(endpoint: Url) -> u8 {
-        let response = raw_client()
+    async fn decode_forty_two(endpoint: Url) -> Result<u8, Box<dyn std::error::Error>> {
+        let response = raw_client()?
             .get(endpoint)
             .send()
             .await
-            .expect("chunked request");
+            .map_err(HttpError::Network)?;
         assert!(
             response.headers().get(CONTENT_LENGTH).is_none(),
             "the server must not declare a length"
         );
-        decode_response::<u8>(response).await.expect("decode")
+        decode_response::<u8>(response).await.map_err(Into::into)
     }
 
     #[test]
-    fn a_chunked_body_crossing_the_ceiling_fails_closed_without_a_content_length() {
-        let endpoint = spawn_raw_server(|stream| {
-            write_bytes(stream, &chunked_head());
+    fn a_chunked_body_crossing_the_ceiling_fails_closed_without_a_content_length()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
+            write_bytes(&mut *stream, &chunked_head());
             let filler = vec![0u8; 64 * 1024];
             let mut sent = 0;
             while sent <= MAX_HTTP_BODY_BYTES + 64 * 1024 {
-                chunk(stream, &filler);
+                chunk(&mut *stream, &filler);
                 sent += filler.len();
             }
-            write_bytes(stream, b"0\r\n\r\n");
-        });
+            write_bytes(&mut *stream, b"0\r\n\r\n");
+        })?;
         assert!(matches!(
-            test_runtime().block_on(ceiling_error(endpoint)),
+            test_runtime()?.block_on(ceiling_error(endpoint)),
             Err(HttpError::BodyTooLarge)
         ));
+        Ok(())
     }
 
     async fn ceiling_error(endpoint: Url) -> Result<u8, HttpError> {
-        let response = raw_client()
-            .get(endpoint)
-            .send()
-            .await
-            .expect("over-ceiling request");
-        decode_response::<u8>(response).await
-    }
-
-    #[test]
-    fn a_declared_length_above_the_ceiling_is_refused_before_the_body_is_read() {
-        let endpoint = spawn_raw_server(|stream| {
-            write_bytes(
-                stream,
-                format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: {}\r\n\r\n",
-                    MAX_HTTP_BODY_BYTES + 1
-                )
-                .as_bytes(),
-            );
-            chunk(stream, CBOR_FORTY_TWO);
-        });
-        assert!(matches!(
-            test_runtime().block_on(ceiling_error(endpoint)),
-            Err(HttpError::BodyTooLarge)
-        ));
-    }
-
-    #[test]
-    fn a_body_shorter_than_its_declared_length_is_an_error_never_a_hang() {
-        let endpoint = spawn_raw_server(|stream| {
-            write_bytes(
-                stream,
-                format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: 5\r\n\r\n"
-                )
-                .as_bytes(),
-            );
-            write_bytes(stream, CBOR_FORTY_TWO);
-        });
-        let started = std::time::Instant::now();
-        let outcome = test_runtime().block_on(short_body(endpoint));
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "must not stall"
-        );
-        assert!(outcome.is_err(), "a truncated body must not decode");
-    }
-
-    async fn short_body(endpoint: Url) -> Result<u8, HttpError> {
-        let response = raw_client()
+        let response = raw_client()?
             .get(endpoint)
             .send()
             .await
@@ -916,29 +934,82 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_is_refused_and_its_target_is_never_contacted() {
+    fn a_declared_length_above_the_ceiling_is_refused_before_the_body_is_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
+            write_bytes(
+                &mut *stream,
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: {}\r\n\r\n",
+                    MAX_HTTP_BODY_BYTES + 1
+                )
+                .as_bytes(),
+            );
+            chunk(&mut *stream, CBOR_FORTY_TWO);
+        })?;
+        assert!(matches!(
+            test_runtime()?.block_on(ceiling_error(endpoint)),
+            Err(HttpError::BodyTooLarge)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_declared_length_is_an_error_never_a_hang()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
+            write_bytes(
+                &mut *stream,
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {MEDIA_TYPE}\r\ncontent-length: 5\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            write_bytes(&mut *stream, CBOR_FORTY_TWO);
+        })?;
+        let started = std::time::Instant::now();
+        let outcome = test_runtime()?.block_on(short_body(endpoint));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not stall"
+        );
+        assert!(outcome.is_err(), "a truncated body must not decode");
+        Ok(())
+    }
+
+    async fn short_body(endpoint: Url) -> Result<u8, HttpError> {
+        let response = raw_client()?
+            .get(endpoint)
+            .send()
+            .await
+            .map_err(HttpError::Network)?;
+        decode_response::<u8>(response).await
+    }
+
+    #[test]
+    fn a_redirect_is_refused_and_its_target_is_never_contacted()
+    -> Result<(), Box<dyn std::error::Error>> {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         };
         let followed = Arc::new(AtomicBool::new(false));
         let marker = Arc::clone(&followed);
-        let target = spawn_raw_server(move |stream| {
+        let (target, _target_server) = spawn_raw_server(move |stream| {
             marker.store(true, Ordering::SeqCst);
-            write_bytes(stream, &chunked_head());
-            chunk(stream, CBOR_FORTY_TWO);
-            write_bytes(stream, b"0\r\n\r\n");
-        });
-        let redirect = spawn_raw_server(move |stream| {
-            write_bytes(
-                stream,
+            write_bytes(&mut *stream, &chunked_head());
+            chunk(&mut *stream, CBOR_FORTY_TWO);
+            write_bytes(&mut *stream, b"0\r\n\r\n");
+        })?;
+        let (redirect, _redirect_server) = spawn_raw_server(move |stream| {
+            write_bytes(&mut *stream,
                 format!(
                     "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}\r\ncontent-length: 0\r\n\r\n"
                 )
                 .as_bytes(),
             );
-        });
-        let error = test_runtime().block_on(pull_from(redirect));
+        })?;
+        let error = test_runtime()?.block_on(pull_from(redirect));
         assert!(
             matches!(error, Err(HttpError::Status { code: 307, .. })),
             "a redirect must surface as a status error, got {error:?}"
@@ -947,63 +1018,67 @@ mod tests {
             !followed.load(Ordering::SeqCst),
             "the transport followed a redirect it was told to refuse"
         );
+        Ok(())
     }
 
     async fn pull_from(endpoint: Url) -> Result<PullResult, HttpError> {
         use logical_db_model::{AccountId, OperationDigest, ReplicaId, Scope, SpaceId};
-        let mut transport =
-            HttpTransport::new(endpoint, StaticBearer::new("blackbox").expect("bearer"))
-                .expect("transport");
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("blackbox")?)?;
         transport
-            .pull(PullRequest {
-                protocol: logical_db_protocol::PROTOCOL_VERSION,
-                scope: Scope::new(AccountId::new(), SpaceId::new()),
-                replica: ReplicaId::new(),
-                request: OperationDigest::new([2; 32]),
-                after: None,
-                max_changes: 1,
-                max_bytes: 1_024,
-            })
+            .pull(PullRequest::new(
+                logical_db_protocol::PROTOCOL_VERSION,
+                Scope::new(AccountId::new(), SpaceId::new()),
+                ReplicaId::new(),
+                OperationDigest::new([2; 32]),
+                None,
+                1,
+                1_024,
+            ))
             .await
     }
 
     #[test]
-    fn a_stalled_response_is_released_by_the_request_timeout() {
-        let endpoint = spawn_raw_server(|stream| {
-            write_bytes(stream, &chunked_head());
-            std::thread::sleep(Duration::from_secs(45));
-        });
+    fn a_stalled_response_is_released_by_the_request_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, _server) = spawn_raw_server(|stream| {
+            write_bytes(&mut *stream, &chunked_head());
+            std::thread::park_timeout(Duration::from_secs(45));
+        })?;
         let started = std::time::Instant::now();
-        let outcome = test_runtime().block_on(pull_from(endpoint));
+        let outcome = test_runtime()?.block_on(pull_from(endpoint));
         let elapsed = started.elapsed();
         assert!(outcome.is_err(), "a stalled response must not succeed");
         assert!(
             elapsed >= Duration::from_secs(25) && elapsed < Duration::from_secs(44),
             "the client timeout must bound the stall, elapsed {elapsed:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn cancelling_an_in_flight_request_leaves_the_transport_usable() {
-        let slow = spawn_raw_server(|stream| {
-            write_bytes(stream, &chunked_head());
-            chunk(stream, &[0x18]);
-            std::thread::sleep(Duration::from_secs(20));
-        });
-        let fast = spawn_raw_server(|stream| {
-            write_bytes(stream, &chunked_head());
-            chunk(stream, CBOR_FORTY_TWO);
-            write_bytes(stream, b"0\r\n\r\n");
-        });
-        let runtime = test_runtime();
-        runtime.block_on(cancel_then_succeed(slow, fast));
+    fn cancelling_an_in_flight_request_leaves_the_transport_usable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (slow, _slow_server) = spawn_raw_server(|stream| {
+            write_bytes(&mut *stream, &chunked_head());
+            chunk(&mut *stream, &[0x18]);
+            std::thread::park_timeout(Duration::from_secs(20));
+        })?;
+        let (fast, _fast_server) = spawn_raw_server(|stream| {
+            write_bytes(&mut *stream, &chunked_head());
+            chunk(&mut *stream, CBOR_FORTY_TWO);
+            write_bytes(&mut *stream, b"0\r\n\r\n");
+        })?;
+        let runtime = test_runtime()?;
+        runtime.block_on(cancel_then_succeed(slow, fast))?;
+        Ok(())
     }
 
-    async fn cancel_then_succeed(slow: Url, fast: Url) {
+    async fn cancel_then_succeed(slow: Url, fast: Url) -> Result<(), Box<dyn std::error::Error>> {
         let pending = lgwks_bot::rt::task::spawn(pull_from(slow));
         lgwks_bot::rt::task::yield_now().await;
         pending.abort();
-        let decoded = decode_forty_two(fast).await;
+        let decoded = decode_forty_two(fast).await?;
         assert_eq!(decoded, 42, "the transport must stay usable");
+        Ok(())
     }
 }

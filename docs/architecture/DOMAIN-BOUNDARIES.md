@@ -47,7 +47,6 @@ crates/
     logical-db-service/
     logical-db-store-fdb/
     logical-db-server/
-    logical-db-braid/
     logical-db-daemon/
     logical-db-cloud-contract/        # future: partition/view/placement ports
     logical-db-cloud-e2e/             # future: Cloud-only integration harness

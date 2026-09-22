@@ -1,10 +1,18 @@
-//! Retained black-box journey: public facade -> HTTP -> Braid -> `FoundationDB`.
+//! Retained black-box journey: public facade -> HTTP -> host authority -> `FoundationDB`.
 //!
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::print_stderr,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
+)]
 
 use std::{error::Error, fs, io};
 
@@ -15,6 +23,7 @@ use logical_db::{
 };
 use uuid::Uuid;
 
+/// Reads one required environment variable, naming it when it is missing.
 fn required(name: &'static str) -> Result<String, io::Error> {
     std::env::var(name).map_err(|error| {
         io::Error::new(
@@ -24,10 +33,12 @@ fn required(name: &'static str) -> Result<String, io::Error> {
     })
 }
 
+/// Boots the async runtime and drives the facade journey to completion.
 fn main() -> Result<(), Box<dyn Error>> {
     lgwks_bot::Runtime::new()?.block_on(journey())
 }
 
+/// Pulls, verifies, and reopens one document through the public facade.
 async fn journey() -> Result<(), Box<dyn Error>> {
     let endpoint: Url = required("LOGICAL_DB_JOURNEY_ENDPOINT")?.parse()?;
     let bearer_token = required("LOGICAL_DB_BEARER_TOKEN")?;
@@ -53,7 +64,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             editor.put(
                 &Object::root(),
                 "verified",
-                Scalar::String("facade-http-braid-fdb".into()),
+                Scalar::String("facade-http-authority-fdb".into()),
             )
         },
     )?;
@@ -66,7 +77,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let observed = second.read(document, |reader| reader.get(&Object::root(), "verified"))?;
     if observed
         != Some(Some(Item::Scalar(Scalar::String(
-            "facade-http-braid-fdb".into(),
+            "facade-http-authority-fdb".into(),
         ))))
     {
         eprintln!("facade-fdb-journey: replica did not materialize verified state");
@@ -87,7 +98,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     fs::remove_file(&first_path)?;
     fs::remove_file(&second_path)?;
     println!(
-        "PASS facade-http-braid-fdb pushed={} pulled={} retry={}",
+        "PASS facade-http-authority-fdb pushed={} pulled={} retry={}",
         upload.pushed, download.pulled, retry.pushed
     );
     Ok(())

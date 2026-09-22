@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Falsifiers for the checked execution-access registry.
+"""Falsifiers for the source-anchored execution-access registry.
 
 Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
@@ -15,53 +15,50 @@ import access_graph
 
 
 class AccessGraphContract(unittest.TestCase):
-    def test_registry_has_one_writer_for_every_resource(self):
+    def source_with(self, old: str, new: str) -> str:
+        return access_graph.GRAPH_PATH.read_text(encoding="utf-8").replace(old, new, 1)
+
+    def assert_refused(self, source: str, message: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "access-graph.toml"
+            path.write_text(source, encoding="utf-8")
+            with self.assertRaisesRegex(access_graph.AccessGraphError, message):
+                access_graph.load(path)
+
+    def test_registry_is_source_anchored_and_deterministic(self):
         document = access_graph.load()
-        self.assertEqual(document["version"], 1)
-        self.assertEqual(len(document["resource"]), 8)
-        self.assertEqual(len(document["system"]), 5)
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(len(document["system"]), 16)
+        self.assertEqual(access_graph.render(), access_graph.render())
+        self.assertEqual(access_graph.render_dot(), access_graph.render_dot())
+        self.assertIn('"embedded.remote-page" -> "replica.state" [label="write"];', access_graph.render_dot())
 
     def test_unknown_resource_is_refused(self):
-        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "access-graph.toml"
-            path.write_text(source.replace('reads = ["replica.state", "replica.outbox"]',
-                                            'reads = ["unknown.resource"]', 1), encoding="utf-8")
-            with self.assertRaisesRegex(access_graph.AccessGraphError, "unknown resource"):
-                access_graph.load(path)
+        self.assert_refused(self.source_with('reads = ["replica.state", "replica.outbox"]', 'reads = ["unknown.resource"]'), "unknown resource")
 
-    def test_second_writer_is_refused(self):
-        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "access-graph.toml"
-            path.write_text(source + '\n[[system]]\nname="bad"\nowner="x"\nreads=["replica.state"]\nwrites=["replica.state"]\nreceipt="x"\ncontinuation="bounded"\n', encoding="utf-8")
-            with self.assertRaisesRegex(access_graph.AccessGraphError, "multiple writers"):
-                access_graph.load(path)
+    def test_absent_source_anchor_is_refused(self):
+        self.assert_refused(
+            self.source_with(
+                'source = "crates/logical-db/src/lib.rs#Database::edit"',
+                'source = "crates/logical-db/src/lib.rs#Database::absent"',
+            ),
+            "anchor is absent",
+        )
 
-    def test_missing_system_owner_is_refused(self):
-        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "access-graph.toml"
-            path.write_text(source.replace('owner = "logical-db-store"', '# owner omitted', 1), encoding="utf-8")
-            with self.assertRaisesRegex(access_graph.AccessGraphError, "owner is required"):
-                access_graph.load(path)
+    def test_missing_required_source_is_refused(self):
+        self.assert_refused(self.source_with('  "crates/logical-db/src/lib.rs#Database::edit",\n', ""), "source inventory mismatch")
 
-    def test_duplicate_writes_is_refused(self):
-        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "access-graph.toml"
-            path.write_text(source.replace('writes = ["replica.state", "replica.outbox"]',
-                                            'writes = ["replica.state", "replica.state"]', 1), encoding="utf-8")
-            with self.assertRaisesRegex(access_graph.AccessGraphError, "duplicate resources"):
-                access_graph.load(path)
+    def test_unknown_predecessor_is_refused(self):
+        self.assert_refused(self.source_with("predecessors = []", 'predecessors = ["missing"]'), "unknown predecessor")
 
-    def test_unwritten_resource_is_refused(self):
-        source = access_graph.GRAPH_PATH.read_text(encoding="utf-8")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "access-graph.toml"
-            path.write_text(source + '\n[[resource]]\nname="orphan.resource"\nowner="x"\ndurability="ephemeral"\n', encoding="utf-8")
-            with self.assertRaisesRegex(access_graph.AccessGraphError, "resources without a declared writer"):
-                access_graph.load(path)
+    def test_causal_cycle_is_refused(self):
+        self.assert_refused(self.source_with("predecessors = []", 'predecessors = ["embedded.migrate"]'), "causal predecessor cycle")
+
+    def test_missing_atomicity_is_refused(self):
+        self.assert_refused(self.source_with('atomicity = "state and outbox commit together"', '# atomicity omitted'), "atomicity is required")
+
+    def test_unbounded_limit_is_refused(self):
+        self.assert_refused(self.source_with('limit = "one document and MAX_CHANGE_BYTES"', 'limit = "unbounded"'), "must declare a bound")
 
 
 if __name__ == "__main__":

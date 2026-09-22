@@ -26,8 +26,10 @@ use logical_db_episode::{
 };
 use uuid::Uuid;
 
+/// The episode snapshot roundtrips through a facade document under the guard.
 #[test]
-fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard() {
+fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard()
+-> Result<(), Box<dyn std::error::Error>> {
     let account = Uuid::now_v7();
     let space = Uuid::now_v7();
     let payload = b"semantics journey payload".to_vec();
@@ -38,59 +40,62 @@ fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard() {
         EpisodeTime::default(),
         Vec::new(),
         Vec::new(),
-        payload.clone(),
+        payload,
         Some((account, space)),
-    )
-    .unwrap();
-    assert_eq!(episode.id.into_bytes(), content_id(&episode));
+    )?;
+    assert_eq!(
+        episode.id.into_bytes(),
+        content_id(&episode),
+        "episode id must equal its content id"
+    );
 
     let mut log = OriginLog::default();
-    let id = log.append(episode.clone()).unwrap();
-    assert_eq!(id, episode.id);
-    log.verify_log().unwrap();
+    let id = log.append(episode.clone())?;
+    assert_eq!(id, episode.id, "append must return the episode id");
+    log.verify_log()?;
 
-    let reference = EpisodeRef::try_from(id).unwrap();
-    let observation = Observation {
-        id: reference,
-        kind: episode.kind,
-        modality: Modality::Text,
-        uncertainty: 0.1,
-        actionability: Actionability::Inspect,
-        value: episode.payload.clone(),
-        links: Vec::new(),
-    };
-    observation.validate().unwrap();
-    assert_eq!(observation.content_hash(), observation.content_hash());
+    let reference = EpisodeRef::try_from(id)?;
+    let observation = Observation::new(
+        reference,
+        episode.kind,
+        Modality::Text,
+        0.1,
+        Actionability::Inspect,
+        episode.payload.clone(),
+        Vec::new(),
+    );
+    observation.validate()?;
+    assert_eq!(
+        observation.content_hash(),
+        observation.content_hash(),
+        "observation content hash must be deterministic"
+    );
 
     let mut snapshot = Vec::new();
-    ciborium::into_writer(&episode, &mut snapshot).unwrap();
+    ciborium::into_writer(&episode, &mut snapshot)?;
 
     let path = std::env::temp_dir().join(format!("logical-db-semantics-{}.redb", Uuid::now_v7()));
     let scope = Scope::new(AccountId::from_uuid(account), SpaceId::from_uuid(space));
     let replica = ReplicaId::new();
     let document = DocumentId::new();
-    let database = Database::open(&path, scope, replica).unwrap();
-    database
-        .edit(
-            document,
-            OperationId::new(),
-            OperationDigest::new([0x5E; 32]),
-            |editor| editor.put(&Object::root(), "snapshot", Scalar::Bytes(snapshot.clone())),
-        )
-        .unwrap();
+    let database = Database::open(&path, scope, replica)?;
+    database.edit(
+        document,
+        OperationId::new(),
+        OperationDigest::new([0x5E; 32]),
+        |editor| editor.put(&Object::root(), "snapshot", Scalar::Bytes(snapshot.clone())),
+    )?;
 
-    let stored = database
-        .read(document, |reader| reader.get(&Object::root(), "snapshot"))
-        .unwrap();
+    let stored = database.read(document, |reader| reader.get(&Object::root(), "snapshot"))?;
     let Some(Some(Item::Scalar(Scalar::Bytes(bytes)))) = stored else {
-        panic!("facade must return the stored snapshot bytes");
+        return Err("facade must return the stored snapshot bytes".into());
     };
-    let reloaded: Episode = ciborium::from_reader(bytes.as_slice()).unwrap();
-    assert_eq!(reloaded, episode);
-    reloaded.validate().unwrap();
+    let reloaded: Episode = ciborium::from_reader(bytes.as_slice())?;
+    assert_eq!(reloaded, episode, "reloaded episode must equal original");
+    reloaded.validate()?;
 
-    let via_facade = logical_db::logical_db_cairn::EpisodeRef::try_from(id).unwrap();
-    assert_eq!(reference, via_facade);
+    let via_facade = logical_db::logical_db_cairn::EpisodeRef::try_from(id)?;
+    assert_eq!(reference, via_facade, "facade EpisodeRef must match");
 
     let record = logical_db::logical_db_episode::LocalWorldRecord::new(
         0,
@@ -100,42 +105,56 @@ fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard() {
         Vec::new(),
         b"state".to_vec(),
         Some((account, space)),
-    )
-    .unwrap();
-    assert_eq!(record.source_heads, vec![id]);
+    )?;
+    assert_eq!(
+        record.source_heads,
+        vec![id],
+        "record source heads must hold the episode"
+    );
     let uncovered = LocalWorldRecord::new(
         0,
         vec![id],
         vec![id],
-        vec![EpisodeId::new([9u8; 32]).unwrap()],
+        vec![EpisodeId::new([9u8; 32])?],
         Vec::new(),
         b"state".to_vec(),
         Some((account, space)),
     );
-    assert_eq!(uncovered, Err(EpisodeError::UnprovenReference));
+    assert_eq!(
+        uncovered,
+        Err(EpisodeError::UnprovenReference),
+        "uncovered reference must be refused"
+    );
 
     drop(database);
-    let reopened = Database::open(&path, scope, replica).unwrap();
-    let stored = reopened
-        .read(document, |reader| reader.get(&Object::root(), "snapshot"))
-        .unwrap();
+    let reopened = Database::open(&path, scope, replica)?;
+    let stored = reopened.read(document, |reader| reader.get(&Object::root(), "snapshot"))?;
     let Some(Some(Item::Scalar(Scalar::Bytes(bytes)))) = stored else {
-        panic!("snapshot must survive reopen");
+        return Err("snapshot must survive reopen".into());
     };
-    let reloaded: Episode = ciborium::from_reader(bytes.as_slice()).unwrap();
-    assert_eq!(reloaded.id, id);
-    reloaded.validate().unwrap();
+    let reloaded: Episode = ciborium::from_reader(bytes.as_slice())?;
+    assert_eq!(reloaded.id, id, "reopened snapshot must keep its id");
+    reloaded.validate()?;
 
     drop(reopened);
-    fs::remove_file(path).unwrap();
+    fs::remove_file(path)?;
+    Ok(())
 }
 
+/// Semantic CBOR rejects zero ids, unknown versions, and forged indexes.
 #[test]
-fn semantic_cbor_rejects_zero_ids_unknown_versions_and_forged_indexes() {
+fn semantic_cbor_rejects_zero_ids_unknown_versions_and_forged_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut zero = Vec::new();
-    ciborium::into_writer(&[0u8; 32], &mut zero).unwrap();
-    assert!(ciborium::from_reader::<EpisodeId, _>(zero.as_slice()).is_err());
-    assert!(ciborium::from_reader::<EpisodeRef, _>(zero.as_slice()).is_err());
+    ciborium::into_writer(&[0u8; 32], &mut zero)?;
+    assert!(
+        ciborium::from_reader::<EpisodeId, _>(zero.as_slice()).is_err(),
+        "zero id must be rejected as EpisodeId"
+    );
+    assert!(
+        ciborium::from_reader::<EpisodeRef, _>(zero.as_slice()).is_err(),
+        "zero id must be rejected as EpisodeRef"
+    );
 
     let episode = Episode::new(
         0,
@@ -145,57 +164,71 @@ fn semantic_cbor_rejects_zero_ids_unknown_versions_and_forged_indexes() {
         Vec::new(),
         b"versioned snapshot".to_vec(),
         None,
-    )
-    .unwrap();
+    )?;
     let mut encoded = Vec::new();
-    ciborium::into_writer(&episode, &mut encoded).unwrap();
-    let mut value: Value = ciborium::from_reader(encoded.as_slice()).unwrap();
-    let Value::Map(fields) = &mut value else {
-        panic!("episode snapshot must be a CBOR map");
+    ciborium::into_writer(&episode, &mut encoded)?;
+    let mut value: Value = ciborium::from_reader(encoded.as_slice())?;
+    let Value::Map(ref mut fields) = value else {
+        return Err("episode snapshot must be a CBOR map".into());
     };
     let version = fields
         .iter_mut()
-        .find(|(key, _)| key == &Value::Text("version".into()))
-        .unwrap();
+        .find(|entry| entry.0 == Value::Text("version".into()))
+        .ok_or("episode snapshot must carry a version field")?;
     version.1 = Value::Integer(2.into());
     encoded.clear();
-    ciborium::into_writer(&value, &mut encoded).unwrap();
-    assert!(ciborium::from_reader::<Episode, _>(encoded.as_slice()).is_err());
+    ciborium::into_writer(&value, &mut encoded)?;
+    assert!(
+        ciborium::from_reader::<Episode, _>(encoded.as_slice()).is_err(),
+        "unknown episode version must be refused"
+    );
 
     let mut log = OriginLog::default();
-    log.append(episode.clone()).unwrap();
+    log.append(episode.clone())?;
     let mut valid = Vec::new();
-    ciborium::into_writer(&log, &mut valid).unwrap();
-    let rebuilt: OriginLog = ciborium::from_reader(valid.as_slice()).unwrap();
-    assert_eq!(rebuilt.get(episode.id), Ok(&episode));
-    let mut forged: Value = ciborium::from_reader(valid.as_slice()).unwrap();
-    let Value::Map(fields) = &mut forged else {
-        panic!("origin-log snapshot must be a CBOR map");
+    ciborium::into_writer(&log, &mut valid)?;
+    let rebuilt: OriginLog = ciborium::from_reader(valid.as_slice())?;
+    assert_eq!(
+        rebuilt.get(episode.id),
+        Ok(&episode),
+        "rebuilt log must return the appended episode"
+    );
+    let mut forged: Value = ciborium::from_reader(valid.as_slice())?;
+    let Value::Map(ref mut fields) = forged else {
+        return Err("origin-log snapshot must be a CBOR map".into());
     };
     fields.push((Value::Text("index".into()), Value::Map(Vec::new())));
     let mut forged_bytes = Vec::new();
-    ciborium::into_writer(&forged, &mut forged_bytes).unwrap();
-    assert!(ciborium::from_reader::<OriginLog, _>(forged_bytes.as_slice()).is_err());
+    ciborium::into_writer(&forged, &mut forged_bytes)?;
+    assert!(
+        ciborium::from_reader::<OriginLog, _>(forged_bytes.as_slice()).is_err(),
+        "forged index field must be refused"
+    );
 
-    let valid_log: Value = ciborium::from_reader(valid.as_slice()).unwrap();
+    let valid_log: Value = ciborium::from_reader(valid.as_slice())?;
     let Value::Map(log_fields) = valid_log else {
-        panic!("origin-log snapshot must be a CBOR map");
+        return Err("origin-log snapshot must be a CBOR map".into());
     };
     let (_, Value::Array(episodes)) = log_fields
         .into_iter()
-        .find(|(key, _)| key == &Value::Text("episodes".into()))
-        .unwrap()
+        .find(|entry| entry.0 == Value::Text("episodes".into()))
+        .ok_or("origin-log snapshot must carry episodes")?
     else {
-        panic!("origin-log snapshot must carry episodes");
+        return Err("episodes field must be a CBOR array".into());
     };
+    let first = episodes.first().ok_or("episodes array must not be empty")?;
     let hostile = Value::Map(vec![
         (Value::Text("version".into()), Value::Integer(1.into())),
         (
             Value::Text("episodes".into()),
-            Value::Array(vec![episodes[0].clone(); 257]),
+            Value::Array(vec![first.clone(); 257]),
         ),
     ]);
     let mut hostile_bytes = Vec::new();
-    ciborium::into_writer(&hostile, &mut hostile_bytes).unwrap();
-    assert!(ciborium::from_reader::<OriginLog, _>(hostile_bytes.as_slice()).is_err());
+    ciborium::into_writer(&hostile, &mut hostile_bytes)?;
+    assert!(
+        ciborium::from_reader::<OriginLog, _>(hostile_bytes.as_slice()).is_err(),
+        "oversized episode array must be refused"
+    );
+    Ok(())
 }

@@ -42,6 +42,30 @@ image_tag="logical-db-ci-${lane}:${source_tree}"
 docker build --pull=false --platform linux/amd64 -f "scripts/ci-${lane}.Dockerfile" -t "$image_tag" .
 image_id=$(docker image inspect "$image_tag" --format '{{.Id}}')
 
+# A stopped worker owns only disposable build caches. Preserve its complete
+# filesystem before replacing it whenever its verified image or mount contract
+# no longer matches the newly built emulator image.
+replace_retained_worker() {
+  local reason=$1
+  local archived_worker
+  archived_worker="$HOME/.Trash/logical-db-ci-worker-${lane}-${checkout_id}-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar"
+  docker export "$worker" -o "$archived_worker"
+  [[ -s "$archived_worker" ]] || { echo "worker export was empty: $archived_worker" >&2; exit 1; }
+  docker rm "$worker" >/dev/null
+  echo "Retained worker $reason; exported worker to $archived_worker before replacement"
+}
+
+# Docker may collect an image while retaining its stopped container. Preserve
+# that worker's complete filesystem before replacement; otherwise the later
+# image inspection fails with an opaque "No such image" and the CI lane cannot
+# recover on its own.
+if docker container inspect "$worker" >/dev/null 2>&1; then
+  worker_image=$(docker container inspect "$worker" --format '{{.Image}}')
+  if ! docker image inspect "$worker_image" >/dev/null 2>&1; then
+    replace_retained_worker "image was unavailable"
+  fi
+fi
+
 # One reusable, normally stopped worker per checkout/lane. The frozen source
 # mount excludes .git (checkout credentials), host caches and sockets.
 # Build/Wine caches belong to this worker; logs rotate at 2 x 10 MiB.
@@ -62,20 +86,14 @@ if docker container inspect "$worker" >/dev/null 2>&1; then
   # actual runtime configuration and filesystem, while retaining both receipts.
   image_content=$(docker image inspect "$image_id" --format '{{json .Config}} {{json .RootFS}}')
   worker_content=$(docker image inspect "$worker_image" --format '{{json .Config}} {{json .RootFS}}')
-  [[ "$image_content" == "$worker_content" ]] || {
-    echo "Retained worker $worker has different runtime image bytes; preserve/export it before replacement." >&2
-    exit 1
-  }
-  configuration=$(printf '%s\0' "$PWD" "$worker_image" "${mounts[@]}" | shasum -a 256 | cut -d ' ' -f 1)
-  recorded=$(docker container inspect "$worker" --format '{{index .Config.Labels "logical-db.configuration"}}')
-  [[ "$recorded" == "$configuration" ]] || {
-    echo "Retained worker $worker has a different image/mount configuration; preserve/export it before replacement." >&2
-    exit 1
-  }
-  [[ $(docker container inspect "$worker" --format '{{.State.Running}}') == false ]] || {
-    echo "Worker $worker is already owned by an active run." >&2; exit 1;
-  }
-else
+  [[ "$image_content" == "$worker_content" ]] || replace_retained_worker "had different runtime image bytes"
+  if docker container inspect "$worker" >/dev/null 2>&1; then
+    configuration=$(printf '%s\0' "$PWD" "$worker_image" "${mounts[@]}" | shasum -a 256 | cut -d ' ' -f 1)
+    recorded=$(docker container inspect "$worker" --format '{{index .Config.Labels "logical-db.configuration"}}')
+    [[ "$recorded" == "$configuration" ]] || replace_retained_worker "had a different image or mount configuration"
+  fi
+fi
+if ! docker container inspect "$worker" >/dev/null 2>&1; then
   docker create --name "$worker" --platform linux/amd64 --cpus 4 --memory 6g --pids-limit 512 \
     --network bridge --log-opt max-size=10m --log-opt max-file=2 \
     --label logical-db.owner=ci --label "logical-db.configuration=$configuration" \

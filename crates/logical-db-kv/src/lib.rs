@@ -170,7 +170,11 @@ pub const MAX_BLOB_CHUNK_BYTES: usize = MAX_CHANGE_BYTES;
 /// above [`TIER_THRESHOLD_BYTES`] tier instead of using this headroom.
 pub const MAX_VALUE_BYTES: usize = MAX_CHANGE_BYTES - 65_536;
 
-const _: () = assert!(TIER_THRESHOLD_BYTES < MAX_VALUE_BYTES);
+const _: () = assert!(
+    TIER_THRESHOLD_BYTES < MAX_VALUE_BYTES,
+    "the tier threshold must leave room for the inline envelope headroom"
+);
+/// Stream buffer used while hashing a tiered blob file.
 const BLOB_HASH_BUFFER_BYTES: usize = 64 * 1024;
 /// Largest page accepted by [`KvCache::scan`] and [`KvCache::evict_expired`],
 /// mirroring the facade's bounded pages.
@@ -207,6 +211,7 @@ pub const FIELD_SEQUENCE: &str = "kv_seq";
 
 /// One live cache entry returned by [`KvCache::scan`].
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CacheEntry {
     /// Original cache key.
     pub key: String,
@@ -217,6 +222,7 @@ pub struct CacheEntry {
 /// Content address of a tiered value, returned by
 /// [`KvCache::blob_reference`] for chunked sync transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct BlobReference {
     /// SHA-256 of the complete value bytes; also the blob file name.
     pub digest: [u8; 32],
@@ -226,6 +232,7 @@ pub struct BlobReference {
 
 /// One entry of an atomic [`KvCache::put_many`] batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct BatchPut {
     /// Cache key, validated exactly like [`KvCache::put`].
     pub key: String,
@@ -237,6 +244,7 @@ pub struct BatchPut {
 
 /// Stable failures exposed by the cache facade.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum KvError {
     /// The embedded replica below the cache failed.
     #[error("cache storage failed: {0}")]
@@ -327,11 +335,17 @@ pub enum KvError {
 }
 
 /// Deterministic key-value cache with TTL above one embedded replica.
+#[non_exhaustive]
 pub struct KvCache {
+    /// Embedded replica backing this cache.
     database: Database,
+    /// Cache namespace prefixing every key.
     namespace: String,
+    /// Monotonic sequence stamped on every committed mutation.
     sequence: AtomicU64,
+    /// Directory holding tiered blob files for this cache.
     blob_dir: PathBuf,
+    /// Serializes tiered blob create/delete against concurrent readers.
     blob_lock: Mutex<()>,
 }
 
@@ -433,7 +447,6 @@ impl KvCache {
     pub fn put(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Result<(), KvError> {
         validate_key(key)?;
         if value.len() > MAX_TIERED_VALUE_BYTES {
-            eprintln!("logical-db-kv: cache value exceeds {MAX_TIERED_VALUE_BYTES} byte limit");
             return Err(KvError::BlobTooLarge {
                 actual: value.len(),
                 maximum: MAX_TIERED_VALUE_BYTES,
@@ -488,14 +501,12 @@ impl KvCache {
         entries: &[BatchPut],
     ) -> Result<(), KvError> {
         if entries.is_empty() || entries.len() > MAX_BATCH_PUT {
-            eprintln!("logical-db-kv: invalid batch count {}", entries.len());
             return Err(KvError::InvalidBatchSize(entries.len()));
         }
         let started_at_ms = operation_started_at_ms(&operation)?;
         for entry in entries {
             validate_key(&entry.key)?;
             if entry.value.len() > MAX_TIERED_VALUE_BYTES {
-                eprintln!("logical-db-kv: cache value exceeds {MAX_TIERED_VALUE_BYTES} byte limit");
                 return Err(KvError::BlobTooLarge {
                     actual: entry.value.len(),
                     maximum: MAX_TIERED_VALUE_BYTES,
@@ -629,11 +640,9 @@ impl KvCache {
         limit: usize,
     ) -> Result<Vec<CacheEntry>, KvError> {
         if limit == 0 || limit > MAX_PAGE_LIMIT {
-            eprintln!("logical-db-kv: invalid scan limit {limit}");
             return Err(KvError::InvalidScanLimit(limit));
         }
         if after.is_some_and(|cursor| cursor.len() > logical_db_model::MAX_NAME_BYTES) {
-            eprintln!("logical-db-kv: invalid key or cursor length");
             return Err(KvError::InvalidKey);
         }
         let _blob_guard = self.lock_blobs();
@@ -684,7 +693,6 @@ impl KvCache {
     /// [`KvError::BlobIo`] for durable failures.
     pub fn recent(&self, prefix: &str, limit: usize) -> Result<Vec<CacheEntry>, KvError> {
         if limit == 0 || limit > MAX_PAGE_LIMIT {
-            eprintln!("logical-db-kv: invalid scan limit {limit}");
             return Err(KvError::InvalidScanLimit(limit));
         }
         let _blob_guard = self.lock_blobs();
@@ -698,11 +706,13 @@ impl KvCache {
             }
             let complete = events.len() < MAX_PAGE_LIMIT;
             for event in &events {
-                if let ChangeEvent::Document {
-                    document, sequence, ..
+                if let &ChangeEvent::Document {
+                    ref document,
+                    sequence,
+                    ..
                 } = event
                 {
-                    observed.insert(*document, *sequence);
+                    observed.insert(*document, sequence);
                 }
                 after = event.sequence();
             }
@@ -754,7 +764,6 @@ impl KvCache {
     /// and blob-store failures.
     pub fn evict_expired(&self, limit: usize) -> Result<usize, KvError> {
         if limit == 0 || limit > MAX_PAGE_LIMIT {
-            eprintln!("logical-db-kv: invalid eviction limit {limit}");
             return Err(KvError::InvalidEvictionLimit(limit));
         }
         let _blob_guard = self.lock_blobs();
@@ -775,7 +784,7 @@ impl KvCache {
             if !outcome.cleared {
                 continue;
             }
-            cleared += 1;
+            cleared = cleared.saturating_add(1);
         }
         Ok(cleared)
     }
@@ -1074,7 +1083,7 @@ impl KvCache {
             };
             if orphan {
                 match fs::remove_file(entry.path()) {
-                    Ok(()) => removed += 1,
+                    Ok(()) => removed = removed.saturating_add(1),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(KvError::BlobIo(error)),
                 }
@@ -1083,6 +1092,7 @@ impl KvCache {
         Ok(removed)
     }
 
+    /// Returns whether a staging blob should be discarded as orphaned.
     fn gc_staging_is_orphan(
         &self,
         path: &Path,
@@ -1111,6 +1121,7 @@ impl KvCache {
         }
     }
 
+    /// Builds the inline or tiered slot and the batch edit for one entry.
     fn prepare_batch_member(
         &self,
         entry: &BatchPut,
@@ -1131,8 +1142,8 @@ impl KvCache {
             SlotValue::Inline(entry.value.clone())
         };
         let operation = batch_member_operation(batch_operation, index);
-        let request = match &slot {
-            SlotValue::Inline(value) => put_digest(
+        let request = match slot {
+            SlotValue::Inline(ref value) => put_digest(
                 &operation,
                 &self.namespace,
                 &entry.key,
@@ -1140,12 +1151,12 @@ impl KvCache {
                 expires_at_ms,
                 sequence,
             ),
-            SlotValue::Tiered { digest, size } => tiered_put_digest(
+            SlotValue::Tiered { ref digest, size } => tiered_put_digest(
                 &operation,
                 &self.namespace,
                 &entry.key,
                 digest,
-                *size,
+                size,
                 expires_at_ms,
                 sequence,
             ),
@@ -1159,19 +1170,19 @@ impl KvCache {
             editor.delete(&Object::root(), FIELD_VALUE)?;
             editor.delete(&Object::root(), FIELD_BLOB)?;
             editor.delete(&Object::root(), FIELD_SIZE)?;
-            match &stored_slot {
-                SlotValue::Inline(value) => {
+            match stored_slot {
+                SlotValue::Inline(ref value) => {
                     editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(1))?;
                     editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(value.clone()))?;
                 }
-                SlotValue::Tiered { digest, size } => {
+                SlotValue::Tiered { ref digest, size } => {
                     editor.put(
                         &Object::root(),
                         FIELD_VERSION,
                         Scalar::Unsigned(ENVELOPE_VERSION),
                     )?;
                     editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(digest.to_vec()))?;
-                    editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(*size))?;
+                    editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(size))?;
                 }
             }
             editor.put(&Object::root(), FIELD_KEY, Scalar::String(stored_key))?;
@@ -1191,6 +1202,7 @@ impl KvCache {
         Ok((slot, edit))
     }
 
+    /// Writes a value with an explicit expiry and sequence.
     fn put_absolute(
         &self,
         key: &str,
@@ -1218,6 +1230,7 @@ impl KvCache {
         )
     }
 
+    /// Persists a decoded slot envelope into the database document.
     fn put_envelope(
         &self,
         key: &str,
@@ -1236,8 +1249,8 @@ impl KvCache {
             }
         }
         let operation = OperationId::new();
-        let digest = match slot {
-            SlotValue::Inline(value) => put_digest(
+        let digest = match *slot {
+            SlotValue::Inline(ref value) => put_digest(
                 &operation,
                 &self.namespace,
                 key,
@@ -1245,12 +1258,12 @@ impl KvCache {
                 expires_at_ms,
                 sequence,
             ),
-            SlotValue::Tiered { digest, size } => tiered_put_digest(
+            SlotValue::Tiered { ref digest, size } => tiered_put_digest(
                 &operation,
                 &self.namespace,
                 key,
                 digest,
-                *size,
+                size,
                 expires_at_ms,
                 sequence,
             ),
@@ -1262,19 +1275,19 @@ impl KvCache {
             editor.delete(&Object::root(), FIELD_VALUE)?;
             editor.delete(&Object::root(), FIELD_BLOB)?;
             editor.delete(&Object::root(), FIELD_SIZE)?;
-            match &stored_slot {
-                SlotValue::Inline(value) => {
+            match stored_slot {
+                SlotValue::Inline(ref value) => {
                     editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(1))?;
                     editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(value.clone()))?;
                 }
-                SlotValue::Tiered { digest, size } => {
+                SlotValue::Tiered { ref digest, size } => {
                     editor.put(
                         &Object::root(),
                         FIELD_VERSION,
                         Scalar::Unsigned(ENVELOPE_VERSION),
                     )?;
                     editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(digest.to_vec()))?;
-                    editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(*size))?;
+                    editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(size))?;
                 }
             }
             editor.put(&Object::root(), FIELD_KEY, Scalar::String(stored_key))?;
@@ -1292,10 +1305,14 @@ impl KvCache {
             Ok(())
         })? {
             EditOutcome::Applied(_) | EditOutcome::Duplicate(_) => {}
+            // `EditOutcome` is non_exhaustive: a future outcome is not a
+            // successful slot write, so this fails closed.
+            _ => return Err(KvError::CorruptEnvelope),
         }
         Ok(())
     }
 
+    /// Reads and validates the envelope stored under a document id.
     fn decode_slot(&self, document: DocumentId) -> Result<Decoded, KvError> {
         let decoded = self.database.read_with_revision(document, |reader| {
             let key = match reader.get(&Object::root(), FIELD_KEY)? {
@@ -1395,6 +1412,7 @@ impl KvCache {
         })
     }
 
+    /// Decodes expiry and sequence fields from a reader.
     fn decode_expiry_and_sequence(
         reader: &mut logical_db::Reader<'_>,
     ) -> Result<Option<(i64, u64)>, logical_db::CrdtError> {
@@ -1417,6 +1435,7 @@ impl KvCache {
         Ok(Some((expires_at_ms, sequence)))
     }
 
+    /// Clears a reference if the stored key and namespace match.
     fn remove_reference(&self, document: DocumentId, key: &str) -> Result<ClearOutcome, KvError> {
         let expected_revision = match self.decode_slot(document)? {
             Decoded::Found(envelope)
@@ -1433,6 +1452,7 @@ impl KvCache {
         self.remove_reference_at(document, key, expected_revision)
     }
 
+    /// Clears a reference when an optional revision precondition holds.
     fn remove_reference_at(
         &self,
         document: DocumentId,
@@ -1473,6 +1493,8 @@ impl KvCache {
                         live,
                         cleared: true,
                     }),
+                    // `EditOutcome` is non_exhaustive: fail closed.
+                    _ => Err(KvError::CorruptEnvelope),
                 }
             }
             Decoded::Found(_) | Decoded::Absent => Ok(ClearOutcome {
@@ -1484,6 +1506,7 @@ impl KvCache {
         }
     }
 
+    /// Collects digests of every live tiered blob reference under the lock.
     fn blob_references_locked(&self) -> Result<BTreeSet<[u8; 32]>, KvError> {
         let mut live = BTreeSet::new();
         for document in self.snapshot_documents()? {
@@ -1504,15 +1527,18 @@ impl KvCache {
         Ok(live)
     }
 
+    /// Returns the canonical path for a blob digest.
     fn blob_path(&self, digest: &[u8; 32]) -> PathBuf {
         self.blob_dir.join(hex_digest(digest))
     }
 
+    /// Returns the staging path for a blob of the given total size.
     fn blob_staging_path(&self, digest: &[u8; 32], total: u64) -> PathBuf {
         self.blob_dir
             .join(format!("{}.tmp-{total}", hex_digest(digest)))
     }
 
+    /// Writes blob bytes to a staged file and installs them atomically.
     fn write_blob_file(&self, digest: &[u8; 32], bytes: &[u8]) -> Result<(), KvError> {
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if self.blob_valid(digest, size)? {
@@ -1536,10 +1562,12 @@ impl KvCache {
         Ok(())
     }
 
+    /// Returns whether the canonical blob file matches digest and size.
     fn blob_valid(&self, digest: &[u8; 32], size: u64) -> Result<bool, KvError> {
         Self::blob_valid_path(&self.blob_path(digest), digest, size)
     }
 
+    /// Hashes a path and checks it against the expected digest and size.
     fn blob_valid_path(path: &Path, digest: &[u8; 32], size: u64) -> Result<bool, KvError> {
         let stored = match fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -1569,11 +1597,12 @@ impl KvCache {
                 }
                 Err(error) => return Err(KvError::BlobIo(error)),
             }
-            remaining -= u64::try_from(width).unwrap_or(0);
+            remaining = remaining.saturating_sub(u64::try_from(width).unwrap_or(0));
         }
         Ok(*hasher.finalize().as_bytes() == *digest)
     }
 
+    /// Renames a staged blob into place, resolving existing targets.
     fn install_blob(&self, source: &Path, digest: &[u8; 32], size: u64) -> Result<(), KvError> {
         let target = self.blob_path(digest);
         match fs::rename(source, &target) {
@@ -1599,6 +1628,7 @@ impl KvCache {
         }
     }
 
+    /// Acquires the blob lock, recovering from a poisoned mutex.
     fn lock_blobs(&self) -> std::sync::MutexGuard<'_, ()> {
         match self.blob_lock.lock() {
             Ok(guard) => guard,
@@ -1606,6 +1636,7 @@ impl KvCache {
         }
     }
 
+    /// Reads, verifies, and returns a tiered blob under the blob lock.
     fn resolve_tiered_locked(&self, digest: &[u8; 32], size: u64) -> Result<Vec<u8>, KvError> {
         let address = hex_digest(digest);
         let tiered_max = u64::try_from(MAX_TIERED_VALUE_BYTES).unwrap_or(u64::MAX);
@@ -1642,6 +1673,7 @@ impl KvCache {
         Ok(bytes)
     }
 
+    /// Pages change history to collect every scoped document id.
     fn snapshot_documents(&self) -> Result<BTreeSet<DocumentId>, KvError> {
         let mut documents = BTreeSet::new();
         let mut after = 0_u64;
@@ -1652,14 +1684,16 @@ impl KvCache {
             }
             let complete = events.len() < MAX_PAGE_LIMIT;
             for event in &events {
-                let ChangeEvent::Document {
-                    document, sequence, ..
+                let &ChangeEvent::Document {
+                    ref document,
+                    sequence,
+                    ..
                 } = event
                 else {
                     return Err(KvError::ScopeRewritten);
                 };
                 documents.insert(*document);
-                after = *sequence;
+                after = sequence;
             }
             if complete {
                 break;
@@ -1668,6 +1702,7 @@ impl KvCache {
         Ok(documents)
     }
 
+    /// Advances the recency sequence past a wall-clock floor and returns it.
     fn next_sequence(&self, now: i64) -> u64 {
         let floor = u64::try_from(now.max(0)).unwrap_or(0);
         self.sequence.fetch_max(floor, Ordering::SeqCst);
@@ -1676,6 +1711,7 @@ impl KvCache {
             .saturating_add(1)
     }
 
+    /// Reserves recency sequences covering every member of a batch.
     fn reserve_batch_sequences(&self, started_at_ms: i64, count: usize) -> Result<(), KvError> {
         let last_index = count.checked_sub(1).ok_or(KvError::InvalidBatchSize(0))?;
         let last_sequence = batch_sequence(started_at_ms, last_index)?;
@@ -1723,6 +1759,7 @@ pub fn kv_projections() -> Vec<Projection> {
     ]
 }
 
+/// Returns whether a reader describes a well-formed live slot value.
 fn projection_has_live_value(
     reader: &mut logical_db::Reader<'_>,
 ) -> Result<bool, logical_db::CrdtError> {
@@ -1783,69 +1820,88 @@ fn projection_has_live_value(
     }
 }
 
+/// Decoded identity, payload, and metadata for one KV document slot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Envelope {
+    /// Logical key stored in the envelope.
     key: String,
+    /// Namespace the envelope belongs to.
     namespace: String,
+    /// Inline bytes or a tiered content address.
     value: SlotValue,
+    /// Absolute expiry in Unix milliseconds, or never-expires sentinel.
     expires_at_ms: i64,
+    /// Monotonic recency sequence assigned at write time.
     sequence: u64,
+    /// Document revision observed while decoding.
     revision: DocumentRevision,
 }
 
+/// How a KV value is stored: inline bytes or a tiered blob reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SlotValue {
+    /// Value kept entirely inside the document.
     Inline(Vec<u8>),
-    Tiered { digest: [u8; 32], size: u64 },
+    /// Content address and byte length of an external blob.
+    Tiered {
+        /// Blake3 content digest of the blob file.
+        digest: [u8; 32],
+        /// Exact blob length in bytes.
+        size: u64,
+    },
 }
 
+/// Result of clearing a reference: liveness before clear and whether it cleared.
 struct ClearOutcome {
+    /// Whether the value was unexpired when the clear was attempted.
     live: bool,
+    /// Whether a clear edit was applied to the document.
     cleared: bool,
 }
 
+/// Outcome of decoding a document slot during point reads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Decoded {
+    /// Document has no KV envelope fields.
     Absent,
+    /// Envelope fields are present but malformed.
     Corrupt,
+    /// Envelope declares a newer format version than this crate understands.
     Unsupported(u64),
+    /// Envelope decoded successfully.
     Found(Envelope),
 }
 
+/// Validates a key against empty and max-name bounds.
 fn validate_key(key: &str) -> Result<(), KvError> {
     if key.is_empty() || key.len() > logical_db_model::MAX_NAME_BYTES {
-        eprintln!("logical-db-kv: invalid key or cursor length");
         return Err(KvError::InvalidKey);
     }
     Ok(())
 }
 
+/// Validates a namespace against empty and max-name bounds.
 fn validate_namespace(namespace: &str) -> Result<(), KvError> {
     if namespace.is_empty() || namespace.len() > logical_db_model::MAX_NAME_BYTES {
-        eprintln!(
-            "logical-db-kv: invalid namespace length {}",
-            namespace.len()
-        );
         return Err(KvError::InvalidNamespace);
     }
     Ok(())
 }
 
+/// Maps model checkpoint-map errors onto the KV error surface.
 fn checkpoint_map_error(error: &logical_db_model::ModelError) -> KvError {
-    match error {
+    match *error {
         logical_db_model::ModelError::UnsupportedNamespaceCheckpointVersion { actual } => {
-            KvError::UnsupportedCheckpointMapVersion { actual: *actual }
+            KvError::UnsupportedCheckpointMapVersion { actual }
         }
         logical_db_model::ModelError::NamespaceCheckpointMapTooLarge { actual, maximum } => {
-            KvError::CheckpointMapTooLarge {
-                actual: *actual,
-                maximum: *maximum,
-            }
+            KvError::CheckpointMapTooLarge { actual, maximum }
         }
         _ => KvError::CorruptCheckpointMap,
     }
 }
 
+/// Returns the current Unix time in milliseconds, zero on clock failure.
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1854,10 +1910,12 @@ fn now_ms() -> i64 {
         })
 }
 
+/// Seeds a recency sequence from the current wall clock.
 fn seed_sequence() -> u64 {
     u64::try_from(now_ms().max(0)).unwrap_or(0)
 }
 
+/// Converts an optional TTL into an absolute expiry timestamp.
 fn expiry_for(ttl: Option<Duration>, now: i64) -> i64 {
     match ttl {
         None => NEVER_EXPIRES_AT_MS,
@@ -1869,16 +1927,19 @@ fn expiry_for(ttl: Option<Duration>, now: i64) -> i64 {
     }
 }
 
+/// Computes the content digest used as a blob's canonical address.
 fn content_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
     *hasher.finalize().as_bytes()
 }
 
+/// Encodes a digest as lowercase hex for blob file names.
 fn hex_digest(digest: &[u8; 32]) -> String {
     lgwks_std::hex::encode(digest)
 }
 
+/// Parses a lowercase hex blob name into a 32-byte digest.
 fn hex_to_digest(name: &str) -> Option<[u8; 32]> {
     if name.len() != 64
         || !name
@@ -1890,16 +1951,19 @@ fn hex_to_digest(name: &str) -> Option<[u8; 32]> {
     lgwks_std::hex::decode(name).ok()?.try_into().ok()
 }
 
+/// Returns whether a name is a well-formed hex blob digest.
 fn is_blob_name(name: &str) -> bool {
     hex_to_digest(name).is_some()
 }
 
+/// Returns the sibling blob directory for a cache database path.
 fn blob_dir_for(path: &Path) -> PathBuf {
     let mut dir = path.as_os_str().to_owned();
     dir.push(".blobs");
     PathBuf::from(dir)
 }
 
+/// Extracts the wall-clock start time encoded in a UUIDv7 operation id.
 fn operation_started_at_ms(operation: &OperationId) -> Result<i64, KvError> {
     let uuid = operation.as_uuid();
     if uuid.get_version_num() != 7 {
@@ -1911,11 +1975,12 @@ fn operation_started_at_ms(operation: &OperationId) -> Result<i64, KvError> {
     let (seconds, nanos) = timestamp.to_unix();
     seconds
         .checked_mul(1_000)
-        .and_then(|millis| millis.checked_add(u64::from(nanos / 1_000_000)))
+        .and_then(|millis| millis.checked_add(u64::from(nanos.checked_div(1_000_000)?)))
         .and_then(|millis| i64::try_from(millis).ok())
         .ok_or(KvError::InvalidOperationId)
 }
 
+/// Derives a unique recency sequence for one index within a batch.
 fn batch_sequence(started_at_ms: i64, index: usize) -> Result<u64, KvError> {
     let started_at_ms = u64::try_from(started_at_ms).map_err(|_| KvError::InvalidOperationId)?;
     let stride = u64::try_from(MAX_BATCH_PUT + 1).unwrap_or(u64::MAX);
@@ -1925,6 +1990,7 @@ fn batch_sequence(started_at_ms: i64, index: usize) -> Result<u64, KvError> {
         .ok_or(KvError::InvalidOperationId)
 }
 
+/// Derives a deterministic operation id for one member of a batch.
 fn batch_member_operation(batch: OperationId, index: usize) -> OperationId {
     let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/batch-member/v1");
@@ -1939,6 +2005,7 @@ fn batch_member_operation(batch: OperationId, index: usize) -> OperationId {
     OperationId::from_uuid(Uuid::from_bytes(bytes))
 }
 
+/// Hashes a full batch request for idempotent apply and deduplication.
 fn batch_request_digest(
     namespace: &str,
     entries: &[BatchPut],
@@ -1978,6 +2045,7 @@ fn batch_request_digest(
     Ok(OperationDigest::new(*hasher.finalize().as_bytes()))
 }
 
+/// Binds a member request digest to its parent batch request digest.
 fn bind_batch_request(request: OperationDigest, batch_digest: &OperationDigest) -> OperationDigest {
     let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/batch-member-request/v1");
@@ -1986,6 +2054,7 @@ fn bind_batch_request(request: OperationDigest, batch_digest: &OperationDigest) 
     OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
+/// Builds the request digest for an inline put operation.
 fn put_digest(
     operation: &OperationId,
     namespace: &str,
@@ -2008,6 +2077,7 @@ fn put_digest(
     OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
+/// Builds the request digest for a tiered put operation.
 fn tiered_put_digest(
     operation: &OperationId,
     namespace: &str,
@@ -2032,6 +2102,7 @@ fn tiered_put_digest(
     OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
+/// Builds the request digest for a clear/delete operation.
 fn clear_digest(operation: &OperationId, namespace: &str, key: &str) -> OperationDigest {
     let mut hasher = Hasher::new();
     hasher.update(b"logical-db-kv/clear/v1");
@@ -2043,6 +2114,7 @@ fn clear_digest(operation: &OperationId, namespace: &str, key: &str) -> Operatio
     OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
+/// Derives the deterministic document id for a namespace and key pair.
 fn document_for(namespace: &str, key: &str) -> DocumentId {
     let namespace_length = u64::try_from(namespace.len()).unwrap_or(u64::MAX);
     let key_length = u64::try_from(key.len()).unwrap_or(u64::MAX);
@@ -2065,6 +2137,7 @@ fn document_for(namespace: &str, key: &str) -> DocumentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logical_db::CrdtError;
 
     fn scope() -> Scope {
         Scope::new(AccountId::new(), SpaceId::new())
@@ -2074,29 +2147,28 @@ mod tests {
         std::env::temp_dir().join(format!("logical-db-kv-{tag}-{}.redb", Uuid::now_v7()))
     }
 
-    fn open_cache(path: &std::path::Path, namespace: &str) -> KvCache {
-        KvCache::open(path, scope(), ReplicaId::new(), namespace).unwrap()
+    fn open_cache(
+        path: &std::path::Path,
+        namespace: &str,
+    ) -> Result<KvCache, Box<dyn std::error::Error>> {
+        Ok(KvCache::open(path, scope(), ReplicaId::new(), namespace)?)
     }
 
-    fn cleanup(path: &std::path::Path) {
-        std::fs::remove_file(path).unwrap();
+    fn cleanup(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
-    fn round_trip_put_get_delete_and_prefix_scan_without_caller_identity() {
+    fn round_trip_put_get_delete_and_prefix_scan_without_caller_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("roundtrip");
-        let cache = open_cache(&db_path, "sessions");
-        cache
-            .put("user:ada", b"1", Some(Duration::from_secs(60)))
-            .unwrap();
-        cache
-            .put("user:grace", b"2", Some(Duration::from_secs(60)))
-            .unwrap();
-        cache
-            .put("config:theme", b"dark", Some(Duration::from_secs(60)))
-            .unwrap();
-        assert_eq!(cache.get("user:ada").unwrap(), Some(b"1".to_vec()));
-        let page = cache.scan("user:", None, 10).unwrap();
+        let cache = open_cache(&db_path, "sessions")?;
+        cache.put("user:ada", b"1", Some(Duration::from_secs(60)))?;
+        cache.put("user:grace", b"2", Some(Duration::from_secs(60)))?;
+        cache.put("config:theme", b"dark", Some(Duration::from_secs(60)))?;
+        assert_eq!(cache.get("user:ada")?, Some(b"1".to_vec()));
+        let page = cache.scan("user:", None, 10)?;
         assert_eq!(
             page,
             vec![
@@ -2110,11 +2182,11 @@ mod tests {
                 },
             ]
         );
-        assert!(cache.delete("user:ada").unwrap());
-        assert_eq!(cache.get("user:ada").unwrap(), None);
-        assert!(!cache.delete("user:ada").unwrap());
-        assert!(!cache.delete("missing").unwrap());
-        let page = cache.scan("user:", None, 10).unwrap();
+        assert!(cache.delete("user:ada")?);
+        assert_eq!(cache.get("user:ada")?, None);
+        assert!(!cache.delete("user:ada")?);
+        assert!(!cache.delete("missing")?);
+        let page = cache.scan("user:", None, 10)?;
         assert_eq!(
             page,
             vec![CacheEntry {
@@ -2122,72 +2194,74 @@ mod tests {
                 value: b"2".to_vec()
             }]
         );
-        let first = cache.scan("", None, 1).unwrap();
+        let first = cache.scan("", None, 1)?;
         assert_eq!(first.len(), 1);
-        let rest = cache.scan("", Some(&first[0].key), 10).unwrap();
+        let rest = cache.scan("", Some(&first[0].key), 10)?;
         assert!(
             rest.iter()
                 .all(|entry| entry.key.as_str() > first[0].key.as_str())
         );
         assert_eq!(first.len() + rest.len(), 2);
-        cleanup(&db_path);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn expired_entries_read_absent_and_evict_in_bounded_batches() {
+    fn expired_entries_read_absent_and_evict_in_bounded_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("expiry");
-        let cache = open_cache(&db_path, "sessions");
-        cache.put("gone:1", b"a", Some(Duration::ZERO)).unwrap();
-        cache.put("gone:2", b"b", Some(Duration::ZERO)).unwrap();
-        cache.put("gone:3", b"c", Some(Duration::ZERO)).unwrap();
-        cache
-            .put("live", b"z", Some(Duration::from_secs(60)))
-            .unwrap();
-        assert_eq!(cache.get("gone:1").unwrap(), None);
-        assert_eq!(cache.get("live").unwrap(), Some(b"z".to_vec()));
-        assert_eq!(cache.evict_expired(2).unwrap(), 2);
-        assert_eq!(cache.evict_expired(10).unwrap(), 1);
-        assert_eq!(cache.evict_expired(10).unwrap(), 0);
-        assert_eq!(cache.get("live").unwrap(), Some(b"z".to_vec()));
-        assert!(cache.scan("gone:", None, 10).unwrap().is_empty());
-        cleanup(&db_path);
+        let cache = open_cache(&db_path, "sessions")?;
+        cache.put("gone:1", b"a", Some(Duration::ZERO))?;
+        cache.put("gone:2", b"b", Some(Duration::ZERO))?;
+        cache.put("gone:3", b"c", Some(Duration::ZERO))?;
+        cache.put("live", b"z", Some(Duration::from_secs(60)))?;
+        assert_eq!(cache.get("gone:1")?, None);
+        assert_eq!(cache.get("live")?, Some(b"z".to_vec()));
+        assert_eq!(cache.evict_expired(2)?, 2);
+        assert_eq!(cache.evict_expired(10)?, 1);
+        assert_eq!(cache.evict_expired(10)?, 0);
+        assert_eq!(cache.get("live")?, Some(b"z".to_vec()));
+        assert!(cache.scan("gone:", None, 10)?.is_empty());
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn eviction_revision_guard_preserves_a_concurrent_replacement() {
+    fn eviction_revision_guard_preserves_a_concurrent_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("eviction-revision");
         let scope = scope();
         let replica = ReplicaId::new();
         let (document, revision) = {
-            let first = KvCache::open(&db_path, scope, replica, "sessions").unwrap();
-            first.put("key", b"old", None).unwrap();
+            let first = KvCache::open(&db_path, scope, replica, "sessions")?;
+            first.put("key", b"old", None)?;
             let document = document_for("sessions", "key");
-            let revision = match first.decode_slot(document).unwrap() {
+            let revision = match first.decode_slot(document)? {
                 Decoded::Found(envelope) => envelope.revision,
-                _ => panic!("expected stored envelope"),
+                _ => return Err(std::io::Error::other("expected stored envelope").into()),
             };
             (document, revision)
         };
         {
-            let second = KvCache::open(&db_path, scope, replica, "sessions").unwrap();
-            second.put("key", b"new", None).unwrap();
+            let second = KvCache::open(&db_path, scope, replica, "sessions")?;
+            second.put("key", b"new", None)?;
         }
-        let first = KvCache::open(&db_path, scope, replica, "sessions").unwrap();
-        let outcome = first
-            .remove_reference_at(document, "key", Some(revision))
-            .unwrap();
+        let first = KvCache::open(&db_path, scope, replica, "sessions")?;
+        let outcome = first.remove_reference_at(document, "key", Some(revision))?;
         assert!(!outcome.cleared);
-        assert_eq!(first.get("key").unwrap(), Some(b"new".to_vec()));
-        cleanup(&db_path);
+        assert_eq!(first.get("key")?, Some(b"new".to_vec()));
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn older_envelope_reads_with_new_fields_defaulted_and_newer_refused() {
+    fn older_envelope_reads_with_new_fields_defaulted_and_newer_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("envelope");
         let scope = scope();
         let replica = ReplicaId::new();
         {
-            let raw = Database::open(&db_path, scope, replica).unwrap();
+            let raw = Database::open(&db_path, scope, replica)?;
             let document = document_for("sessions", "legacy");
             raw.edit(
                 document,
@@ -2204,8 +2278,7 @@ mod tests {
                     editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(b"old".to_vec()))?;
                     Ok(())
                 },
-            )
-            .unwrap();
+            )?;
             let future = document_for("sessions", "future");
             raw.edit(
                 future,
@@ -2222,218 +2295,211 @@ mod tests {
                     editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(b"new".to_vec()))?;
                     Ok(())
                 },
-            )
-            .unwrap();
+            )?;
         }
-        let (cache, report) =
-            KvCache::migrate_schema(&db_path, scope, replica, "sessions", 16).unwrap();
+        let (cache, report) = KvCache::migrate_schema(&db_path, scope, replica, "sessions", 16)?;
         assert_eq!(report.documents, 2);
-        assert_eq!(cache.get("legacy").unwrap(), Some(b"old".to_vec()));
-        let stored = cache
-            .database()
-            .query_index(
-                EXPIRY_INDEX,
-                &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
-                None,
-                10,
-            )
-            .unwrap();
+        assert_eq!(cache.get("legacy")?, Some(b"old".to_vec()));
+        let stored = cache.database().query_index(
+            EXPIRY_INDEX,
+            &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
+            None,
+            10,
+        )?;
         assert_eq!(stored, vec![document_for("sessions", "legacy")]);
-        let error = cache.get("future").unwrap_err();
+        let Err(error) = cache.get("future") else {
+            return Err("expected unsupported envelope version".into());
+        };
         assert!(matches!(
             error,
             KvError::UnsupportedEnvelopeVersion { actual: 99 }
         ));
-        cleanup(&db_path);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn tier_boundary_values_round_trip_and_huge_refused_before_commit() {
+    fn tier_boundary_values_round_trip_and_huge_refused_before_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("bounds");
-        let cache = open_cache(&db_path, "blobs");
+        let cache = open_cache(&db_path, "blobs")?;
         let inline = vec![7_u8; TIER_THRESHOLD_BYTES];
-        cache
-            .put("inline", &inline, Some(Duration::from_secs(60)))
-            .unwrap();
-        assert_eq!(cache.get("inline").unwrap(), Some(inline));
-        assert_eq!(cache.blob_reference("inline").unwrap(), None);
+        cache.put("inline", &inline, Some(Duration::from_secs(60)))?;
+        assert_eq!(cache.get("inline")?, Some(inline));
+        assert_eq!(cache.blob_reference("inline")?, None);
         let tiered = vec![9_u8; MAX_VALUE_BYTES + 1];
-        cache
-            .put("tiered", &tiered, Some(Duration::from_secs(60)))
-            .unwrap();
-        assert_eq!(cache.get("tiered").unwrap(), Some(tiered));
-        assert!(cache.blob_reference("tiered").unwrap().is_some());
+        cache.put("tiered", &tiered, Some(Duration::from_secs(60)))?;
+        assert_eq!(cache.get("tiered")?, Some(tiered));
+        assert!(cache.blob_reference("tiered")?.is_some());
         let huge = vec![1_u8; MAX_TIERED_VALUE_BYTES + 1];
-        let error = cache
-            .put("huge", &huge, Some(Duration::from_secs(60)))
-            .unwrap_err();
+        let Err(error) = cache.put("huge", &huge, Some(Duration::from_secs(60))) else {
+            return Err("expected blob too large".into());
+        };
         assert!(matches!(
             error,
             KvError::BlobTooLarge { actual, maximum }
             if actual == MAX_TIERED_VALUE_BYTES + 1 && maximum == MAX_TIERED_VALUE_BYTES
         ));
-        assert_eq!(cache.get("huge").unwrap(), None);
-        let stored: Vec<_> = std::fs::read_dir(&cache.blob_dir).unwrap().collect();
+        assert_eq!(cache.get("huge")?, None);
+        let stored: Vec<_> = std::fs::read_dir(&cache.blob_dir)?.collect();
         assert_eq!(
             stored.len(),
             1,
             "the refused value must leave no blob file behind"
         );
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn schema_migration_preserves_documents_and_installs_indexes() {
+    fn schema_migration_preserves_documents_and_installs_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("migrate");
         let scope = scope();
         let replica = ReplicaId::new();
         {
-            let raw = Database::open(&db_path, scope, replica).unwrap();
+            let raw = Database::open(&db_path, scope, replica)?;
             raw.edit(
                 DocumentId::new(),
                 OperationId::new(),
                 OperationDigest::new([21; 32]),
                 |editor| editor.put(&Object::root(), "note", Scalar::String("plain".into())),
-            )
-            .unwrap();
+            )?;
         }
-        let (cache, _) = KvCache::migrate_schema(&db_path, scope, replica, "sessions", 16).unwrap();
-        cache.put("forever", b"v", None).unwrap();
-        assert_eq!(cache.get("forever").unwrap(), Some(b"v".to_vec()));
-        let hits = cache
-            .database()
-            .query_index(
-                EXPIRY_INDEX,
-                &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
-                None,
-                10,
-            )
-            .unwrap();
+        let (cache, _) = KvCache::migrate_schema(&db_path, scope, replica, "sessions", 16)?;
+        cache.put("forever", b"v", None)?;
+        assert_eq!(cache.get("forever")?, Some(b"v".to_vec()));
+        let hits = cache.database().query_index(
+            EXPIRY_INDEX,
+            &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
+            None,
+            10,
+        )?;
         assert_eq!(hits, vec![document_for("sessions", "forever")]);
-        cleanup(&db_path);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn namespaces_never_share_slots_and_inputs_are_validated() {
+    fn namespaces_never_share_slots_and_inputs_are_validated()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("namespaces");
         let scope = scope();
         let replica = ReplicaId::new();
         {
-            let first = KvCache::open(&db_path, scope, replica, "one").unwrap();
-            first
-                .put("shared", b"1", Some(Duration::from_secs(60)))
-                .unwrap();
-            assert_eq!(first.get("shared").unwrap(), Some(b"1".to_vec()));
+            let first = KvCache::open(&db_path, scope, replica, "one")?;
+            first.put("shared", b"1", Some(Duration::from_secs(60)))?;
+            assert_eq!(first.get("shared")?, Some(b"1".to_vec()));
         }
         {
-            let second = KvCache::open(&db_path, scope, replica, "two").unwrap();
-            assert_eq!(second.get("shared").unwrap(), None);
-            second
-                .put("shared", b"2", Some(Duration::from_secs(60)))
-                .unwrap();
-            assert_eq!(second.get("shared").unwrap(), Some(b"2".to_vec()));
+            let second = KvCache::open(&db_path, scope, replica, "two")?;
+            assert_eq!(second.get("shared")?, None);
+            second.put("shared", b"2", Some(Duration::from_secs(60)))?;
+            assert_eq!(second.get("shared")?, Some(b"2".to_vec()));
         }
         {
-            let first = KvCache::open(&db_path, scope, replica, "one").unwrap();
-            assert_eq!(first.get("shared").unwrap(), Some(b"1".to_vec()));
-            assert!(matches!(first.get("").unwrap_err(), KvError::InvalidKey));
-            assert!(matches!(
-                first.scan("", None, 0).unwrap_err(),
-                KvError::InvalidScanLimit(0)
-            ));
-            assert!(matches!(
-                first.evict_expired(0).unwrap_err(),
-                KvError::InvalidEvictionLimit(0)
-            ));
+            let first = KvCache::open(&db_path, scope, replica, "one")?;
+            assert_eq!(first.get("shared")?, Some(b"1".to_vec()));
+            let Err(error) = first.get("") else {
+                return Err("expected invalid key".into());
+            };
+            assert!(matches!(error, KvError::InvalidKey));
+            let Err(error) = first.scan("", None, 0) else {
+                return Err("expected invalid scan limit".into());
+            };
+            assert!(matches!(error, KvError::InvalidScanLimit(0)));
+            let Err(error) = first.evict_expired(0) else {
+                return Err("expected invalid eviction limit".into());
+            };
+            assert!(matches!(error, KvError::InvalidEvictionLimit(0)));
         }
         assert!(matches!(
             KvCache::open(&db_path, scope, replica, ""),
             Err(KvError::InvalidNamespace)
         ));
-        cleanup(&db_path);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn batch_put_applies_every_entry_atomically() {
+    fn batch_put_applies_every_entry_atomically() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("batch-apply");
-        let cache = open_cache(&db_path, "sessions");
-        cache
-            .put_many(&[
-                BatchPut {
-                    key: "a".into(),
-                    value: b"1".to_vec(),
-                    ttl: Some(Duration::from_secs(60)),
-                },
-                BatchPut {
-                    key: "b".into(),
-                    value: b"2".to_vec(),
-                    ttl: None,
-                },
-                BatchPut {
-                    key: "c".into(),
-                    value: b"3".to_vec(),
-                    ttl: Some(Duration::from_secs(60)),
-                },
-            ])
-            .unwrap();
-        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(cache.get("b").unwrap(), Some(b"2".to_vec()));
-        assert_eq!(cache.get("c").unwrap(), Some(b"3".to_vec()));
-        cleanup(&db_path);
+        let cache = open_cache(&db_path, "sessions")?;
+        cache.put_many(&[
+            BatchPut {
+                key: "a".into(),
+                value: b"1".to_vec(),
+                ttl: Some(Duration::from_secs(60)),
+            },
+            BatchPut {
+                key: "b".into(),
+                value: b"2".to_vec(),
+                ttl: None,
+            },
+            BatchPut {
+                key: "c".into(),
+                value: b"3".to_vec(),
+                ttl: Some(Duration::from_secs(60)),
+            },
+        ])?;
+        assert_eq!(cache.get("a")?, Some(b"1".to_vec()));
+        assert_eq!(cache.get("b")?, Some(b"2".to_vec()));
+        assert_eq!(cache.get("c")?, Some(b"3".to_vec()));
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn batch_put_validation_failure_applies_nothing() {
+    fn batch_put_validation_failure_applies_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("batch-atomic");
-        let cache = open_cache(&db_path, "sessions");
-        cache
-            .put("keep", b"v0", Some(Duration::from_secs(60)))
-            .unwrap();
+        let cache = open_cache(&db_path, "sessions")?;
+        cache.put("keep", b"v0", Some(Duration::from_secs(60)))?;
         let oversize = vec![7_u8; MAX_TIERED_VALUE_BYTES + 1];
-        let error = cache
-            .put_many(&[
-                BatchPut {
-                    key: "first".into(),
-                    value: b"1".to_vec(),
-                    ttl: Some(Duration::from_secs(60)),
-                },
-                BatchPut {
-                    key: "keep".into(),
-                    value: b"replaced".to_vec(),
-                    ttl: Some(Duration::from_secs(60)),
-                },
-                BatchPut {
-                    key: "big".into(),
-                    value: oversize,
-                    ttl: Some(Duration::from_secs(60)),
-                },
-                BatchPut {
-                    key: "last".into(),
-                    value: b"z".to_vec(),
-                    ttl: Some(Duration::from_secs(60)),
-                },
-            ])
-            .unwrap_err();
+        let Err(error) = cache.put_many(&[
+            BatchPut {
+                key: "first".into(),
+                value: b"1".to_vec(),
+                ttl: Some(Duration::from_secs(60)),
+            },
+            BatchPut {
+                key: "keep".into(),
+                value: b"replaced".to_vec(),
+                ttl: Some(Duration::from_secs(60)),
+            },
+            BatchPut {
+                key: "big".into(),
+                value: oversize,
+                ttl: Some(Duration::from_secs(60)),
+            },
+            BatchPut {
+                key: "last".into(),
+                value: b"z".to_vec(),
+                ttl: Some(Duration::from_secs(60)),
+            },
+        ]) else {
+            return Err("expected blob too large".into());
+        };
         assert!(matches!(
             error,
             KvError::BlobTooLarge { actual, maximum }
             if actual == MAX_TIERED_VALUE_BYTES + 1 && maximum == MAX_TIERED_VALUE_BYTES
         ));
-        assert_eq!(cache.get("first").unwrap(), None);
-        assert_eq!(cache.get("last").unwrap(), None);
-        assert_eq!(cache.get("big").unwrap(), None);
-        assert_eq!(cache.get("keep").unwrap(), Some(b"v0".to_vec()));
-        cleanup(&db_path);
+        assert_eq!(cache.get("first")?, None);
+        assert_eq!(cache.get("last")?, None);
+        assert_eq!(cache.get("big")?, None);
+        assert_eq!(cache.get("keep")?, Some(b"v0".to_vec()));
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn batch_put_rejects_empty_and_oversize_batches() {
+    fn batch_put_rejects_empty_and_oversize_batches() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("batch-bounds");
-        let cache = open_cache(&db_path, "sessions");
-        assert!(matches!(
-            cache.put_many(&[]).unwrap_err(),
-            KvError::InvalidBatchSize(0)
-        ));
+        let cache = open_cache(&db_path, "sessions")?;
+        let Err(error) = cache.put_many(&[]) else {
+            return Err("expected invalid batch size".into());
+        };
+        assert!(matches!(error, KvError::InvalidBatchSize(0)));
         let oversize: Vec<BatchPut> = (0..=MAX_BATCH_PUT)
             .map(|offset| BatchPut {
                 key: format!("k{offset}"),
@@ -2441,18 +2507,23 @@ mod tests {
                 ttl: None,
             })
             .collect();
+        let Err(error) = cache.put_many(&oversize) else {
+            return Err("expected invalid batch size".into());
+        };
         assert!(matches!(
-            cache.put_many(&oversize).unwrap_err(),
+            error,
             KvError::InvalidBatchSize(actual) if actual == MAX_BATCH_PUT + 1
         ));
-        assert_eq!(cache.get("k0").unwrap(), None);
-        cleanup(&db_path);
+        assert_eq!(cache.get("k0")?, None);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn batch_put_with_operation_retries_without_appending_changes() {
+    fn batch_put_with_operation_retries_without_appending_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("batch-retry");
-        let cache = open_cache(&db_path, "sessions");
+        let cache = open_cache(&db_path, "sessions")?;
         let operation = OperationId::new();
         let entries = [
             BatchPut {
@@ -2466,23 +2537,15 @@ mod tests {
                 ttl: None,
             },
         ];
-        cache.put_many_with_operation(operation, &entries).unwrap();
-        let changes = cache
-            .database()
-            .changes_since(0, MAX_PAGE_LIMIT)
-            .unwrap()
-            .len();
-        cache.put_many_with_operation(operation, &entries).unwrap();
+        cache.put_many_with_operation(operation, &entries)?;
+        let changes = cache.database().changes_since(0, MAX_PAGE_LIMIT)?.len();
+        cache.put_many_with_operation(operation, &entries)?;
         assert_eq!(
-            cache
-                .database()
-                .changes_since(0, MAX_PAGE_LIMIT)
-                .unwrap()
-                .len(),
+            cache.database().changes_since(0, MAX_PAGE_LIMIT)?.len(),
             changes
         );
-        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(cache.get("b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(cache.get("a")?, Some(b"1".to_vec()));
+        assert_eq!(cache.get("b")?, Some(b"2".to_vec()));
         let extended = [
             entries[0].clone(),
             entries[1].clone(),
@@ -2493,7 +2556,7 @@ mod tests {
             },
         ];
         assert!(cache.put_many_with_operation(operation, &extended).is_err());
-        assert_eq!(cache.get("c").unwrap(), None);
+        assert_eq!(cache.get("c")?, None);
         let overwritten = [
             BatchPut {
                 key: "a".into(),
@@ -2508,8 +2571,8 @@ mod tests {
                 .put_many_with_operation(operation, &overwritten)
                 .is_err()
         );
-        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(cache.get("b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(cache.get("a")?, Some(b"1".to_vec()));
+        assert_eq!(cache.get("b")?, Some(b"2".to_vec()));
         assert!(
             cache
                 .put_many_with_operation(
@@ -2522,92 +2585,88 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
-        cleanup(&db_path);
+        assert_eq!(cache.get("a")?, Some(b"1".to_vec()));
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn batch_reserves_recency_before_a_following_put() {
+    fn batch_reserves_recency_before_a_following_put() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("batch-sequence");
-        let cache = open_cache(&db_path, "sessions");
+        let cache = open_cache(&db_path, "sessions")?;
         let batch_operation = OperationId::new();
-        cache
-            .put_many_with_operation(
-                batch_operation,
-                &[BatchPut {
-                    key: "batch".into(),
-                    value: b"batch-value".to_vec(),
-                    ttl: None,
-                }],
-            )
-            .unwrap();
-        let batch_sequence = match cache
-            .decode_slot(document_for("sessions", "batch"))
-            .unwrap()
-        {
+        cache.put_many_with_operation(
+            batch_operation,
+            &[BatchPut {
+                key: "batch".into(),
+                value: b"batch-value".to_vec(),
+                ttl: None,
+            }],
+        )?;
+        let batch_sequence = match cache.decode_slot(document_for("sessions", "batch"))? {
             Decoded::Found(envelope) => envelope.sequence,
-            _ => panic!("batch envelope must be present"),
+            _ => {
+                return Err(std::io::Error::other("batch envelope must be present").into());
+            }
         };
-        cache.put("following", b"following-value", None).unwrap();
-        let following_sequence = match cache
-            .decode_slot(document_for("sessions", "following"))
-            .unwrap()
-        {
+        cache.put("following", b"following-value", None)?;
+        let following_sequence = match cache.decode_slot(document_for("sessions", "following"))? {
             Decoded::Found(envelope) => envelope.sequence,
-            _ => panic!("following envelope must be present"),
+            _ => {
+                return Err(std::io::Error::other("following envelope must be present").into());
+            }
         };
         assert!(following_sequence > batch_sequence);
-        cleanup(&db_path);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn batch_put_with_operation_rejects_non_uuidv7_identity() {
+    fn batch_put_with_operation_rejects_non_uuidv7_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("batch-operation-id");
-        let cache = open_cache(&db_path, "sessions");
-        let error = cache
-            .put_many_with_operation(
-                OperationId::from_uuid(Uuid::nil()),
-                &[BatchPut {
-                    key: "key".into(),
-                    value: b"value".to_vec(),
-                    ttl: None,
-                }],
-            )
-            .unwrap_err();
+        let cache = open_cache(&db_path, "sessions")?;
+        let Err(error) = cache.put_many_with_operation(
+            OperationId::from_uuid(Uuid::nil()),
+            &[BatchPut {
+                key: "key".into(),
+                value: b"value".to_vec(),
+                ttl: None,
+            }],
+        ) else {
+            return Err("expected invalid operation id".into());
+        };
         assert!(matches!(error, KvError::InvalidOperationId));
-        assert_eq!(cache.get("key").unwrap(), None);
-        cleanup(&db_path);
+        assert_eq!(cache.get("key")?, None);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn fresh_device_catches_up_newest_first_then_backfills() {
+    fn fresh_device_catches_up_newest_first_then_backfills()
+    -> Result<(), Box<dyn std::error::Error>> {
         let writer_path = path("catchup-a");
         let reader_path = path("catchup-b");
         let scope = scope();
         let peer = logical_db_model::PeerId::new();
         {
-            let writer = KvCache::open(&writer_path, scope, ReplicaId::new(), "sessions").unwrap();
+            let writer = KvCache::open(&writer_path, scope, ReplicaId::new(), "sessions")?;
             for key in ["k1", "k2", "k3", "k4", "k5"] {
-                writer
-                    .put(key, key.as_bytes(), Some(Duration::from_secs(60)))
-                    .unwrap();
+                writer.put(key, key.as_bytes(), Some(Duration::from_secs(60)))?;
             }
-            let pending = writer.database().pending_changes(0, 64).unwrap();
+            let pending = writer.database().pending_changes(0, 64)?;
             let remote: Vec<logical_db::RemoteChange> = pending
                 .into_iter()
-                .map(|change| logical_db::RemoteChange {
-                    document: change.document,
-                    digest: change.digest,
-                    bytes: change.bytes,
+                .map(|change| {
+                    logical_db::RemoteChange::new(change.document, change.digest, change.bytes)
                 })
                 .collect();
             assert_eq!(remote.len(), 5);
-            let reader = KvCache::open(&reader_path, scope, ReplicaId::new(), "sessions").unwrap();
+            let reader = KvCache::open(&reader_path, scope, ReplicaId::new(), "sessions")?;
             reader
                 .database()
-                .install_remote_page(peer, &remote, b"cursor-1")
-                .unwrap();
-            let newest = reader.recent("", 2).unwrap();
+                .install_remote_page(peer, &remote, b"cursor-1")?;
+            let newest = reader.recent("", 2)?;
             assert_eq!(
                 newest,
                 vec![
@@ -2621,7 +2680,7 @@ mod tests {
                     },
                 ]
             );
-            let backfill = reader.scan("", None, 10).unwrap();
+            let backfill = reader.scan("", None, 10)?;
             assert_eq!(
                 backfill
                     .iter()
@@ -2629,7 +2688,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["k1", "k2", "k3", "k4", "k5"]
             );
-            let full_recent = reader.recent("", 10).unwrap();
+            let full_recent = reader.recent("", 10)?;
             assert_eq!(
                 full_recent
                     .iter()
@@ -2638,91 +2697,101 @@ mod tests {
                 vec!["k5", "k4", "k3", "k2", "k1"]
             );
         }
-        cleanup(&writer_path);
-        cleanup(&reader_path);
+        cleanup(&writer_path)?;
+        cleanup(&reader_path)?;
+        Ok(())
     }
 
     #[test]
-    fn namespace_checkpoint_map_round_trips_through_the_durable_slot() {
+    fn namespace_checkpoint_map_round_trips_through_the_durable_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("ns-slot");
         let scope = scope();
         let peer = logical_db_model::PeerId::new();
-        let cache = KvCache::open(&db_path, scope, ReplicaId::new(), "sessions").unwrap();
-        assert!(cache.namespace_checkpoints(peer).unwrap().is_empty());
+        let cache = KvCache::open(&db_path, scope, ReplicaId::new(), "sessions")?;
+        assert!(cache.namespace_checkpoints(peer)?.is_empty());
         let mut map = logical_db_model::NamespaceCheckpoints::new();
         map.insert(
             "hot",
-            logical_db_model::NamespaceCheckpoint::new(vec![1, 2], 1_000).unwrap(),
-        )
-        .unwrap();
+            logical_db_model::NamespaceCheckpoint::new(vec![1, 2], 1_000)?,
+        )?;
         map.insert(
             "cold",
-            logical_db_model::NamespaceCheckpoint::new(vec![3], 2_000).unwrap(),
-        )
-        .unwrap();
-        cache.store_namespace_checkpoints(peer, &map).unwrap();
-        let loaded = cache.namespace_checkpoints(peer).unwrap();
-        assert_eq!(loaded.get("hot").unwrap().cursor(), &[1, 2]);
-        assert_eq!(loaded.get("cold").unwrap().cursor(), &[3]);
-        let mut advanced = loaded.clone();
-        advanced
-            .insert(
-                "hot",
-                logical_db_model::NamespaceCheckpoint::new(vec![9], 3_000).unwrap(),
-            )
-            .unwrap();
-        cache.store_namespace_checkpoints(peer, &advanced).unwrap();
-        let reloaded = cache.namespace_checkpoints(peer).unwrap();
-        assert_eq!(reloaded.get("hot").unwrap().cursor(), &[9]);
-        assert_eq!(reloaded.get("cold").unwrap().cursor(), &[3]);
-        cleanup(&db_path);
+            logical_db_model::NamespaceCheckpoint::new(vec![3], 2_000)?,
+        )?;
+        cache.store_namespace_checkpoints(peer, &map)?;
+        let loaded = cache.namespace_checkpoints(peer)?;
+        assert_eq!(loaded.get("hot").ok_or("expected Some")?.cursor(), &[1, 2]);
+        assert_eq!(loaded.get("cold").ok_or("expected Some")?.cursor(), &[3]);
+        let mut advanced = loaded;
+        advanced.insert(
+            "hot",
+            logical_db_model::NamespaceCheckpoint::new(vec![9], 3_000)?,
+        )?;
+        cache.store_namespace_checkpoints(peer, &advanced)?;
+        let reloaded = cache.namespace_checkpoints(peer)?;
+        assert_eq!(reloaded.get("hot").ok_or("expected Some")?.cursor(), &[9]);
+        assert_eq!(reloaded.get("cold").ok_or("expected Some")?.cursor(), &[3]);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
-    fn cleanup_tree(db: &std::path::Path, blobs: &std::path::Path) {
+    fn cleanup_tree(
+        db: &std::path::Path,
+        blobs: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if blobs.exists() {
-            std::fs::remove_dir_all(blobs).unwrap();
+            std::fs::remove_dir_all(blobs)?;
         }
         if db.exists() {
-            std::fs::remove_file(db).unwrap();
+            std::fs::remove_file(db)?;
         }
+        Ok(())
     }
 
     fn deterministic_bytes(len: usize) -> Vec<u8> {
         (0..len)
-            .map(|index| u8::try_from((index * 31 + 7) % 251).unwrap_or(0))
+            .map(|index| {
+                let scaled = index
+                    .checked_mul(31)
+                    .and_then(|partial| partial.checked_add(7));
+                u8::try_from(scaled.unwrap_or(0).checked_rem(251).unwrap_or(0)).unwrap_or(0)
+            })
             .collect()
     }
 
-    fn install_all(writer: &KvCache, reader: &KvCache, peer: PeerId) -> usize {
-        let pending = writer.database().pending_changes(0, 64).unwrap();
+    fn install_all(
+        writer: &KvCache,
+        reader: &KvCache,
+        peer: PeerId,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let pending = writer.database().pending_changes(0, 64)?;
         let remote: Vec<logical_db::RemoteChange> = pending
             .into_iter()
-            .map(|change| logical_db::RemoteChange {
-                document: change.document,
-                digest: change.digest,
-                bytes: change.bytes,
+            .map(|change| {
+                logical_db::RemoteChange::new(change.document, change.digest, change.bytes)
             })
             .collect();
         let count = remote.len();
         reader
             .database()
-            .install_remote_page(peer, &remote, b"cursor-u8")
-            .unwrap();
-        count
+            .install_remote_page(peer, &remote, b"cursor-u8")?;
+        Ok(count)
     }
 
     #[test]
-    fn tiered_value_round_trips_byte_identical_on_two_synced_replicas() {
+    fn tiered_value_round_trips_byte_identical_on_two_synced_replicas()
+    -> Result<(), Box<dyn std::error::Error>> {
         let writer_path = path("tier-sync-a");
         let reader_path = path("tier-sync-b");
         let scope = scope();
         let peer = PeerId::new();
-        let writer = KvCache::open(&writer_path, scope, ReplicaId::new(), "media").unwrap();
-        let reader = KvCache::open(&reader_path, scope, ReplicaId::new(), "media").unwrap();
+        let writer = KvCache::open(&writer_path, scope, ReplicaId::new(), "media")?;
+        let reader = KvCache::open(&reader_path, scope, ReplicaId::new(), "media")?;
         let big = deterministic_bytes(3 * MAX_BLOB_CHUNK_BYTES + 12_345);
-        writer.put("big", &big, None).unwrap();
-        assert_eq!(writer.get("big").unwrap(), Some(big.clone()));
-        let pending = writer.database().pending_changes(0, 64).unwrap();
+        writer.put("big", &big, None)?;
+        assert_eq!(writer.get("big")?, Some(big.clone()));
+        let pending = writer.database().pending_changes(0, 64)?;
         assert_eq!(pending.len(), 1);
         for change in &pending {
             assert!(
@@ -2730,12 +2799,11 @@ mod tests {
                 "sidecar reference must stay inside the bounded change"
             );
         }
-        install_all(&writer, &reader, peer);
+        install_all(&writer, &reader, peer)?;
         let reference = reader
-            .blob_reference("big")
-            .unwrap()
-            .expect("tiered ref synced");
-        assert_eq!(reference.size, big.len() as u64);
+            .blob_reference("big")?
+            .ok_or("expected tiered blob reference")?;
+        assert_eq!(reference.size, u64::try_from(big.len()).unwrap_or(u64::MAX));
         assert!(
             matches!(reader.get("big"), Err(KvError::MissingBlob { .. })),
             "reference without bytes must fail loudly, never partial"
@@ -2743,101 +2811,112 @@ mod tests {
         let mut offset = 0_u64;
         let mut chunks = 0_u32;
         while offset < reference.size {
-            let want = usize::try_from(reference.size - offset)
-                .unwrap()
-                .min(MAX_BLOB_CHUNK_BYTES);
-            let bytes = writer
-                .read_blob_chunk(&reference.digest, offset, want)
-                .unwrap();
+            let want = usize::try_from(reference.size - offset)?.min(MAX_BLOB_CHUNK_BYTES);
+            let bytes = writer.read_blob_chunk(&reference.digest, offset, want)?;
             assert!(!bytes.is_empty() && bytes.len() <= MAX_BLOB_CHUNK_BYTES);
-            let complete = reader
-                .write_blob_chunk(&reference.digest, reference.size, offset, &bytes)
-                .unwrap();
-            offset += bytes.len() as u64;
+            let complete =
+                reader.write_blob_chunk(&reference.digest, reference.size, offset, &bytes)?;
+            offset = offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
             chunks += 1;
             assert_eq!(complete, offset == reference.size);
         }
         assert!(chunks > 1, "large value must travel in multiple chunks");
-        assert_eq!(reader.get("big").unwrap(), Some(big));
-        cleanup_tree(&writer_path, &writer.blob_dir.clone());
-        cleanup_tree(&reader_path, &reader.blob_dir.clone());
+        assert_eq!(reader.get("big")?, Some(big));
+        cleanup_tree(&writer_path, &writer.blob_dir)?;
+        cleanup_tree(&reader_path, &reader.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn small_values_never_touch_the_blob_path() {
+    fn small_values_never_touch_the_blob_path() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-small");
-        let cache = open_cache(&db_path, "sessions");
-        cache.put("a", b"1", Some(Duration::from_secs(60))).unwrap();
-        cache.put("empty-ok", b"x", None).unwrap();
-        assert_eq!(cache.get("a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(cache.scan("", None, 10).unwrap().len(), 2);
-        assert_eq!(cache.recent("", 10).unwrap().len(), 2);
-        assert_eq!(cache.blob_reference("a").unwrap(), None);
-        assert_eq!(cache.evict_expired(10).unwrap(), 0);
+        let cache = open_cache(&db_path, "sessions")?;
+        cache.put("a", b"1", Some(Duration::from_secs(60)))?;
+        cache.put("empty-ok", b"x", None)?;
+        assert_eq!(cache.get("a")?, Some(b"1".to_vec()));
+        assert_eq!(cache.scan("", None, 10)?.len(), 2);
+        assert_eq!(cache.recent("", 10)?.len(), 2);
+        assert_eq!(cache.blob_reference("a")?, None);
+        assert_eq!(cache.evict_expired(10)?, 0);
         assert!(
             !cache.blob_dir.exists(),
             "small values must never create the blob directory"
         );
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn delete_and_evict_remove_reference_and_tiered_bytes() {
+    fn delete_and_evict_remove_reference_and_tiered_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
         let db_path = path("tier-delete");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let first = deterministic_bytes(TIER_THRESHOLD_BYTES + 1_000);
-        cache.put("gone", &first, None).unwrap();
+        cache.put("gone", &first, None)?;
         let digest = cache
-            .blob_reference("gone")
-            .unwrap()
-            .expect("tiered")
+            .blob_reference("gone")?
+            .ok_or("expected tiered blob reference")?
             .digest;
         assert!(cache.blob_path(&digest).exists());
-        assert!(cache.delete("gone").unwrap());
-        assert_eq!(cache.get("gone").unwrap(), None);
-        assert_eq!(cache.sweep_blobs().unwrap(), 1);
+        assert!(cache.delete("gone")?);
+        assert_eq!(cache.get("gone")?, None);
+        assert_eq!(cache.sweep_blobs()?, 1);
         assert!(
             !cache.blob_path(&digest).exists(),
             "sweep must remove tiered bytes after the reference commit"
         );
-        cache.put("old", &first, Some(Duration::ZERO)).unwrap();
-        let old_digest = cache.blob_reference("old").unwrap().expect("tiered").digest;
-        assert_eq!(cache.get("old").unwrap(), None);
-        assert_eq!(cache.evict_expired(10).unwrap(), 1);
-        assert_eq!(cache.sweep_blobs().unwrap(), 1);
+        cache.put("old", &first, Some(Duration::ZERO))?;
+        let old_digest = cache
+            .blob_reference("old")?
+            .ok_or("expected tiered blob reference")?
+            .digest;
+        assert_eq!(cache.get("old")?, None);
+        assert_eq!(cache.evict_expired(10)?, 1);
+        assert_eq!(cache.sweep_blobs()?, 1);
         assert!(!cache.blob_path(&old_digest).exists());
         let shared = deterministic_bytes(TIER_THRESHOLD_BYTES + 7);
-        cache.put("s1", &shared, None).unwrap();
-        cache.put("s2", &shared, None).unwrap();
-        let shared_digest = cache.blob_reference("s1").unwrap().expect("tiered").digest;
+        cache.put("s1", &shared, None)?;
+        cache.put("s2", &shared, None)?;
+        let shared_digest = cache
+            .blob_reference("s1")?
+            .ok_or("expected tiered blob reference")?
+            .digest;
         assert_eq!(
-            cache.blob_reference("s2").unwrap().expect("tiered").digest,
+            cache
+                .blob_reference("s2")?
+                .ok_or("expected tiered blob reference")?
+                .digest,
             shared_digest
         );
-        assert!(cache.delete("s1").unwrap());
+        assert!(cache.delete("s1")?);
         assert!(
             cache.blob_path(&shared_digest).exists(),
             "shared bytes survive while a live reference remains"
         );
-        assert_eq!(cache.get("s2").unwrap(), Some(shared.clone()));
-        assert!(cache.delete("s2").unwrap());
-        assert_eq!(cache.sweep_blobs().unwrap(), 1);
+        assert_eq!(cache.get("s2")?, Some(shared));
+        assert!(cache.delete("s2")?);
+        assert_eq!(cache.sweep_blobs()?, 1);
         assert!(!cache.blob_path(&shared_digest).exists());
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn crash_between_reference_removal_and_blob_deletion_recovered_by_sweep() {
+    fn crash_between_reference_removal_and_blob_deletion_recovered_by_sweep()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-crash");
         let scope = scope();
         let replica = ReplicaId::new();
         let digest = {
-            let cache = KvCache::open(&db_path, scope, replica, "media").unwrap();
+            let cache = KvCache::open(&db_path, scope, replica, "media")?;
             let big = deterministic_bytes(TIER_THRESHOLD_BYTES + 511);
-            cache.put("big", &big, None).unwrap();
-            let digest = cache.blob_reference("big").unwrap().expect("tiered").digest;
+            cache.put("big", &big, None)?;
+            let digest = cache
+                .blob_reference("big")?
+                .ok_or("expected tiered blob reference")?
+                .digest;
             let document = document_for("media", "big");
-            let outcome = cache.remove_reference(document, "big").unwrap();
+            let outcome = cache.remove_reference(document, "big")?;
             assert!(outcome.live);
             let blobs = cache.blob_dir.clone();
             drop(cache);
@@ -2848,151 +2927,167 @@ mod tests {
             digest
         };
         {
-            let cache = KvCache::open(&db_path, scope, replica, "media").unwrap();
-            assert_eq!(cache.get("big").unwrap(), None);
+            let cache = KvCache::open(&db_path, scope, replica, "media")?;
+            assert_eq!(cache.get("big")?, None);
             assert!(cache.blob_path(&digest).exists());
-            assert_eq!(cache.sweep_blobs().unwrap(), 1);
+            assert_eq!(cache.sweep_blobs()?, 1);
             assert!(!cache.blob_path(&digest).exists());
-            assert_eq!(cache.sweep_blobs().unwrap(), 0);
+            assert_eq!(cache.sweep_blobs()?, 0);
             let blobs = cache.blob_dir.clone();
             drop(cache);
-            cleanup_tree(&db_path, &blobs);
+            cleanup_tree(&db_path, &blobs)?;
         }
+        Ok(())
     }
 
     #[test]
-    fn sweep_promotes_referenced_gc_staging_back_to_canonical_storage() {
+    fn sweep_promotes_referenced_gc_staging_back_to_canonical_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-gc-republish");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let value = deterministic_bytes(TIER_THRESHOLD_BYTES + 512);
-        cache.put("old", &value, None).unwrap();
-        let digest = cache.blob_reference("old").unwrap().expect("tiered").digest;
-        assert!(cache.delete("old").unwrap());
+        cache.put("old", &value, None)?;
+        let digest = cache
+            .blob_reference("old")?
+            .ok_or("expected tiered blob reference")?
+            .digest;
+        assert!(cache.delete("old")?);
         let staged = cache
             .blob_dir
             .join(format!("{}.tmp-gc-test", hex_digest(&digest)));
-        std::fs::rename(cache.blob_path(&digest), &staged).unwrap();
+        std::fs::rename(cache.blob_path(&digest), &staged)?;
         assert!(!cache.blob_path(&digest).exists());
 
         let document = document_for("media", "new");
-        cache
-            .database()
-            .edit(
-                document,
-                OperationId::new(),
-                OperationDigest::new([78; 32]),
-                |editor| {
-                    editor.put(
-                        &Object::root(),
-                        FIELD_VERSION,
-                        Scalar::Unsigned(ENVELOPE_VERSION),
-                    )?;
-                    editor.put(&Object::root(), FIELD_KEY, Scalar::String("new".into()))?;
-                    editor.put(
-                        &Object::root(),
-                        FIELD_NAMESPACE,
-                        Scalar::String("media".into()),
-                    )?;
-                    editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(digest.to_vec()))?;
-                    editor.put(
-                        &Object::root(),
-                        FIELD_SIZE,
-                        Scalar::Unsigned(u64::try_from(value.len()).unwrap()),
-                    )?;
-                    Ok(())
-                },
-            )
-            .unwrap();
-        assert_eq!(cache.sweep_blobs().unwrap(), 0);
-        assert_eq!(cache.get("new").unwrap(), Some(value));
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cache.database().edit(
+            document,
+            OperationId::new(),
+            OperationDigest::new([78; 32]),
+            |editor| {
+                editor.put(
+                    &Object::root(),
+                    FIELD_VERSION,
+                    Scalar::Unsigned(ENVELOPE_VERSION),
+                )?;
+                editor.put(&Object::root(), FIELD_KEY, Scalar::String("new".into()))?;
+                editor.put(
+                    &Object::root(),
+                    FIELD_NAMESPACE,
+                    Scalar::String("media".into()),
+                )?;
+                editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(digest.to_vec()))?;
+                editor.put(
+                    &Object::root(),
+                    FIELD_SIZE,
+                    Scalar::Unsigned(
+                        u64::try_from(value.len())
+                            .map_err(|_error| CrdtError::InvalidChangeSize(value.len()))?,
+                    ),
+                )?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(cache.sweep_blobs()?, 0);
+        assert_eq!(cache.get("new")?, Some(value));
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn missing_or_damaged_blob_fails_read_loudly_without_partial_bytes() {
+    fn missing_or_damaged_blob_fails_read_loudly_without_partial_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-loud");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let big = deterministic_bytes(TIER_THRESHOLD_BYTES + 999);
-        cache.put("big", &big, None).unwrap();
-        let digest = cache.blob_reference("big").unwrap().expect("tiered").digest;
+        cache.put("big", &big, None)?;
+        let digest = cache
+            .blob_reference("big")?
+            .ok_or("expected tiered blob reference")?
+            .digest;
         let file = cache.blob_path(&digest);
-        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_file(&file)?;
         assert!(matches!(cache.get("big"), Err(KvError::MissingBlob { .. })));
         assert!(matches!(
             cache.scan("", None, 10),
             Err(KvError::MissingBlob { .. })
         ));
-        cache.put("big", &big, None).unwrap();
-        let mut damaged = std::fs::read(&file).unwrap();
+        cache.put("big", &big, None)?;
+        let mut damaged = std::fs::read(&file)?;
         damaged[100] ^= 0xFF;
-        std::fs::write(&file, &damaged).unwrap();
+        std::fs::write(&file, &damaged)?;
         assert!(matches!(cache.get("big"), Err(KvError::CorruptBlob { .. })));
         assert!(matches!(
             cache.read_blob_chunk(&digest, 0, 1),
             Err(KvError::CorruptBlob { .. })
         ));
-        cache.put("big", &big, None).unwrap();
-        let truncated = std::fs::read(&file).unwrap();
-        std::fs::write(&file, &truncated[..truncated.len() / 2]).unwrap();
+        cache.put("big", &big, None)?;
+        let truncated = std::fs::read(&file)?;
+        let half = truncated.len().checked_div(2).unwrap_or(0);
+        std::fs::write(&file, &truncated[..half])?;
         assert!(matches!(cache.get("big"), Err(KvError::CorruptBlob { .. })));
-        assert!(cache.blob_reference("big").unwrap().is_some());
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        assert!(cache.blob_reference("big")?.is_some());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn invalid_chunk_never_mutates_an_existing_canonical_blob() {
+    fn invalid_chunk_never_mutates_an_existing_canonical_blob()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-chunk-isolation");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let original = deterministic_bytes(TIER_THRESHOLD_BYTES + 64);
-        cache.put("big", &original, None).unwrap();
-        let reference = cache.blob_reference("big").unwrap().expect("tiered");
+        cache.put("big", &original, None)?;
+        let reference = cache
+            .blob_reference("big")?
+            .ok_or("expected tiered blob reference")?;
         let invalid = vec![0_u8; original.len()];
         assert!(matches!(
             cache.write_blob_chunk(&reference.digest, reference.size, 0, &invalid),
             Err(KvError::CorruptBlob { .. })
         ));
-        assert_eq!(cache.get("big").unwrap(), Some(original));
+        assert_eq!(cache.get("big")?, Some(original));
         assert!(cache.blob_path(&reference.digest).exists());
-        assert_eq!(cache.sweep_blobs().unwrap(), 1);
+        assert_eq!(cache.sweep_blobs()?, 1);
         assert!(cache.blob_path(&reference.digest).exists());
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn sweep_refuses_unsupported_and_corrupt_cache_envelopes() {
+    fn sweep_refuses_unsupported_and_corrupt_cache_envelopes()
+    -> Result<(), Box<dyn std::error::Error>> {
         for (tag, version, blob) in [("unsupported", 99_u64, None), ("corrupt", 2, Some(vec![1]))] {
             let db_path = path(tag);
-            let cache = open_cache(&db_path, "media");
+            let cache = open_cache(&db_path, "media")?;
             let document = document_for("media", "bad");
-            cache
-                .database()
-                .edit(
-                    document,
-                    OperationId::new(),
-                    OperationDigest::new([41; 32]),
-                    |editor| {
-                        editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(version))?;
-                        editor.put(&Object::root(), FIELD_KEY, Scalar::String("bad".into()))?;
+            cache.database().edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([41; 32]),
+                |editor| {
+                    editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(version))?;
+                    editor.put(&Object::root(), FIELD_KEY, Scalar::String("bad".into()))?;
+                    editor.put(
+                        &Object::root(),
+                        FIELD_NAMESPACE,
+                        Scalar::String("media".into()),
+                    )?;
+                    if let Some(blob) = blob {
+                        editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(blob))?;
+                        editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(1))?;
+                    } else {
                         editor.put(
                             &Object::root(),
-                            FIELD_NAMESPACE,
-                            Scalar::String("media".into()),
+                            FIELD_VALUE,
+                            Scalar::Bytes(b"future".to_vec()),
                         )?;
-                        if let Some(blob) = &blob {
-                            editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(blob.clone()))?;
-                            editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(1))?;
-                        } else {
-                            editor.put(
-                                &Object::root(),
-                                FIELD_VALUE,
-                                Scalar::Bytes(b"future".to_vec()),
-                            )?;
-                        }
-                        Ok(())
-                    },
-                )
-                .unwrap();
-            let error = cache.sweep_blobs().unwrap_err();
+                    }
+                    Ok(())
+                },
+            )?;
+            let Err(error) = cache.sweep_blobs() else {
+                return Err("expected sweep error".into());
+            };
             if version == 99 {
                 assert!(matches!(
                     error,
@@ -3001,57 +3096,56 @@ mod tests {
             } else {
                 assert!(matches!(error, KvError::CorruptEnvelope));
             }
-            cleanup_tree(&db_path, &cache.blob_dir.clone());
+            cleanup_tree(&db_path, &cache.blob_dir.clone())?;
         }
+        Ok(())
     }
 
     #[test]
-    fn point_reads_refuse_malformed_tiered_shapes() {
+    fn point_reads_refuse_malformed_tiered_shapes() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-shape");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         for (key, digest, size) in [("inline", None, None), ("small", Some([8; 32]), Some(1))] {
             let document = document_for("media", key);
-            cache
-                .database()
-                .edit(
-                    document,
-                    OperationId::new(),
-                    OperationDigest::new([42; 32]),
-                    |editor| {
-                        editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(2))?;
-                        editor.put(&Object::root(), FIELD_KEY, Scalar::String(key.into()))?;
-                        editor.put(
-                            &Object::root(),
-                            FIELD_NAMESPACE,
-                            Scalar::String("media".into()),
-                        )?;
-                        match (digest, size) {
-                            (None, None) => {
-                                editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(vec![1]))?;
-                            }
-                            (Some(digest), Some(size)) => {
-                                editor.put(
-                                    &Object::root(),
-                                    FIELD_BLOB,
-                                    Scalar::Bytes(digest.to_vec()),
-                                )?;
-                                editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(size))?;
-                            }
-                            _ => unreachable!(),
+            cache.database().edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([42; 32]),
+                |editor| {
+                    editor.put(&Object::root(), FIELD_VERSION, Scalar::Unsigned(2))?;
+                    editor.put(&Object::root(), FIELD_KEY, Scalar::String(key.into()))?;
+                    editor.put(
+                        &Object::root(),
+                        FIELD_NAMESPACE,
+                        Scalar::String("media".into()),
+                    )?;
+                    match (digest, size) {
+                        (None, None) => {
+                            editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(vec![1]))?;
                         }
-                        Ok(())
-                    },
-                )
-                .unwrap();
+                        (Some(digest), Some(size)) => {
+                            editor.put(
+                                &Object::root(),
+                                FIELD_BLOB,
+                                Scalar::Bytes(digest.to_vec()),
+                            )?;
+                            editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(size))?;
+                        }
+                        _ => return Err(CrdtError::InvalidChangeSize(0)),
+                    }
+                    Ok(())
+                },
+            )?;
             assert!(matches!(cache.get(key), Err(KvError::CorruptEnvelope)));
         }
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn point_reads_refuse_unbounded_envelope_axes() {
+    fn point_reads_refuse_unbounded_envelope_axes() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("envelope-bounds");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let oversized = "x".repeat(logical_db_model::MAX_NAME_BYTES + 1);
         let malformed = vec![
             (
@@ -3071,142 +3165,142 @@ mod tests {
             ),
         ];
         for (index, (document, key, namespace)) in malformed.into_iter().enumerate() {
-            let request_byte = 50_u8 + u8::try_from(index).unwrap();
-            cache
-                .database()
-                .edit(
-                    document,
-                    OperationId::new(),
-                    OperationDigest::new([request_byte; 32]),
-                    move |editor| {
-                        editor.put(&Object::root(), FIELD_KEY, Scalar::String(key))?;
-                        editor.put(&Object::root(), FIELD_NAMESPACE, Scalar::String(namespace))?;
-                        editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(vec![1]))?;
-                        Ok(())
-                    },
-                )
-                .unwrap();
+            let request_byte = 50_u8 + u8::try_from(index)?;
+            cache.database().edit(
+                document,
+                OperationId::new(),
+                OperationDigest::new([request_byte; 32]),
+                move |editor| {
+                    editor.put(&Object::root(), FIELD_KEY, Scalar::String(key))?;
+                    editor.put(&Object::root(), FIELD_NAMESPACE, Scalar::String(namespace))?;
+                    editor.put(&Object::root(), FIELD_VALUE, Scalar::Bytes(vec![1]))?;
+                    Ok(())
+                },
+            )?;
             assert!(matches!(
                 cache.document_namespace(document),
                 Err(KvError::CorruptEnvelope)
             ));
         }
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn values_beyond_inline_bound_tier_and_huge_values_refused_before_allocation() {
+    fn values_beyond_inline_bound_tier_and_huge_values_refused_before_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-bounds");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let large = deterministic_bytes(MAX_VALUE_BYTES + 1);
-        cache.put("large", &large, None).unwrap();
-        assert_eq!(cache.get("large").unwrap(), Some(large));
-        assert!(cache.blob_reference("large").unwrap().is_some());
+        cache.put("large", &large, None)?;
+        assert_eq!(cache.get("large")?, Some(large));
+        assert!(cache.blob_reference("large")?.is_some());
         let blobs = cache.blob_dir.clone();
         assert!(blobs.exists());
-        let before = std::fs::read_dir(&blobs).unwrap().count();
+        let before = std::fs::read_dir(&blobs)?.count();
         let huge = vec![7_u8; MAX_TIERED_VALUE_BYTES + 1];
-        let error = cache.put("huge", &huge, None).unwrap_err();
+        let Err(error) = cache.put("huge", &huge, None) else {
+            return Err("expected blob too large".into());
+        };
         assert!(matches!(
             error,
             KvError::BlobTooLarge { actual, maximum }
             if actual == MAX_TIERED_VALUE_BYTES + 1 && maximum == MAX_TIERED_VALUE_BYTES
         ));
-        assert_eq!(cache.get("huge").unwrap(), None);
-        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), before);
+        assert_eq!(cache.get("huge")?, None);
+        assert_eq!(std::fs::read_dir(&blobs)?.count(), before);
         drop(cache);
-        cleanup_tree(&db_path, &blobs);
+        cleanup_tree(&db_path, &blobs)?;
+        Ok(())
     }
 
     #[test]
-    fn tiered_overwrite_and_batch_reclaim_displaced_bytes_on_sweep() {
+    fn tiered_overwrite_and_batch_reclaim_displaced_bytes_on_sweep()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-overwrite");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let first = deterministic_bytes(TIER_THRESHOLD_BYTES + 11);
         let second = deterministic_bytes(TIER_THRESHOLD_BYTES + 12);
-        cache.put("k", &first, None).unwrap();
-        let first_digest = cache.blob_reference("k").unwrap().expect("tiered").digest;
-        cache.put("k", &second, None).unwrap();
+        cache.put("k", &first, None)?;
+        let first_digest = cache
+            .blob_reference("k")?
+            .ok_or("expected tiered blob reference")?
+            .digest;
+        cache.put("k", &second, None)?;
         assert!(cache.blob_path(&first_digest).exists());
-        assert_eq!(cache.sweep_blobs().unwrap(), 1);
+        assert_eq!(cache.sweep_blobs()?, 1);
         assert!(!cache.blob_path(&first_digest).exists());
-        assert_eq!(cache.get("k").unwrap(), Some(second));
-        cache
-            .put_many(&[
-                BatchPut {
-                    key: "b1".into(),
-                    value: deterministic_bytes(TIER_THRESHOLD_BYTES + 21),
-                    ttl: None,
-                },
-                BatchPut {
-                    key: "b2".into(),
-                    value: b"small".to_vec(),
-                    ttl: Some(Duration::from_secs(60)),
-                },
-            ])
-            .unwrap();
-        assert!(cache.blob_reference("b1").unwrap().is_some());
-        assert_eq!(cache.blob_reference("b2").unwrap(), None);
+        assert_eq!(cache.get("k")?, Some(second));
+        cache.put_many(&[
+            BatchPut {
+                key: "b1".into(),
+                value: deterministic_bytes(TIER_THRESHOLD_BYTES + 21),
+                ttl: None,
+            },
+            BatchPut {
+                key: "b2".into(),
+                value: b"small".to_vec(),
+                ttl: Some(Duration::from_secs(60)),
+            },
+        ])?;
+        assert!(cache.blob_reference("b1")?.is_some());
+        assert_eq!(cache.blob_reference("b2")?, None);
         assert_eq!(
-            cache.get("b1").unwrap().expect("tiered batch value").len(),
+            cache.get("b1")?.ok_or("expected b1 value")?.len(),
             TIER_THRESHOLD_BYTES + 21
         );
         let keep = deterministic_bytes(TIER_THRESHOLD_BYTES + 31);
-        cache.put("keep", &keep, None).unwrap();
+        cache.put("keep", &keep, None)?;
         let keep_digest = cache
-            .blob_reference("keep")
-            .unwrap()
-            .expect("tiered")
+            .blob_reference("keep")?
+            .ok_or("expected tiered blob reference")?
             .digest;
         let replacement = deterministic_bytes(TIER_THRESHOLD_BYTES + 32);
-        let error = cache
-            .put_many(&[
-                BatchPut {
-                    key: "keep".into(),
-                    value: replacement,
-                    ttl: None,
-                },
-                BatchPut {
-                    key: "bad".into(),
-                    value: vec![0_u8; MAX_TIERED_VALUE_BYTES + 1],
-                    ttl: None,
-                },
-            ])
-            .unwrap_err();
-        assert!(matches!(error, KvError::BlobTooLarge { .. }));
-        assert_eq!(cache.get("keep").unwrap(), Some(keep));
-        assert!(cache.blob_path(&keep_digest).exists());
-        assert_eq!(cache.get("bad").unwrap(), None);
-        let expired = deterministic_bytes(TIER_THRESHOLD_BYTES + 33);
-        cache
-            .put("expired", &expired, Some(Duration::ZERO))
-            .unwrap();
-        let expired_digest = cache
-            .blob_reference("expired")
-            .unwrap()
-            .expect("expired tiered value")
-            .digest;
-        cache
-            .put_many(&[BatchPut {
-                key: "expired".into(),
-                value: b"replaced".to_vec(),
+        let Err(error) = cache.put_many(&[
+            BatchPut {
+                key: "keep".into(),
+                value: replacement,
                 ttl: None,
-            }])
-            .unwrap();
+            },
+            BatchPut {
+                key: "bad".into(),
+                value: vec![0_u8; MAX_TIERED_VALUE_BYTES + 1],
+                ttl: None,
+            },
+        ]) else {
+            return Err("expected blob too large".into());
+        };
+        assert!(matches!(error, KvError::BlobTooLarge { .. }));
+        assert_eq!(cache.get("keep")?, Some(keep));
+        assert!(cache.blob_path(&keep_digest).exists());
+        assert_eq!(cache.get("bad")?, None);
+        let expired = deterministic_bytes(TIER_THRESHOLD_BYTES + 33);
+        cache.put("expired", &expired, Some(Duration::ZERO))?;
+        let expired_digest = cache
+            .blob_reference("expired")?
+            .ok_or("expected tiered blob reference")?
+            .digest;
+        cache.put_many(&[BatchPut {
+            key: "expired".into(),
+            value: b"replaced".to_vec(),
+            ttl: None,
+        }])?;
         assert!(cache.blob_path(&expired_digest).exists());
-        assert_eq!(cache.sweep_blobs().unwrap(), 1);
+        assert_eq!(cache.sweep_blobs()?, 1);
         assert!(!cache.blob_path(&expired_digest).exists());
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn concurrent_writers_do_not_expose_partial_tiered_values() {
+    fn concurrent_writers_do_not_expose_partial_tiered_values()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-concurrent");
-        let cache = std::sync::Arc::new(open_cache(&db_path, "media"));
+        let cache = std::sync::Arc::new(open_cache(&db_path, "media")?);
         let workers: Vec<_> = (0..6)
             .map(|index| {
                 let cache = std::sync::Arc::clone(&cache);
-                std::thread::spawn(move || {
+                std::thread::Builder::new().spawn(move || {
                     let value = deterministic_bytes(TIER_THRESHOLD_BYTES + index + 1);
                     let mut result = cache.put("race", &value, None);
                     for _ in 0..8 {
@@ -3222,124 +3316,113 @@ mod tests {
                     result
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         for worker in workers {
-            worker.join().unwrap().unwrap();
+            match worker.join() {
+                Ok(result) => result?,
+                Err(_) => return Err("concurrent writer panicked".into()),
+            }
         }
-        let value = cache.get("race").unwrap().expect("one writer commits");
+        let value = cache.get("race")?.ok_or("expected race value")?;
         assert!(value.len() > TIER_THRESHOLD_BYTES);
         let blobs = cache.blob_dir.clone();
         drop(cache);
-        cleanup_tree(&db_path, &blobs);
+        cleanup_tree(&db_path, &blobs)?;
+        Ok(())
     }
 
     #[test]
-    fn blob_chunk_transfer_rejects_out_of_bounds_before_allocation() {
+    fn blob_chunk_transfer_rejects_out_of_bounds_before_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("tier-chunks");
-        let cache = open_cache(&db_path, "media");
+        let cache = open_cache(&db_path, "media")?;
         let value = deterministic_bytes(TIER_THRESHOLD_BYTES + 64);
-        cache.put("v", &value, None).unwrap();
-        let reference = cache.blob_reference("v").unwrap().expect("tiered");
+        cache.put("v", &value, None)?;
+        let reference = cache
+            .blob_reference("v")?
+            .ok_or("expected tiered blob reference")?;
         let oversize = vec![0_u8; MAX_BLOB_CHUNK_BYTES + 1];
-        assert!(matches!(
-            cache
-                .read_blob_chunk(&reference.digest, 0, oversize.len())
-                .unwrap_err(),
-            KvError::InvalidChunkLength(_)
-        ));
-        assert!(matches!(
-            cache
-                .write_blob_chunk(&reference.digest, reference.size, 0, &oversize)
-                .unwrap_err(),
-            KvError::InvalidChunkLength(_)
-        ));
-        assert!(matches!(
-            cache
-                .write_blob_chunk(&reference.digest, reference.size, reference.size, b"x")
-                .unwrap_err(),
-            KvError::InvalidChunkOffset(_)
-        ));
-        assert!(matches!(
-            cache.read_blob_chunk(&[9_u8; 32], 0, 8).unwrap_err(),
-            KvError::MissingBlob { .. }
-        ));
+        let Err(error) = cache.read_blob_chunk(&reference.digest, 0, oversize.len()) else {
+            return Err("expected invalid chunk length".into());
+        };
+        assert!(matches!(error, KvError::InvalidChunkLength(_)));
+        let Err(error) = cache.write_blob_chunk(&reference.digest, reference.size, 0, &oversize)
+        else {
+            return Err("expected invalid chunk length".into());
+        };
+        assert!(matches!(error, KvError::InvalidChunkLength(_)));
+        let Err(error) =
+            cache.write_blob_chunk(&reference.digest, reference.size, reference.size, b"x")
+        else {
+            return Err("expected invalid chunk offset".into());
+        };
+        assert!(matches!(error, KvError::InvalidChunkOffset(_)));
+        let Err(error) = cache.read_blob_chunk(&[9_u8; 32], 0, 8) else {
+            return Err("expected missing blob".into());
+        };
+        assert!(matches!(error, KvError::MissingBlob { .. }));
         let foreign = [7_u8; 32];
-        assert!(matches!(
-            cache.write_blob_chunk(&foreign, 3, 0, b"xyz").unwrap_err(),
-            KvError::CorruptBlob { .. }
-        ));
+        let Err(error) = cache.write_blob_chunk(&foreign, 3, 0, b"xyz") else {
+            return Err("expected corrupt blob".into());
+        };
+        assert!(matches!(error, KvError::CorruptBlob { .. }));
         assert_eq!(
-            cache.sweep_blobs().unwrap(),
+            cache.sweep_blobs()?,
             1,
             "a completed-but-diverged staging file is an unreferenced orphan"
         );
         assert!(!cache.blob_path(&foreign).exists());
         let payload = b"hello-chunked-world";
         let staged = content_digest(payload);
-        let total = payload.len() as u64;
-        let complete = cache
-            .write_blob_chunk(&staged, total, 0, &payload[..5])
-            .unwrap();
+        let total = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let complete = cache.write_blob_chunk(&staged, total, 0, &payload[..5])?;
         assert!(!complete);
-        let complete = cache
-            .write_blob_chunk(&staged, total, 5, &payload[5..])
-            .unwrap();
+        let complete = cache.write_blob_chunk(&staged, total, 5, &payload[5..])?;
         assert!(complete);
-        assert_eq!(
-            cache.read_blob_chunk(&staged, 0, payload.len()).unwrap(),
-            payload
-        );
-        std::fs::remove_file(cache.blob_path(&staged)).unwrap();
-        cleanup_tree(&db_path, &cache.blob_dir.clone());
+        assert_eq!(cache.read_blob_chunk(&staged, 0, payload.len())?, payload);
+        std::fs::remove_file(cache.blob_path(&staged))?;
+        cleanup_tree(&db_path, &cache.blob_dir)?;
+        Ok(())
     }
 
     #[test]
-    fn document_namespace_classifies_slots_for_sync_filtering() {
+    fn document_namespace_classifies_slots_for_sync_filtering()
+    -> Result<(), Box<dyn std::error::Error>> {
         let db_path = path("ns-classify");
         let scope = scope();
         let replica = ReplicaId::new();
         {
-            let first = KvCache::open(&db_path, scope, replica, "one").unwrap();
-            first
-                .put("shared", b"1", Some(Duration::from_secs(60)))
-                .unwrap();
+            let first = KvCache::open(&db_path, scope, replica, "one")?;
+            first.put("shared", b"1", Some(Duration::from_secs(60)))?;
             assert_eq!(
-                first
-                    .document_namespace(document_for("one", "shared"))
-                    .unwrap(),
+                first.document_namespace(document_for("one", "shared"))?,
                 Some("one".to_owned())
             );
             assert_eq!(
-                first
-                    .document_namespace(document_for("two", "shared"))
-                    .unwrap(),
+                first.document_namespace(document_for("two", "shared"))?,
                 None
             );
-            assert_eq!(first.document_namespace(DocumentId::new()).unwrap(), None);
+            assert_eq!(first.document_namespace(DocumentId::new())?, None);
         }
         {
-            let second = KvCache::open(&db_path, scope, replica, "two").unwrap();
-            second
-                .put("shared", b"2", Some(Duration::from_secs(60)))
-                .unwrap();
+            let second = KvCache::open(&db_path, scope, replica, "two")?;
+            second.put("shared", b"2", Some(Duration::from_secs(60)))?;
             assert_eq!(
-                second
-                    .document_namespace(document_for("two", "shared"))
-                    .unwrap(),
+                second.document_namespace(document_for("two", "shared"))?,
                 Some("two".to_owned())
             );
             assert_eq!(
-                second
-                    .document_namespace(document_for("one", "shared"))
-                    .unwrap(),
+                second.document_namespace(document_for("one", "shared"))?,
                 Some("one".to_owned())
             );
         }
-        cleanup(&db_path);
+        cleanup(&db_path)?;
+        Ok(())
     }
 
     #[test]
-    fn blob_names_are_canonical_lowercase_hex_and_reject_every_near_miss() {
+    fn blob_names_are_canonical_lowercase_hex_and_reject_every_near_miss()
+    -> Result<(), Box<dyn std::error::Error>> {
         let canonical = hex_digest(&[0xab; 32]);
         assert_eq!(canonical.len(), 64);
         assert_eq!(hex_to_digest(&canonical), Some([0xab; 32]));
@@ -3356,5 +3439,6 @@ mod tests {
         assert!(!is_blob_name(&long));
         assert!(!is_blob_name(&mixed_case));
         assert!(!is_blob_name(&invalid_digit));
+        Ok(())
     }
 }

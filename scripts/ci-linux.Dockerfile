@@ -3,7 +3,7 @@
 # Existing self-hosted runner image; deliberately no hosted execution service.
 FROM logical-db-act:local
 RUN apt-get update && apt-get install --no-install-recommends -y libclang-dev
-RUN rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+RUN rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt
 ENV CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_BACKTRACE=1
 # Keep the same link configuration in default and FDB checks. Otherwise Cargo
 # rebuilds every shared dependency when the optional lane introduces RUSTFLAGS.
