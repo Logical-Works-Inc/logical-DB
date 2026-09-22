@@ -784,7 +784,6 @@ mod tests {
              content-type: application/vnd.logical-db.v1+cbor\r\n\
              accept: application/vnd.logical-db.v1+cbor\r\n\
              {authorization_line}\
-             /// content-length
              content-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         )
