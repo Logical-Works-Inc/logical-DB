@@ -400,7 +400,11 @@ where
         if self.store.residency() != write.object.region() {
             return Err(ArchiveError::ResidencyMismatch);
         }
+        let expected = ArchiveReceipt::from_object(write.object());
         let receipt = self.store.put(write)?;
+        if receipt != expected {
+            return Err(ArchiveError::ReceiptMismatch);
+        }
         Ok(receipt)
     }
 
@@ -463,6 +467,7 @@ mod tests {
         region: Region,
         objects: BTreeMap<ArchiveObjectId, ArchiveObject>,
         tamper_on_read: bool,
+        wrong_receipt: bool,
     }
 
     impl ArchiveObjectStore for MemoryArchive {
@@ -474,7 +479,10 @@ mod tests {
             if write.object.region != self.region {
                 return Err(ArchiveError::ResidencyMismatch);
             }
-            let receipt = ArchiveReceipt::from_object(&write.object);
+            let mut receipt = ArchiveReceipt::from_object(&write.object);
+            if self.wrong_receipt {
+                receipt.key_version = CustomerKeyVersion::new(3)?;
+            }
             self.objects.insert(write.object.id.clone(), write.object);
             Ok(receipt)
         }
@@ -512,6 +520,7 @@ mod tests {
             region: Region::new("us-east")?,
             objects: BTreeMap::new(),
             tamper_on_read: false,
+            wrong_receipt: false,
         });
         assert_eq!(
             archive.archive(ArchiveWrite::new(object)),
@@ -534,12 +543,30 @@ mod tests {
             region: region.clone(),
             objects: BTreeMap::new(),
             tamper_on_read: false,
+            wrong_receipt: false,
         });
         let receipt = archive.archive(ArchiveWrite::new(object))?;
         archive.store.tamper_on_read = true;
         let restore = ArchiveRestore::new(scope, region, receipt)?;
         assert_eq!(
             archive.restore(&restore),
+            Err(ArchiveError::ReceiptMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_rejects_a_port_receipt_that_relabels_the_customer_key_version()
+    -> Result<(), ArchiveError> {
+        let object = fixture("ca-central")?;
+        let mut archive = SovereignArchive::new(MemoryArchive {
+            region: Region::new("ca-central")?,
+            objects: BTreeMap::new(),
+            tamper_on_read: false,
+            wrong_receipt: true,
+        });
+        assert_eq!(
+            archive.archive(ArchiveWrite::new(object)),
             Err(ArchiveError::ReceiptMismatch)
         );
         Ok(())
