@@ -127,13 +127,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use lgwks_std::hash::Hasher;
 pub use crate::{
     BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
 };
 use crate::{
     ChangeEvent, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar,
 };
+use lgwks_std::hash::Hasher;
 use logical_db_model::MAX_CHANGE_BYTES;
 pub use logical_db_model::{
     AccountId, DocumentId, DocumentRevision, IndexId, IndexValue, NamespaceCheckpoint,
@@ -1813,9 +1813,7 @@ pub fn kv_projections() -> Vec<Projection> {
 }
 
 /// Returns whether a reader describes a well-formed live slot value.
-fn projection_has_live_value(
-    reader: &mut crate::Reader<'_>,
-) -> Result<bool, crate::CrdtError> {
+fn projection_has_live_value(reader: &mut crate::Reader<'_>) -> Result<bool, crate::CrdtError> {
     let Some(Item::Scalar(Scalar::String(key))) = reader.get(&Object::root(), FIELD_KEY)? else {
         return Ok(false);
     };
@@ -2711,11 +2709,7 @@ mod tests {
             let remote: Vec<crate::RemoteChange> = pending
                 .into_iter()
                 .map(|change| {
-                    crate::RemoteChange::new(
-                        change.document,
-                        change.digest,
-                        change.into_bytes(),
-                    )
+                    crate::RemoteChange::new(change.document, change.digest, change.into_bytes())
                 })
                 .collect();
             assert_eq!(remote.len(), 5);

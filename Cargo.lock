@@ -1596,17 +1596,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "logical-db-kv"
-version = "0.1.0"
-dependencies = [
- "lgwks_std",
- "logical-db",
- "logical-db-model",
- "thiserror",
- "uuid",
-]
-
-[[package]]
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
