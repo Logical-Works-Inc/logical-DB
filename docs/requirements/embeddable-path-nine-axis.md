@@ -10,6 +10,63 @@
 > Status of every row is **pass**, **fail**, or **unknown**. A green compile is
 > not a pass. An unrun measurement is unknown, never pass.
 
+## 0. Displacement thesis (why switch)
+
+The embeddable path is judged against the enterprise it must move, not against
+other libraries. The incumbent is the **Gary class**: legacy OLTP (MySQL and
+peers) installed by someone who left, whose schema invariants, triggers, and
+replication topology no one can explain — less interpretability than an AI
+reading its own logs, and unsafe to grant write authority to the agents already
+doing ops.
+
+Switching is justified only where logical-db is the answer to all three:
+
+| # | Incumbent failure | logical-db obligation | Proof row |
+|---|---|---|---|
+| D1 | Cannot explain why a row is what it is | Every mutation carries `OperationId`, request digest, receipt, and causal frontier | EP-2, AE6 |
+| D2 | Unsafe to grant an agent write authority | Scoped grants, exact-request confirmation, immutable receipts that re-enter evidence | EP-X4, ER-T02 |
+| D3 | Cannot leave without a big-bang prayer | Dual-write + content digests + versioned export/restore, fail-closed on corrupt input | EP-1, AE3, AE5 |
+
+**Comparators.** Raw table engines (`native_db`, `redb`, `sqlite`) own local
+storage and lose D1–D3. CRDTs (`Automerge`) merge without authority or durable
+sync. Cloud sync (`CloudKit`, `Realm`, `ElectricSQL`) takes custody. A
+component that cannot own provable operational truth is not a rival for this
+slot. **The answer is never “we are a nicer embedded DB.”**
+
+**Buyers (Director, 2026-09-22 — all of them).** Gary-class displacement (B1),
+agent-ops platforms (B2), sovereign/regulated shops (B3), local-first app ISVs
+(B4), and the enterprise that cannot set up PowerBI and will not staff a DBA,
+alongside the real developers who still have to ship (B5).
+
+**Tesler's law is binding on every decision.** Essential complexity of
+distributed data — retries, recovery, residency, provenance, grants — is
+absorbed by `logical-db`, never left to the app, the operator, or tribal
+knowledge. A choice that moves complexity onto B5 is the wrong choice even when
+it is the smaller diff. Concretely: one dependency (`logical-db`, with
+`logical_db::cache`), typed refusals instead of clamps, receipts instead of
+promises, defaults that fail closed with a recovery transition.
+
+**Scale and impact, not code.** The hard work is displacement at A02 scale and
+A01 class evidence. Thin local benches cannot pass the thesis.
+
+### Beat-eval rule (where we compete)
+
+Adopt the `native_db` criterion harness class (insert / get / range / delete,
+secondary-key counts, batched vs single transaction, `criterion-table`
+reporting) as the **local store** eval so numbers are comparable. Beat evals
+**only where our semantics are the game**:
+
+| We must beat | We match or disclose |
+|---|---|
+| Exact retry under replay (duplicate cost = receipt, no second write) | Raw insert / get / delete without sync or receipts |
+| Kill / crash / reopen integrity | Single-threaded point read latency |
+| Export / restore + corrupt-restore refusal | Secondary-key scan throughput vs `native_db` |
+| Multi-replica convergence + checkpoint-expiry recovery | |
+| Agent-grant refusal and scoped isolation negatives | |
+
+Do not claim a receipt is free. Disclose overhead of digest + durable receipt on
+the raw path as part of A09.
+
 ## 1. Scope of the embeddable path
 
 **Definition.** The embeddable path is what an application can consume when it
