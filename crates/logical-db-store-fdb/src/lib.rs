@@ -207,8 +207,8 @@ impl Record {
             && self.operation == change.operation
             && self.request == change.request
             && self.digest == change.digest
-            && self.byte_len == change.bytes.len()
-            && self.chunks == chunk_count(change.bytes.len())
+            && self.byte_len == change.as_bytes().len()
+            && self.chunks == chunk_count(change.as_bytes().len())
     }
 
     /// Envelope
@@ -232,11 +232,11 @@ fn encode_manifest(
     sequence: u64,
     invocation_id: [u8; 32],
 ) -> Result<[u8; OPERATION_BYTES], DataError> {
-    if !(1..=MAX_CHANGE_BYTES).contains(&change.bytes.len()) {
+    if !(1..=MAX_CHANGE_BYTES).contains(&change.as_bytes().len()) {
         return Err(DataError::InvalidManifest { at: "manifest" });
     }
-    let byte_len = u32::try_from(change.bytes.len()).map_err(malformed_data)?;
-    let chunks = chunk_count(change.bytes.len());
+    let byte_len = u32::try_from(change.as_bytes().len()).map_err(malformed_data)?;
+    let chunks = chunk_count(change.as_bytes().len());
     let mut bytes = [0; OPERATION_BYTES];
     bytes[..16].copy_from_slice(change.document.as_uuid().as_bytes());
     bytes[16..32].copy_from_slice(change.replica.as_uuid().as_bytes());
@@ -1199,7 +1199,7 @@ mod runtime {
             .filter(|value| i64::try_from(*value).is_ok())
             .ok_or_else(|| binding(DataError::SequenceExhausted))?;
         let manifest = encode_manifest(&change, sequence, invocation_id).map_err(binding)?;
-        for (index, bytes) in change.bytes.chunks(CHUNK_BYTES).enumerate() {
+        for (index, bytes) in change.as_bytes().chunks(CHUNK_BYTES).enumerate() {
             let index = u16::try_from(index).map_err(binding_invalid)?;
             transaction.set(&chunk_space.pack(&(sequence, index)), bytes);
         }
@@ -1840,7 +1840,7 @@ mod runtime {
         let exact_retry = record.matches(change)
             && exact_bytes
                 .as_ref()
-                .is_none_or(|bytes| *bytes == change.bytes);
+                .is_none_or(|bytes| *bytes == change.as_bytes());
         Ok(Some(if exact_retry {
             if maybe_committed {
                 AcceptResult::RecoveredUnknownCommit
@@ -2300,7 +2300,10 @@ mod tests {
         let record = operation.record;
         assert_eq!(record.sequence, 41);
         assert!(record.matches(&change));
-        assert_eq!(record.envelope(change.scope, change.bytes.clone()), change);
+        assert_eq!(
+            record.envelope(change.scope, change.as_bytes().to_vec()),
+            change
+        );
         assert_eq!(
             decode_manifest(&encoded[..MANIFEST_BYTES], 99)?.sequence,
             99
@@ -2322,7 +2325,9 @@ mod tests {
         altered.digest = ChangeDigest::new([10; 32]);
         assert!(!record.matches(&altered));
         altered = change.clone();
-        altered.bytes.pop();
+        let mut truncated = altered.as_bytes().to_vec();
+        truncated.pop();
+        altered.replace_bytes(truncated);
         assert!(!record.matches(&altered));
         assert!(
             !Record {

@@ -1124,7 +1124,7 @@ mod tests {
             OperationId::new(),
             OperationDigest::new([8; 32]),
             encoded.digest,
-            encoded.bytes,
+            encoded.as_bytes().to_vec(),
         ))
     }
 
@@ -1140,9 +1140,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES).await?;
         let decoded: PushResponse = ciborium::from_reader(body.as_ref())?;
-        assert_eq!(decoded.outcomes.len(), 1);
+        assert_eq!(decoded.outcomes().len(), 1);
         decoded
-            .outcomes
+            .into_outcomes()
             .into_iter()
             .next()
             .ok_or_else(|| "expected exactly one push outcome".into())
@@ -1185,7 +1185,7 @@ mod tests {
         mutations[5].request = OperationDigest::new([99; 32]);
         mutations[6].digest = ChangeDigest::new([99; 32]);
         let replacement = change(scope, original.replica)?;
-        mutations[7].bytes = replacement.bytes;
+        mutations[7].replace_bytes(replacement.as_bytes().to_vec());
         mutations[7].digest = replacement.digest;
         for mutation in mutations {
             assert!(matches!(
@@ -1251,7 +1251,7 @@ mod tests {
         let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES).await?;
         let response: PushResponse = ciborium::from_reader(body.as_ref())?;
         assert!(matches!(
-            response.outcomes.as_slice(),
+            response.outcomes(),
             [PushOutcome::Accepted { operation }] if *operation == change.operation
         ));
 
@@ -1270,7 +1270,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES).await?;
         let page: PullPage = ciborium::from_reader(body.as_ref())?;
-        assert_eq!(page.changes, vec![change]);
+        assert_eq!(page.changes(), &[change]);
         Ok(())
     }
 
@@ -1401,7 +1401,7 @@ mod tests {
         let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES).await?;
         let response: PushResponse = ciborium::from_reader(body.as_ref())?;
         assert!(matches!(
-            response.outcomes.as_slice(),
+            response.outcomes(),
             [PushOutcome::Rejected { operation, code: RejectionCode::Forbidden }]
                 if *operation == change.operation
         ));
@@ -1452,7 +1452,7 @@ mod tests {
         let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES).await?;
         let response: PushResponse = ciborium::from_reader(body.as_ref())?;
         assert!(matches!(
-            response.outcomes.as_slice(),
+            response.outcomes(),
             [PushOutcome::Rejected {
                 operation,
                 code: RejectionCode::InvocationConsumed

@@ -85,7 +85,26 @@ pub struct ChangeEnvelope {
         serialize_with = "serde_bytes::serialize",
         deserialize_with = "deserialize_change_bytes"
     )]
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl ChangeEnvelope {
+    /// Canonical change bytes. Borrowed so a host never clones the payload.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this envelope, returning its canonical bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Replaces the canonical bytes after validation (test/host repair seam).
+    pub fn replace_bytes(&mut self, bytes: Vec<u8>) {
+        self.bytes = bytes;
+    }
 }
 
 impl ChangeEnvelope {
@@ -139,10 +158,22 @@ pub struct PushRequest {
     pub replica: ReplicaId,
     /// Ordered, independently idempotent changes.
     #[serde(deserialize_with = "deserialize_changes")]
-    pub changes: Vec<ChangeEnvelope>,
+    changes: Vec<ChangeEnvelope>,
 }
 
 impl PushRequest {
+    /// Ordered changes in this request. Borrowed so a host never clones payloads.
+    #[must_use]
+    pub fn changes(&self) -> &[ChangeEnvelope] {
+        &self.changes
+    }
+
+    /// Consumes this request, returning its changes.
+    #[must_use]
+    pub fn into_changes(self) -> Vec<ChangeEnvelope> {
+        self.changes
+    }
+
     /// Builds a bounded upload request from its version, sender, and changes.
     ///
     /// `#[non_exhaustive]` makes a struct expression impossible outside this
@@ -230,10 +261,22 @@ pub struct PushResponse {
     pub protocol: u16,
     /// One result for every request entry, in request order.
     #[serde(deserialize_with = "deserialize_outcomes")]
-    pub outcomes: Vec<PushOutcome>,
+    outcomes: Vec<PushOutcome>,
 }
 
 impl PushResponse {
+    /// Ordered outcomes in this response. Borrowed so a host never clones payloads.
+    #[must_use]
+    pub fn outcomes(&self) -> &[PushOutcome] {
+        &self.outcomes
+    }
+
+    /// Consumes this response, returning its outcomes.
+    #[must_use]
+    pub fn into_outcomes(self) -> Vec<PushOutcome> {
+        self.outcomes
+    }
+
     /// Builds a service response from its version and ordered outcomes.
     ///
     /// `#[non_exhaustive]` makes a struct expression impossible outside this
@@ -344,7 +387,7 @@ pub struct PullPage {
     pub protocol: u16,
     /// Changes preceding `checkpoint` in the scoped service log.
     #[serde(deserialize_with = "deserialize_changes")]
-    pub changes: Vec<ChangeEnvelope>,
+    changes: Vec<ChangeEnvelope>,
     /// Replacement checkpoint persisted atomically with `changes`.
     pub checkpoint: Checkpoint,
     /// Whether another page is immediately available.
@@ -352,6 +395,18 @@ pub struct PullPage {
 }
 
 impl PullPage {
+    /// Changes in this page. Borrowed so a host never clones the payload.
+    #[must_use]
+    pub fn changes(&self) -> &[ChangeEnvelope] {
+        &self.changes
+    }
+
+    /// Consumes this page, returning its changes and checkpoint metadata.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ChangeEnvelope>, Checkpoint, bool) {
+        (self.changes, self.checkpoint, self.more)
+    }
+
     /// Builds one bounded service-to-client page from its changes and checkpoint.
     ///
     /// `#[non_exhaustive]` makes a struct expression impossible outside this
@@ -466,10 +521,22 @@ pub struct BaselineDocument {
         serialize_with = "serde_bytes::serialize",
         deserialize_with = "deserialize_baseline_snapshot"
     )]
-    pub snapshot: Vec<u8>,
+    snapshot: Vec<u8>,
 }
 
 impl BaselineDocument {
+    /// Canonical serialized document state. Borrowed so a host never clones payloads.
+    #[must_use]
+    pub fn as_snapshot(&self) -> &[u8] {
+        &self.snapshot
+    }
+
+    /// Consumes this document state, returning its canonical bytes.
+    #[must_use]
+    pub fn into_snapshot(self) -> Vec<u8> {
+        self.snapshot
+    }
+
     /// Builds one document state from its identity, tombstone flag, and bytes.
     ///
     /// `#[non_exhaustive]` makes a struct expression impossible outside this
@@ -504,10 +571,10 @@ pub struct BaselinePage {
         serialize_with = "serde_bytes::serialize",
         deserialize_with = "deserialize_baseline_descriptor"
     )]
-    pub descriptor: Vec<u8>,
+    descriptor: Vec<u8>,
     /// Strictly ascending document states through the descriptor position.
     #[serde(deserialize_with = "deserialize_baseline_documents")]
-    pub documents: Vec<BaselineDocument>,
+    documents: Vec<BaselineDocument>,
     /// Replacement checkpoint covering `descriptor` exactly.
     pub checkpoint: Checkpoint,
     /// Whether more documents follow this page for the same descriptor.
@@ -517,6 +584,24 @@ pub struct BaselinePage {
 }
 
 impl BaselinePage {
+    /// Canonical descriptor bytes. Borrowed so a host never clones payloads.
+    #[must_use]
+    pub fn as_descriptor(&self) -> &[u8] {
+        &self.descriptor
+    }
+
+    /// Strictly ascending document states in this page.
+    #[must_use]
+    pub fn documents(&self) -> &[BaselineDocument] {
+        &self.documents
+    }
+
+    /// Consumes this page, returning its descriptor and documents.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<BaselineDocument>, Checkpoint, bool) {
+        (self.descriptor, self.documents, self.checkpoint, self.more)
+    }
+
     /// Builds one bounded baseline page from its descriptor, documents, and cursor.
     ///
     /// `#[non_exhaustive]` makes a struct expression impossible outside this

@@ -717,7 +717,7 @@ impl Database {
             operation,
             request,
             change.digest,
-            &change.bytes,
+            change.as_bytes(),
         )?;
         let outcome = self.store.commit_local(LocalCommit::new(
             local_change,
@@ -771,7 +771,7 @@ impl Database {
             operation: edit.operation,
             request: edit.request,
             digest: change.digest,
-            bytes: change.bytes,
+            bytes: change.into_bytes(),
             expected_revision,
             snapshot,
             indexes,
@@ -933,7 +933,7 @@ impl Database {
             operation,
             request,
             change.digest,
-            &change.bytes,
+            change.as_bytes(),
         )?;
         let outcome = self.store.commit_local(LocalCommit::new(
             local_change,
@@ -1161,7 +1161,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let mut grouped: BTreeMap<DocumentId, Vec<EncodedChange>> = BTreeMap::new();
         for change in changes {
-            let encoded = EncodedChange::new(change.digest, change.bytes.clone());
+            let encoded = EncodedChange::new(change.digest, change.as_bytes().to_vec());
             encoded.validate()?;
             grouped.entry(change.document).or_default().push(encoded);
         }
@@ -1189,7 +1189,9 @@ impl Database {
             .collect::<Vec<_>>();
         let durable_changes = changes
             .iter()
-            .map(|change| StoredRemoteChange::new(change.document, change.digest, &change.bytes))
+            .map(|change| {
+                StoredRemoteChange::new(change.document, change.digest, change.as_bytes())
+            })
             .collect::<Vec<_>>();
         self.store.install_remote_page(
             self.scope,
@@ -1689,7 +1691,7 @@ impl ReplicaPort for Database {
                         change.operation,
                         change.request,
                         change.digest,
-                        change.bytes,
+                        change.into_bytes(),
                     )
                 })
                 .collect()
@@ -2421,7 +2423,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<transport::PushResponse, Self::Error>>
         {
             let outcomes = request
-                .changes
+                .changes()
                 .iter()
                 .map(|change| transport::PushOutcome::Accepted {
                     operation: change.operation,
@@ -3074,7 +3076,7 @@ mod tests {
             OperationId::new(),
             OperationDigest::new([0x4c; 32]),
             change.digest,
-            &change.bytes,
+            change.as_bytes(),
         )?;
         let outcome = store.commit_local(LocalCommit::new(
             local_change,
@@ -3540,7 +3542,7 @@ mod tests {
                     .map(|change| RemoteChange {
                         document: change.document,
                         digest: change.digest,
-                        bytes: change.bytes.clone(),
+                        bytes: change.as_bytes().to_vec(),
                     })
                     .collect::<Vec<_>>(),
                 b"checkpoint-a",
@@ -3552,7 +3554,7 @@ mod tests {
                     .map(|change| RemoteChange {
                         document: change.document,
                         digest: change.digest,
-                        bytes: change.bytes.clone(),
+                        bytes: change.as_bytes().to_vec(),
                     })
                     .collect::<Vec<_>>(),
                 b"checkpoint-b",
@@ -4020,7 +4022,7 @@ mod tests {
                     change.operation,
                     change.request,
                     change.digest,
-                    change.bytes.clone(),
+                    change.as_bytes().to_vec(),
                 )
             })
             .collect()

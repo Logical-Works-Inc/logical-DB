@@ -460,7 +460,7 @@ where
             }
             continue;
         };
-        let inbound = page.changes.len();
+        let inbound = page.changes().len();
         report.pulled = report.pulled.saturating_add(inbound);
         report.pages = report.pages.saturating_add(1);
         let download_more = page.more;
@@ -498,7 +498,7 @@ where
     let mut pending = Vec::with_capacity(available.len());
     for change in available {
         let next_bytes = aggregate_bytes
-            .checked_add(change.bytes.len())
+            .checked_add(change.as_bytes().len())
             .ok_or(SyncError::Protocol(ProtocolError::PageLimit))?;
         if next_bytes > usize::try_from(byte_limit).unwrap_or(usize::MAX) {
             break;
@@ -522,7 +522,7 @@ where
                     change.operation,
                     change.request,
                     change.digest,
-                    change.bytes.clone(),
+                    change.as_bytes().to_vec(),
                 )
             })
             .collect(),
@@ -533,7 +533,7 @@ where
         .await
         .map_err(SyncError::Transport)?;
     response.validate(&request).map_err(SyncError::Protocol)?;
-    for outcome in &response.outcomes {
+    for outcome in response.outcomes() {
         if let PushOutcome::Rejected { operation, code } = *outcome {
             return Err(SyncError::Rejected { operation, code });
         }
@@ -615,12 +615,12 @@ where
     page.validate(replica.scope())
         .map_err(SyncError::Protocol)?;
     let inbound = page
-        .changes
+        .changes()
         .iter()
         .map(|change| InboundChange {
             document: change.document,
             digest: change.digest,
-            bytes: change.bytes.clone(),
+            bytes: change.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
     replica
@@ -672,7 +672,7 @@ where
     let mut checkpoint = page.checkpoint.clone();
     let mut fetched = 1usize;
     let mut bytes = page_snapshot_bytes(&page);
-    let mut accumulated = page.documents.len();
+    let mut accumulated = page.documents().len();
     if accumulated > declared || bytes > limits.recovery_bytes {
         return Err(SyncError::RecoveryBudgetExhausted);
     }
@@ -698,7 +698,7 @@ where
             .checked_add(page_snapshot_bytes(&page))
             .ok_or(SyncError::RecoveryBudgetExhausted)?;
         accumulated = accumulated
-            .checked_add(page.documents.len())
+            .checked_add(page.documents().len())
             .ok_or(SyncError::Protocol(ProtocolError::BaselineMismatch))?;
         if accumulated > declared || bytes > limits.recovery_bytes {
             return Err(SyncError::RecoveryBudgetExhausted);
@@ -721,9 +721,9 @@ where
 
 /// Encoded snapshot bytes carried by one baseline page.
 fn page_snapshot_bytes(page: &BaselinePage) -> u64 {
-    page.documents
+    page.documents()
         .iter()
-        .map(|document| u64::try_from(document.snapshot.len()).unwrap_or(u64::MAX))
+        .map(|document| u64::try_from(document.as_snapshot().len()).unwrap_or(u64::MAX))
         .sum()
 }
 
@@ -1182,7 +1182,7 @@ where
     let mut pending = Vec::with_capacity(mine.len());
     for change in mine {
         let next_bytes = aggregate_bytes
-            .checked_add(change.bytes.len())
+            .checked_add(change.as_bytes().len())
             .ok_or(NamespaceSyncError::Protocol(ProtocolError::PageLimit))?;
         if next_bytes > usize::try_from(policy.bytes_per_page()).unwrap_or(usize::MAX) {
             break;
@@ -1206,7 +1206,7 @@ where
                     change.operation,
                     change.request,
                     change.digest,
-                    change.bytes.clone(),
+                    change.as_bytes().to_vec(),
                 )
             })
             .collect(),
@@ -1219,7 +1219,7 @@ where
     response
         .validate(&request)
         .map_err(NamespaceSyncError::Protocol)?;
-    for outcome in &response.outcomes {
+    for outcome in response.outcomes() {
         if let PushOutcome::Rejected { operation, code } = *outcome {
             return Err(NamespaceSyncError::Rejected { operation, code });
         }
@@ -1292,13 +1292,13 @@ where
     R: ReplicaPort,
 {
     let inbound = page
-        .changes
+        .changes()
         .iter()
         .filter(|change| is_mine(change.document))
         .map(|change| InboundChange {
             document: change.document,
             digest: change.digest,
-            bytes: change.bytes.clone(),
+            bytes: change.as_bytes().to_vec(),
         })
         .collect::<Vec<_>>();
     let refreshed = NamespaceCheckpoint::new(
@@ -3085,8 +3085,8 @@ mod tests {
             &mut self,
             request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
-            let mut outcomes = Vec::with_capacity(request.changes.len());
-            for change in &request.changes {
+            let mut outcomes = Vec::with_capacity(request.changes().len());
+            for change in request.changes() {
                 self.pushed_operations.borrow_mut().push(change.operation);
                 if self.reject_push {
                     outcomes.push(PushOutcome::Rejected {
@@ -3699,13 +3699,13 @@ mod tests {
             &mut self,
             request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
-            for change in &request.changes {
+            for change in request.changes() {
                 self.pushed.borrow_mut().push(change.operation);
             }
             std::future::ready(Ok(PushResponse::new(
                 PROTOCOL_VERSION,
                 request
-                    .changes
+                    .changes()
                     .iter()
                     .map(|change| PushOutcome::Accepted {
                         operation: change.operation,
@@ -3828,13 +3828,13 @@ mod tests {
                 self.faults_left = self.faults_left.saturating_sub(1);
                 return std::future::ready(Err(self.fault));
             }
-            for change in &request.changes {
+            for change in request.changes() {
                 self.pushes.borrow_mut().push(change.operation);
             }
             std::future::ready(Ok(PushResponse::new(
                 PROTOCOL_VERSION,
                 request
-                    .changes
+                    .changes()
                     .iter()
                     .map(|change| PushOutcome::Accepted {
                         operation: change.operation,
@@ -3883,12 +3883,12 @@ mod tests {
             request: PushRequest,
         ) -> impl Future<Output = Result<PushResponse, Self::Error>> {
             let mut entries = self.entries.borrow_mut();
-            let mut outcomes = Vec::with_capacity(request.changes.len());
-            for change in &request.changes {
+            let mut outcomes = Vec::with_capacity(request.changes().len());
+            for change in request.changes() {
                 self.pushes.borrow_mut().push(change.operation);
-                let duplicate = entries
-                    .iter()
-                    .any(|entry| entry.document == change.document && entry.bytes == change.bytes);
+                let duplicate = entries.iter().any(|entry| {
+                    entry.document == change.document && entry.bytes == change.as_bytes().to_vec()
+                });
                 if duplicate {
                     outcomes.push(PushOutcome::Duplicate {
                         operation: change.operation,
@@ -3896,7 +3896,7 @@ mod tests {
                 } else {
                     entries.push(LogChange {
                         document: change.document,
-                        bytes: change.bytes.clone(),
+                        bytes: change.as_bytes().to_vec(),
                     });
                     outcomes.push(PushOutcome::Accepted {
                         operation: change.operation,

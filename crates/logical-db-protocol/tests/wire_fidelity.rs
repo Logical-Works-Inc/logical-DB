@@ -94,9 +94,9 @@ fn a_pre_migration_push_request_round_trips_byte_for_byte() -> Result<(), Box<dy
         decoded.protocol, PROTOCOL_VERSION,
         "the protocol version must decode unchanged"
     );
-    assert_eq!(decoded.changes.len(), 1, "one change must decode");
+    assert_eq!(decoded.changes().len(), 1, "one change must decode");
     assert_eq!(
-        decoded.changes[0].bytes,
+        decoded.changes()[0].as_bytes().to_vec(),
         vec![1, 2, 3],
         "the change bytes must decode unchanged"
     );
