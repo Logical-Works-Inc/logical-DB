@@ -1,28 +1,17 @@
 {
-  "evidence": "Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in evidence/SOURCES.md.",
   "profile": "embedded",
   "backend_class": "EmbeddedLocal",
   "status": "measured",
-  "workload": {
-    "operations": 5000,
-    "documents": 32,
-    "operations_per_commit": 32,
-    "runs": 1
-  },
-  "cold_start_micros": 43256,
-  "recovery_reopen_micros": 7081,
-  "p50_latency_micros": 15170,
-  "p99_latency_micros": 26194,
-  "throughput_ops_per_second": 2084,
+  "workload": { "operations": 5000, "documents": 32, "operations_per_commit": 32, "runs": 1 },
+  "cold_start_micros": 31245,
+  "recovery_reopen_micros": 6879,
+  "p50_latency_micros": 8901,
+  "p99_latency_micros": 12608,
+  "throughput_ops_per_second": 3657,
   "durable_bytes": 10162176,
   "cpu_seconds": null,
   "peak_rss_bytes": null,
   "unmeasured_reason": "std exposes no portable process-CPU or RSS API; adding a platform crate is a separate lgwks-deps decision",
-  "correctness": {
-    "committed_operations": 5000,
-    "duplicate_retries_honored": 1,
-    "index_queries_matched": 1,
-    "tombstones_verified": 1
-  },
+  "correctness": { "committed_operations": 5000, "duplicate_retries_honored": 1, "index_queries_matched": 1, "tombstones_verified": 1 },
   "detail": "redb embedded replica; 32 operations per durable commit; median of 1 runs"
 }
