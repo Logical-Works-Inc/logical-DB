@@ -34,6 +34,21 @@ Database::restore(payload)
 Database::restore_cursor()
 ```
 
+One dependency is enough (Tesler’s law). Two optional surfaces live on the
+same facade:
+
+```text
+logical_db::sync::{SyncOrchestrator, OrchestratorState, OrchestratorPolicy,
+                   RetrySignal, RunReport, ReplicaPort, SyncError, ...}
+logical_db::cache::{KvCache, BatchPut, CacheEntry, KvError, ...}
+```
+
+`sync` owns batching, backoff, and opaque persisted scheduling state around
+`Database::synchronize`; it never forks the push/pull loop. `cache` is the
+typed key/TTL/eviction/tiering facade (R10–R13) on the same embedded replica.
+Hosts do not import `logical-db-sync`, `logical-db-store`, or a second cache
+crate to finish the documented journey.
+
 Each `Projection` supplies an explicit `ProjectionSemantics` that is bound
 into the durable schema digest alongside its `IndexId`. Changing a projection
 function's output requires changed semantics and an explicit
