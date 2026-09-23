@@ -33,8 +33,8 @@ may_depend_on = ["kernel", "cloud", "cairn", "lem"]
 
 # Product adapters sit above the facade.
 [layers.adapter]
-crates = ["logical-db-kv"]
-public_contracts = ["logical-db-kv"]
+crates = ["logical-db"]
+public_contracts = ["logical-db"]
 may_depend_on = ["kernel", "facade"]
 
 # The cross-domain journey harness. It is a test composition layer and may

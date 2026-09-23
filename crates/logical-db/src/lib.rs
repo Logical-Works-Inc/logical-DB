@@ -48,6 +48,11 @@ use thiserror::Error;
 /// MAX EDIT BATCH
 const MAX_EDIT_BATCH: usize = 256;
 
+/// Deterministic key-value cache with TTL, batching, namespace checkpoints,
+/// and tiered values (R10–R13). Application-facing as `logical_db::cache` so
+/// a host takes one dependency (Tesler: complexity stays in this crate).
+pub mod cache;
+
 /// Opt-in production thin-client transport exposed by the same app facade.
 #[cfg(feature = "http")]
 pub mod http {

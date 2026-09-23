@@ -128,10 +128,10 @@ use std::{
 };
 
 use lgwks_std::hash::Hasher;
-pub use logical_db::{
+pub use crate::{
     BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
 };
-use logical_db::{
+use crate::{
     ChangeEvent, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar,
 };
 use logical_db_model::MAX_CHANGE_BYTES;
@@ -1363,9 +1363,6 @@ impl KvCache {
             Ok(())
         })? {
             EditOutcome::Applied(_) | EditOutcome::Duplicate(_) => {}
-            // `EditOutcome` is non_exhaustive: a future outcome is not a
-            // successful slot write, so this fails closed.
-            _ => return Err(KvError::CorruptEnvelope),
         }
         Ok(())
     }
@@ -1472,8 +1469,8 @@ impl KvCache {
 
     /// Decodes expiry and sequence fields from a reader.
     fn decode_expiry_and_sequence(
-        reader: &mut logical_db::Reader<'_>,
-    ) -> Result<Option<(i64, u64)>, logical_db::CrdtError> {
+        reader: &mut crate::Reader<'_>,
+    ) -> Result<Option<(i64, u64)>, crate::CrdtError> {
         let expires_at_ms = match reader.get(&Object::root(), FIELD_EXPIRY)? {
             None => NEVER_EXPIRES_AT_MS,
             Some(Item::Scalar(Scalar::Timestamp(millis) | Scalar::Integer(millis))) => millis,
@@ -1532,7 +1529,7 @@ impl KvCache {
                 let sequence = self.next_sequence(now);
                 let operation = OperationId::new();
                 let digest = clear_digest(&operation, &self.namespace, key);
-                let clear = |editor: &mut logical_db::Editor<'_>| {
+                let clear = |editor: &mut crate::Editor<'_>| {
                     editor.delete(&Object::root(), FIELD_VALUE)?;
                     editor.delete(&Object::root(), FIELD_BLOB)?;
                     editor.delete(&Object::root(), FIELD_SIZE)?;
@@ -1551,8 +1548,6 @@ impl KvCache {
                         live,
                         cleared: true,
                     }),
-                    // `EditOutcome` is non_exhaustive: fail closed.
-                    _ => Err(KvError::CorruptEnvelope),
                 }
             }
             Decoded::Found(_) | Decoded::Absent => Ok(ClearOutcome {
@@ -1819,8 +1814,8 @@ pub fn kv_projections() -> Vec<Projection> {
 
 /// Returns whether a reader describes a well-formed live slot value.
 fn projection_has_live_value(
-    reader: &mut logical_db::Reader<'_>,
-) -> Result<bool, logical_db::CrdtError> {
+    reader: &mut crate::Reader<'_>,
+) -> Result<bool, crate::CrdtError> {
     let Some(Item::Scalar(Scalar::String(key))) = reader.get(&Object::root(), FIELD_KEY)? else {
         return Ok(false);
     };
@@ -2195,7 +2190,7 @@ fn document_for(namespace: &str, key: &str) -> DocumentId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logical_db::CrdtError;
+    use crate::CrdtError;
 
     fn scope() -> Scope {
         Scope::new(AccountId::new(), SpaceId::new())
@@ -2713,10 +2708,10 @@ mod tests {
                 writer.put(key, key.as_bytes(), Some(Duration::from_secs(60)))?;
             }
             let pending = writer.database().pending_changes(0, 64)?;
-            let remote: Vec<logical_db::RemoteChange> = pending
+            let remote: Vec<crate::RemoteChange> = pending
                 .into_iter()
                 .map(|change| {
-                    logical_db::RemoteChange::new(
+                    crate::RemoteChange::new(
                         change.document,
                         change.digest,
                         change.into_bytes(),
@@ -2828,10 +2823,10 @@ mod tests {
         peer: PeerId,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let pending = writer.database().pending_changes(0, 64)?;
-        let remote: Vec<logical_db::RemoteChange> = pending
+        let remote: Vec<crate::RemoteChange> = pending
             .into_iter()
             .map(|change| {
-                logical_db::RemoteChange::new(change.document, change.digest, change.into_bytes())
+                crate::RemoteChange::new(change.document, change.digest, change.into_bytes())
             })
             .collect();
         let count = remote.len();
