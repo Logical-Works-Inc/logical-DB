@@ -31,8 +31,8 @@ license = "Apache-2.0"
 repository = "https://github.com/srinji-kaggss/logical-DB"
 
 [workspace.dependencies]
-automerge = "=0.11.0"
-redb = "=4.2.0"
+automerge = "=0.12.0"
+redb = "=4.3.0"
 thiserror = "=2.0.20"
 uuid = { version = "=1.26.1", features = ["serde", "v7"] }
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
