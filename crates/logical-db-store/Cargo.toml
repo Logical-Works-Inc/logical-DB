@@ -14,7 +14,6 @@ repository.workspace = true
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 redb.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
 
 [lints]
 workspace = true

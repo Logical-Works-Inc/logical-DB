@@ -6,13 +6,15 @@
 
 use std::{fs, process::Command, thread, time::Duration};
 
-use logical_db::{AccountId, Database, Item, Object, ReplicaId, Scalar, Scope, SpaceId};
+use logical_db::{
+    AccountId, Database, DocumentId, Item, Object, ReplicaId, Scalar, Scope, SpaceId,
+};
 
 /// A killed writer never exposes a partial embedded transition on reopen.
 #[test]
 fn forced_termination_never_exposes_a_partial_embedded_transition()
 -> Result<(), Box<dyn std::error::Error>> {
-    let suffix = uuid::Uuid::now_v7();
+    let suffix = DocumentId::unique_suffix();
     let path = std::env::temp_dir().join(format!("logical-db-kill-{suffix}.redb"));
     let ready = std::env::temp_dir().join(format!("logical-db-kill-{suffix}.ready"));
     let scope = Scope::new(AccountId::new(), SpaceId::new());

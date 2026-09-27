@@ -6,13 +6,20 @@
 > `evidence/SOURCES.md`.
 
 Logical-DB is one product with four independently developed domains: the
-sovereign Cloud Plane, Cairn ontology/evidence, LEM/ORIGIN agent memory, and
-Forge operations. They share versioned contracts rather than ambient mutable
-authority. The current public facade is an embedded structured-state API: each
+sovereign Cloud Plane, Cairn ontology/evidence, LEM/ORIGIN agent memory, and Forge
+operations. They share versioned contracts rather than ambient mutable
+authority. Read the [product and architecture direction](docs/PRODUCT-DIRECTION.md)
+before choosing a workstream: it is the concise statement of what Logical-DB
+is, what it deliberately is not, and how the local-first, provenance-first
+substrate absorbs old SQL/Postgres systems without making the team own
+distributed state.
+
+The current public facade is an embedded structured-state API: each
 app owns an immediately durable replica and may exchange immutable causal
-changes through an optional FoundationDB-backed relay.
+ changes through an optional FoundationDB-backed relay.
 
 The desired Cloud Plane is a sovereign hyperscale data substrate; that is a
+
 measured target, not a present-tense scale claim. Local execution reduces
 retained remote data, transfer, and cloud compute, but does not replace the
 self-hostable distributed service contract. Read the [product map](docs/PRODUCT-MAP.md),

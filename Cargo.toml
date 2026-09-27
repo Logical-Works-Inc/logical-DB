@@ -33,9 +33,8 @@ repository = "https://github.com/srinji-kaggss/logical-DB"
 automerge = "=0.11.0"
 redb = "=4.2.0"
 thiserror = "=2.0.20"
-uuid = { version = "=1.26.1", features = ["serde", "v7"] }
-foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
-foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] }
+foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3"] }
+foundationdb-tuple = "=0.11.0"
 serde_bytes = "=0.11.19"
 ciborium = "=0.2.2"
 # FROZEN BOUNDARY (async surface): `reqwest` and `axum` are the async HTTP

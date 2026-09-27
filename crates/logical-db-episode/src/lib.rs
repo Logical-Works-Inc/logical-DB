@@ -23,7 +23,6 @@ use lgwks_std::json::serde::{
 };
 use logical_db_cairn::{EpisodeRef, TokenKind, digest_frame};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Maximum episode references accepted in one bounded list (mirrors
 /// model `MAX_CHANGES_PER_PAGE`).
@@ -45,10 +44,22 @@ pub const EPISODE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_EPISODES_PER_SNAPSHOT: usize = 256;
 
 /// Content-derived episode identity; the zero digest is rejected.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(crate = "lgwks_std::json::serde")]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EpisodeId([u8; 32]);
+
+impl Serialize for EpisodeId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use lgwks_std::json::serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(self.0.len())?;
+        for byte in self.0 {
+            tuple.serialize_element(&byte)?;
+        }
+        tuple.end()
+    }
+}
 
 impl<'de> Deserialize<'de> for EpisodeId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -245,14 +256,49 @@ pub fn content_id(episode: &Episode) -> [u8; 32] {
     ])
 }
 
+/// Writes the scope pair as two 16-byte strings, the locked v1 wire shape.
+fn serialize_scope<S>(
+    scope: &Option<([u8; 16], [u8; 16])>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use lgwks_std::json::serde::ser::SerializeTuple;
+    let Some(pair) = scope.as_ref() else {
+        return serializer.serialize_none();
+    };
+    let mut tuple = serializer.serialize_tuple(2)?;
+    for identifier in [
+        DefiniteBytes(pair.0.as_slice()),
+        DefiniteBytes(pair.1.as_slice()),
+    ] {
+        tuple.serialize_element(&identifier)?;
+    }
+    tuple.end()
+}
+
+/// Serializes a byte slice as one definite-length CBOR byte string, so it never
+/// collapses into a bare sequence of integers.
+struct DefiniteBytes<'a>(&'a [u8]);
+
+impl Serialize for DefiniteBytes<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
 /// Encodes an optional `(account, space)` scope as a presence byte plus both
 /// 16-byte UUIDs, so a `None` scope hashes distinctly from any real pair.
-fn scope_bytes(scope: Option<(Uuid, Uuid)>) -> Vec<u8> {
+fn scope_bytes(scope: Option<([u8; 16], [u8; 16])>) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(33);
     bytes.push(u8::from(scope.is_some()));
     if let Some((account, space)) = scope {
-        bytes.extend_from_slice(account.as_bytes());
-        bytes.extend_from_slice(space.as_bytes());
+        bytes.extend_from_slice(&account);
+        bytes.extend_from_slice(&space);
     }
     bytes
 }
@@ -418,10 +464,9 @@ pub struct Episode {
     pub seq: u64,
     /// Episode kind from the CAIRN token vocabulary.
     pub kind: TokenKind,
-    /// Account/space scope as an `(account, space)` [`Uuid`] pair mirroring the
-    /// bytes of model `AccountId`/`SpaceId`; kept as [`Uuid`]s here so this
-    /// layer does not depend on model types.
-    pub scope: Option<(Uuid, Uuid)>,
+    /// Account/space scope as the 16-byte model `AccountId` and `SpaceId`
+    /// values, so this crate names no identifier type of its own.
+    pub scope: Option<([u8; 16], [u8; 16])>,
     /// Seven-clock timestamp.
     pub time: EpisodeTime,
     /// Upstream episodes, bounded to 256 and deduped.
@@ -447,7 +492,7 @@ impl Episode {
         evidence: Vec<EpisodeId>,
         parents: Vec<EpisodeId>,
         payload: Vec<u8>,
-        scope: Option<(Uuid, Uuid)>,
+        scope: Option<([u8; 16], [u8; 16])>,
     ) -> Result<Self, EpisodeError> {
         check_ref_list(&evidence, "evidence")?;
         check_ref_list(&parents, "parents")?;
@@ -503,7 +548,8 @@ struct EpisodeWire {
     /// Episode kind from the CAIRN token vocabulary.
     kind: TokenKind,
     /// Account/space scope as an `(account, space)` UUID pair.
-    scope: Option<(Uuid, Uuid)>,
+    #[serde(serialize_with = "serialize_scope")]
+    scope: Option<([u8; 16], [u8; 16])>,
     /// Seven-clock timestamp.
     time: EpisodeTime,
     /// Bounded, deduped upstream episodes.
@@ -576,10 +622,9 @@ impl<'de> Deserialize<'de> for Episode {
 pub struct LocalWorldRecord {
     /// Local replay checkpoint, not cross-instance identity.
     pub source_sequence: u64,
-    /// Account/space scope as an `(account, space)` [`Uuid`] pair mirroring the
-    /// bytes of model `AccountId`/`SpaceId`; kept as [`Uuid`]s here so this
-    /// layer does not depend on model types.
-    pub scope: Option<(Uuid, Uuid)>,
+    /// Account/space scope as the 16-byte model `AccountId` and `SpaceId`
+    /// values, so this crate names no identifier type of its own.
+    pub scope: Option<([u8; 16], [u8; 16])>,
     /// Causal DAG frontier.
     pub source_heads: Vec<EpisodeId>,
     /// Upstream episodes the rendering rests on.
@@ -609,7 +654,7 @@ impl LocalWorldRecord {
         trajectories: Vec<EpisodeId>,
         contradictions: Vec<EpisodeId>,
         rendered: Vec<u8>,
-        scope: Option<(Uuid, Uuid)>,
+        scope: Option<([u8; 16], [u8; 16])>,
     ) -> Result<Self, EpisodeError> {
         if i64::try_from(source_sequence).is_err() {
             return Err(EpisodeError::BadSequence);
@@ -919,8 +964,8 @@ mod tests {
     }
 
     /// Returns the fixed `(account, space)` scope used by most fixtures.
-    fn scope() -> (Uuid, Uuid) {
-        (Uuid::from_bytes([1u8; 16]), Uuid::from_bytes([2u8; 16]))
+    fn scope() -> ([u8; 16], [u8; 16]) {
+        ([1u8; 16], [2u8; 16])
     }
 
     /// Builds a valid evidence-bearing episode, failing loudly on a bound bug.

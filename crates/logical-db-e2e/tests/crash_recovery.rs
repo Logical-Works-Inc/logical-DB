@@ -18,7 +18,7 @@ fn committed_edit_survives_process_exit_without_destructors()
 -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::temp_dir().join(format!(
         "logical-db-crash-recovery-{}.redb",
-        uuid::Uuid::now_v7()
+        DocumentId::new()
     ));
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let replica = ReplicaId::new();

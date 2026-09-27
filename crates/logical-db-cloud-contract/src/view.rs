@@ -401,20 +401,18 @@ fn validate_identity(value: &str, kind: &'static str) -> Result<(), ViewError> {
 
 #[cfg(test)]
 mod tests {
-    use logical_db_model::{AccountId, SpaceId};
-    use uuid::Uuid;
-
     use super::{
         AuthorizedView, ViewCursor, ViewError, ViewGrant, ViewId, ViewLimits, ViewRequest,
         ViewVersion,
     };
     use crate::{PartitionId, RecoveryAuthority, Scope};
+    use logical_db_model::{AccountId, SpaceId};
 
     /// Builds a deterministic scope for view-contract tests.
     fn scope() -> Scope {
         Scope::new(
-            AccountId::from_uuid(Uuid::from_u128(1)),
-            SpaceId::from_uuid(Uuid::from_u128(2)),
+            AccountId::from_fixture_u128(1),
+            SpaceId::from_fixture_u128(2),
         )
     }
 

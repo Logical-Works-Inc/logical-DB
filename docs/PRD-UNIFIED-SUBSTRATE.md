@@ -11,6 +11,10 @@
 - Supersedes: nothing; ratifies the recorded rulings in `GOVERNANCE.md`
   (#6 substrate-not-apps, #8 redb-local + FDB-distributed) and extends them
   with the semantic-plane unification of ADR-0001
+- Product/architecture direction: [`PRODUCT-DIRECTION.md`](PRODUCT-DIRECTION.md)
+  defines the zero-cognitive-debt USP, the four-plane architecture, and the
+  research-derived boundaries; this PRD remains the detailed work-package
+  definition.
 
 ## 1. Product thesis
 

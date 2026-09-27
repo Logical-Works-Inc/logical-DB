@@ -32,7 +32,6 @@ use logical_db::{
         BaselineRequest, BaselineResult, PullRequest, PullResult, PushRequest, PushResponse,
     },
 };
-use uuid::Uuid;
 
 /// HTTP transport wrapper that signals the recovery seam and can stall there.
 struct PausingTransport {
@@ -88,11 +87,11 @@ async fn recover() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
     let path = PathBuf::from(required(&arguments, 1, "redb path")?);
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&required(&arguments, 2, "account")?)?),
-        SpaceId::from_uuid(Uuid::parse_str(&required(&arguments, 3, "space")?)?),
+        AccountId::parse_canonical(&required(&arguments, 2, "account")?)?,
+        SpaceId::parse_canonical(&required(&arguments, 3, "space")?)?,
     );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(&required(&arguments, 4, "replica")?)?);
-    let peer = PeerId::from_uuid(Uuid::parse_str(&required(&arguments, 5, "peer")?)?);
+    let replica = ReplicaId::parse_canonical(&required(&arguments, 4, "replica")?)?;
+    let peer = PeerId::parse_canonical(&required(&arguments, 5, "peer")?)?;
     let endpoint: Url = required(&arguments, 6, "endpoint")?.parse()?;
     let bearer = StaticBearer::new(&required(&arguments, 7, "bearer")?)?;
     let ready = PathBuf::from(required(&arguments, 8, "ready path")?);

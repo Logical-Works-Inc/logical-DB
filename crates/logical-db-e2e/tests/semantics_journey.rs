@@ -24,14 +24,13 @@ use logical_db_cairn::{Actionability, EpisodeRef, Modality, Observation, TokenKi
 use logical_db_episode::{
     Episode, EpisodeError, EpisodeId, EpisodeTime, LocalWorldRecord, OriginLog, content_id,
 };
-use uuid::Uuid;
 
 /// The episode snapshot roundtrips through a facade document under the guard.
 #[test]
 fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard()
 -> Result<(), Box<dyn std::error::Error>> {
-    let account = Uuid::now_v7();
-    let space = Uuid::now_v7();
+    let account = AccountId::new();
+    let space = SpaceId::new();
     let payload = b"semantics journey payload".to_vec();
 
     let episode = Episode::new(
@@ -41,7 +40,7 @@ fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard()
         Vec::new(),
         Vec::new(),
         payload,
-        Some((account, space)),
+        Some((account.as_bytes(), space.as_bytes())),
     )?;
     assert_eq!(
         episode.id.into_bytes(),
@@ -74,8 +73,11 @@ fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard()
     let mut snapshot = Vec::new();
     ciborium::into_writer(&episode, &mut snapshot)?;
 
-    let path = std::env::temp_dir().join(format!("logical-db-semantics-{}.redb", Uuid::now_v7()));
-    let scope = Scope::new(AccountId::from_uuid(account), SpaceId::from_uuid(space));
+    let path = std::env::temp_dir().join(format!(
+        "logical-db-semantics-{}.redb",
+        DocumentId::unique_suffix()
+    ));
+    let scope = Scope::new(account, space);
     let replica = ReplicaId::new();
     let document = DocumentId::new();
     let database = Database::open(&path, scope, replica)?;
@@ -104,7 +106,7 @@ fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard()
         vec![id],
         Vec::new(),
         b"state".to_vec(),
-        Some((account, space)),
+        Some((account.as_bytes(), space.as_bytes())),
     )?;
     assert_eq!(
         record.source_heads,
@@ -118,7 +120,7 @@ fn episode_snapshot_roundtrips_through_facade_document_with_evidence_guard()
         vec![EpisodeId::new([9u8; 32])?],
         Vec::new(),
         b"state".to_vec(),
-        Some((account, space)),
+        Some((account.as_bytes(), space.as_bytes())),
     );
     assert_eq!(
         uncovered,

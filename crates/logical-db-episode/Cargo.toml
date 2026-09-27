@@ -18,7 +18,6 @@ repository.workspace = true
 lgwks_std.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 thiserror.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true

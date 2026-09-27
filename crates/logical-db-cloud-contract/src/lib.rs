@@ -450,7 +450,7 @@ impl PartitionMap {
                 transition: self.transition(),
             });
         }
-        let key = u128::from_be_bytes(request.document.as_uuid().into_bytes());
+        let key = u128::from_be_bytes(request.document.as_bytes());
         let route = self
             .routes
             .values()
@@ -684,17 +684,15 @@ fn ranges_overlap(left: &PartitionRoute, right: &PartitionRoute) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use logical_db_model::{AccountId, OperationDigest, OperationId, SpaceId};
-    use uuid::Uuid;
-
     use super::{
         DocumentId, OrderingDomain, PartitionId, PartitionMap, PartitionRoute, RecoveryAuthority,
         RouteHandoff, RouteRequest, RoutingEpoch, RoutingError, Scope,
     };
+    use logical_db_model::{AccountId, OperationDigest, OperationId, SpaceId};
 
     /// Builds a deterministic document key for routing tests.
     fn document(value: u128) -> DocumentId {
-        DocumentId::from_uuid(Uuid::from_u128(value))
+        DocumentId::from_fixture_u128(value)
     }
 
     /// Builds a scope-bound retry request with deterministic operation identity.
@@ -706,7 +704,7 @@ mod tests {
         Ok(RouteRequest::new(
             scope,
             document,
-            OperationId::from_uuid(Uuid::from_u128(99)),
+            OperationId::from_fixture_u128(99),
             OperationDigest::new([7; 32]),
             RoutingEpoch::new(epoch)?,
         ))
@@ -735,8 +733,8 @@ mod tests {
             None => value,
         };
         Scope::new(
-            AccountId::from_uuid(Uuid::from_u128(value)),
-            SpaceId::from_uuid(Uuid::from_u128(space)),
+            AccountId::from_fixture_u128(value),
+            SpaceId::from_fixture_u128(space),
         )
     }
 

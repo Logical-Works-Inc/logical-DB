@@ -64,6 +64,12 @@ const KIND_RESTORE: u8 = 17;
 const KIND_BASELINE: u8 = 18;
 /// Row kind for one durable baseline invalidation.
 const KIND_BASELINE_EVENT: u8 = 19;
+/// Row kind for one post-checkpoint change pointer, ordered by document revision.
+const KIND_SNAPSHOT_DELTA: u8 = 20;
+/// Row kind for the revision represented by each complete snapshot checkpoint.
+const KIND_SNAPSHOT_CHECKPOINT: u8 = 21;
+/// Row kind for the bounded serialized checkpoint-suffix byte count.
+const KIND_SNAPSHOT_SUFFIX_BYTES: u8 = 22;
 /// Magic prefix identifying a versioned logical export payload.
 const EXPORT_MAGIC: [u8; 5] = [b'L', b'D', b'B', b'E', 0x01];
 /// Version of the logical export payload defined in this module.
@@ -80,6 +86,8 @@ const EXPORT_DOCUMENT_PREFIX_BYTES: usize = 16 + 1 + 4;
 const RESTORE_MARKER_BYTES: usize = 32 + 8;
 /// Maximum aggregate snapshot state retained while installing or migrating one page.
 pub const MAX_MATERIALIZED_PAGE_BYTES: usize = 67_108_864;
+/// Maximum immutable changes replayed after one complete snapshot checkpoint.
+pub const MAX_SNAPSHOT_DELTAS: usize = 31;
 /// Length of the shared scope prefix: format magic plus account and space UUIDs.
 const SCOPE_PREFIX_BYTES: usize = FORMAT.len() + 16 + 16;
 /// Length of one kind-prefixed sequence key: scope prefix, kind tag, and `u64`.
@@ -162,7 +170,8 @@ pub struct LocalCommit<'a> {
     pub change: LocalChange<'a>,
     /// Revision observed with the input snapshot, or none for a new document.
     pub expected_revision: Option<DocumentRevision>,
-    /// Complete verified Automerge snapshot after applying the change.
+    /// Complete verified Automerge checkpoint after applying the change, or
+    /// empty to append the immutable change as a bounded checkpoint suffix.
     pub snapshot: &'a [u8],
     /// Complete materialized index set for the successor snapshot.
     pub indexes: &'a [IndexEntry],
@@ -195,16 +204,62 @@ impl<'a> LocalCommit<'a> {
             tombstone,
         }
     }
+
+    /// Builds one atomic local commit that appends its immutable change to the
+    /// existing checkpoint suffix. The store refuses the append once its
+    /// bounded suffix is full, requiring the caller to provide a new checkpoint.
+    #[must_use]
+    pub fn new_incremental(
+        change: LocalChange<'a>,
+        expected_revision: DocumentRevision,
+        indexes: &'a [IndexEntry],
+        tombstone: bool,
+    ) -> Self {
+        Self {
+            change,
+            expected_revision: Some(expected_revision),
+            snapshot: &[],
+            indexes,
+            tombstone,
+        }
+    }
 }
 
 /// Latest complete snapshot and its optimistic concurrency marker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct StoredSnapshot {
-    /// Complete verified Automerge snapshot bytes.
-    pub bytes: Vec<u8>,
+    /// Complete verified Automerge checkpoint bytes.
+    bytes: Vec<u8>,
     /// Last locally committed change identity.
     pub revision: DocumentRevision,
+    /// Ordered immutable changes after `bytes`, bounded by `MAX_SNAPSHOT_DELTAS`.
+    deltas: Vec<(ChangeDigest, Vec<u8>)>,
+}
+
+impl StoredSnapshot {
+    /// Builds one complete checkpoint plus its bounded ordered suffix.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose snapshots through here.
+    #[must_use]
+    pub fn new(
+        bytes: Vec<u8>,
+        revision: DocumentRevision,
+        deltas: Vec<(ChangeDigest, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            bytes,
+            revision,
+            deltas,
+        }
+    }
+
+    /// The complete verified checkpoint and its ordered suffix.
+    #[must_use]
+    pub fn checkpoint_and_deltas(&self) -> (&[u8], &[(ChangeDigest, Vec<u8>)]) {
+        (&self.bytes, &self.deltas)
+    }
 }
 
 /// One immutable remote change to install with a materialized snapshot.
@@ -352,8 +407,37 @@ pub struct MigrationDocument {
     pub document: DocumentId,
     /// Revision that must still be current when replacement indexes commit.
     pub revision: DocumentRevision,
-    /// Complete verified snapshot used to compute replacement projections.
-    pub snapshot: Vec<u8>,
+    /// Complete verified base checkpoint used to compute replacement projections.
+    snapshot: Vec<u8>,
+    /// Ordered immutable changes after the checkpoint.
+    deltas: Vec<(ChangeDigest, Vec<u8>)>,
+}
+
+impl MigrationDocument {
+    /// Builds one checkpoint-plus-suffix input for a migration batch.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose migration documents through here.
+    #[must_use]
+    pub fn new(
+        document: DocumentId,
+        revision: DocumentRevision,
+        snapshot: Vec<u8>,
+        deltas: Vec<(ChangeDigest, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            document,
+            revision,
+            snapshot,
+            deltas,
+        }
+    }
+
+    /// The complete verified base checkpoint and its ordered suffix.
+    #[must_use]
+    pub fn checkpoint_and_deltas(&self) -> (&[u8], &[(ChangeDigest, Vec<u8>)]) {
+        (&self.snapshot, &self.deltas)
+    }
 }
 
 /// One bounded migration page and the cursor it was read from.
@@ -363,7 +447,24 @@ pub struct MigrationPage {
     /// Durable cursor that must still identify the migration when applied.
     pub after: Option<DocumentId>,
     /// Ordered documents following `after`.
-    pub documents: Vec<MigrationDocument>,
+    documents: Vec<MigrationDocument>,
+}
+
+impl MigrationPage {
+    /// Builds one bounded migration page read from a durable cursor.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose migration pages through here.
+    #[must_use]
+    pub fn new(after: Option<DocumentId>, documents: Vec<MigrationDocument>) -> Self {
+        Self { after, documents }
+    }
+
+    /// The ordered documents following this page's cursor.
+    #[must_use]
+    pub fn documents(&self) -> &[MigrationDocument] {
+        &self.documents
+    }
 }
 
 /// Replacement materialized rows for one migration document.
@@ -410,7 +511,7 @@ pub struct ExportEntry {
     /// Immutable CRDT change identity.
     pub digest: ChangeDigest,
     /// Canonical CRDT change bytes.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl ExportEntry {
@@ -434,6 +535,19 @@ impl ExportEntry {
             bytes,
         }
     }
+
+    /// The canonical CRDT change bytes of this entry.
+    #[must_use]
+    pub fn change_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Replaces this entry's canonical change bytes, for re-encoding a
+    /// deliberately altered export fixture. The bytes are not validated here;
+    /// `decode_export` and the CRDT validator remain the boundary.
+    pub fn replace_change_bytes(&mut self, bytes: Vec<u8>) {
+        self.bytes = bytes;
+    }
 }
 
 /// One document snapshot carried by a versioned logical export.
@@ -445,7 +559,7 @@ pub struct ExportDocument {
     /// Whether the exported snapshot carries a first-class tombstone.
     pub tombstone: bool,
     /// Complete verified snapshot after the last exported change.
-    pub snapshot: Vec<u8>,
+    snapshot: Vec<u8>,
 }
 
 impl ExportDocument {
@@ -461,6 +575,12 @@ impl ExportDocument {
             snapshot,
         }
     }
+
+    /// The complete verified snapshot of this exported document.
+    #[must_use]
+    pub fn snapshot_bytes(&self) -> &[u8] {
+        &self.snapshot
+    }
 }
 
 /// One bounded document page of a resumable logical export scan.
@@ -470,7 +590,65 @@ pub struct ExportScanPage {
     /// Durable cursor the page was read from.
     pub after: Option<DocumentId>,
     /// Ordered documents following `after`.
-    pub documents: Vec<ExportDocument>,
+    documents: Vec<ExportScanDocument>,
+}
+
+impl ExportScanPage {
+    /// Builds one bounded export-scan page read from a durable cursor.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose export scan pages through here.
+    #[must_use]
+    pub fn new(after: Option<DocumentId>, documents: Vec<ExportScanDocument>) -> Self {
+        Self { after, documents }
+    }
+
+    /// The ordered documents following this page's cursor.
+    #[must_use]
+    pub fn documents(&self) -> &[ExportScanDocument] {
+        &self.documents
+    }
+}
+
+/// One scoped checkpoint and bounded suffix returned by an export scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ExportScanDocument {
+    /// Document ordered by its portable identifier.
+    pub document: DocumentId,
+    /// Whether the checkpoint plus suffix carries a first-class tombstone.
+    pub tombstone: bool,
+    /// Complete verified base checkpoint bytes.
+    snapshot: Vec<u8>,
+    /// Ordered immutable changes after the checkpoint.
+    deltas: Vec<(ChangeDigest, Vec<u8>)>,
+}
+
+impl ExportScanDocument {
+    /// Builds one bounded checkpoint-and-suffix entry for an export scan.
+    ///
+    /// `#[non_exhaustive]` makes a struct expression impossible outside this
+    /// crate, so external callers compose export scan documents through here.
+    #[must_use]
+    pub fn new(
+        document: DocumentId,
+        tombstone: bool,
+        snapshot: Vec<u8>,
+        deltas: Vec<(ChangeDigest, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            document,
+            tombstone,
+            snapshot,
+            deltas,
+        }
+    }
+
+    /// The complete verified base checkpoint and its ordered suffix.
+    #[must_use]
+    pub fn checkpoint_and_deltas(&self) -> (&[u8], &[(ChangeDigest, Vec<u8>)]) {
+        (&self.snapshot, &self.deltas)
+    }
 }
 
 /// Durable cursor of an interrupted versioned restore.
@@ -562,7 +740,7 @@ impl EmbeddedStore {
         let existing_replica = {
             let replica_value = table.get(REPLICA_KEY)?;
             replica_value
-                .map(|value| decode_uuid(value.value()).map(ReplicaId::from_uuid))
+                .map(|value| decode_identifier(value.value(), ReplicaId::from_durable_bytes))
                 .transpose()?
         };
         match existing_replica {
@@ -732,17 +910,28 @@ impl EmbeddedStore {
                 let error = StoreError::CorruptInternalValue;
                 return Err(error);
             }
-            let Some(next_bytes) = add_materialized_bytes(materialized_bytes, snapshot_bytes)
+            let document = decode_identifier(
+                &key.value()[row_prefix.len()..],
+                DocumentId::from_durable_bytes,
+            )?;
+            let revision = stored_revision(&table, scope, document)?;
+            let checkpoint_revision =
+                snapshot_checkpoint_revision(&table, scope, document, revision)?;
+            let deltas =
+                read_snapshot_deltas(&table, scope, document, checkpoint_revision, revision.get())?;
+            let Some(next_bytes) =
+                add_checkpoint_and_delta_bytes(materialized_bytes, snapshot_bytes, &deltas)
             else {
+                if documents.is_empty() {
+                    return Err(StoreError::InvalidMigrationPage);
+                }
                 break;
             };
-            let document =
-                decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)?;
-            let revision = stored_revision(&table, scope, document)?;
             documents.push(MigrationDocument {
                 document,
                 revision,
                 snapshot: value.value().to_vec(),
+                deltas,
             });
             materialized_bytes = next_bytes;
         }
@@ -813,7 +1002,10 @@ impl EmbeddedStore {
                     let error = StoreError::CorruptInternalValue;
                     return Err(error);
                 }
-                decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)
+                decode_identifier(
+                    &key.value()[row_prefix.len()..],
+                    DocumentId::from_durable_bytes,
+                )
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         if expected_documents.len() != documents.len()
@@ -933,17 +1125,18 @@ impl EmbeddedStore {
                 let error = StoreError::CorruptInternalValue;
                 return Err(error);
             }
-            let Some(next_bytes) = add_materialized_bytes(materialized_bytes, snapshot.len())
-            else {
+            let document = export_document(&table, scope, key.value(), row_prefix.len(), snapshot)?;
+            let Some(next_bytes) = add_checkpoint_and_delta_bytes(
+                materialized_bytes,
+                snapshot.len(),
+                &document.deltas,
+            ) else {
+                if documents.is_empty() {
+                    return Err(StoreError::InvalidExportSize(snapshot.len()));
+                }
                 break;
             };
-            documents.push(export_document(
-                &table,
-                scope,
-                key.value(),
-                row_prefix.len(),
-                snapshot,
-            )?);
+            documents.push(document);
             materialized_bytes = next_bytes;
         }
         Ok(ExportScanPage { after, documents })
@@ -1020,7 +1213,12 @@ impl EmbeddedStore {
         let mut documents = BTreeSet::new();
         let mut operations = BTreeSet::new();
         for commit in commits {
-            if !is_nonempty_bounded(commit.snapshot.len(), MAX_SNAPSHOT_BYTES) {
+            if commit.snapshot.is_empty() && commit.expected_revision.is_none() {
+                return Err(StoreError::SnapshotCheckpointRequired);
+            }
+            if !commit.snapshot.is_empty()
+                && !is_nonempty_bounded(commit.snapshot.len(), MAX_SNAPSHOT_BYTES)
+            {
                 let error = StoreError::InvalidSnapshotSize(commit.snapshot.len());
                 return Err(error);
             }
@@ -1158,9 +1356,63 @@ impl EmbeddedStore {
             .transpose()?;
         match (snapshot, revision) {
             (None, None) => Ok(None),
-            (Some(bytes), Some(revision)) => Ok(Some(StoredSnapshot { bytes, revision })),
+            (Some(bytes), Some(revision)) => {
+                let checkpoint_revision =
+                    snapshot_checkpoint_revision(&table, scope, document, revision)?;
+                let deltas = read_snapshot_deltas(
+                    &table,
+                    scope,
+                    document,
+                    checkpoint_revision,
+                    revision.get(),
+                )?;
+                let delta_bytes = deltas
+                    .iter()
+                    .fold(0usize, |total, delta| total.saturating_add(delta.1.len()));
+                let materialized_bytes = bytes.len().saturating_add(delta_bytes);
+                if materialized_bytes > MAX_SNAPSHOT_BYTES {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                let suffix_size = table
+                    .get(key_snapshot_suffix_bytes(scope, document).as_slice())?
+                    .map(|value| decode_u64(value.value()))
+                    .transpose()?;
+                if suffix_size
+                    .is_some_and(|stored| usize::try_from(stored).ok() != Some(delta_bytes))
+                    || (suffix_size.is_none() && !deltas.is_empty())
+                {
+                    return Err(StoreError::CorruptInternalValue);
+                }
+                Ok(Some(StoredSnapshot {
+                    bytes,
+                    revision,
+                    deltas,
+                }))
+            }
             _ => Err(StoreError::CorruptInternalValue),
         }
+    }
+
+    /// Reads only the latest document revision, without loading its checkpoint suffix.
+    ///
+    /// This is the cache-validation path for a scope-bound facade. A cached
+    /// document is usable only when this durable marker exactly matches it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed read, corruption, or migration-state error.
+    pub fn document_revision(
+        &self,
+        scope: Scope,
+        document: DocumentId,
+    ) -> Result<Option<DocumentRevision>, StoreError> {
+        let transaction = self.database.begin_read()?;
+        let table = transaction.open_table(DATA)?;
+        ensure_not_migrating(&table, scope)?;
+        table
+            .get(key_revision(scope, document).as_slice())?
+            .map(|value| decode_revision(value.value()))
+            .transpose()
     }
 
     /// Returns whether a first-class tombstone is durably recorded.
@@ -1385,8 +1637,10 @@ impl EmbeddedStore {
                     let error = StoreError::CorruptInternalValue;
                     return Err(error);
                 }
-                let document =
-                    decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)?;
+                let document = decode_identifier(
+                    &key.value()[row_prefix.len()..],
+                    DocumentId::from_durable_bytes,
+                )?;
                 let reverse = table
                     .get(key_index_reverse(scope, document, index).as_slice())?
                     .ok_or(StoreError::CorruptInternalValue)?;
@@ -1817,6 +2071,9 @@ pub enum StoreError {
     /// Complete snapshot bytes violated the local resource bound.
     #[error("snapshot byte length {0} is outside local bounds")]
     InvalidSnapshotSize(usize),
+    /// The bounded incremental suffix needs a new full snapshot checkpoint.
+    #[error("document checkpoint is required before another incremental change")]
+    SnapshotCheckpointRequired,
     /// An operation identity was reused for a different change.
     #[error("operation identity was already committed with different bytes")]
     OperationConflict,
@@ -1973,10 +2230,74 @@ fn commit_local_member(
         *sequence,
     );
     let outbox_value = encode_outbox(commit.change);
-    table.insert(
-        key_snapshot(scope, commit.change.document).as_slice(),
-        commit.snapshot,
-    )?;
+    if commit.snapshot.is_empty() {
+        let Some(current_revision) = current_revision else {
+            return Err(StoreError::SnapshotCheckpointRequired);
+        };
+        let snapshot_key = key_snapshot(scope, commit.change.document);
+        if table.get(snapshot_key.as_slice())?.is_none() {
+            return Err(StoreError::SnapshotCheckpointRequired);
+        }
+        let delta_count = snapshot_delta_rows(table, scope, commit.change.document)?.len();
+        if delta_count >= MAX_SNAPSHOT_DELTAS {
+            return Err(StoreError::SnapshotCheckpointRequired);
+        }
+        let checkpoint = table
+            .get(snapshot_key.as_slice())?
+            .ok_or(StoreError::SnapshotCheckpointRequired)?;
+        let checkpoint_size = checkpoint.value().len();
+        drop(checkpoint);
+        let suffix_key = key_snapshot_suffix_bytes(scope, commit.change.document);
+        let suffix_bytes = table
+            .get(suffix_key.as_slice())?
+            .map(|value| decode_u64(value.value()))
+            .transpose()?
+            .unwrap_or(0);
+        if suffix_bytes == 0 && delta_count > 0 {
+            return Err(StoreError::CorruptInternalValue);
+        }
+        let next_suffix_bytes = usize::try_from(suffix_bytes)
+            .ok()
+            .and_then(|current| current.checked_add(commit.change.bytes.len()))
+            .ok_or(StoreError::SnapshotCheckpointRequired)?;
+        if checkpoint_size
+            .checked_add(next_suffix_bytes)
+            .is_none_or(|total| total > MAX_SNAPSHOT_BYTES)
+        {
+            return Err(StoreError::SnapshotCheckpointRequired);
+        }
+        let next_suffix_bytes_u64 =
+            u64::try_from(next_suffix_bytes).map_err(|_| StoreError::SnapshotCheckpointRequired)?;
+        table.insert(
+            suffix_key.as_slice(),
+            next_suffix_bytes_u64.to_be_bytes().as_slice(),
+        )?;
+        let checkpoint_key = key_snapshot_checkpoint(scope, commit.change.document);
+        if table.get(checkpoint_key.as_slice())?.is_none() {
+            table.insert(
+                checkpoint_key.as_slice(),
+                current_revision.get().to_be_bytes().as_slice(),
+            )?;
+        }
+        table.insert(
+            key_snapshot_delta(scope, commit.change.document, next_revision).as_slice(),
+            commit.change.digest.into_bytes().as_slice(),
+        )?;
+    } else {
+        table.insert(
+            key_snapshot(scope, commit.change.document).as_slice(),
+            commit.snapshot,
+        )?;
+        table.insert(
+            key_snapshot_checkpoint(scope, commit.change.document).as_slice(),
+            next_revision.get().to_be_bytes().as_slice(),
+        )?;
+        table.insert(
+            key_snapshot_suffix_bytes(scope, commit.change.document).as_slice(),
+            0_u64.to_be_bytes().as_slice(),
+        )?;
+        clear_snapshot_deltas(table, scope, commit.change.document)?;
+    }
     table.insert(
         key_change(scope, commit.change.document, commit.change.digest).as_slice(),
         commit.change.bytes,
@@ -2059,15 +2380,19 @@ fn export_document(
     key: &[u8],
     prefix_length: usize,
     snapshot: &[u8],
-) -> Result<ExportDocument, StoreError> {
-    let document = decode_uuid(&key[prefix_length..]).map(DocumentId::from_uuid)?;
+) -> Result<ExportScanDocument, StoreError> {
+    let document = decode_identifier(&key[prefix_length..], DocumentId::from_durable_bytes)?;
     let tombstone = table
         .get(key_tombstone(scope, document).as_slice())?
         .is_some_and(|value| value.value() == [1_u8]);
-    Ok(ExportDocument {
+    let revision = stored_revision(table, scope, document)?;
+    let checkpoint_revision = snapshot_checkpoint_revision(table, scope, document, revision)?;
+    let deltas = read_snapshot_deltas(table, scope, document, checkpoint_revision, revision.get())?;
+    Ok(ExportScanDocument {
         document,
         tombstone,
         snapshot: snapshot.to_vec(),
+        deltas,
     })
 }
 
@@ -2085,6 +2410,15 @@ fn install_remote_document(
         key_snapshot(scope, document.document).as_slice(),
         document.snapshot,
     )?;
+    table.insert(
+        key_snapshot_checkpoint(scope, document.document).as_slice(),
+        next.get().to_be_bytes().as_slice(),
+    )?;
+    table.insert(
+        key_snapshot_suffix_bytes(scope, document.document).as_slice(),
+        0_u64.to_be_bytes().as_slice(),
+    )?;
+    clear_snapshot_deltas(table, scope, document.document)?;
     table.insert(
         key_revision(scope, document.document).as_slice(),
         next.get().to_be_bytes().as_slice(),
@@ -2153,7 +2487,7 @@ fn bind_upstream_in_table(
 ) -> Result<(), StoreError> {
     let upstream_key = key_upstream(scope);
     if let Some(value) = table.get(upstream_key.as_slice())? {
-        let configured = decode_uuid(value.value()).map(PeerId::from_uuid)?;
+        let configured = decode_identifier(value.value(), PeerId::from_durable_bytes)?;
         return if configured == requested {
             Ok(())
         } else {
@@ -2177,7 +2511,10 @@ fn bind_upstream_in_table(
                 let error = StoreError::CorruptInternalValue;
                 return Err(error);
             }
-            decode_uuid(&key.value()[checkpoint_prefix.len()..]).map(PeerId::from_uuid)
+            decode_identifier(
+                &key.value()[checkpoint_prefix.len()..],
+                PeerId::from_durable_bytes,
+            )
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
     let configured = match *legacy_peers.as_slice() {
@@ -2253,7 +2590,10 @@ fn decode_migration(
         {
             None
         }
-        1 => Some(decode_uuid(&bytes[1 + SCHEMA_VALUE_BYTES..]).map(DocumentId::from_uuid)?),
+        1 => Some(decode_identifier(
+            &bytes[1 + SCHEMA_VALUE_BYTES..],
+            DocumentId::from_durable_bytes,
+        )?),
         _ => {
             let error = StoreError::CorruptInternalValue;
             return Err(error);
@@ -2283,6 +2623,141 @@ fn key_snapshot(scope: Scope, document: DocumentId) -> Vec<u8> {
     let mut key = prefix(scope, KIND_SNAPSHOT);
     key.extend_from_slice(document.as_uuid().as_bytes());
     key
+}
+
+/// Builds the marker key for the revision materialized by a full checkpoint.
+fn key_snapshot_checkpoint(scope: Scope, document: DocumentId) -> Vec<u8> {
+    let mut key = prefix(scope, KIND_SNAPSHOT_CHECKPOINT);
+    key.extend_from_slice(document.as_uuid().as_bytes());
+    key
+}
+
+/// Builds the bounded suffix-byte accounting key for one document.
+fn key_snapshot_suffix_bytes(scope: Scope, document: DocumentId) -> Vec<u8> {
+    let mut key = prefix(scope, KIND_SNAPSHOT_SUFFIX_BYTES);
+    key.extend_from_slice(document.as_uuid().as_bytes());
+    key
+}
+
+/// Builds the ordered suffix prefix for one document's post-checkpoint changes.
+fn key_snapshot_delta_prefix(scope: Scope, document: DocumentId) -> Vec<u8> {
+    let mut key = prefix(scope, KIND_SNAPSHOT_DELTA);
+    key.extend_from_slice(document.as_uuid().as_bytes());
+    key
+}
+
+/// Builds the suffix-index row key for one document revision.
+fn key_snapshot_delta(scope: Scope, document: DocumentId, revision: DocumentRevision) -> Vec<u8> {
+    let mut key = key_snapshot_delta_prefix(scope, document);
+    key.extend_from_slice(&revision.get().to_be_bytes());
+    key
+}
+
+/// One bounded suffix row's guarded key and value.
+type SnapshotDeltaRow<'a> = (
+    redb::AccessGuard<'a, &'static [u8]>,
+    redb::AccessGuard<'a, &'static [u8]>,
+);
+
+/// Reads one document's bounded suffix rows, refusing a suffix longer than
+/// [`MAX_SNAPSHOT_DELTAS`] so no caller can silently read or clear past the cap.
+fn snapshot_delta_rows<'a, T>(
+    table: &'a T,
+    scope: Scope,
+    document: DocumentId,
+) -> Result<Vec<SnapshotDeltaRow<'a>>, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let row_prefix = key_snapshot_delta_prefix(scope, document);
+    let end = next_prefix(&row_prefix).ok_or(StoreError::CorruptInternalValue)?;
+    let mut rows = Vec::new();
+    for entry in table
+        .range(row_prefix.as_slice()..end.as_slice())?
+        .take(MAX_SNAPSHOT_DELTAS.saturating_add(1))
+    {
+        if rows.len() >= MAX_SNAPSHOT_DELTAS {
+            return Err(StoreError::CorruptInternalValue);
+        }
+        rows.push(entry?);
+    }
+    Ok(rows)
+}
+
+/// Reads and validates the bounded immutable-change suffix after one checkpoint.
+fn read_snapshot_deltas(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+    document: DocumentId,
+    checkpoint_revision: u64,
+    latest_revision: u64,
+) -> Result<Vec<(ChangeDigest, Vec<u8>)>, StoreError> {
+    let row_prefix = key_snapshot_delta_prefix(scope, document);
+    let mut expected_revision = checkpoint_revision;
+    let mut deltas = Vec::new();
+    for (key, value) in snapshot_delta_rows(table, scope, document)? {
+        if key.value().len() != row_prefix.len().saturating_add(8) || value.value().len() != 32 {
+            return Err(StoreError::CorruptInternalValue);
+        }
+        expected_revision = expected_revision
+            .checked_add(1)
+            .ok_or(StoreError::CorruptInternalValue)?;
+        if decode_u64(&key.value()[row_prefix.len()..])? != expected_revision
+            || expected_revision > latest_revision
+        {
+            return Err(StoreError::CorruptInternalValue);
+        }
+        let digest_bytes: [u8; 32] = value
+            .value()
+            .try_into()
+            .map_err(|_| StoreError::CorruptInternalValue)?;
+        let digest = ChangeDigest::new(digest_bytes);
+        let change = table
+            .get(key_change(scope, document, digest).as_slice())?
+            .ok_or(StoreError::CorruptInternalValue)?;
+        if !is_nonempty_bounded(change.value().len(), MAX_CHANGE_BYTES) {
+            return Err(StoreError::CorruptInternalValue);
+        }
+        deltas.push((digest, change.value().to_vec()));
+    }
+    if expected_revision != latest_revision {
+        return Err(StoreError::CorruptInternalValue);
+    }
+    Ok(deltas)
+}
+
+/// Returns the checkpoint revision, treating pre-suffix snapshots as current.
+fn snapshot_checkpoint_revision(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    scope: Scope,
+    document: DocumentId,
+    latest_revision: DocumentRevision,
+) -> Result<u64, StoreError> {
+    let checkpoint_revision = table
+        .get(key_snapshot_checkpoint(scope, document).as_slice())?
+        .map(|value| decode_u64(value.value()))
+        .transpose()?
+        .unwrap_or_else(|| latest_revision.get());
+    if checkpoint_revision > latest_revision.get() {
+        return Err(StoreError::CorruptInternalValue);
+    }
+    Ok(checkpoint_revision)
+}
+
+/// Removes one document's bounded incremental suffix during checkpointing.
+fn clear_snapshot_deltas(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    scope: Scope,
+    document: DocumentId,
+) -> Result<(), StoreError> {
+    let keys = snapshot_delta_rows(table, scope, document)?
+        .into_iter()
+        .map(|(key, _)| key.value().to_vec())
+        .collect::<Vec<_>>();
+    for key in keys {
+        table.remove(key.as_slice())?;
+    }
+    Ok(())
 }
 
 /// Builds the immutable-change row key for one document and digest.
@@ -2481,7 +2956,10 @@ fn replace_indexes(
             let error = StoreError::CorruptInternalValue;
             return Err(error);
         }
-        let index = decode_uuid(&reverse_key[reverse_prefix.len()..]).map(IndexId::from_uuid)?;
+        let index = decode_identifier(
+            &reverse_key[reverse_prefix.len()..],
+            IndexId::from_durable_bytes,
+        )?;
         table.remove(key_index_row(scope, index, &encoded_value, document).as_slice())?;
         table.remove(reverse_key.as_slice())?;
     }
@@ -2549,6 +3027,18 @@ fn add_materialized_bytes(current: usize, additional: usize) -> Option<usize> {
     current
         .checked_add(additional)
         .filter(|total| *total <= MAX_MATERIALIZED_PAGE_BYTES)
+}
+
+/// Adds the encoded base checkpoint and bounded suffix to a page byte budget.
+fn add_checkpoint_and_delta_bytes(
+    current: usize,
+    checkpoint_bytes: usize,
+    deltas: &[(ChangeDigest, Vec<u8>)],
+) -> Option<usize> {
+    deltas.iter().try_fold(
+        add_materialized_bytes(current, checkpoint_bytes)?,
+        |total, delta| add_materialized_bytes(total, delta.1.len()),
+    )
 }
 
 /// Validates every count, byte, and coverage bound of one remote page.
@@ -2646,7 +3136,7 @@ fn decode_operation(bytes: &[u8]) -> Result<CommittedOperation, StoreError> {
         let error = StoreError::CorruptInternalValue;
         return Err(error);
     }
-    let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
+    let document = decode_identifier(&bytes[..16], DocumentId::from_durable_bytes)?;
     let request = bytes[16..48]
         .try_into()
         .map(OperationDigest::new)
@@ -2678,8 +3168,8 @@ fn decode_outbox(sequence: u64, bytes: &[u8]) -> Result<OutboxEntry, StoreError>
         let error = StoreError::CorruptInternalValue;
         return Err(error);
     }
-    let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
-    let operation = decode_uuid(&bytes[16..32]).map(OperationId::from_uuid)?;
+    let document = decode_identifier(&bytes[..16], DocumentId::from_durable_bytes)?;
+    let operation = decode_identifier(&bytes[16..32], OperationId::from_durable_bytes)?;
     let digest = bytes[32..]
         .try_into()
         .map(ChangeDigest::new)
@@ -2706,7 +3196,7 @@ fn decode_event(sequence: u64, bytes: &[u8]) -> Result<ChangeEvent, StoreError> 
         let error = StoreError::CorruptInternalValue;
         return Err(error);
     }
-    let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
+    let document = decode_identifier(&bytes[..16], DocumentId::from_durable_bytes)?;
     let digest = bytes[16..]
         .try_into()
         .map(ChangeDigest::new)
@@ -2760,9 +3250,13 @@ fn decode_revision(bytes: &[u8]) -> Result<DocumentRevision, StoreError> {
     decode_u64(bytes).map(DocumentRevision::new)
 }
 
-/// Decodes one UUID from its durable bytes.
-fn decode_uuid(bytes: &[u8]) -> Result<uuid::Uuid, StoreError> {
-    uuid::Uuid::from_slice(bytes).map_err(malformed_store)
+/// Rehydrates a typed identifier from exactly 16 durable bytes, through the
+/// model crate that owns the approved `uuid` boundary.
+fn decode_identifier<T>(bytes: &[u8], wrap: fn(&[u8; 16]) -> T) -> Result<T, StoreError> {
+    let raw: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| StoreError::CorruptInternalValue)?;
+    Ok(wrap(&raw))
 }
 
 /// Encodes one versioned logical export payload.
@@ -2827,8 +3321,8 @@ pub fn decode_export(
         let error = StoreError::InvalidExport;
         return Err(error);
     }
-    let account = decode_uuid(&bytes[5..21]).map(AccountId::from_uuid)?;
-    let space = decode_uuid(&bytes[21..37]).map(SpaceId::from_uuid)?;
+    let account = decode_identifier(&bytes[5..21], AccountId::from_durable_bytes)?;
+    let space = decode_identifier(&bytes[21..37], SpaceId::from_durable_bytes)?;
     let scope = Scope::new(account, space);
     let mut position = EXPORT_HEADER_BYTES;
     let entry_count = usize::try_from(read_u32(bytes, &mut position)?).map_err(malformed_store)?;
@@ -2896,11 +3390,9 @@ fn encode_export_document(
 /// Reads one export history entry, advancing the cursor.
 fn decode_export_entry(bytes: &[u8], position: &mut usize) -> Result<ExportEntry, StoreError> {
     let document_bytes = read_array::<16>(bytes, position)?;
-    let document_uuid = decode_uuid(&document_bytes)?;
-    let document = DocumentId::from_uuid(document_uuid);
+    let document = DocumentId::from_durable_bytes(&document_bytes);
     let operation_bytes = read_array::<16>(bytes, position)?;
-    let operation_uuid = decode_uuid(&operation_bytes)?;
-    let operation = OperationId::from_uuid(operation_uuid);
+    let operation = OperationId::from_durable_bytes(&operation_bytes);
     let request = read_array::<32>(bytes, position).map(OperationDigest::new)?;
     let digest = read_array::<32>(bytes, position).map(ChangeDigest::new)?;
     let change_len = usize::try_from(read_u32(bytes, position)?).map_err(malformed_store)?;
@@ -2924,8 +3416,7 @@ fn decode_export_document(
     position: &mut usize,
 ) -> Result<ExportDocument, StoreError> {
     let document_bytes = read_array::<16>(bytes, position)?;
-    let document_uuid = decode_uuid(&document_bytes)?;
-    let document = DocumentId::from_uuid(document_uuid);
+    let document = DocumentId::from_durable_bytes(&document_bytes);
     let tombstone = match read_array::<1>(bytes, position)? {
         [0] => false,
         [1] => true,
@@ -2987,7 +3478,7 @@ pub fn restore_operation(
         );
     }
     (
-        OperationId::from_uuid(uuid::Uuid::from_bytes(operation)),
+        OperationId::from_durable_bytes(&operation),
         OperationDigest::new(request),
     )
 }
@@ -3077,7 +3568,7 @@ mod tests {
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "logical-db-v3-{name}-{}.redb",
-            uuid::Uuid::now_v7()
+            DocumentId::unique_suffix()
         ))
     }
 
@@ -3097,6 +3588,71 @@ mod tests {
             ChangeDigest::new([digest_byte; 32]),
             b"verified-change",
         )
+    }
+
+    #[test]
+    fn concurrent_scope_suffixes_do_not_cross_for_one_document_id() -> Result<(), Box<dyn Error>> {
+        let path = test_path("scoped-snapshot-suffix");
+        let store = EmbeddedStore::open(&path, ReplicaId::new())?;
+        let scope_a = Scope::new(AccountId::new(), SpaceId::new());
+        let scope_b = Scope::new(AccountId::new(), SpaceId::new());
+        let document = DocumentId::new();
+
+        for (scope, snapshot, request, digest) in [
+            (scope_a, b"checkpoint-a".as_slice(), 1, 11),
+            (scope_b, b"checkpoint-b".as_slice(), 2, 22),
+        ] {
+            store.commit_local(LocalCommit::new(
+                change(scope, document, OperationId::new(), request, digest)?,
+                None,
+                snapshot,
+                &[],
+                false,
+            ))?;
+        }
+
+        let append_suffix = |scope: Scope, request_base: u8, digest_base: u8| {
+            for offset in 0_u8..8 {
+                let expected = DocumentRevision::new(u64::from(offset).saturating_add(1));
+                store.commit_local(LocalCommit::new_incremental(
+                    change(
+                        scope,
+                        document,
+                        OperationId::new(),
+                        request_base.saturating_add(offset),
+                        digest_base.saturating_add(offset),
+                    )?,
+                    expected,
+                    &[],
+                    false,
+                ))?;
+            }
+            Ok::<(), StoreError>(())
+        };
+        std::thread::scope(|threads| -> Result<(), Box<dyn Error>> {
+            let writer_a = threads.spawn(|| append_suffix(scope_a, 30, 40));
+            let writer_b = threads.spawn(|| append_suffix(scope_b, 60, 70));
+            writer_a.join().map_err(|_| "scope A writer panicked")??;
+            writer_b.join().map_err(|_| "scope B writer panicked")??;
+            Ok(())
+        })?;
+
+        let snapshot_a = store
+            .load_snapshot(scope_a, document)?
+            .ok_or("scope A checkpoint disappeared")?;
+        let snapshot_b = store
+            .load_snapshot(scope_b, document)?
+            .ok_or("scope B checkpoint disappeared")?;
+        assert_eq!(snapshot_a.bytes, b"checkpoint-a");
+        assert_eq!(snapshot_b.bytes, b"checkpoint-b");
+        assert_eq!(snapshot_a.deltas.len(), 8);
+        assert_eq!(snapshot_b.deltas.len(), 8);
+        assert_eq!(snapshot_a.deltas[0].0, ChangeDigest::new([40; 32]));
+        assert_eq!(snapshot_b.deltas[0].0, ChangeDigest::new([70; 32]));
+        assert_ne!(snapshot_a.deltas[0].0, snapshot_b.deltas[0].0);
+        drop(store);
+        fs::remove_file(path)?;
+        Ok(())
     }
 
     /// Writes one raw legacy row inside its own immediate transaction.
@@ -3189,6 +3745,7 @@ mod tests {
                 Some(StoredSnapshot {
                     bytes: b"verified-snapshot".to_vec(),
                     revision: DocumentRevision::new(1),
+                    deltas: Vec::new(),
                 }),
                 "the committed snapshot must survive restart"
             );
@@ -3286,6 +3843,7 @@ mod tests {
             Some(StoredSnapshot {
                 bytes: b"first".to_vec(),
                 revision: DocumentRevision::new(1),
+                deltas: Vec::new(),
             }),
             "the stale commit must leave the materialized snapshot untouched"
         );
@@ -3398,7 +3956,7 @@ mod tests {
     #[test]
     fn unicode_and_space_path_survives_restart() -> Result<(), Box<dyn Error>> {
         let directory =
-            std::env::temp_dir().join(format!("logical db 雲 {}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("logical db 雲 {}", DocumentId::unique_suffix()));
         fs::create_dir(&directory)?;
         let path = directory.join("replica state.redb");
         let replica = ReplicaId::new();
@@ -3471,9 +4029,9 @@ mod tests {
 
     #[test]
     fn embedded_key_axis_is_versioned_scoped_and_order_preserving() {
-        let account = logical_db_model::AccountId::from_uuid(uuid::Uuid::from_bytes([1; 16]));
-        let space = SpaceId::from_uuid(uuid::Uuid::from_bytes([2; 16]));
-        let document = DocumentId::from_uuid(uuid::Uuid::from_bytes([3; 16]));
+        let account = logical_db_model::AccountId::from_durable_bytes(&[1; 16]);
+        let space = SpaceId::from_durable_bytes(&[2; 16]);
+        let document = DocumentId::from_durable_bytes(&[3; 16]);
         let scope = Scope::new(account, space);
         let snapshot = key_snapshot(scope, document);
         let mut expected = FORMAT.to_vec();
@@ -3491,7 +4049,7 @@ mod tests {
         );
         assert_ne!(
             key_snapshot(
-                Scope::new(account, SpaceId::from_uuid(uuid::Uuid::from_bytes([4; 16]))),
+                Scope::new(account, SpaceId::from_durable_bytes(&[4; 16])),
                 document
             ),
             snapshot,
@@ -3629,9 +4187,9 @@ mod tests {
         let old_index = IndexId::new();
         let new_index = IndexId::new();
         let documents = [
-            DocumentId::from_uuid(uuid::Uuid::from_u128(1)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(2)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(3)),
+            DocumentId::from_fixture_u128(1),
+            DocumentId::from_fixture_u128(2),
+            DocumentId::from_fixture_u128(3),
         ];
         let store = EmbeddedStore::open(&path, replica)?;
         seed_migration_documents(&store, scope, old_index, documents)?;
@@ -3766,9 +4324,9 @@ mod tests {
         let path = test_path("migration-skip");
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let documents = [
-            DocumentId::from_uuid(uuid::Uuid::from_u128(1)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(2)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(3)),
+            DocumentId::from_fixture_u128(1),
+            DocumentId::from_fixture_u128(2),
+            DocumentId::from_fixture_u128(3),
         ];
         let store = EmbeddedStore::open(&path, ReplicaId::new())?;
         seed_migration_documents(&store, scope, IndexId::new(), documents)?;
@@ -4091,8 +4649,8 @@ mod tests {
         let store = EmbeddedStore::open(&path, ReplicaId::new())?;
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let index = IndexId::new();
-        let first_document = DocumentId::from_uuid(uuid::Uuid::from_u128(1));
-        let second_document = DocumentId::from_uuid(uuid::Uuid::from_u128(2));
+        let first_document = DocumentId::from_fixture_u128(1);
+        let second_document = DocumentId::from_fixture_u128(2);
         for (document, byte) in [(first_document, 1), (second_document, 2)] {
             store.commit_local(LocalCommit {
                 change: change(scope, document, OperationId::new(), byte, byte)?,
@@ -4608,9 +5166,7 @@ mod tests {
         );
         let excessive = (0..=256_u16)
             .map(|value| MigrationIndexes {
-                document: DocumentId::from_uuid(uuid::Uuid::from_u128(
-                    u128::from(value).saturating_add(1),
-                )),
+                document: DocumentId::from_fixture_u128(u128::from(value).saturating_add(1)),
                 expected_revision: DocumentRevision::new(1),
                 indexes: &[],
             })
@@ -4777,9 +5333,9 @@ mod tests {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         store.bind_schema(scope, 1, [1; 32])?;
         let documents = [
-            DocumentId::from_uuid(uuid::Uuid::from_u128(3)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(1)),
-            DocumentId::from_uuid(uuid::Uuid::from_u128(2)),
+            DocumentId::from_fixture_u128(3),
+            DocumentId::from_fixture_u128(1),
+            DocumentId::from_fixture_u128(2),
         ];
         store.commit_local(LocalCommit {
             change: change(scope, documents[0], OperationId::new(), 1, 11)?,

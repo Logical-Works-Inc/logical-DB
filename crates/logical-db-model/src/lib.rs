@@ -26,7 +26,15 @@ use thiserror::Error;
 
 mod namespace_wire;
 use namespace_wire::{take, take_checkpoint, take_namespace, take_u16, take_u32};
-use uuid::Uuid;
+
+/// The estate's named owner for RFC 4122 identifiers is `lgwks_std::id`.
+///
+/// That module supplies the `UUIDv4` layout and the OS entropy this crate
+/// builds time-ordered `UUIDv7` values on top of, which the standard library
+/// cannot provide. See `uuid_v7` for the layout and the `uuid` entry in
+/// `contract/APPROVED.toml` (`capability = "identity.uuid-v7"`) for the
+/// registered approval of the external parse contract.
+use lgwks_std::id::Uuid;
 
 /// Maximum UTF-8 bytes in a user-controlled display-independent name.
 pub const MAX_NAME_BYTES: usize = 512;
@@ -39,6 +47,31 @@ pub const MAX_PAGE_BYTES: usize = 8_388_608;
 /// Maximum encoded state for one materialized document snapshot.
 pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 
+/// Milliseconds since the Unix epoch used to order time-ordered identifiers.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Builds one time-ordered `UUIDv7` from the estate's OS entropy.
+///
+/// `lgwks_std::id` owns the RFC 4122 layout and the entropy source but
+/// generates v4 only, so the v7 prefix is composed here: a 48-bit big-endian
+/// Unix millisecond timestamp, the RFC 9562 version nibble `7`, and the
+/// variant bits `10`. The remaining 74 random bits keep identifiers unique
+/// within a millisecond.
+#[must_use]
+pub fn uuid_v7() -> Uuid {
+    let mut raw: [u8; 16] = lgwks_std::random::bytes().unwrap_or_default();
+    raw[..6].copy_from_slice(&unix_millis().to_be_bytes()[2..]);
+    raw[6] = (raw[6] & 0x0F) | 0x70;
+    raw[8] = (raw[8] & 0x3F) | 0x80;
+    Uuid::from_bytes(raw)
+}
+
 /// Declares a UUID-backed newtype identifier with the shared model surface.
 ///
 /// Each invocation emits the transparent newtype, its `now_v7` constructor,
@@ -47,18 +80,14 @@ pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 macro_rules! entity_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(
-            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-        )]
-        #[serde(crate = "lgwks_std::json::serde")]
-        #[serde(transparent)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(Uuid);
 
         impl $name {
             /// Generates a time-ordered `UUIDv7` identifier.
             #[must_use]
             pub fn new() -> Self {
-                Self(Uuid::now_v7())
+                Self(uuid_v7())
             }
 
             /// Wraps a previously validated UUID.
@@ -72,6 +101,63 @@ macro_rules! entity_id {
             pub const fn as_uuid(self) -> Uuid {
                 self.0
             }
+
+            /// Exposes the identifier's 16 big-endian bytes, for key layouts
+            /// whose backend tuple codec owns its own element types.
+            #[must_use]
+            pub fn as_bytes(self) -> [u8; 16] {
+                *self.0.as_bytes()
+            }
+
+            /// Parses the canonical 8-4-4-4-12 hyphenated identifier form.
+            pub fn parse_canonical(text: &str) -> Result<Self, lgwks_std::id::ParseError> {
+                Uuid::parse(text).map(Self)
+            }
+
+            /// The RFC 4122 variant nibble, or `None` when unrecognised.
+            #[must_use]
+            pub fn variant_bits(self) -> Option<u8> {
+                let bytes = *self.0.as_bytes();
+                match bytes[8] & 0xC0 {
+                    0x80 => Some(bytes[8] >> 6),
+                    0xC0 => Some((bytes[8] >> 4) & 0b11),
+                    _ => None,
+                }
+            }
+
+            /// The 48-bit Unix millisecond prefix of a time-ordered `v7`
+            /// identifier, or `None` for any other version.
+            #[must_use]
+            pub fn unix_millis(self) -> Option<u64> {
+                let bytes = *self.0.as_bytes();
+                if bytes[6] >> 4 != 7 || self.variant_bits() != Some(0b10) {
+                    return None;
+                }
+                let mut prefix = [0_u8; 8];
+                prefix[2..].copy_from_slice(&bytes[..6]);
+                Some(u64::from_be_bytes(prefix))
+            }
+
+            /// Rehydrates an identifier from exactly 16 durable bytes.
+            ///
+            /// This crate owns identifier construction for the whole
+            /// workspace, so every other crate decodes durable identifiers
+            /// through here rather than building them itself.
+            pub fn from_durable_bytes(bytes: &[u8; 16]) -> Self {
+                Self(Uuid::from_bytes(*bytes))
+            }
+
+            /// Builds a deterministic identifier from a 128-bit fixture value.
+            #[must_use]
+            pub fn from_fixture_u128(value: u128) -> Self {
+                Self(Uuid::from_bytes(value.to_be_bytes()))
+            }
+
+            /// A fresh time-ordered identifier rendered for a unique path.
+            #[must_use]
+            pub fn unique_suffix() -> String {
+                Self::new().to_string()
+            }
         }
 
         impl Default for $name {
@@ -82,7 +168,67 @@ macro_rules! entity_id {
 
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(formatter)
+                let bytes = self.0.as_bytes();
+                for (index, byte) in bytes.iter().enumerate() {
+                    if matches!(index, 4 | 6 | 8 | 10) {
+                        formatter.write_str("-")?;
+                    }
+                    write!(formatter, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: lgwks_std::json::serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error> {
+                let bytes = self.as_bytes();
+                serializer.serialize_bytes(bytes.as_slice())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: lgwks_std::json::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
+                struct ByteVisitor;
+
+                impl<'de> lgwks_std::json::serde::de::Visitor<'de> for ByteVisitor {
+                    type Value = [u8; 16];
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("16 durable identifier bytes")
+                    }
+
+                    fn visit_bytes<E: lgwks_std::json::serde::de::Error>(
+                        self,
+                        value: &[u8],
+                    ) -> Result<Self::Value, E> {
+                        value
+                            .try_into()
+                            .map_err(|_| E::custom("identifier is not 16 bytes"))
+                    }
+
+                    fn visit_seq<A: lgwks_std::json::serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut raw = [0_u8; 16];
+                        for slot in &mut raw {
+                            *slot = seq.next_element()?.ok_or_else(|| {
+                                lgwks_std::json::serde::de::Error::custom(
+                                    "identifier ended before 16 bytes",
+                                )
+                            })?;
+                        }
+                        Ok(raw)
+                    }
+                }
+
+                let raw = deserializer.deserialize_bytes(ByteVisitor)?;
+                Ok(Self(Uuid::from_bytes(raw)))
             }
         }
     };

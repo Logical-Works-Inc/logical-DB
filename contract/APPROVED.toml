@@ -133,24 +133,11 @@ approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
 # ── Identity, errors, and hashing ───────────────────────────────────────────
-# UUIDv7 identities, typed library errors, and the SHA-256/HMAC credential
-# check. The estate offers `lgwks_std::id::Uuid`, manual `std::error::Error`
-# impls, and BLAKE3-only hashing; each mismatch is recorded as its own
-# boundary rather than silently claimed as adopted.
-
-[[approved]]
-crate = "uuid"
-tier = "boundary"
-version = "=1.26.1"
-owner = "logical-db-model"
-capability = "identity.uuid-v7"
-source = "registry"
-allowed_consumers = "logical-db,logical-db-model,logical-db-store,logical-db-store-fdb,logical-db-episode,logical-db-daemon,logical-db-e2e,logical-db-cairn,logical-db-http,logical-db-cloud-contract"
-allowed_kinds = "normal,dev"
-reason = "Time-ordered UUIDv7 identities and their parse contract are not provided by the standard library."
-approved_by = "Director"
-approved_on = "2026-09-13"
-review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+# The estate owns identifier construction: `logical-db-model` builds every
+# RFC 4122 value on `lgwks_std::id` and the OS entropy it re-exports, and no
+# logical-db crate names a UUID crate. Typed library errors and the SHA-256 /
+# HMAC credential check remain the recorded boundaries below; the estate
+# offers manual `std::error::Error` impls and BLAKE3-only hashing.
 
 [[approved]]
 crate = "thiserror"

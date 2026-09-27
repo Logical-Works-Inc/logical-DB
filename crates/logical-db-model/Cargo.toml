@@ -11,9 +11,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-lgwks_std.workspace = true
+lgwks_std = { workspace = true, features = ["random"] }
 thiserror.workspace = true
-uuid.workspace = true
 
 [lints]
 workspace = true

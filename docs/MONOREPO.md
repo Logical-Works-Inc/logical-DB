@@ -8,6 +8,10 @@
 > Status: active development workspace. The target domain map is in
 > [`architecture/DOMAIN-BOUNDARIES.md`](architecture/DOMAIN-BOUNDARIES.md);
 > migration status is distinct from canonical authority.
+>
+> The product narrative and zero-cognitive-debt boundary are in
+> [`PRODUCT-DIRECTION.md`](PRODUCT-DIRECTION.md). This file owns workspace
+> organization; it does not redefine the product or promote an implementation.
 
 ## Why one workspace
 

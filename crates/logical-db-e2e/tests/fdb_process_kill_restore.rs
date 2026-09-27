@@ -66,7 +66,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let http_database = FdbDatabase::new_compat(Some(&cluster_file)).await?;
     let prune_database = FdbDatabase::new_compat(Some(&cluster_file)).await?;
     let root = Subspace::from_bytes(
-        format!("logical-db/process-kill-restore/{}/", uuid::Uuid::now_v7()).into_bytes(),
+        format!("logical-db/process-kill-restore/{}/", DocumentId::new()).into_bytes(),
     );
     let service_store = FdbServiceStore::new(http_database, root.clone())?;
     let prune_store = FdbServiceStore::new(prune_database, root)?;
@@ -86,7 +86,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let peer = PeerId::new();
-    let run = uuid::Uuid::now_v7();
+    let run = DocumentId::new();
     let first_path = std::env::temp_dir().join(format!("logical-db-kill-first-{run}.redb"));
     let consumer_path = std::env::temp_dir().join(format!("logical-db-kill-consumer-{run}.redb"));
     let ready = std::env::temp_dir().join(format!("logical-db-kill-ready-{run}"));

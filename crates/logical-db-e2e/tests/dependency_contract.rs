@@ -125,11 +125,11 @@ fn refusals_of(register: &str) -> Result<Vec<lgwks_deps::Refusal>, Box<dyn std::
 #[test]
 fn withdrawing_an_approval_surfaces_an_unregistered_edge() -> Result<(), Box<dyn std::error::Error>>
 {
-    let refusals = refusals_of(&drop_block(committed_register()?, "uuid")?)?;
+    let refusals = refusals_of(&drop_block(committed_register()?, "ciborium")?)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
-            lgwks_deps::Refusal::UnregisteredEdge { krate, .. } if krate == "uuid"
+            lgwks_deps::Refusal::UnregisteredEdge { krate, .. } if krate == "ciborium"
         )),
         "a withdrawn approval left no refusal: {refusals:?}"
     );
@@ -140,14 +140,14 @@ fn withdrawing_an_approval_surfaces_an_unregistered_edge() -> Result<(), Box<dyn
 /// refusal, not a silent widening.
 #[test]
 fn a_consumer_outside_the_approval_list_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-    let mutated = mutate_block(committed_register()?, "uuid", |block| {
-        replace_field(block, "allowed_consumers", "\"logical-db-model\"")
+    let mutated = mutate_block(committed_register()?, "foundationdb", |block| {
+        replace_field(block, "allowed_consumers", "\"logical-db-store-fdb\"")
     })?;
     let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
-            lgwks_deps::Refusal::ConsumerNotAllowed { krate, .. } if krate == "uuid"
+            lgwks_deps::Refusal::ConsumerNotAllowed { krate, .. } if krate == "foundationdb"
         )),
         "an unlisted consumer passed the gate: {refusals:?}"
     );
@@ -176,15 +176,15 @@ fn a_dev_edge_under_a_normal_only_approval_is_refused() -> Result<(), Box<dyn st
 #[test]
 fn a_requirement_that_differs_from_the_approval_is_refused()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mutated = mutate_block(committed_register()?, "uuid", |block| {
-        replace_field(block, "version", "\"=1.25.0\"")
+    let mutated = mutate_block(committed_register()?, "redb", |block| {
+        replace_field(block, "version", "\"=4.1.0\"")
     })?;
     let refusals = refusals_of(&mutated)?;
     assert!(
         refusals.iter().any(|refusal| matches!(
             refusal,
             lgwks_deps::Refusal::RequirementDrift { krate, approved, .. }
-                if krate == "uuid" && approved == "=1.25.0"
+                if krate == "redb" && approved == "=4.1.0"
         )),
         "requirement drift passed the gate: {refusals:?}"
     );
@@ -194,7 +194,7 @@ fn a_requirement_that_differs_from_the_approval_is_refused()
 /// Changing a registry edge to a git edge is a source-class refusal.
 #[test]
 fn a_source_class_change_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-    let mutated = mutate_block(committed_register()?, "uuid", |block| {
+    let mutated = mutate_block(committed_register()?, "redb", |block| {
         replace_field(block, "source", "\"git\"")
     })?;
     let refusals = refusals_of(&mutated)?;
@@ -202,7 +202,7 @@ fn a_source_class_change_is_refused() -> Result<(), Box<dyn std::error::Error>> 
         refusals.iter().any(|refusal| matches!(
             refusal,
             lgwks_deps::Refusal::SourceDrift { krate, approved, .. }
-                if krate == "uuid" && approved == "git"
+                if krate == "redb" && approved == "git"
         )),
         "source-class drift passed the gate: {refusals:?}"
     );

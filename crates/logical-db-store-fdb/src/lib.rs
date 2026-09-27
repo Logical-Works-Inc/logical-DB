@@ -456,9 +456,9 @@ fn invocation_binding(change: &ChangeEnvelope) -> [u8; 80] {
 #[cfg(any(feature = "fdb", test))]
 /// Decode record
 fn decode_record(bytes: &[u8], sequence: u64) -> Result<Record, DataError> {
-    let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
-    let replica = decode_uuid(&bytes[16..32]).map(ReplicaId::from_uuid)?;
-    let operation = decode_uuid(&bytes[32..48]).map(OperationId::from_uuid)?;
+    let document = decode_identifier(&bytes[..16], DocumentId::from_durable_bytes)?;
+    let replica = decode_identifier(&bytes[16..32], ReplicaId::from_durable_bytes)?;
+    let operation = decode_identifier(&bytes[32..48], OperationId::from_durable_bytes)?;
     let request = bytes[48..80]
         .try_into()
         .map(OperationDigest::new)
@@ -493,8 +493,13 @@ fn chunk_count(byte_len: usize) -> u16 {
 
 #[cfg(any(feature = "fdb", test))]
 /// Decode uuid
-fn decode_uuid(bytes: &[u8]) -> Result<uuid::Uuid, DataError> {
-    uuid::Uuid::from_slice(bytes).map_err(malformed_data)
+/// Rehydrates a typed identifier from exactly 16 durable bytes, through the
+/// model crate that owns identifier construction for the whole workspace.
+fn decode_identifier<T>(bytes: &[u8], wrap: fn(&[u8; 16]) -> T) -> Result<T, DataError> {
+    let raw: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| malformed_data("identifier is not 16 bytes"))?;
+    Ok(wrap(&raw))
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -699,8 +704,8 @@ mod runtime {
         fn scope_space(&self, scope: Scope) -> Subspace {
             self.root.subspace(&(
                 FORMAT_VERSION,
-                scope.account().as_uuid(),
-                scope.space().as_uuid(),
+                scope.account().as_bytes(),
+                scope.space().as_bytes(),
             ))
         }
     }
@@ -1625,7 +1630,7 @@ mod runtime {
         transaction: &foundationdb::RetryableTransaction,
         spaces: &BaselineSpaces,
         baseline: &SnapshotBaseline,
-        after: Option<uuid::Uuid>,
+        after: Option<DocumentId>,
     ) -> Result<BaselinePageSlice, FdbBindingError> {
         let digest = baseline.digest().into_bytes();
         let document_space = spaces.document.subspace(&(digest.as_slice(),));
@@ -1684,7 +1689,7 @@ mod runtime {
         use lgwks_std::hash::blake3;
 
         let (document_id,) = document_space
-            .unpack::<(uuid::Uuid,)>(key)
+            .unpack::<([u8; 16],)>(key)
             .map_err(binding_invalid)?;
         let snapshot = load_snapshot_bytes(
             transaction,
@@ -1709,7 +1714,7 @@ mod runtime {
         transaction: &foundationdb::RetryableTransaction,
         chunk_space: &Subspace,
         artifact: [u8; 32],
-        document: uuid::Uuid,
+        document: DocumentId,
         manifest: BaselineDocumentManifest,
     ) -> Result<Vec<u8>, FdbBindingError> {
         let mut bytes = Vec::with_capacity(manifest.byte_len);
@@ -2253,14 +2258,14 @@ mod tests {
         let second = Scope::new(AccountId::new(), SpaceId::new());
         let first_log = root.subspace(&(
             FORMAT_VERSION,
-            first.account().as_uuid(),
-            first.space().as_uuid(),
+            first.account().to_string(),
+            first.space().to_string(),
             KIND_LOG,
         ));
         let second_log = root.subspace(&(
             FORMAT_VERSION,
-            second.account().as_uuid(),
-            second.space().as_uuid(),
+            second.account().to_string(),
+            second.space().to_string(),
             KIND_LOG,
         ));
         assert_ne!(first_log.bytes(), second_log.bytes());
@@ -2458,7 +2463,7 @@ mod tests {
             Err(DataError::InvalidManifest { at: "manifest" })
         );
         assert_eq!(
-            decode_uuid(&[0; 15]),
+            decode_identifier(&[0; 15], DocumentId::from_durable_bytes),
             Err(DataError::InvalidManifest { at: "manifest" })
         );
         Ok(())

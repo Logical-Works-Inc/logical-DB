@@ -121,7 +121,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -140,7 +140,6 @@ pub use logical_db_model::{
     NamespaceCheckpoints, PeerId, ReplicaId, Scope, SpaceId,
 };
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Application schema version binding the cache projections to a scope.
 pub const KV_SCHEMA_VERSION: u32 = 1;
@@ -187,9 +186,11 @@ pub const MAX_BATCH_PUT: usize = 32;
 pub const NEVER_EXPIRES_AT_MS: i64 = i64::MAX;
 
 /// Secondary index over slot expiry (`Timestamp` milliseconds).
-pub const EXPIRY_INDEX: IndexId = IndexId::from_uuid(Uuid::from_bytes(*b"ldb-kv-expiry-01"));
+pub static EXPIRY_INDEX: LazyLock<IndexId> =
+    LazyLock::new(|| IndexId::from_durable_bytes(b"ldb-kv-expiry-01"));
 /// Secondary index over slot recency (`Unsigned` writer sequence).
-pub const RECENCY_INDEX: IndexId = IndexId::from_uuid(Uuid::from_bytes(*b"ldb-kv-recency-1"));
+pub static RECENCY_INDEX: LazyLock<IndexId> =
+    LazyLock::new(|| IndexId::from_durable_bytes(b"ldb-kv-recency-1"));
 
 /// Root-map property carrying the envelope layout version.
 pub const FIELD_VERSION: &str = "kv_v";
@@ -1601,7 +1602,7 @@ impl KvCache {
         let staged = self.blob_dir.join(format!(
             "{}.tmp-{}",
             hex_digest(digest),
-            Uuid::now_v7().hyphenated()
+            DocumentId::unique_suffix()
         ));
         let mut file = File::options()
             .create(true)
@@ -1782,7 +1783,7 @@ impl KvCache {
 #[must_use]
 pub fn kv_projections() -> Vec<Projection> {
     vec![
-        Projection::new(EXPIRY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
+        Projection::new(*EXPIRY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -1794,7 +1795,7 @@ pub fn kv_projections() -> Vec<Projection> {
                 Some(_) => None,
             })
         }),
-        Projection::new(RECENCY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
+        Projection::new(*RECENCY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -2016,19 +2017,8 @@ fn blob_dir_for(path: &Path) -> PathBuf {
 
 /// Extracts the wall-clock start time encoded in a UUIDv7 operation id.
 fn operation_started_at_ms(operation: &OperationId) -> Result<i64, KvError> {
-    let uuid = operation.as_uuid();
-    if uuid.get_version_num() != 7 {
-        return Err(KvError::InvalidOperationId);
-    }
-    let Some(timestamp) = uuid.get_timestamp() else {
-        return Err(KvError::InvalidOperationId);
-    };
-    let (seconds, nanos) = timestamp.to_unix();
-    seconds
-        .checked_mul(1_000)
-        .and_then(|millis| millis.checked_add(u64::from(nanos.checked_div(1_000_000)?)))
-        .and_then(|millis| i64::try_from(millis).ok())
-        .ok_or(KvError::InvalidOperationId)
+    let timestamp = operation.unix_millis().ok_or(KvError::InvalidOperationId)?;
+    i64::try_from(timestamp).map_err(|_| KvError::InvalidOperationId)
 }
 
 /// Derives a unique recency sequence for one index within a batch.
@@ -2053,7 +2043,7 @@ fn batch_member_operation(batch: OperationId, index: usize) -> OperationId {
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x80;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    OperationId::from_uuid(Uuid::from_bytes(bytes))
+    OperationId::from_durable_bytes(&bytes)
 }
 
 /// Hashes a full batch request for idempotent apply and deduplication.
@@ -2182,7 +2172,7 @@ fn document_for(namespace: &str, key: &str) -> DocumentId {
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x80;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    DocumentId::from_uuid(Uuid::from_bytes(bytes))
+    DocumentId::from_durable_bytes(&bytes)
 }
 
 #[cfg(test)]
@@ -2195,7 +2185,10 @@ mod tests {
     }
 
     fn path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("logical-db-kv-{tag}-{}.redb", Uuid::now_v7()))
+        std::env::temp_dir().join(format!(
+            "logical-db-kv-{tag}-{}.redb",
+            DocumentId::unique_suffix()
+        ))
     }
 
     fn open_cache(
@@ -2352,7 +2345,7 @@ mod tests {
         assert_eq!(report.documents, 2);
         assert_eq!(cache.get("legacy")?, Some(b"old".to_vec()));
         let stored = cache.database().query_index(
-            EXPIRY_INDEX,
+            *EXPIRY_INDEX,
             &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
             None,
             10,
@@ -2421,7 +2414,7 @@ mod tests {
         cache.put("forever", b"v", None)?;
         assert_eq!(cache.get("forever")?, Some(b"v".to_vec()));
         let hits = cache.database().query_index(
-            EXPIRY_INDEX,
+            *EXPIRY_INDEX,
             &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
             None,
             10,
@@ -2678,7 +2671,7 @@ mod tests {
         let db_path = path("batch-operation-id");
         let cache = open_cache(&db_path, "sessions")?;
         let Err(error) = cache.put_many_with_operation(
-            OperationId::from_uuid(Uuid::nil()),
+            OperationId::from_durable_bytes(&[0; 16]),
             &[BatchPut {
                 key: "key".into(),
                 value: b"value".to_vec(),

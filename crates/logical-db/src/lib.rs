@@ -14,10 +14,10 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroU32,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use lgwks_std::hash::{Hasher, blake3};
@@ -35,9 +35,9 @@ pub use logical_db_platform::PlatformError;
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
 use logical_db_store::{
     CommitOutcome, EmbeddedStore, ExportDocument, ExportEntry, IndexHit, LocalChange, LocalCommit,
-    MAX_MATERIALIZED_PAGE_BYTES, MAX_SNAPSHOT_BYTES, MigrationDocument, MigrationIndexes,
-    RemoteChange as StoredRemoteChange, RemoteDocument, StoreError, decode_export, encode_export,
-    restore_operation,
+    MAX_MATERIALIZED_PAGE_BYTES, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_DELTAS, MigrationDocument,
+    MigrationIndexes, RemoteChange as StoredRemoteChange, RemoteDocument, StoreError,
+    StoredSnapshot, decode_export, encode_export, restore_operation,
 };
 use logical_db_sync::{
     InboundChange, OutboundChange, ReplicaPort, SyncError, synchronize as run_synchronization,
@@ -119,6 +119,103 @@ pub struct Database {
     projections: Vec<Projection>,
     /// Capability bounds enforced on every operation of this handle.
     profile: CapabilityProfile,
+    /// Bounded materialized states owned by this scope-bound handle.
+    state_cache: Mutex<DocumentCache>,
+}
+
+/// Maximum cached documents per scope-bound database handle.
+const MAX_CACHED_DOCUMENTS: usize = 256;
+/// Maximum estimated serialized state retained by one cached document.
+const MAX_CACHED_DOCUMENT_BYTES: usize = 1_048_576;
+/// Maximum aggregate serialized state retained by one handle.
+const MAX_CACHED_STATE_BYTES: usize = 16_777_216;
+
+/// A cached CRDT state tied to its durable revision and encoded-size estimate.
+struct CachedDocument {
+    /// Latest durable document revision represented by `state`.
+    revision: Option<DocumentRevision>,
+    /// Owned materialized Automerge document.
+    state: Document,
+    /// Estimated serialized checkpoint plus suffix byte size.
+    retained_bytes: usize,
+    /// Number of suffix rows after the complete checkpoint.
+    delta_count: usize,
+}
+
+/// Scope-local bounded LRU for recently edited CRDT documents.
+#[derive(Default)]
+struct DocumentCache {
+    /// Cached states keyed by document within this one scope-bound handle.
+    entries: BTreeMap<DocumentId, CachedDocument>,
+    /// Least-recently-used document identifiers, oldest first.
+    recency: VecDeque<DocumentId>,
+    /// Sum of serialized-size estimates for retained states.
+    retained_bytes: usize,
+}
+
+impl CachedDocument {
+    /// Builds one entry for a state that is already materialized and verified.
+    fn new(
+        revision: Option<DocumentRevision>,
+        state: Document,
+        retained_bytes: usize,
+        delta_count: usize,
+    ) -> Self {
+        Self {
+            revision,
+            state,
+            retained_bytes,
+            delta_count,
+        }
+    }
+}
+
+impl DocumentCache {
+    /// Removes and returns state only when it matches the latest durable revision.
+    fn take(
+        &mut self,
+        document: DocumentId,
+        revision: Option<DocumentRevision>,
+    ) -> Option<CachedDocument> {
+        self.remove(document)
+            .filter(|cached| cached.revision == revision)
+    }
+
+    /// Inserts one bounded entry, evicting least-recent entries as required.
+    fn insert(&mut self, document: DocumentId, cached: CachedDocument) {
+        if cached.retained_bytes > MAX_CACHED_DOCUMENT_BYTES {
+            return;
+        }
+        self.remove(document);
+        while self.entries.len() >= MAX_CACHED_DOCUMENTS
+            || self.retained_bytes.saturating_add(cached.retained_bytes) > MAX_CACHED_STATE_BYTES
+        {
+            let Some(evicted) = self.recency.pop_front() else {
+                break;
+            };
+            self.remove(evicted);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(cached.retained_bytes);
+        self.entries.insert(document, cached);
+        self.recency.push_back(document);
+    }
+
+    /// Removes one existing entry, returning it and its accounting.
+    fn remove(&mut self, document: DocumentId) -> Option<CachedDocument> {
+        let cached = self.entries.remove(&document);
+        if let Some(retained) = cached.as_ref().map(|cached| cached.retained_bytes) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(retained);
+        }
+        self.recency.retain(|candidate| *candidate != document);
+        cached
+    }
+
+    /// Drops every entry after recovering a poisoned mutex.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.recency.clear();
+        self.retained_bytes = 0;
+    }
 }
 
 /// MaterializedRemoteDocument
@@ -146,12 +243,18 @@ struct PreparedBatchEdit {
     bytes: Vec<u8>,
     /// Revision the edit expects to overwrite, when conditioned.
     expected_revision: Option<DocumentRevision>,
-    /// Post-edit snapshot bytes retained for projection rebuild.
-    snapshot: Vec<u8>,
+    /// Optional full checkpoint; none appends this edit as a bounded delta.
+    snapshot: Option<Vec<u8>>,
     /// Index rows produced by the edit's projections.
     indexes: Vec<IndexEntry>,
     /// CRDT heads observed before the edit is applied.
     heads: Vec<ChangeDigest>,
+    /// In-memory CRDT state retained only after the durable batch succeeds.
+    state: Document,
+    /// Estimated serialized bytes retained by the successor state.
+    retained_bytes: usize,
+    /// Number of suffix rows after its complete checkpoint.
+    delta_count: usize,
 }
 
 /// ProjectionFunction
@@ -410,7 +513,57 @@ impl Database {
             replica,
             projections,
             profile: CapabilityProfile::embedded_local(),
+            state_cache: Mutex::new(DocumentCache::default()),
         })
+    }
+
+    /// Loads the latest state from the bounded scope-local cache or durable rows.
+    fn load_edit_state(&self, document: DocumentId) -> Result<CachedDocument, DatabaseError> {
+        let durable_revision = self.store.document_revision(self.scope, document)?;
+        let mut cache = match self.state_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                cache
+            }
+        };
+        if let Some(cached) = cache.take(document, durable_revision) {
+            return Ok(cached);
+        }
+        drop(cache);
+
+        match self.store.load_snapshot(self.scope, document)? {
+            Some(snapshot) => {
+                let (checkpoint, deltas) = snapshot.checkpoint_and_deltas();
+                let retained_bytes = deltas.iter().fold(checkpoint.len(), |total, delta| {
+                    total.saturating_add(delta.1.len())
+                });
+                let delta_count = deltas.len();
+                let revision = snapshot.revision;
+                let state = load_stored_document(&snapshot)?;
+                Ok(CachedDocument::new(
+                    Some(revision),
+                    state,
+                    retained_bytes,
+                    delta_count,
+                ))
+            }
+            None => Ok(CachedDocument::new(None, Document::new(), 0, 0)),
+        }
+    }
+
+    /// Caches a committed state after its immediate durable transaction succeeds.
+    fn cache_committed_state(&self, document: DocumentId, cached: CachedDocument) {
+        let mut cache = match self.state_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                cache
+            }
+        };
+        cache.insert(document, cached);
     }
 
     /// Opens a replica and runs or resumes its explicit crash-safe schema/index
@@ -465,6 +618,7 @@ impl Database {
                 replica,
                 projections,
                 profile: CapabilityProfile::embedded_local(),
+                state_cache: Mutex::new(DocumentCache::default()),
             },
             report,
         ))
@@ -692,15 +846,16 @@ impl Database {
             }
             return Err(StoreError::OperationConflict.into());
         }
-        let stored = self.store.load_snapshot(self.scope, document)?;
-        let actual_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let cached = self.load_edit_state(document)?;
+        let actual_revision = cached.revision;
+        let needs_checkpoint =
+            cached.delta_count >= MAX_SNAPSHOT_DELTAS || cached.revision.is_none();
         if required_revision.is_some_and(|expected| actual_revision != Some(expected)) {
             return Err(StoreError::StaleDocument.into());
         }
-        let mut state = match stored {
-            Some(snapshot) => Document::load(&snapshot.bytes)?,
-            None => Document::new(),
-        };
+        let mut state = cached.state;
+        let prior_retained_bytes = cached.retained_bytes;
+        let prior_delta_count = cached.delta_count;
         if state.is_deleted()? {
             return Err(DatabaseError::DocumentDeleted);
         }
@@ -710,7 +865,19 @@ impl Database {
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
         let indexes = self.project(&mut state)?;
-        let snapshot = state.save()?;
+        let projected_bytes = prior_retained_bytes.saturating_add(change.as_bytes().len());
+        let make_checkpoint = needs_checkpoint || projected_bytes > MAX_SNAPSHOT_BYTES;
+        let snapshot = make_checkpoint.then(|| state.save()).transpose()?;
+        let retained_bytes = snapshot.as_ref().map_or_else(|| projected_bytes, Vec::len);
+        let delta_count = if snapshot.is_some() {
+            0
+        } else {
+            prior_delta_count.saturating_add(1)
+        };
+        let cached_revision = match actual_revision {
+            Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+            None => DocumentRevision::new(1),
+        };
         let local_change = LocalChange::new(
             self.scope,
             document,
@@ -719,20 +886,28 @@ impl Database {
             change.digest,
             change.as_bytes(),
         )?;
-        let outcome = self.store.commit_local(LocalCommit::new(
+        let commit = commit_for(
             local_change,
+            snapshot.as_deref(),
             actual_revision,
-            &snapshot,
             &indexes,
             false,
-        ))?;
+        )?;
+        let outcome = self.store.commit_local(commit)?;
         match outcome {
-            CommitOutcome::Applied { sequence } => Ok(EditOutcome::Applied(EditReceipt {
-                value,
-                sequence,
-                digest: change.digest,
-                heads: state.heads(),
-            })),
+            CommitOutcome::Applied { sequence } => {
+                let heads = state.heads();
+                self.cache_committed_state(
+                    document,
+                    CachedDocument::new(Some(cached_revision), state, retained_bytes, delta_count),
+                );
+                Ok(EditOutcome::Applied(EditReceipt {
+                    value,
+                    sequence,
+                    digest: change.digest,
+                    heads,
+                }))
+            }
             CommitOutcome::Duplicate { sequence } => Ok(EditOutcome::Duplicate(DuplicateReceipt {
                 sequence,
                 digest: change.digest,
@@ -749,12 +924,13 @@ impl Database {
         index: usize,
         edit: BatchEdit,
     ) -> Result<PreparedBatchEdit, DatabaseError> {
-        let stored = self.store.load_snapshot(self.scope, edit.document)?;
-        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
-        let mut state = match stored {
-            Some(snapshot) => Document::load(&snapshot.bytes)?,
-            None => Document::new(),
-        };
+        let cached = self.load_edit_state(edit.document)?;
+        let expected_revision = cached.revision;
+        let needs_checkpoint =
+            cached.delta_count >= MAX_SNAPSHOT_DELTAS || cached.revision.is_none();
+        let prior_retained_bytes = cached.retained_bytes;
+        let prior_delta_count = cached.delta_count;
+        let mut state = cached.state;
         if state.is_deleted()? {
             return Err(DatabaseError::DocumentDeleted);
         }
@@ -764,7 +940,15 @@ impl Database {
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
         let indexes = self.project(&mut state)?;
-        let snapshot = state.save()?;
+        let projected_bytes = prior_retained_bytes.saturating_add(change.as_bytes().len());
+        let make_checkpoint = needs_checkpoint || projected_bytes > MAX_SNAPSHOT_BYTES;
+        let snapshot = make_checkpoint.then(|| state.save()).transpose()?;
+        let retained_bytes = snapshot.as_ref().map_or_else(|| projected_bytes, Vec::len);
+        let delta_count = if snapshot.is_some() {
+            0
+        } else {
+            prior_delta_count.saturating_add(1)
+        };
         Ok(PreparedBatchEdit {
             index,
             document: edit.document,
@@ -776,6 +960,9 @@ impl Database {
             snapshot,
             indexes,
             heads: state.heads(),
+            state,
+            retained_bytes,
+            delta_count,
         })
     }
 
@@ -791,13 +978,11 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns a typed CRDT, duplicate-document, stale-read, operation, or
-    /// storage failure.
+    /// Returns [`DatabaseError::InvalidEditBatchSize`] for an empty or
+    /// oversized batch, or a typed CRDT, duplicate-document, stale-read,
+    /// operation, or storage failure.
     pub fn edit_many(&self, edits: Vec<BatchEdit>) -> Result<Vec<EditOutcome<()>>, DatabaseError> {
-        if edits.is_empty() {
-            return Ok(Vec::new());
-        }
-        if edits.len() > MAX_EDIT_BATCH {
+        if edits.is_empty() || edits.len() > MAX_EDIT_BATCH {
             return Err(DatabaseError::InvalidEditBatchSize(edits.len()));
         }
         let mut documents = BTreeSet::new();
@@ -841,23 +1026,38 @@ impl Database {
                 edit.digest,
                 &edit.bytes,
             )?;
-            commits.push(LocalCommit::new(
+            commits.push(commit_for(
                 change,
+                edit.snapshot.as_deref(),
                 edit.expected_revision,
-                &edit.snapshot,
                 &edit.indexes,
                 false,
-            ));
+            )?);
         }
         let outcomes = self.store.commit_local_batch(&commits)?;
         for (outcome, edit) in outcomes.into_iter().zip(prepared) {
             results[edit.index] = Some(match outcome {
-                CommitOutcome::Applied { sequence } => EditOutcome::Applied(EditReceipt {
-                    value: (),
-                    sequence,
-                    digest: edit.digest,
-                    heads: edit.heads,
-                }),
+                CommitOutcome::Applied { sequence } => {
+                    let revision = match edit.expected_revision {
+                        Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+                        None => DocumentRevision::new(1),
+                    };
+                    self.cache_committed_state(
+                        edit.document,
+                        CachedDocument::new(
+                            Some(revision),
+                            edit.state,
+                            edit.retained_bytes,
+                            edit.delta_count,
+                        ),
+                    );
+                    EditOutcome::Applied(EditReceipt {
+                        value: (),
+                        sequence,
+                        digest: edit.digest,
+                        heads: edit.heads,
+                    })
+                }
                 CommitOutcome::Duplicate { sequence } => EditOutcome::Duplicate(DuplicateReceipt {
                     sequence,
                     digest: edit.digest,
@@ -914,18 +1114,31 @@ impl Database {
             }
             return Err(StoreError::OperationConflict.into());
         }
-        let stored = self.store.load_snapshot(self.scope, document)?;
-        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
-        let mut state = match stored {
-            Some(snapshot) => Document::load(&snapshot.bytes)?,
-            None => Document::new(),
-        };
+        let cached = self.load_edit_state(document)?;
+        let expected_revision = cached.revision;
+        let needs_checkpoint =
+            cached.delta_count >= MAX_SNAPSHOT_DELTAS || cached.revision.is_none();
+        let prior_retained_bytes = cached.retained_bytes;
+        let prior_delta_count = cached.delta_count;
+        let mut state = cached.state;
         let mut changes = state.delete()?;
         if changes.len() != 1 {
             return Err(DatabaseError::ChangeCardinality(changes.len()));
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
-        let snapshot = state.save()?;
+        let projected_bytes = prior_retained_bytes.saturating_add(change.as_bytes().len());
+        let make_checkpoint = needs_checkpoint || projected_bytes > MAX_SNAPSHOT_BYTES;
+        let snapshot = make_checkpoint.then(|| state.save()).transpose()?;
+        let retained_bytes = snapshot.as_ref().map_or_else(|| projected_bytes, Vec::len);
+        let delta_count = if snapshot.is_some() {
+            0
+        } else {
+            prior_delta_count.saturating_add(1)
+        };
+        let cached_revision = match expected_revision {
+            Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
+            None => DocumentRevision::new(1),
+        };
         let heads = state.heads();
         let local_change = LocalChange::new(
             self.scope,
@@ -935,19 +1148,26 @@ impl Database {
             change.digest,
             change.as_bytes(),
         )?;
-        let outcome = self.store.commit_local(LocalCommit::new(
+        let commit = commit_for(
             local_change,
+            snapshot.as_deref(),
             expected_revision,
-            &snapshot,
             &[],
             true,
-        ))?;
+        )?;
+        let outcome = self.store.commit_local(commit)?;
         match outcome {
-            CommitOutcome::Applied { sequence } => Ok(DeleteOutcome::Applied(DeleteReceipt {
-                sequence,
-                digest: change.digest,
-                heads,
-            })),
+            CommitOutcome::Applied { sequence } => {
+                self.cache_committed_state(
+                    document,
+                    CachedDocument::new(Some(cached_revision), state, retained_bytes, delta_count),
+                );
+                Ok(DeleteOutcome::Applied(DeleteReceipt {
+                    sequence,
+                    digest: change.digest,
+                    heads,
+                }))
+            }
             CommitOutcome::Duplicate { sequence } => {
                 Ok(DeleteOutcome::Duplicate(DuplicateReceipt {
                     sequence,
@@ -994,7 +1214,7 @@ impl Database {
         match self.store.load_snapshot(self.scope, document)? {
             None => Ok(None),
             Some(snapshot) => {
-                let mut state = Document::load(&snapshot.bytes)?;
+                let mut state = load_stored_document(&snapshot)?;
                 if state.is_deleted()? {
                     Ok(None)
                 } else {
@@ -1025,7 +1245,7 @@ impl Database {
         match self.store.load_snapshot(self.scope, document)? {
             None => Ok(None),
             Some(snapshot) => {
-                let mut state = Document::load(&snapshot.bytes)?;
+                let mut state = load_stored_document(&snapshot)?;
                 Ok(Some(state.reader().conflicts(object, property)?))
             }
         }
@@ -1048,7 +1268,7 @@ impl Database {
         match self.store.load_snapshot(self.scope, document)? {
             None => Ok(None),
             Some(snapshot) => {
-                let mut state = Document::load(&snapshot.bytes)?;
+                let mut state = load_stored_document(&snapshot)?;
                 Ok(Some(state.reader().conflicts_at(object, index)?))
             }
         }
@@ -1065,7 +1285,7 @@ impl Database {
     pub fn is_deleted(&self, document: DocumentId) -> Result<bool, DatabaseError> {
         match self.store.load_snapshot(self.scope, document)? {
             None => Ok(false),
-            Some(snapshot) => Ok(Document::load(&snapshot.bytes)?.is_deleted()?),
+            Some(snapshot) => Ok(load_stored_document(&snapshot)?.is_deleted()?),
         }
     }
 
@@ -1237,7 +1457,7 @@ impl Database {
                 return Err(DatabaseError::InvalidBaseline);
             }
             if let Some(ref local) = local {
-                let mut current = Document::load(&local.bytes)?;
+                let mut current = load_stored_document(local)?;
                 state.merge(&mut current)?;
             }
             let tombstoned = state.is_deleted()?;
@@ -1372,15 +1592,19 @@ impl Database {
         let mut scan = None;
         loop {
             let page = self.store.export_scan(self.scope, scan, 64)?;
-            if page.documents.is_empty() {
+            let scanned = page.documents();
+            if scanned.is_empty() {
                 break;
             }
-            let complete = page.documents.len() < 64;
-            for document in &page.documents {
+            let complete = scanned.len() < 64;
+            for document in scanned {
+                let (checkpoint, deltas) = document.checkpoint_and_deltas();
+                let mut state = load_checkpoint_and_deltas(checkpoint, deltas)?;
+                let snapshot = state.save()?;
                 documents.push(ExportDocument::new(
                     document.document,
                     document.tombstone,
-                    document.snapshot.clone(),
+                    snapshot,
                 ));
                 scan = Some(document.document);
             }
@@ -1489,7 +1713,7 @@ impl Database {
                     .store
                     .load_change(self.scope, entry.document, entry.digest)?
                     .ok_or(DatabaseError::MissingChange(entry.digest))?;
-                if stored != entry.bytes {
+                if stored != entry.change_bytes() {
                     return Err(StoreError::OperationConflict.into());
                 }
                 duplicate.insert(entry.operation);
@@ -1501,7 +1725,7 @@ impl Database {
             let state = states.entry(entry.document).or_default();
             state.apply(std::slice::from_ref(&EncodedChange::new(
                 entry.digest,
-                entry.bytes.clone(),
+                entry.change_bytes().to_vec(),
             )))?;
             last_flag.insert(entry.document, state.is_deleted()?);
         }
@@ -1543,7 +1767,7 @@ impl Database {
         let stored = self.store.load_snapshot(self.scope, document)?;
         let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
         let mut state = match stored {
-            Some(snapshot) => Document::load(&snapshot.bytes)?,
+            Some(snapshot) => load_stored_document(&snapshot)?,
             None => Document::new(),
         };
         state.apply(encoded)?;
@@ -1571,7 +1795,7 @@ impl Database {
     ) -> Result<bool, DatabaseError> {
         state.apply(std::slice::from_ref(&EncodedChange::new(
             entry.digest,
-            entry.bytes.clone(),
+            entry.change_bytes().to_vec(),
         )))?;
         if offset < start {
             return Ok(false);
@@ -1590,7 +1814,7 @@ impl Database {
             entry.operation,
             entry.request,
             entry.digest,
-            &entry.bytes,
+            entry.change_bytes(),
         )?;
         let outcome = self.store.commit_local(LocalCommit::new(
             change, expected, &snapshot, &indexes, tombstoned,
@@ -2059,7 +2283,7 @@ fn check_restore_coverage(
             entry.document,
             entry.request,
             entry.digest,
-            entry.bytes.clone(),
+            entry.change_bytes().to_vec(),
         );
         if let Some(previous) = bindings.insert(entry.operation, binding.clone()) {
             if previous == binding {
@@ -2069,10 +2293,10 @@ fn check_restore_coverage(
         }
     }
     for entry in entries {
-        EncodedChange::new(entry.digest, entry.bytes.clone()).validate()?;
+        EncodedChange::new(entry.digest, entry.change_bytes().to_vec()).validate()?;
     }
     for document in documents {
-        let mut state = Document::load(&document.snapshot)?;
+        let mut state = Document::load(document.snapshot_bytes())?;
         if state.is_deleted()? != document.tombstone {
             return Err(StoreError::InvalidExport.into());
         }
@@ -2197,20 +2421,20 @@ fn decode_identity_sidecar(bytes: &[u8]) -> Result<(Scope, ReplicaId), DatabaseE
             "logical-db identity sidecar is corrupt",
         )));
     }
-    let decode_uuid = |range: std::ops::Range<usize>| {
-        uuid::Uuid::from_slice(&bytes[range]).map_err(|_| {
+    let decode_identifier = |range: std::ops::Range<usize>| -> Result<[u8; 16], DatabaseError> {
+        bytes[range].try_into().map_err(|_| {
             DatabaseError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "logical-db identity sidecar UUID is corrupt",
             ))
         })
     };
-    let account = decode_uuid(5..21)?;
-    let space = decode_uuid(21..37)?;
-    let replica = decode_uuid(37..53)?;
     Ok((
-        Scope::new(AccountId::from_uuid(account), SpaceId::from_uuid(space)),
-        ReplicaId::from_uuid(replica),
+        Scope::new(
+            AccountId::from_durable_bytes(&decode_identifier(5..21)?),
+            SpaceId::from_durable_bytes(&decode_identifier(21..37)?),
+        ),
+        ReplicaId::from_durable_bytes(&decode_identifier(37..53)?),
     ))
 }
 
@@ -2268,6 +2492,50 @@ fn project_with(
         .collect()
 }
 
+/// Selects the commit shape for one local change: a complete checkpoint when
+/// one was produced, otherwise a bounded incremental append against the
+/// document's existing revision. An incremental append without a known prior
+/// revision is refused, because there is no checkpoint to append behind.
+fn commit_for<'a>(
+    change: LocalChange<'a>,
+    snapshot: Option<&'a [u8]>,
+    expected_revision: Option<DocumentRevision>,
+    indexes: &'a [IndexEntry],
+    tombstone: bool,
+) -> Result<LocalCommit<'a>, DatabaseError> {
+    match (snapshot, expected_revision) {
+        (Some(snapshot), revision) => Ok(LocalCommit::new(
+            change, revision, snapshot, indexes, tombstone,
+        )),
+        (None, Some(revision)) => Ok(LocalCommit::new_incremental(
+            change, revision, indexes, tombstone,
+        )),
+        (None, None) => Err(StoreError::SnapshotCheckpointRequired.into()),
+    }
+}
+
+/// Loads a full CRDT document from its verified checkpoint and ordered suffix.
+fn load_stored_document(snapshot: &StoredSnapshot) -> Result<Document, DatabaseError> {
+    let (checkpoint, deltas) = snapshot.checkpoint_and_deltas();
+    load_checkpoint_and_deltas(checkpoint, deltas)
+}
+
+/// Loads and replays one checkpoint suffix with the public CRDT validator.
+fn load_checkpoint_and_deltas(
+    checkpoint: &[u8],
+    deltas: &[(ChangeDigest, Vec<u8>)],
+) -> Result<Document, DatabaseError> {
+    let mut state = Document::load(checkpoint)?;
+    if !deltas.is_empty() {
+        let changes = deltas
+            .iter()
+            .map(|delta| EncodedChange::new(delta.0, delta.1.clone()))
+            .collect::<Vec<_>>();
+        state.apply(&changes)?;
+    }
+    Ok(state)
+}
+
 /// Prepare migration documents
 fn prepare_migration_documents(
     projections: &[Projection],
@@ -2275,7 +2543,8 @@ fn prepare_migration_documents(
 ) -> Result<Vec<(DocumentId, DocumentRevision, Vec<IndexEntry>)>, DatabaseError> {
     let mut prepared = Vec::with_capacity(documents.len());
     for document in documents {
-        let mut state = Document::load(&document.snapshot)?;
+        let (checkpoint, deltas) = document.checkpoint_and_deltas();
+        let mut state = load_checkpoint_and_deltas(checkpoint, deltas)?;
         let indexes = project_with(projections, &mut state)?;
         prepared.push((document.document, document.revision, indexes));
     }
@@ -2292,11 +2561,12 @@ fn migrate_schema_batch(
     batch_size: usize,
 ) -> Result<Option<usize>, DatabaseError> {
     let page = store.migration_page(scope, schema_version, digest, batch_size)?;
-    if page.documents.is_empty() {
+    let scanned = page.documents();
+    if scanned.is_empty() {
         store.finish_schema_migration(scope, schema_version, digest)?;
         return Ok(None);
     }
-    let prepared = prepare_migration_documents(projections, &page.documents)?;
+    let prepared = prepare_migration_documents(projections, scanned)?;
     let updates = prepared
         .iter()
         .map(|&(document, revision, ref indexes)| {
@@ -2315,7 +2585,157 @@ mod tests {
 
     /// Path
     fn path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("logical-db-facade-{}.redb", uuid::Uuid::now_v7()))
+        std::env::temp_dir().join(format!(
+            "logical-db-facade-{}.redb",
+            DocumentId::unique_suffix()
+        ))
+    }
+
+    #[test]
+    fn state_cache_enforces_entry_byte_and_revision_bounds() {
+        const SATURATION_DOCUMENTS: usize = 256;
+        let mut cache = DocumentCache::default();
+        let mut documents = Vec::new();
+        for _ in 0..=SATURATION_DOCUMENTS {
+            let document = DocumentId::new();
+            documents.push(document);
+            cache.insert(
+                document,
+                CachedDocument {
+                    revision: Some(DocumentRevision::new(1)),
+                    state: Document::new(),
+                    retained_bytes: 1,
+                    delta_count: 0,
+                },
+            );
+        }
+        assert_eq!(cache.entries.len(), SATURATION_DOCUMENTS);
+        assert_eq!(cache.retained_bytes, SATURATION_DOCUMENTS);
+        assert!(
+            cache
+                .take(documents[0], Some(DocumentRevision::new(1)))
+                .is_none()
+        );
+        assert!(
+            cache
+                .take(documents[1], Some(DocumentRevision::new(2)))
+                .is_none()
+        );
+        assert_eq!(cache.entries.len(), SATURATION_DOCUMENTS - 1);
+
+        let oversized_document = DocumentId::new();
+        cache.insert(
+            oversized_document,
+            CachedDocument {
+                revision: Some(DocumentRevision::new(1)),
+                state: Document::new(),
+                retained_bytes: MAX_CACHED_DOCUMENT_BYTES.saturating_add(1),
+                delta_count: 0,
+            },
+        );
+        assert!(!cache.entries.contains_key(&oversized_document));
+
+        let mut byte_bounded = DocumentCache::default();
+        for _ in 0..MAX_CACHED_DOCUMENTS {
+            byte_bounded.insert(
+                DocumentId::new(),
+                CachedDocument {
+                    revision: Some(DocumentRevision::new(1)),
+                    state: Document::new(),
+                    retained_bytes: MAX_CACHED_DOCUMENT_BYTES,
+                    delta_count: 0,
+                },
+            );
+        }
+        assert_eq!(byte_bounded.retained_bytes, MAX_CACHED_STATE_BYTES);
+        assert!(byte_bounded.entries.len() < MAX_CACHED_DOCUMENTS);
+    }
+
+    #[test]
+    fn local_edits_append_bounded_suffix_and_reopen_to_latest_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = path();
+        let scope = Scope::new(AccountId::new(), SpaceId::new());
+        let replica = ReplicaId::new();
+        let document = DocumentId::new();
+        let database = Database::open(&path, scope, replica)?;
+        database.put_value(document, "counter", Scalar::Integer(0))?;
+        let checkpoint = database
+            .store
+            .load_snapshot(scope, document)?
+            .ok_or("initial checkpoint was not stored")?
+            .checkpoint_and_deltas()
+            .0
+            .to_vec();
+        let initial_checkpoint = checkpoint.clone();
+
+        for value in 1..=31 {
+            database.put_value(document, "counter", Scalar::Integer(value))?;
+            let stored = database
+                .store
+                .load_snapshot(scope, document)?
+                .ok_or("updated checkpoint was not stored")?;
+            let (stored_checkpoint, stored_deltas) = stored.checkpoint_and_deltas();
+            assert_eq!(
+                stored_checkpoint, checkpoint,
+                "ordinary edits must append immutable changes without rewriting the checkpoint"
+            );
+            assert_eq!(
+                stored_deltas.len(),
+                usize::try_from(value)?,
+                "every non-checkpoint edit must occupy one ordered suffix slot"
+            );
+        }
+        database.put_value(document, "counter", Scalar::Integer(32))?;
+        let checkpoint_heads = database.load_edit_state(document)?.state.heads();
+        let replacement = database
+            .store
+            .load_snapshot(scope, document)?
+            .ok_or("bounded suffix checkpoint was not stored")?;
+        let (replacement_checkpoint, replacement_deltas) = replacement.checkpoint_and_deltas();
+        assert_ne!(
+            replacement_checkpoint, initial_checkpoint,
+            "the configured boundary must write a replacement full checkpoint"
+        );
+        assert!(
+            replacement_deltas.is_empty(),
+            "checkpoint must clear its suffix"
+        );
+        database
+            .state_cache
+            .lock()
+            .map_err(|_poisoned| std::io::Error::other("state cache lock was poisoned"))?
+            .clear();
+        assert_eq!(
+            database.load_edit_state(document)?.state.heads(),
+            checkpoint_heads,
+            "checkpoint replay must preserve causal heads"
+        );
+        database.put_value(document, "counter", Scalar::Integer(33))?;
+        let suffix = database
+            .store
+            .load_snapshot(scope, document)?
+            .ok_or("post-checkpoint edit was not stored")?;
+        let (suffix_checkpoint, suffix_deltas) = suffix.checkpoint_and_deltas();
+        assert_eq!(suffix_checkpoint, replacement_checkpoint);
+        assert_eq!(suffix_deltas.len(), 1);
+        let final_heads = database.load_edit_state(document)?.state.heads();
+
+        drop(database);
+        let reopened = Database::open(&path, scope, replica)?;
+        assert_eq!(
+            reopened.get_value(document, "counter")?,
+            Some(Scalar::Integer(33)),
+            "checkpoint plus committed suffix must reconstruct after reopen"
+        );
+        assert_eq!(
+            reopened.load_edit_state(document)?.state.heads(),
+            final_heads,
+            "checkpoint plus suffix replay must preserve causal heads after reopen"
+        );
+        drop(reopened);
+        fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
@@ -3097,7 +3517,7 @@ mod tests {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         let replica = ReplicaId::new();
         let document = DocumentId::new();
-        let index = IndexId::from_uuid(uuid::Uuid::from_u128(LEGACY_V1_FIXTURE_INDEX));
+        let index = IndexId::from_fixture_u128(LEGACY_V1_FIXTURE_INDEX);
         write_legacy_v1_schema_fixture(&path, scope, replica, index, document)?;
 
         // The current v2 reader refuses the v1-bound rows, with or without the
@@ -3147,12 +3567,8 @@ mod tests {
     #[test]
     fn projection_digest_is_invariant_to_declaration_order_and_reopens_durably()
     -> Result<(), Box<dyn std::error::Error>> {
-        let first = IndexId::from_uuid(uuid::Uuid::from_u128(
-            0x0000_0000_0000_0000_0000_0000_0000_0011,
-        ));
-        let second = IndexId::from_uuid(uuid::Uuid::from_u128(
-            0x0000_0000_0000_0000_0000_0000_0000_0022,
-        ));
+        let first = IndexId::from_fixture_u128(0x0000_0000_0000_0000_0000_0000_0000_0011);
+        let second = IndexId::from_fixture_u128(0x0000_0000_0000_0000_0000_0000_0000_0022);
         let forward = vec![
             Projection::new(
                 first,
@@ -3194,9 +3610,7 @@ mod tests {
     #[test]
     fn projection_digest_separates_semantics_versions_from_opaque_digests()
     -> Result<(), Box<dyn std::error::Error>> {
-        let index = IndexId::from_uuid(uuid::Uuid::from_u128(
-            0x0001_0203_0405_0607_0809_0a0b_0c0d_0e0f,
-        ));
+        let index = IndexId::from_fixture_u128(0x0001_0203_0405_0607_0809_0a0b_0c0d_0e0f);
         let versioned = vec![Projection::new(
             index,
             ProjectionSemantics::version(3).ok_or("expected Some")?,
@@ -3441,7 +3855,7 @@ mod tests {
             })
         });
         let documents = (1..=8_u128)
-            .map(|value| DocumentId::from_uuid(uuid::Uuid::from_u128(value)))
+            .map(|value| DocumentId::from_fixture_u128(value))
             .collect::<Vec<_>>();
         let mut expected = BTreeMap::new();
         let mut operations = Vec::new();
@@ -4151,7 +4565,7 @@ mod tests {
             let state = states.entry(entry.document).or_default();
             state.apply(std::slice::from_ref(&EncodedChange::new(
                 entry.digest,
-                entry.bytes.clone(),
+                entry.change_bytes().to_vec(),
             )))?;
             let tombstone = state.is_deleted()?;
             let snapshot = state.save()?;
@@ -4170,7 +4584,7 @@ mod tests {
                 entry.operation,
                 entry.request,
                 entry.digest,
-                &entry.bytes,
+                entry.change_bytes(),
             )?;
             store.commit_local(LocalCommit::new(
                 change, expected, &snapshot, &indexes, tombstone,
@@ -4412,7 +4826,9 @@ mod tests {
         let live_title = live.read(live_document, |reader| reader.get(&Object::root(), "title"))?;
 
         let (backup_scope, mut entries, documents) = decode_export(&payload)?;
-        entries[0].bytes[0] ^= 0xff;
+        let mut damaged = entries[0].change_bytes().to_vec();
+        damaged[0] ^= 0xff;
+        entries[0].replace_change_bytes(damaged);
         let digest_damaged = encode_export(backup_scope, &entries, &documents)?;
         assert!(matches!(
             live.restore(&digest_damaged),
