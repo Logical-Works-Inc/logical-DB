@@ -10,7 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-logical-db-model = { path = "../logical-db-model" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 lgwks_std.workspace = true
 thiserror.workspace = true
 
