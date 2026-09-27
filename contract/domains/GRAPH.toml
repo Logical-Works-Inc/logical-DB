@@ -31,10 +31,14 @@ crates = ["logical-db"]
 public_contracts = ["logical-db"]
 may_depend_on = ["kernel", "cloud", "cairn", "lem"]
 
-# Product adapters sit above the facade.
+# Product adapters sit above the facade. The embeddable path has no separate
+# adapter crate yet: `logical-db` is the single production entry point and is
+# owned by the facade layer, so this layer is reserved and carries no crate.
+# Declaring `logical-db` here as well would make one crate owned twice, and the
+# ownership rule treats that as a defect rather than a second responsibility.
 [layers.adapter]
-crates = ["logical-db"]
-public_contracts = ["logical-db"]
+crates = []
+public_contracts = []
 may_depend_on = ["kernel", "facade"]
 
 # The cross-domain journey harness. It is a test composition layer and may

@@ -169,18 +169,6 @@ matches the workspace. Do not hand-edit the JSON block.
       "dependency_owner": "kernel"
     },
     {
-      "consumer": "logical-db-kv",
-      "consumer_owner": "adapter",
-      "dependency": "logical-db",
-      "dependency_owner": "facade"
-    },
-    {
-      "consumer": "logical-db-kv",
-      "consumer_owner": "adapter",
-      "dependency": "logical-db-model",
-      "dependency_owner": "kernel"
-    },
-    {
       "consumer": "logical-db-server",
       "consumer_owner": "cloud",
       "dependency": "logical-db-model",
@@ -236,9 +224,7 @@ matches the workspace. Do not hand-edit the JSON block.
     }
   ],
   "owners": {
-    "adapter": [
-      "logical-db-kv"
-    ],
+    "adapter": [],
     "cairn": [
       "logical-db-cairn"
     ],

@@ -1,3 +1,7 @@
+> Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+> S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Primary URLs:
+> `../../evidence/SOURCES.md`.
+
 # Embeddable path — enterprise scale requirements (nine-axis)
 
 > Authority: `GOVERNANCE.md` (claims), `docs/adr/0003-sovereign-hyperscale-data-plane.md`
