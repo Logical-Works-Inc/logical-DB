@@ -3855,7 +3855,7 @@ mod tests {
             })
         });
         let documents = (1..=8_u128)
-            .map(|value| DocumentId::from_fixture_u128(value))
+            .map(DocumentId::from_fixture_u128)
             .collect::<Vec<_>>();
         let mut expected = BTreeMap::new();
         let mut operations = Vec::new();

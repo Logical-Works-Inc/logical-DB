@@ -60,14 +60,11 @@ fn delete_request(document: DocumentId) -> logical_db::OperationDigest {
 
 /// Opens one fresh replica on a unique path, for a journey that needs no
 /// second replica and no shared hub.
-fn fresh_replica(
-    label: &str,
-) -> Result<(PathBuf, Scope, ReplicaId, Database), Box<dyn std::error::Error>> {
+fn fresh_replica(label: &str) -> Result<(PathBuf, Database), Box<dyn std::error::Error>> {
     let path = temp_path(label);
     let scope = Scope::new(AccountId::new(), SpaceId::new());
-    let replica = ReplicaId::new();
-    let database = Database::open(&path, scope, replica)?;
-    Ok((path, scope, replica, database))
+    let database = Database::open(&path, scope, ReplicaId::new())?;
+    Ok((path, database))
 }
 
 /// Sets `status` on one document to `text`, the edit every journey repeats.
@@ -154,8 +151,20 @@ struct ReplicaPair {
     first: (Database, PathBuf),
     /// The second replica and the path backing it.
     second: (Database, PathBuf),
-    /// Scope both replicas share.
-    scope: Scope,
+    /// Logical peer both replicas sync through.
+    peer: PeerId,
+    /// Transport speaking for the first replica; its hub is the shared log.
+    transport_a: HubTransport,
+    /// Transport speaking for the second replica.
+    transport_b: HubTransport,
+}
+
+/// A replica pair split into the pieces a journey drives.
+struct ReplicaParts {
+    /// The first replica and the path backing it.
+    first: (Database, PathBuf),
+    /// The second replica and the path backing it.
+    second: (Database, PathBuf),
     /// Logical peer both replicas sync through.
     peer: PeerId,
     /// Transport speaking for the first replica; its hub is the shared log.
@@ -165,40 +174,23 @@ struct ReplicaPair {
 }
 
 impl ReplicaPair {
-    /// Splits the pair into the two replicas, their paths, the peer, and their
-    /// transports, leaving the scope and hub to a journey that wants them.
-    fn into_parts(
-        self,
-    ) -> (
-        (Database, PathBuf),
-        (Database, PathBuf),
-        PeerId,
-        HubTransport,
-        HubTransport,
-    ) {
-        (
-            self.first,
-            self.second,
-            self.peer,
-            self.transport_a,
-            self.transport_b,
-        )
+    /// Splits the pair into the pieces a journey drives.
+    fn into_parts(self) -> ReplicaParts {
+        ReplicaParts {
+            first: self.first,
+            second: self.second,
+            peer: self.peer,
+            transport_a: self.transport_a,
+            transport_b: self.transport_b,
+        }
     }
 
-    /// Splits the pair and also hands back the shared service log.
-    fn into_parts_with_hub(
-        self,
-    ) -> (
-        (Database, PathBuf),
-        (Database, PathBuf),
-        PeerId,
-        Arc<Mutex<Hub>>,
-        HubTransport,
-        HubTransport,
-    ) {
-        let (first, second, peer, transport_a, transport_b) = self.into_parts();
-        let hub = Arc::clone(&transport_a.hub);
-        (first, second, peer, hub, transport_a, transport_b)
+    /// Splits the pair and also hands back the shared service log, for a
+    /// journey that ages the log behind the retention floor.
+    fn into_parts_with_hub(self) -> (ReplicaParts, Arc<Mutex<Hub>>) {
+        let parts = self.into_parts();
+        let hub = Arc::clone(&parts.transport_a.hub);
+        (parts, hub)
     }
 
     /// Opens two fresh replicas on a shared hub.
@@ -222,7 +214,6 @@ impl ReplicaPair {
         Ok(Self {
             first,
             second,
-            scope,
             peer: PeerId::new(),
             transport_a,
             transport_b,
@@ -453,7 +444,7 @@ fn sync_once(
 #[test]
 fn restore_corrupt_refuses_and_preserves_live_state() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a replica holding one committed value and a fresh export of it.
-    let (path, scope, replica, database) = fresh_replica("restore-corrupt")?;
+    let (path, database) = fresh_replica("restore-corrupt")?;
     let document = DocumentId::new();
     database.put_value(document, "status", Scalar::String(String::from("live")))?;
     let mut payload = database.export()?;
@@ -493,7 +484,7 @@ fn restore_corrupt_refuses_and_preserves_live_state() -> Result<(), Box<dyn std:
 #[test]
 fn restore_truncated_refuses() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a valid export shorter than the versioned header.
-    let (path, scope, replica, database) = fresh_replica("restore-truncated")?;
+    let (path, database) = fresh_replica("restore-truncated")?;
     let document = DocumentId::new();
     database.put_value(document, "status", Scalar::String(String::from("live")))?;
     let payload = database.export()?;
@@ -513,7 +504,7 @@ fn restore_truncated_refuses() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn restore_foreign_version_refuses() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a payload whose magic is intact but whose version byte is foreign.
-    let (path, scope, replica, database) = fresh_replica("restore-version")?;
+    let (path, database) = fresh_replica("restore-version")?;
     let mut payload = vec![0_u8; 37];
     payload[..4].copy_from_slice(b"LDBE");
     payload[4] = 2_u8;
@@ -532,7 +523,7 @@ fn restore_foreign_version_refuses() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn restore_oversize_refuses() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a payload one byte past the export size bound.
-    let (path, scope, replica, database) = fresh_replica("restore-oversize")?;
+    let (path, database) = fresh_replica("restore-oversize")?;
     let payload = vec![0_u8; logical_db::MAX_EXPORT_BYTES.saturating_add(1)];
 
     // When: the oversize payload is offered to restore.
@@ -552,7 +543,7 @@ fn restore_oversize_refuses() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn restore_at_bound_refuses() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a payload of exactly the export size bound with no valid magic.
-    let (path, scope, replica, database) = fresh_replica("restore-at-bound")?;
+    let (path, database) = fresh_replica("restore-at-bound")?;
     let payload = vec![0_u8; logical_db::MAX_EXPORT_BYTES];
 
     // When: the at-bound payload is offered to restore.
@@ -580,7 +571,7 @@ fn restore_at_bound_refuses() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn edit_many_zero_refuses() -> Result<(), Box<dyn std::error::Error>> {
     // Given: an open replica and no edits.
-    let (path, scope, replica, database) = fresh_replica("batch-zero")?;
+    let (path, database) = fresh_replica("batch-zero")?;
 
     // When: an empty edit batch is offered.
     // Then: the batch is refused with `InvalidEditBatchSize(0)`.
@@ -604,7 +595,7 @@ fn edit_many_zero_refuses() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn edit_many_one_applies() -> Result<(), Box<dyn std::error::Error>> {
     // Given: an open replica and one prepared edit.
-    let (path, scope, replica, database) = fresh_replica("batch-one")?;
+    let (path, database) = fresh_replica("batch-one")?;
     let edits = batch_of(1);
     let document = edits[0].document;
 
@@ -640,7 +631,7 @@ fn edit_many_one_applies() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn edit_many_at_limit_applies() -> Result<(), Box<dyn std::error::Error>> {
     // Given: an open replica and a full batch of distinct documents.
-    let (path, scope, replica, database) = fresh_replica("batch-at-limit")?;
+    let (path, database) = fresh_replica("batch-at-limit")?;
     let edits = batch_of(256);
     let last_document = edits[255].document;
 
@@ -673,7 +664,7 @@ fn edit_many_at_limit_applies() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn edit_many_over_limit_refuses() -> Result<(), Box<dyn std::error::Error>> {
     // Given: an open replica and one edit past the ceiling.
-    let (path, scope, replica, database) = fresh_replica("batch-over")?;
+    let (path, database) = fresh_replica("batch-over")?;
     let edits = batch_of(257);
 
     // When: the oversize batch is offered.
@@ -705,7 +696,7 @@ fn edit_many_over_limit_refuses() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn edit_exact_retry_returns_duplicate_receipt() -> Result<(), Box<dyn std::error::Error>> {
     // Given: one committed edit identified by an operation and request digest.
-    let (path, scope, replica, database) = fresh_replica("exact-retry")?;
+    let (path, database) = fresh_replica("exact-retry")?;
     let document = DocumentId::new();
     let operation = OperationId::new();
     let request = status_request(document, "draft");
@@ -1203,10 +1194,13 @@ fn delete_tiered_removes_reference_and_bytes() -> Result<(), Box<dyn std::error:
 #[test]
 fn delete_then_sync_converges_to_absent() -> Result<(), Box<dyn std::error::Error>> {
     // Given: two replicas that both hold one shared document.
-    let (first, second, peer, mut transport_a, mut transport_b) =
-        ReplicaPair::open("ae1")?.into_parts();
-    let (database_a, path_a) = first;
-    let (database_b, path_b) = second;
+    let ReplicaParts {
+        first: (database_a, path_a),
+        second: (database_b, path_b),
+        peer,
+        mut transport_a,
+        mut transport_b,
+    } = ReplicaPair::open("ae1")?.into_parts();
     let document = DocumentId::new();
     database_a.put_value(document, "status", Scalar::String(String::from("shared")))?;
     sync_once(&database_a, peer, &mut transport_a)?;
@@ -1291,10 +1285,14 @@ fn delete_late_replica_converges_to_absent() -> Result<(), Box<dyn std::error::E
 fn pull_checkpoint_expired_recovers_full_state() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a second replica that already holds an early prefix and a hub
     // whose cursors then expire behind the retention floor.
-    let (first, second, peer, hub, mut transport_a, mut transport_b) =
-        ReplicaPair::open("ae2")?.into_parts_with_hub();
-    let (database_a, path_a) = first;
-    let (database_b, path_b) = second;
+    let (parts, hub) = ReplicaPair::open("ae2")?.into_parts_with_hub();
+    let ReplicaParts {
+        first: (database_a, path_a),
+        second: (database_b, path_b),
+        peer,
+        mut transport_a,
+        mut transport_b,
+    } = parts;
     let early = DocumentId::new();
     let late_one = DocumentId::new();
     let late_two = DocumentId::new();
@@ -1387,13 +1385,17 @@ fn synchronize_permanent_failure_surfaces_typed_error() -> Result<(), Box<dyn st
 fn import_boundary_journey_completes() -> Result<(), Box<dyn std::error::Error>> {
     // Given: a fresh app project that names only `logical_db` paths.
     use logical_db::{
-        AccountId, Database, DocumentId, EditOutcome, Object, OperationId, ReplicaId, Scalar,
-        Scope, SpaceId,
+        AccountId, Database, EditOutcome, Object, ReplicaId, Scalar, Scope, SpaceId,
         cache::{CacheEntry, KvCache},
-        content_digest,
     };
     // When: the app runs open, exact-retry edit, read, export, restore, cache.
-    let (path, scope, replica, database) = fresh_replica("import-boundary")?;
+    // The open path is spelled out here rather than through the shared
+    // fixture, because the point of this journey is that these names alone
+    // are enough to run the embeddable path.
+    let path = temp_path("import-boundary");
+    let scope = Scope::new(AccountId::new(), SpaceId::new());
+    let replica = ReplicaId::new();
+    let database = Database::open(&path, scope, replica)?;
     let CommittedStatus {
         receipt: first,
         document,
