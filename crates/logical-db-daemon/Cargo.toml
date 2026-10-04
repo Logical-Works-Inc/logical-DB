@@ -38,7 +38,6 @@ lgwks_bot.workspace = true
 lgwks_std.workspace = true
 logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", features = ["fdb"], optional = true }
 reqwest.workspace = true
-uuid.workspace = true
 
 # Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
 # network-boot FFI call, so it is one of the two crates that do not carry a

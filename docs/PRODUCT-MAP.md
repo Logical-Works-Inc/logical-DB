@@ -9,7 +9,9 @@
 > `GOVERNANCE.md`; “migration in progress” remains governed by ADR-0002.
 
 Logical-DB is one product with four independently developed domains. They share
-versioned contracts, not ambient mutable authority.
+versioned contracts, not ambient mutable authority. The concise product thesis,
+the zero-cognitive-debt experience contract, and the Redis/Spanner/CockroachDB/
+native_db research synthesis live in [PRODUCT-DIRECTION.md](PRODUCT-DIRECTION.md).
 
 | Domain | Product responsibility | Comparable category | Never claims |
 |---|---|---|---|

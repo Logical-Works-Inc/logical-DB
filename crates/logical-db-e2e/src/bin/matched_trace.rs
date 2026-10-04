@@ -165,16 +165,21 @@ fn number(text: &str, flag: &str) -> Result<u64, io::Error> {
     })
 }
 
-/// Metrics from one complete trace run on one fresh replica.
-struct RunMetrics {
+/// Metrics measured over durable work, shared by one run and its folded report.
+#[derive(Clone, Copy, Default)]
+struct CommitMetrics {
     /// Microseconds from open to first durable commit.
     cold_start_micros: u64,
     /// Microseconds spent reopening and replaying after a simulated crash.
     recovery_reopen_micros: u64,
     /// Median durable-commit latency in microseconds.
     p50_commit_micros: u64,
+    /// 95th-percentile durable-commit latency in microseconds.
+    p95_commit_micros: u64,
     /// 99th-percentile durable-commit latency in microseconds.
     p99_commit_micros: u64,
+    /// Number of durable commits in the measured latency distribution.
+    commit_latency_samples: u64,
     /// Completed operations per second for the whole run.
     throughput_ops_per_second: u64,
     /// Durable bytes the replica wrote during the run.
@@ -188,6 +193,9 @@ struct RunMetrics {
     /// Tombstoned documents verified as absent on read.
     tombstones_verified: u64,
 }
+
+/// Metrics from one complete trace run on one fresh replica.
+type RunMetrics = CommitMetrics;
 
 /// Measured result of one profile arm.
 struct TraceReport {
@@ -205,26 +213,8 @@ struct TraceReport {
     operations_per_commit: u64,
     /// Measured repetitions folded into this report.
     runs: u32,
-    /// Microseconds from open to first durable commit.
-    cold_start_micros: u64,
-    /// Microseconds spent reopening and replaying after a simulated crash.
-    recovery_reopen_micros: u64,
-    /// Median durable-commit latency in microseconds.
-    p50_latency_micros: u64,
-    /// 99th-percentile durable-commit latency in microseconds.
-    p99_latency_micros: u64,
-    /// Completed operations per second.
-    throughput_ops_per_second: u64,
-    /// Durable bytes written during the measured run.
-    durable_bytes: u64,
-    /// Operations that reached a durable commit.
-    committed_operations: u64,
-    /// Duplicate retries the store recognized and absorbed.
-    duplicate_retries_honored: u64,
-    /// Index queries that returned exactly the expected document.
-    index_queries_matched: u64,
-    /// Tombstoned documents verified as absent on read.
-    tombstones_verified: u64,
+    /// Metrics folded across this arm's measured repetitions.
+    metrics: CommitMetrics,
     /// Process CPU seconds for the measured run, when the platform exposes them.
     cpu_seconds: Option<f64>,
     /// Peak resident set size in bytes, when the platform exposes it.
@@ -260,7 +250,9 @@ impl TraceReport {
                 "  \"cold_start_micros\": {},\n",
                 "  \"recovery_reopen_micros\": {},\n",
                 "  \"p50_latency_micros\": {},\n",
+                "  \"p95_latency_micros\": {},\n",
                 "  \"p99_latency_micros\": {},\n",
+                "  \"commit_latency_samples\": {},\n",
                 "  \"throughput_ops_per_second\": {},\n",
                 "  \"durable_bytes\": {},\n",
                 "  \"cpu_seconds\": {},\n",
@@ -279,19 +271,21 @@ impl TraceReport {
             self.documents,
             self.operations_per_commit,
             self.runs,
-            self.cold_start_micros,
-            self.recovery_reopen_micros,
-            self.p50_latency_micros,
-            self.p99_latency_micros,
-            self.throughput_ops_per_second,
-            self.durable_bytes,
+            self.metrics.cold_start_micros,
+            self.metrics.recovery_reopen_micros,
+            self.metrics.p50_commit_micros,
+            self.metrics.p95_commit_micros,
+            self.metrics.p99_commit_micros,
+            self.metrics.commit_latency_samples,
+            self.metrics.throughput_ops_per_second,
+            self.metrics.durable_bytes,
             cpu,
             rss,
             self.unmeasured_reason,
-            self.committed_operations,
-            self.duplicate_retries_honored,
-            self.index_queries_matched,
-            self.tombstones_verified,
+            self.metrics.committed_operations,
+            self.metrics.duplicate_retries_honored,
+            self.metrics.index_queries_matched,
+            self.metrics.tombstones_verified,
             self.detail,
         )
     }
@@ -340,8 +334,11 @@ fn trace_projection(index: IndexId) -> Projection {
 }
 
 /// Deterministic index identity shared by every run of the trace.
+///
+/// Identifiers route through the model crate, which owns the approved
+/// `uuid` boundary, so no other crate names the `uuid` crate itself.
 fn trace_index() -> IndexId {
-    IndexId::from_uuid(uuid::Uuid::from_bytes(TRACE_INDEX_SEED))
+    IndexId::from_durable_bytes(&TRACE_INDEX_SEED)
 }
 
 /// Nearest-rank percentile of an already-sorted slice.
@@ -379,16 +376,7 @@ fn run_embedded(config: &Config) -> Result<TraceReport, Box<dyn Error>> {
         documents: config.documents,
         operations_per_commit: config.batch,
         runs: config.runs,
-        cold_start_micros: median.cold_start_micros,
-        recovery_reopen_micros: median.recovery_reopen_micros,
-        p50_latency_micros: median.p50_commit_micros,
-        p99_latency_micros: median.p99_commit_micros,
-        throughput_ops_per_second: median.throughput_ops_per_second,
-        durable_bytes: median.durable_bytes,
-        committed_operations: median.committed_operations,
-        duplicate_retries_honored: median.duplicate_retries_honored,
-        index_queries_matched: median.index_queries_matched,
-        tombstones_verified: median.tombstones_verified,
+        metrics: *median,
         cpu_seconds: None,
         peak_rss_bytes: None,
         unmeasured_reason: "std exposes no portable process-CPU or RSS API; adding a platform crate is a separate lgwks-deps decision",
@@ -398,7 +386,10 @@ fn run_embedded(config: &Config) -> Result<TraceReport, Box<dyn Error>> {
 
 /// Runs the full trace once against a fresh replica and returns its metrics.
 fn one_embedded_run(config: &Config) -> Result<RunMetrics, Box<dyn Error>> {
-    let path = std::env::temp_dir().join(format!("logical-db-trace-{}.redb", uuid::Uuid::now_v7()));
+    let path = std::env::temp_dir().join(format!(
+        "logical-db-trace-{}.redb",
+        DocumentId::unique_suffix()
+    ));
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let index = trace_index();
     let replica = ReplicaId::new();
@@ -505,7 +496,9 @@ fn one_embedded_run(config: &Config) -> Result<RunMetrics, Box<dyn Error>> {
         cold_start_micros,
         recovery_reopen_micros,
         p50_commit_micros: percentile(&commit_latencies, 50),
+        p95_commit_micros: percentile(&commit_latencies, 95),
         p99_commit_micros: percentile(&commit_latencies, 99),
+        commit_latency_samples: config.operations.div_ceil(config.batch),
         throughput_ops_per_second: throughput,
         durable_bytes,
         committed_operations: committed,
@@ -571,16 +564,7 @@ fn run_distributed(config: &Config) -> TraceReport {
         documents: config.documents,
         operations_per_commit: config.batch,
         runs: config.runs,
-        cold_start_micros: 0,
-        recovery_reopen_micros: 0,
-        p50_latency_micros: 0,
-        p99_latency_micros: 0,
-        throughput_ops_per_second: 0,
-        durable_bytes: 0,
-        committed_operations: 0,
-        duplicate_retries_honored: 0,
-        index_queries_matched: 0,
-        tombstones_verified: 0,
+        metrics: CommitMetrics::default(),
         cpu_seconds: None,
         peak_rss_bytes: None,
         unmeasured_reason: "std exposes no portable process-CPU or RSS API; adding a platform crate is a separate lgwks-deps decision",

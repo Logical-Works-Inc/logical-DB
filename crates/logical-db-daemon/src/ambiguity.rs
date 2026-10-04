@@ -1046,14 +1046,14 @@ async fn verify_page(
         let page = read_page_with_retry(store, action, &grant).await?;
         if page.position <= after
             || page.position > observed
-            || page.changes.is_empty()
-            || page.changes.len() > usize::from(count)
+            || page.changes().is_empty()
+            || page.changes().len() > usize::from(count)
             || page.more != (page.position < observed)
         {
             return Err(io::Error::other("ordered FDB page violated its bounds").into());
         }
         returned = returned
-            .checked_add(page.changes.len())
+            .checked_add(page.changes().len())
             .ok_or_else(|| io::Error::other("page coverage overflowed"))?;
         pages = pages
             .checked_add(1)
@@ -1061,7 +1061,7 @@ async fn verify_page(
         if pages == 1 {
             first_page_had_more = page.more;
         }
-        for returned_change in &page.changes {
+        for returned_change in page.changes() {
             if !operations.insert(returned_change.operation) {
                 return Err(io::Error::other("ordered FDB pages repeated an operation").into());
             }

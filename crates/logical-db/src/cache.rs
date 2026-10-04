@@ -121,26 +121,25 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use lgwks_std::hash::Hasher;
-pub use logical_db::{
+pub use crate::{
     BatchEdit, Database, DatabaseError, MigrationReport, Projection, ProjectionSemantics,
 };
-use logical_db::{
+use crate::{
     ChangeEvent, EditOutcome, Item, Object, OperationDigest, OperationId, RemoteChange, Scalar,
 };
+use lgwks_std::hash::Hasher;
 use logical_db_model::MAX_CHANGE_BYTES;
 pub use logical_db_model::{
     AccountId, DocumentId, DocumentRevision, IndexId, IndexValue, NamespaceCheckpoint,
     NamespaceCheckpoints, PeerId, ReplicaId, Scope, SpaceId,
 };
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Application schema version binding the cache projections to a scope.
 pub const KV_SCHEMA_VERSION: u32 = 1;
@@ -187,9 +186,11 @@ pub const MAX_BATCH_PUT: usize = 32;
 pub const NEVER_EXPIRES_AT_MS: i64 = i64::MAX;
 
 /// Secondary index over slot expiry (`Timestamp` milliseconds).
-pub const EXPIRY_INDEX: IndexId = IndexId::from_uuid(Uuid::from_bytes(*b"ldb-kv-expiry-01"));
+pub static EXPIRY_INDEX: LazyLock<IndexId> =
+    LazyLock::new(|| IndexId::from_durable_bytes(b"ldb-kv-expiry-01"));
 /// Secondary index over slot recency (`Unsigned` writer sequence).
-pub const RECENCY_INDEX: IndexId = IndexId::from_uuid(Uuid::from_bytes(*b"ldb-kv-recency-1"));
+pub static RECENCY_INDEX: LazyLock<IndexId> =
+    LazyLock::new(|| IndexId::from_durable_bytes(b"ldb-kv-recency-1"));
 
 /// Root-map property carrying the envelope layout version.
 pub const FIELD_VERSION: &str = "kv_v";
@@ -214,9 +215,35 @@ pub const FIELD_SEQUENCE: &str = "kv_seq";
 #[non_exhaustive]
 pub struct CacheEntry {
     /// Original cache key.
-    pub key: String,
+    key: String,
     /// Opaque value bytes as stored.
-    pub value: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl CacheEntry {
+    /// Builds one live cache entry from its key and stored value bytes.
+    #[must_use]
+    pub fn new(key: String, value: Vec<u8>) -> Self {
+        Self { key, value }
+    }
+
+    /// Original cache key. Immutable entry data.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Opaque value bytes as stored. Immutable entry data.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Consumes this entry, returning its key and value bytes.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<u8>) {
+        (self.key, self.value)
+    }
 }
 
 /// Content address of a tiered value, returned by
@@ -235,11 +262,43 @@ pub struct BlobReference {
 #[non_exhaustive]
 pub struct BatchPut {
     /// Cache key, validated exactly like [`KvCache::put`].
-    pub key: String,
+    key: String,
     /// Opaque value bytes, bounded exactly like [`KvCache::put`].
-    pub value: Vec<u8>,
+    value: Vec<u8>,
     /// Optional time-to-live; `None` never expires.
-    pub ttl: Option<Duration>,
+    ttl: Option<Duration>,
+}
+
+impl BatchPut {
+    /// Builds one batch entry from its key, value bytes, and optional TTL.
+    #[must_use]
+    pub fn new(key: String, value: Vec<u8>, ttl: Option<Duration>) -> Self {
+        Self { key, value, ttl }
+    }
+
+    /// Cache key. Immutable batch-entry data.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Opaque value bytes. Immutable batch-entry data.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Optional time-to-live; `None` never expires.
+    #[must_use]
+    pub fn ttl(&self) -> Option<Duration> {
+        self.ttl
+    }
+
+    /// Consumes this entry, returning its key, value bytes, and optional TTL.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<u8>, Option<Duration>) {
+        (self.key, self.value, self.ttl)
+    }
 }
 
 /// Stable failures exposed by the cache facade.
@@ -1305,9 +1364,6 @@ impl KvCache {
             Ok(())
         })? {
             EditOutcome::Applied(_) | EditOutcome::Duplicate(_) => {}
-            // `EditOutcome` is non_exhaustive: a future outcome is not a
-            // successful slot write, so this fails closed.
-            _ => return Err(KvError::CorruptEnvelope),
         }
         Ok(())
     }
@@ -1414,8 +1470,8 @@ impl KvCache {
 
     /// Decodes expiry and sequence fields from a reader.
     fn decode_expiry_and_sequence(
-        reader: &mut logical_db::Reader<'_>,
-    ) -> Result<Option<(i64, u64)>, logical_db::CrdtError> {
+        reader: &mut crate::Reader<'_>,
+    ) -> Result<Option<(i64, u64)>, crate::CrdtError> {
         let expires_at_ms = match reader.get(&Object::root(), FIELD_EXPIRY)? {
             None => NEVER_EXPIRES_AT_MS,
             Some(Item::Scalar(Scalar::Timestamp(millis) | Scalar::Integer(millis))) => millis,
@@ -1474,7 +1530,7 @@ impl KvCache {
                 let sequence = self.next_sequence(now);
                 let operation = OperationId::new();
                 let digest = clear_digest(&operation, &self.namespace, key);
-                let clear = |editor: &mut logical_db::Editor<'_>| {
+                let clear = |editor: &mut crate::Editor<'_>| {
                     editor.delete(&Object::root(), FIELD_VALUE)?;
                     editor.delete(&Object::root(), FIELD_BLOB)?;
                     editor.delete(&Object::root(), FIELD_SIZE)?;
@@ -1493,8 +1549,6 @@ impl KvCache {
                         live,
                         cleared: true,
                     }),
-                    // `EditOutcome` is non_exhaustive: fail closed.
-                    _ => Err(KvError::CorruptEnvelope),
                 }
             }
             Decoded::Found(_) | Decoded::Absent => Ok(ClearOutcome {
@@ -1548,7 +1602,7 @@ impl KvCache {
         let staged = self.blob_dir.join(format!(
             "{}.tmp-{}",
             hex_digest(digest),
-            Uuid::now_v7().hyphenated()
+            DocumentId::unique_suffix()
         ));
         let mut file = File::options()
             .create(true)
@@ -1729,7 +1783,7 @@ impl KvCache {
 #[must_use]
 pub fn kv_projections() -> Vec<Projection> {
     vec![
-        Projection::new(EXPIRY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
+        Projection::new(*EXPIRY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -1741,7 +1795,7 @@ pub fn kv_projections() -> Vec<Projection> {
                 Some(_) => None,
             })
         }),
-        Projection::new(RECENCY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
+        Projection::new(*RECENCY_INDEX, KV_PROJECTION_SEMANTICS, |reader| {
             if !projection_has_live_value(reader)? {
                 return Ok(None);
             }
@@ -1760,9 +1814,7 @@ pub fn kv_projections() -> Vec<Projection> {
 }
 
 /// Returns whether a reader describes a well-formed live slot value.
-fn projection_has_live_value(
-    reader: &mut logical_db::Reader<'_>,
-) -> Result<bool, logical_db::CrdtError> {
+fn projection_has_live_value(reader: &mut crate::Reader<'_>) -> Result<bool, crate::CrdtError> {
     let Some(Item::Scalar(Scalar::String(key))) = reader.get(&Object::root(), FIELD_KEY)? else {
         return Ok(false);
     };
@@ -1965,19 +2017,8 @@ fn blob_dir_for(path: &Path) -> PathBuf {
 
 /// Extracts the wall-clock start time encoded in a UUIDv7 operation id.
 fn operation_started_at_ms(operation: &OperationId) -> Result<i64, KvError> {
-    let uuid = operation.as_uuid();
-    if uuid.get_version_num() != 7 {
-        return Err(KvError::InvalidOperationId);
-    }
-    let Some(timestamp) = uuid.get_timestamp() else {
-        return Err(KvError::InvalidOperationId);
-    };
-    let (seconds, nanos) = timestamp.to_unix();
-    seconds
-        .checked_mul(1_000)
-        .and_then(|millis| millis.checked_add(u64::from(nanos.checked_div(1_000_000)?)))
-        .and_then(|millis| i64::try_from(millis).ok())
-        .ok_or(KvError::InvalidOperationId)
+    let timestamp = operation.unix_millis().ok_or(KvError::InvalidOperationId)?;
+    i64::try_from(timestamp).map_err(|_| KvError::InvalidOperationId)
 }
 
 /// Derives a unique recency sequence for one index within a batch.
@@ -2002,7 +2043,7 @@ fn batch_member_operation(batch: OperationId, index: usize) -> OperationId {
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x80;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    OperationId::from_uuid(Uuid::from_bytes(bytes))
+    OperationId::from_durable_bytes(&bytes)
 }
 
 /// Hashes a full batch request for idempotent apply and deduplication.
@@ -2131,20 +2172,23 @@ fn document_for(namespace: &str, key: &str) -> DocumentId {
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x80;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
-    DocumentId::from_uuid(Uuid::from_bytes(bytes))
+    DocumentId::from_durable_bytes(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logical_db::CrdtError;
+    use crate::CrdtError;
 
     fn scope() -> Scope {
         Scope::new(AccountId::new(), SpaceId::new())
     }
 
     fn path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("logical-db-kv-{tag}-{}.redb", Uuid::now_v7()))
+        std::env::temp_dir().join(format!(
+            "logical-db-kv-{tag}-{}.redb",
+            DocumentId::unique_suffix()
+        ))
     }
 
     fn open_cache(
@@ -2301,7 +2345,7 @@ mod tests {
         assert_eq!(report.documents, 2);
         assert_eq!(cache.get("legacy")?, Some(b"old".to_vec()));
         let stored = cache.database().query_index(
-            EXPIRY_INDEX,
+            *EXPIRY_INDEX,
             &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
             None,
             10,
@@ -2370,7 +2414,7 @@ mod tests {
         cache.put("forever", b"v", None)?;
         assert_eq!(cache.get("forever")?, Some(b"v".to_vec()));
         let hits = cache.database().query_index(
-            EXPIRY_INDEX,
+            *EXPIRY_INDEX,
             &IndexValue::Timestamp(NEVER_EXPIRES_AT_MS),
             None,
             10,
@@ -2627,7 +2671,7 @@ mod tests {
         let db_path = path("batch-operation-id");
         let cache = open_cache(&db_path, "sessions")?;
         let Err(error) = cache.put_many_with_operation(
-            OperationId::from_uuid(Uuid::nil()),
+            OperationId::from_durable_bytes(&[0; 16]),
             &[BatchPut {
                 key: "key".into(),
                 value: b"value".to_vec(),
@@ -2655,10 +2699,10 @@ mod tests {
                 writer.put(key, key.as_bytes(), Some(Duration::from_secs(60)))?;
             }
             let pending = writer.database().pending_changes(0, 64)?;
-            let remote: Vec<logical_db::RemoteChange> = pending
+            let remote: Vec<crate::RemoteChange> = pending
                 .into_iter()
                 .map(|change| {
-                    logical_db::RemoteChange::new(change.document, change.digest, change.bytes)
+                    crate::RemoteChange::new(change.document, change.digest, change.into_bytes())
                 })
                 .collect();
             assert_eq!(remote.len(), 5);
@@ -2766,10 +2810,10 @@ mod tests {
         peer: PeerId,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let pending = writer.database().pending_changes(0, 64)?;
-        let remote: Vec<logical_db::RemoteChange> = pending
+        let remote: Vec<crate::RemoteChange> = pending
             .into_iter()
             .map(|change| {
-                logical_db::RemoteChange::new(change.document, change.digest, change.bytes)
+                crate::RemoteChange::new(change.document, change.digest, change.into_bytes())
             })
             .collect();
         let count = remote.len();
@@ -2795,7 +2839,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         for change in &pending {
             assert!(
-                change.bytes.len() < TIER_THRESHOLD_BYTES,
+                change.as_bytes().len() < TIER_THRESHOLD_BYTES,
                 "sidecar reference must stay inside the bounded change"
             );
         }

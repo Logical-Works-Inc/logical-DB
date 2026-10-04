@@ -800,7 +800,6 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "static_assertions",
- "uuid",
 ]
 
 [[package]]
@@ -1447,6 +1446,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0c687bdb1c6b1bffbb558bee0020c079e4d39035f3ec7b7805ffec4f49b4ba1"
 dependencies = [
  "blake3",
+ "getrandom 0.4.3",
  "iri-string",
  "serde",
  "serde_json",
@@ -1497,7 +1497,6 @@ dependencies = [
  "logical-db-store",
  "logical-db-sync",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1506,7 +1505,6 @@ version = "0.1.0"
 dependencies = [
  "lgwks_std",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1516,7 +1514,6 @@ dependencies = [
  "lgwks_std",
  "logical-db-model",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1545,7 +1542,6 @@ dependencies = [
  "logical-db-service",
  "logical-db-store-fdb",
  "reqwest",
- "uuid",
 ]
 
 [[package]]
@@ -1565,7 +1561,6 @@ dependencies = [
  "logical-db-server",
  "logical-db-service",
  "logical-db-store-fdb",
- "uuid",
 ]
 
 [[package]]
@@ -1576,7 +1571,6 @@ dependencies = [
  "lgwks_std",
  "logical-db-cairn",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1596,23 +1590,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "logical-db-kv"
-version = "0.1.0"
-dependencies = [
- "lgwks_std",
- "logical-db",
- "logical-db-model",
- "thiserror",
- "uuid",
-]
-
-[[package]]
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
  "lgwks_std",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1667,7 +1649,6 @@ dependencies = [
  "logical-db-model",
  "redb",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1681,7 +1662,6 @@ dependencies = [
  "logical-db-protocol",
  "logical-db-service",
  "thiserror",
- "uuid",
 ]
 
 [[package]]

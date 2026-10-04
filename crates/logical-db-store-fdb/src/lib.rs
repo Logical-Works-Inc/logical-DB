@@ -207,8 +207,8 @@ impl Record {
             && self.operation == change.operation
             && self.request == change.request
             && self.digest == change.digest
-            && self.byte_len == change.bytes.len()
-            && self.chunks == chunk_count(change.bytes.len())
+            && self.byte_len == change.as_bytes().len()
+            && self.chunks == chunk_count(change.as_bytes().len())
     }
 
     /// Envelope
@@ -232,11 +232,11 @@ fn encode_manifest(
     sequence: u64,
     invocation_id: [u8; 32],
 ) -> Result<[u8; OPERATION_BYTES], DataError> {
-    if !(1..=MAX_CHANGE_BYTES).contains(&change.bytes.len()) {
+    if !(1..=MAX_CHANGE_BYTES).contains(&change.as_bytes().len()) {
         return Err(DataError::InvalidManifest { at: "manifest" });
     }
-    let byte_len = u32::try_from(change.bytes.len()).map_err(malformed_data)?;
-    let chunks = chunk_count(change.bytes.len());
+    let byte_len = u32::try_from(change.as_bytes().len()).map_err(malformed_data)?;
+    let chunks = chunk_count(change.as_bytes().len());
     let mut bytes = [0; OPERATION_BYTES];
     bytes[..16].copy_from_slice(change.document.as_uuid().as_bytes());
     bytes[16..32].copy_from_slice(change.replica.as_uuid().as_bytes());
@@ -456,9 +456,9 @@ fn invocation_binding(change: &ChangeEnvelope) -> [u8; 80] {
 #[cfg(any(feature = "fdb", test))]
 /// Decode record
 fn decode_record(bytes: &[u8], sequence: u64) -> Result<Record, DataError> {
-    let document = decode_uuid(&bytes[..16]).map(DocumentId::from_uuid)?;
-    let replica = decode_uuid(&bytes[16..32]).map(ReplicaId::from_uuid)?;
-    let operation = decode_uuid(&bytes[32..48]).map(OperationId::from_uuid)?;
+    let document = decode_identifier(&bytes[..16], DocumentId::from_durable_bytes)?;
+    let replica = decode_identifier(&bytes[16..32], ReplicaId::from_durable_bytes)?;
+    let operation = decode_identifier(&bytes[32..48], OperationId::from_durable_bytes)?;
     let request = bytes[48..80]
         .try_into()
         .map(OperationDigest::new)
@@ -493,8 +493,13 @@ fn chunk_count(byte_len: usize) -> u16 {
 
 #[cfg(any(feature = "fdb", test))]
 /// Decode uuid
-fn decode_uuid(bytes: &[u8]) -> Result<uuid::Uuid, DataError> {
-    uuid::Uuid::from_slice(bytes).map_err(malformed_data)
+/// Rehydrates a typed identifier from exactly 16 durable bytes, through the
+/// model crate that owns identifier construction for the whole workspace.
+fn decode_identifier<T>(bytes: &[u8], wrap: fn(&[u8; 16]) -> T) -> Result<T, DataError> {
+    let raw: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| malformed_data("identifier is not 16 bytes"))?;
+    Ok(wrap(&raw))
 }
 
 #[cfg(any(feature = "fdb", test))]
@@ -699,8 +704,8 @@ mod runtime {
         fn scope_space(&self, scope: Scope) -> Subspace {
             self.root.subspace(&(
                 FORMAT_VERSION,
-                scope.account().as_uuid(),
-                scope.space().as_uuid(),
+                scope.account().as_bytes(),
+                scope.space().as_bytes(),
             ))
         }
     }
@@ -1199,7 +1204,7 @@ mod runtime {
             .filter(|value| i64::try_from(*value).is_ok())
             .ok_or_else(|| binding(DataError::SequenceExhausted))?;
         let manifest = encode_manifest(&change, sequence, invocation_id).map_err(binding)?;
-        for (index, bytes) in change.bytes.chunks(CHUNK_BYTES).enumerate() {
+        for (index, bytes) in change.as_bytes().chunks(CHUNK_BYTES).enumerate() {
             let index = u16::try_from(index).map_err(binding_invalid)?;
             transaction.set(&chunk_space.pack(&(sequence, index)), bytes);
         }
@@ -1625,7 +1630,7 @@ mod runtime {
         transaction: &foundationdb::RetryableTransaction,
         spaces: &BaselineSpaces,
         baseline: &SnapshotBaseline,
-        after: Option<uuid::Uuid>,
+        after: Option<DocumentId>,
     ) -> Result<BaselinePageSlice, FdbBindingError> {
         let digest = baseline.digest().into_bytes();
         let document_space = spaces.document.subspace(&(digest.as_slice(),));
@@ -1684,7 +1689,7 @@ mod runtime {
         use lgwks_std::hash::blake3;
 
         let (document_id,) = document_space
-            .unpack::<(uuid::Uuid,)>(key)
+            .unpack::<([u8; 16],)>(key)
             .map_err(binding_invalid)?;
         let snapshot = load_snapshot_bytes(
             transaction,
@@ -1709,7 +1714,7 @@ mod runtime {
         transaction: &foundationdb::RetryableTransaction,
         chunk_space: &Subspace,
         artifact: [u8; 32],
-        document: uuid::Uuid,
+        document: DocumentId,
         manifest: BaselineDocumentManifest,
     ) -> Result<Vec<u8>, FdbBindingError> {
         let mut bytes = Vec::with_capacity(manifest.byte_len);
@@ -1840,7 +1845,7 @@ mod runtime {
         let exact_retry = record.matches(change)
             && exact_bytes
                 .as_ref()
-                .is_none_or(|bytes| *bytes == change.bytes);
+                .is_none_or(|bytes| *bytes == change.as_bytes());
         Ok(Some(if exact_retry {
             if maybe_committed {
                 AcceptResult::RecoveredUnknownCommit
@@ -2253,14 +2258,14 @@ mod tests {
         let second = Scope::new(AccountId::new(), SpaceId::new());
         let first_log = root.subspace(&(
             FORMAT_VERSION,
-            first.account().as_uuid(),
-            first.space().as_uuid(),
+            first.account().to_string(),
+            first.space().to_string(),
             KIND_LOG,
         ));
         let second_log = root.subspace(&(
             FORMAT_VERSION,
-            second.account().as_uuid(),
-            second.space().as_uuid(),
+            second.account().to_string(),
+            second.space().to_string(),
             KIND_LOG,
         ));
         assert_ne!(first_log.bytes(), second_log.bytes());
@@ -2300,7 +2305,10 @@ mod tests {
         let record = operation.record;
         assert_eq!(record.sequence, 41);
         assert!(record.matches(&change));
-        assert_eq!(record.envelope(change.scope, change.bytes.clone()), change);
+        assert_eq!(
+            record.envelope(change.scope, change.as_bytes().to_vec()),
+            change
+        );
         assert_eq!(
             decode_manifest(&encoded[..MANIFEST_BYTES], 99)?.sequence,
             99
@@ -2322,7 +2330,9 @@ mod tests {
         altered.digest = ChangeDigest::new([10; 32]);
         assert!(!record.matches(&altered));
         altered = change.clone();
-        altered.bytes.pop();
+        let mut truncated = altered.as_bytes().to_vec();
+        truncated.pop();
+        altered.replace_bytes(truncated);
         assert!(!record.matches(&altered));
         assert!(
             !Record {
@@ -2453,7 +2463,7 @@ mod tests {
             Err(DataError::InvalidManifest { at: "manifest" })
         );
         assert_eq!(
-            decode_uuid(&[0; 15]),
+            decode_identifier(&[0; 15], DocumentId::from_durable_bytes),
             Err(DataError::InvalidManifest { at: "manifest" })
         );
         Ok(())

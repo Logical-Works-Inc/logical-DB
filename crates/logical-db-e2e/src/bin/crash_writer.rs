@@ -19,7 +19,6 @@ use logical_db::{
     Scope, SpaceId,
 };
 use std::error::Error;
-use uuid::Uuid;
 
 /// Reports a failed fixture run on stderr and exits nonzero.
 fn main() {
@@ -36,11 +35,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         .try_into()
         .map_err(|_| "expected path, account, space, replica, and document arguments")?;
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&account)?),
-        SpaceId::from_uuid(Uuid::parse_str(&space)?),
+        AccountId::parse_canonical(&account)?,
+        SpaceId::parse_canonical(&space)?,
     );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(&replica)?);
-    let document = DocumentId::from_uuid(Uuid::parse_str(&document)?);
+    let replica = ReplicaId::parse_canonical(&replica)?;
+    let document = DocumentId::parse_canonical(&document)?;
     let database = Database::open(&path, scope, replica)?;
     database.edit(
         document,

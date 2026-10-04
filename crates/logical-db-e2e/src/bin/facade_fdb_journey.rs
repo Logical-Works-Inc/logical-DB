@@ -21,7 +21,6 @@ use logical_db::{
     Scalar, Scope, SpaceId, SyncLimits,
     http::{HttpTransport, StaticBearer, Url},
 };
-use uuid::Uuid;
 
 /// Reads one required environment variable, naming it when it is missing.
 fn required(name: &'static str) -> Result<String, io::Error> {
@@ -44,10 +43,10 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let bearer_token = required("LOGICAL_DB_BEARER_TOKEN")?;
     let bearer = StaticBearer::new(&bearer_token)?;
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&required("LOGICAL_DB_ACCOUNT_ID")?)?),
-        SpaceId::from_uuid(Uuid::parse_str(&required("LOGICAL_DB_SPACE_ID")?)?),
+        AccountId::parse_canonical(&required("LOGICAL_DB_ACCOUNT_ID")?)?,
+        SpaceId::parse_canonical(&required("LOGICAL_DB_SPACE_ID")?)?,
     );
-    let run = Uuid::now_v7();
+    let run = DocumentId::unique_suffix();
     let first_path = std::env::temp_dir().join(format!("logical-db-fdb-first-{run}.redb"));
     let second_path = std::env::temp_dir().join(format!("logical-db-fdb-second-{run}.redb"));
     let first = Database::open(&first_path, scope, ReplicaId::new())?;

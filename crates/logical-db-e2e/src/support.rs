@@ -283,7 +283,7 @@ impl ServiceStore for MemoryServiceStore {
             .skip(usize::try_from(after.saturating_sub(floor)).unwrap_or(usize::MAX))
             .take(usize::from(max_changes))
             .take_while(|change| {
-                bytes = bytes.saturating_add(change.bytes.len());
+                bytes = bytes.saturating_add(change.as_bytes().len());
                 bytes <= usize::try_from(max_bytes).unwrap_or(usize::MAX)
             })
             .map(|change| (*change).clone())

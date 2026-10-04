@@ -32,7 +32,7 @@ mod tests {
     fn path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "logical-db-network-{label}-{}.redb",
-            uuid::Uuid::now_v7()
+            DocumentId::new()
         ))
     }
 
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real()
     -> Result<(), Box<dyn std::error::Error>> {
-        let application = format!("com.logicaldb.windows.{}", uuid::Uuid::now_v7());
+        let application = format!("com.logicaldb.windows.{}", DocumentId::new());
         let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -701,7 +701,9 @@ mod tests {
 
         let resurrection = pre_floor
             .iter()
-            .map(|change| RemoteChange::new(change.document, change.digest, change.bytes.clone()))
+            .map(|change| {
+                RemoteChange::new(change.document, change.digest, change.as_bytes().to_vec())
+            })
             .collect::<Vec<_>>();
         second.install_remote_page(peer, &resurrection, b"resurrection-attempt")?;
         assert!(second.is_deleted(document)?);

@@ -1,5 +1,4 @@
 {
-  "evidence": "Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in evidence/SOURCES.md.",
   "profile": "embedded",
   "backend_class": "EmbeddedLocal",
   "status": "measured",
@@ -9,11 +8,11 @@
     "operations_per_commit": 32,
     "runs": 1
   },
-  "cold_start_micros": 28965,
-  "recovery_reopen_micros": 7681,
-  "p50_latency_micros": 39637,
-  "p99_latency_micros": 96941,
-  "throughput_ops_per_second": 781,
+  "cold_start_micros": 30904,
+  "recovery_reopen_micros": 6682,
+  "p50_latency_micros": 18120,
+  "p99_latency_micros": 33030,
+  "throughput_ops_per_second": 1704,
   "durable_bytes": 40636416,
   "cpu_seconds": null,
   "peak_rss_bytes": null,
@@ -24,5 +23,6 @@
     "index_queries_matched": 1,
     "tombstones_verified": 1
   },
-  "detail": "redb embedded replica; 32 operations per durable commit; median of 1 runs"
+  "detail": "redb embedded replica; 32 operations per durable commit; median of 1 runs",
+  "evidence_sources": "\"Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in evidence/SOURCES.md."
 }

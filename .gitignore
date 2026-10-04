@@ -3,6 +3,7 @@
 # evidence/SOURCES.md.
 
 /target/
+target/
 /.codegraph/
 /.keel/
 /keel-core/

@@ -28,7 +28,6 @@ logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", optional = true }
-uuid.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true

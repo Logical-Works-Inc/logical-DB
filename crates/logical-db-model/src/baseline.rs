@@ -404,14 +404,14 @@ mod tests {
     /// A scope with fixed bytes, so digests are reproducible across runs.
     fn fixed_scope() -> Scope {
         Scope::new(
-            AccountId::from_uuid(uuid::Uuid::from_bytes([0x11; 16])),
-            SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
+            AccountId::from_durable_bytes(&[0x11; 16]),
+            SpaceId::from_durable_bytes(&[0x22; 16]),
         )
     }
     /// A document with a fixed identity so its digest is stable across runs.
     fn fixed_doc(byte: u8, snapshot: Vec<u8>, tombstone: bool) -> SnapshotDocument {
         SnapshotDocument {
-            document: DocumentId::from_uuid(uuid::Uuid::from_bytes([byte; 16])),
+            document: DocumentId::from_durable_bytes(&[byte; 16]),
             snapshot,
             tombstone,
         }
@@ -453,14 +453,14 @@ mod tests {
     #[test]
     fn artifact_digest_has_a_portable_golden_encoding() -> Result<(), Box<dyn std::error::Error>> {
         let scope = Scope::new(
-            AccountId::from_uuid(uuid::Uuid::from_bytes([0x11; 16])),
-            SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
+            AccountId::from_durable_bytes(&[0x11; 16]),
+            SpaceId::from_durable_bytes(&[0x22; 16]),
         );
         let artifact = SnapshotArtifact::new(
             scope,
             7,
             vec![SnapshotDocument {
-                document: DocumentId::from_uuid(uuid::Uuid::from_bytes([0x33; 16])),
+                document: DocumentId::from_durable_bytes(&[0x33; 16]),
                 snapshot: vec![1, 2, 3],
                 tombstone: false,
             }],
@@ -515,7 +515,7 @@ mod tests {
         let scope = scope();
         let documents = (0..200_u128)
             .map(|index| SnapshotDocument {
-                document: DocumentId::from_uuid(uuid::Uuid::from_u128(index)),
+                document: DocumentId::from_fixture_u128(index),
                 snapshot: vec![1, 2, 3],
                 tombstone: index % 2 == 0,
             })
@@ -540,7 +540,7 @@ mod tests {
         let mut builder = SnapshotDigestBuilder::new(scope, 0, declared.saturating_add(1));
         for index in 0..=MAX_BASELINE_DOCUMENTS {
             builder.push(&SnapshotDocument {
-                document: DocumentId::from_uuid(uuid::Uuid::from_u128(u128::try_from(index)?)),
+                document: DocumentId::from_fixture_u128(u128::try_from(index)?),
                 snapshot: vec![7],
                 tombstone: false,
             })?;
@@ -687,8 +687,8 @@ mod tests {
         let documents = [fixed_doc(0x33, vec![1, 2, 3], false)];
         let base = streamed_digest(fixed_scope(), 7, &documents)?;
         let other_scope = Scope::new(
-            AccountId::from_uuid(uuid::Uuid::from_bytes([0x12; 16])),
-            SpaceId::from_uuid(uuid::Uuid::from_bytes([0x22; 16])),
+            AccountId::from_durable_bytes(&[0x12; 16]),
+            SpaceId::from_durable_bytes(&[0x22; 16]),
         );
         assert_ne!(base, streamed_digest(other_scope, 7, &documents)?);
         assert_ne!(base, streamed_digest(fixed_scope(), 8, &documents)?);
@@ -773,7 +773,7 @@ mod tests {
         let documents = (0..=declared)
             .map(|index| {
                 Ok(SnapshotDocument {
-                    document: DocumentId::from_uuid(uuid::Uuid::from_u128(u128::from(index))),
+                    document: DocumentId::from_fixture_u128(u128::from(index)),
                     snapshot: vec![7],
                     tombstone: false,
                 })

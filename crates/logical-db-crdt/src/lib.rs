@@ -8,7 +8,7 @@
 
 use automerge::{
     AutoCommit, AutomergeError, Change, ChangeHash, LoadChangeError, LoadOptions, ObjId, ObjType,
-    ROOT, ReadDoc, ScalarValue, TextEncoding, Value, transaction::Transactable,
+    ROOT, ReadDoc, SaveOptions, ScalarValue, TextEncoding, Value, transaction::Transactable,
 };
 use logical_db_model::{
     ChangeDigest, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, MAX_SNAPSHOT_BYTES,
@@ -143,7 +143,21 @@ pub struct EncodedChange {
     /// Native Automerge change identity.
     pub digest: ChangeDigest,
     /// Canonical binary change representation.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl EncodedChange {
+    /// Canonical change bytes. Immutable so the digest binding holds.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes this change, returning its canonical bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 impl EncodedChange {
@@ -202,13 +216,26 @@ impl Document {
         })
     }
 
-    /// Serializes a verified complete snapshot.
+    /// Serializes a complete snapshot for durable materialization.
+    ///
+    /// Verification is a **load** concern ([`Document::load`] of untrusted
+    /// bytes). Automerge's `save_and_verify` reloads the document before
+    /// returning — documented upstream as slow — and `save` DEFLATE-compresses
+    /// the entire history on every call. Both are O(history) per edit and were
+    /// three orders of magnitude off a row write. The hot path stores
+    /// uncompressed bytes and trusts the in-memory document it just edited;
+    /// restore, remote install, and export still refuse malformed bytes at
+    /// load.
     ///
     /// # Errors
     ///
-    /// Returns [`CrdtError::Automerge`] if internal document verification fails.
+    /// Returns [`CrdtError::InvalidSnapshotSize`] when the encoding is empty or
+    /// exceeds [`MAX_SNAPSHOT_BYTES`].
     pub fn save(&mut self) -> Result<Vec<u8>, CrdtError> {
-        let snapshot = self.inner.save_and_verify()?;
+        let snapshot = self.inner.save_with_options(SaveOptions {
+            deflate: false,
+            ..SaveOptions::default()
+        });
         if !is_nonempty_bounded(snapshot.len(), MAX_SNAPSHOT_BYTES) {
             return Err(CrdtError::InvalidSnapshotSize(snapshot.len()));
         }
@@ -397,7 +424,27 @@ pub struct ConflictValue {
     /// Scalar or nested object authored by one causal operation.
     pub value: Item,
     /// Stable opaque Automerge operation identity for UI reconciliation.
-    pub causal_id: Vec<u8>,
+    causal_id: Vec<u8>,
+}
+
+impl ConflictValue {
+    /// Builds one retained conflict candidate.
+    #[must_use]
+    pub fn new(value: Item, causal_id: Vec<u8>) -> Self {
+        Self { value, causal_id }
+    }
+
+    /// Stable opaque operation identity. Immutable reconciliation data.
+    #[must_use]
+    pub fn causal_id(&self) -> &[u8] {
+        &self.causal_id
+    }
+
+    /// Consumes this candidate, returning its value and causal identity.
+    #[must_use]
+    pub fn into_parts(self) -> (Item, Vec<u8>) {
+        (self.value, self.causal_id)
+    }
 }
 
 /// Read-only document view used by application projections.
@@ -801,7 +848,7 @@ fn encode_change(change: &Change) -> EncodedChange {
 
 /// Decodes one change and verifies it against its asserted digest.
 fn decode_change(encoded: &EncodedChange) -> Result<Change, CrdtError> {
-    let change = Change::from_bytes(encoded.bytes.clone())?;
+    let change = Change::from_bytes(encoded.as_bytes().to_vec())?;
     if hash_digest(change.hash()) != encoded.digest {
         return Err(CrdtError::DigestMismatch);
     }

@@ -84,7 +84,6 @@ ALLOWED_INTERNAL_DEPENDENCIES = {
         "logical-db-store",
         "logical-db-sync",
     },
-    "logical-db-kv": {"logical-db", "logical-db-model"},
     "logical-db-cairn": set(),
     "logical-db-episode": {"logical-db-cairn"},
     "logical-db-cloud-contract": {"logical-db-model"},

@@ -1,0 +1,211 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Primary URLs:
+# ../../evidence/SOURCES.md.
+# Nine-axis requirement graph — arming packet for the embeddable path
+#
+# House rule: every requirement has a test id or an OPEN pin. No third state.
+# Axes inform architecture and regression selection before code is written
+# (workflow-guard.md). `cargo test` green is not verification: the experience
+# track requires a real journey through the public interface.
+#
+# Tesler's law (Director, 2026-09-22): at every decision, the design that
+# absorbs essential complexity into the system wins. The buyer cannot set up
+# PowerBI and will not become a DBA. Complexity lives in logical-db, never in
+# the app, the operator, or tribal knowledge.
+
+meta:
+  product: logical-DB
+  purpose: embeddable path to a sovereign structured-data substrate
+  scope: >
+    EP-1..EP-6 (local CRUD through sync orchestration and cache). Cloud Plane
+    hyperscale and Forge grants remain OPEN pins (EP-X1..EP-X5).
+  release_bar: >
+    one Git revision of `logical-db` (+ `logical_db::cache`) that a fresh
+    Cargo project can pin, embed, run offline, export, restore, and sync
+    without importing an internal crate
+  tesler_rule: >
+    every API and default must be usable by an application developer with no
+    data-platform training and by an agent operating with a scoped grant; the
+    hard cases (retry, recovery, residency, provenance) are absorbed here
+  buyers:
+    B1: Gary-MySQL displacement — explainability, agent-safe writes, portable exit
+    B2: agent-ops platform — scoped grants, receipts, refusal paths
+    B3: sovereign / regulated — residency, dual-write cutover, exit
+    B4: local-first app ISV — embeddable store + multi-replica sync
+    B5: >
+      enterprise with zero data-platform understanding and no PowerBI path,
+      plus the real developers who must still ship — Tesler's law on every call
+  comparators_all_four_classes: true   # A01 measures managed-sync, database-log-sync, CRDT-sync, object/compute-stack
+  tenancy_key: AccountId + SpaceId
+  concurrency_bounded:
+    MAX_EDIT_BATCH: 256
+    MAX_EXPORT_BYTES: see logical_db_model
+    MAX_SNAPSHOT_BYTES: see logical_db_store
+    MAX_MATERIALIZED_PAGE_BYTES: see logical_db_store
+    sync_limits: SyncLimits (explicit; zero/excess refused)
+    refusal: typed errors — never a silent clamp
+
+axes:
+  A01:
+    name: Frontier
+    invariant: >
+      the embeddable design beats credible alternatives on the actual problem
+      (provable operational truth: D1 explain, D2 agent-safe, D3 exit) without
+      sacrificing correctness
+    evidence: >
+      dated primary research, named adopted/rejected mechanisms, matched
+      capability/cost measurements across all four ADR-0003 classes
+    disposition: Unverified
+    missing: >
+      no dated matched superiority measurement. Beat-eval rule: win retry,
+      crash, restore, convergence, grant-refusal; match or disclose raw CRUD
+      against native_db's criterion class (insert/get/range/delete, SK counts,
+      batched vs single transaction)
+    test: ER-T09
+  A02:
+    name: Hyperscale
+    invariant: 1,000,000+ active concurrent users stay correct under skew and failure
+    evidence: sustained load, burst, saturation, recovery with raw telemetry
+    disposition: Not evaluated
+    missing: >
+      embeddable-side bounds exist (SyncLimits, export/snapshot caps) but are
+      only read; Cloud ladder is EP-X3 / issue #72. A small local test cannot
+      pass this row.
+    test: ER-T10
+  A03:
+    name: Idiomatic Rust
+    invariant: ownership, errors, states, lifetimes explicit and sound; R01–R10 hold
+    evidence: file-specific design review, compiler/lint, soundness checks, exercised failure paths
+    disposition: Partial
+    missing: >
+      lint-expressible ceiling held (25/75). Invariant-bearing Vec/String fields
+      now private with bounded accessors. Remaining 50 anti-patterns need Miri
+      / perf / review. Lint silence is not a pass.
+    test: ER-T01
+  A04:
+    name: Generalized
+    invariant: semantics hold across the whole declared input and deployment family
+    evidence: independent boundary/property cases, config variation; no fixture-specific shortcuts
+    disposition: Partial
+    missing: AE1–AE5 and unicode/TTL/batch/export bounds under black-box e2e
+    test: ER-T03, ER-T04
+  A05:
+    name: Decoupled
+    invariant: components have explicit owners/contracts and are independently replaceable
+    evidence: dependency analysis, replacement tests, contract compat, version-skew results
+    disposition: Partial
+    missing: external consumer tape (EP-X5); replacement fixture for transport
+    test: ER-T05, ER-T08
+  A06:
+    name: Ephemeral
+    invariant: correctness survives process loss; durable state owned outside disposable workers
+    evidence: real crash/restart/replay proving integrity, idempotency, cancellation, recovery
+    disposition: Partial
+    missing: >
+      kill-during-write and kill-during-restore already pass. AE3 corrupt
+      restore and orchestrator-state resume need embeddable-suite receipts.
+      ≥10% of applicable e2e induce a real kill; report counts.
+    test: ER-T06
+  A07:
+    name: Portable
+    invariant: same required semantics on every declared OS/arch/runtime target
+    evidence: reproducible builds and actual e2e per target; cross-compilation alone cannot pass
+    disposition: Partial
+    missing: >
+      declared targets are macOS arm64, Windows-native, Linux. No per-target
+      e2e receipt matrix in evidence/. Wine is supporting, not native.
+    test: ER-T07
+  A08:
+    name: Multi-tenant
+    invariant: identity, data, caches, receipts, quotas, recovery isolated under concurrent use
+    evidence: cross-tenant negatives, scope propagation, noisy-neighbour and failure isolation
+    disposition: Partial
+    missing: cross-scope negatives on cache, orchestrator state, export/restore
+    test: ER-T03
+  A09:
+    name: Fastest correct Rust
+    invariant: performance comparisons retain every required semantic and the complete execution path
+    evidence: matched CPU/alloc/memory/IO/contention/throughput and p50/p95/p99 vs credible alternatives
+    disposition: Unmeasured
+    missing: >
+      three matched-trace files only. Native_db class uses criterion +
+      criterion-table. Disclose receipt/digest overhead on the raw path; do
+      not claim a receipt is free. Tail bar is p50/p95/p99. Availability class
+      bar is five nines only when an availability claim is made.
+    test: ER-T09
+
+displacement:   # D1–D3 from the thesis; each must keep a test id or OPEN pin
+  D1:
+    claim: every mutation is explainable (OperationId, request digest, receipt, frontier)
+    test: AE6
+  D2:
+    claim: safe to grant an agent scoped write authority
+    test: OPEN  # EP-X4 deferred by Director 2026-09-22
+  D3:
+    claim: leave with receipts (dual-write, digests, versioned export/restore, fail-closed corrupt)
+    test: AE3, AE5
+
+rust_requirements:
+  R01: ownership and scope — never edit third-party repos; never commit derived output
+  R02: estate reuse and architecture — CodeGraph before new types; dependency inversion; narrow interfaces
+  R03: valid states and API contracts — invariant fields private; validated constructors; state transitions typed
+  R04: errors and borrowing — typed domain errors; no production unwrap/expect; no defensive clone
+  R05: concurrency and bounds — no lock across .await; no unbounded channel/cache/spawn; every loop bounded in-loop
+  R06: lifecycle and failure — RAII; deterministic cleanup; durable state outside disposable workers
+  R07: diagnostics and soundness — tracing not println in libs; every allow/expect carries reason = "..."
+  R08: one buildable implementation — every commit compiles and passes; judge rustc error codes
+  R09: real tests and counterexamples — assert actual values; ≥10% of e2e induce real kills
+  R10: measured performance and delivery — receipts for the exact artifact; delegate handoff ≠ done
+
+surface:
+  EP-1: {what: Database local CRUD, schema, indexes, delete, export, restore, status: partial, test: ER-T02, ER-T04}
+  EP-2: {what: exact retry identity and crash durability, status: partial, test: ER-T06, AE-retry}
+  EP-3: {what: Database::synchronize push/pull, status: met-in-crate, test: existing sync suites}
+  EP-4: {what: logical_db::sync orchestrator surface, status: met-this-branch, test: AE6, AE7}
+  EP-5: {what: logical_db::cache (KvCache, TTL, batch, namespace, tiering), status: OPEN, note: "Director: re-export as logical_db::cache; Cargo cycle blocks a re-export while logical-db-kv depends on logical-db — invert by owning cache under logical_db::cache in this task", test: AE4, AE5}
+  EP-6: {what: multi-scope isolation on one binary, status: partial, test: ER-T03}
+
+test_attack_bar:
+  naming: "{method}_{state}_{outcome} — admit_at_ceiling_rejects, restore_corrupt_refuses"
+  shape: "Given/When/Then in the body. One scenario per test. No logic in the test."
+  assert: exact values, never bare is_ok()/is_some()
+  public_api: prefer; a private helper tested through itself is not the contract
+  weird_edges_required:
+    - empty string vs None vs whitespace-only key
+    - unicode keys (Ægir, 李, RTL) through digest and index paths
+    - TTL absent / future / expired / i64::MAX never-expires
+    - value at, under, and over TIER_THRESHOLD_BYTES
+    - export at MAX_EXPORT_BYTES bound (refused typed, not truncated)
+    - corrupt export bytes, truncated export, foreign version
+    - batch size 0 (refused), 1, at MAX_EDIT_BATCH, one past
+    - two scopes, same key, same process
+    - exact retry of the same OperationId + request digest
+    - checkpoint expired mid-sync (explicit recovery, never a partial prefix)
+    - orchestrator state blob at wrong version (fail closed)
+  never: weaken an assertion to go green
+
+beat_evals:
+  harness: criterion + criterion-table (native_db class); matched workloads and versions disclosed
+  must_win:
+    - exact retry under replay (duplicate → receipt, no second write)
+    - kill / crash / reopen integrity
+    - export / restore + corrupt-restore refusal
+    - multi-replica convergence + checkpoint-expiry recovery
+    - agent-grant / scope isolation negatives
+  match_or_disclose:
+    - raw insert / get / delete without sync or receipts
+    - single-threaded point read latency
+    - secondary-key scan throughput vs native_db
+  classes:
+    managed-sync: [CloudKit, Realm]
+    database-log-sync: [MySQL-as-found / Gary class, Postgres logical replication]
+    crdt-sync: [Automerge, Yjs]
+    object-compute-stack: [S3 + lambda patterns]
+    local-store-bench: [native_db, redb, sqlite]   # A09 harness donor, not a D1–D3 rival
+
+open_pins:
+  - {id: D2, what: agent grants / LocalScopeAuthority journeys, owner: host-authority work}
+  - {id: EP-X5, what: external consumer tape, owner: PRD WP2}
+  - {id: ER-T07, what: per-target e2e receipt matrix, owner: portable lane}
+  - {id: ER-T09, what: criterion matched traces vs all four classes, owner: benchmark harness}
+  - {id: ER-T10, what: >1M scale ladder, owner: issue #72}

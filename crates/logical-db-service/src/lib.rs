@@ -118,7 +118,7 @@ pub fn materialize_snapshot(
         change
             .validate()
             .map_err(|_error| SnapshotMaterializationError::InvalidChange)?;
-        let encoded = EncodedChange::new(change.digest, change.bytes.clone());
+        let encoded = EncodedChange::new(change.digest, change.as_bytes().to_vec());
         encoded
             .validate()
             .map_err(|_error| SnapshotMaterializationError::InvalidChange)?;
@@ -330,7 +330,7 @@ pub enum AcceptResult {
 #[non_exhaustive]
 pub struct StoredPage {
     /// Changes strictly after the requested position.
-    pub changes: Vec<ChangeEnvelope>,
+    changes: Vec<ChangeEnvelope>,
     /// Durable position covering every returned change.
     pub position: u64,
     /// Whether another page is immediately available.
@@ -349,6 +349,24 @@ impl StoredPage {
             position,
             more,
         }
+    }
+
+    /// Ordered changes in this page. Borrowed so a host never clones payloads.
+    #[must_use]
+    pub fn changes(&self) -> &[ChangeEnvelope] {
+        &self.changes
+    }
+
+    /// Consumes the page and returns its ordered changes.
+    #[must_use]
+    pub fn into_changes(self) -> Vec<ChangeEnvelope> {
+        self.changes
+    }
+
+    /// Consumes the page into `(changes, position, more)`.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ChangeEnvelope>, u64, bool) {
+        (self.changes, self.position, self.more)
     }
 }
 
@@ -612,7 +630,7 @@ pub enum ConsumedResult {
 #[non_exhaustive]
 pub struct BaselinePageSlice {
     /// Strictly ascending documents after the requested cursor.
-    pub documents: Vec<SnapshotDocument>,
+    documents: Vec<SnapshotDocument>,
     /// Whether further documents follow this slice for the same descriptor.
     pub more: bool,
 }
@@ -625,6 +643,24 @@ impl BaselinePageSlice {
     #[must_use]
     pub fn new(documents: Vec<SnapshotDocument>, more: bool) -> Self {
         Self { documents, more }
+    }
+
+    /// Ordered documents in this slice. Borrowed so a host never clones payloads.
+    #[must_use]
+    pub fn documents(&self) -> &[SnapshotDocument] {
+        &self.documents
+    }
+
+    /// Consumes the slice and returns its ordered documents.
+    #[must_use]
+    pub fn into_documents(self) -> Vec<SnapshotDocument> {
+        self.documents
+    }
+
+    /// Consumes the slice into `(documents, more)`.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<SnapshotDocument>, bool) {
+        (self.documents, self.more)
     }
 }
 
@@ -1026,10 +1062,11 @@ where
         now_unix_ms: u64,
     ) -> Result<PushResponse, ServiceError<Store::Error>> {
         request.validate().map_err(ServiceError::Protocol)?;
-        let mut outcomes = Vec::with_capacity(request.changes.len());
-        for change in &request.changes {
+        let mut outcomes = Vec::with_capacity(request.changes().len());
+        for change in request.changes() {
             let operation = change.operation;
-            let validation = EncodedChange::new(change.digest, change.bytes.clone()).validate();
+            let validation =
+                EncodedChange::new(change.digest, change.as_bytes().to_vec()).validate();
             if let Err(error) = validation {
                 outcomes.push(PushOutcome::Rejected {
                     operation,
@@ -1166,7 +1203,7 @@ where
             return Err(ServiceError::CrossScopeStoreData);
         }
         for change in &stored.changes {
-            EncodedChange::new(change.digest, change.bytes.clone())
+            EncodedChange::new(change.digest, change.as_bytes().to_vec())
                 .validate()
                 .map_err(|_error| ServiceError::CorruptStoreData)?;
         }
@@ -1827,7 +1864,7 @@ mod tests {
                 .skip(skip)
                 .take(usize::from(max_changes))
                 .take_while(|change| {
-                    bytes = bytes.saturating_add(change.bytes.len());
+                    bytes = bytes.saturating_add(change.as_bytes().len());
                     bytes <= limit
                 })
                 .cloned()
@@ -2058,7 +2095,7 @@ mod tests {
             operation,
             OperationDigest::new([4; 32]),
             encoded.digest,
-            encoded.bytes,
+            encoded.as_bytes().to_vec(),
         ))
     }
 
@@ -2157,14 +2194,14 @@ mod tests {
         );
         assert!(
             matches!(
-                lgwks_std::task::block_on(service.push(&request, 10))?.outcomes[0],
+                lgwks_std::task::block_on(service.push(&request, 10))?.outcomes()[0],
                 PushOutcome::Accepted { .. }
             ),
             "first admission must be accepted"
         );
         assert!(
             matches!(
-                lgwks_std::task::block_on(service.push(&request, 10))?.outcomes[0],
+                lgwks_std::task::block_on(service.push(&request, 10))?.outcomes()[0],
                 PushOutcome::Duplicate { .. }
             ),
             "exact retry must be a duplicate"
@@ -2247,7 +2284,7 @@ mod tests {
             CheckpointCodec::new([5; 32], 100)?,
         );
         let mut malformed = change(scope, replica, OperationId::new())?;
-        malformed.bytes = vec![1];
+        malformed.replace_bytes(vec![1]);
         let mut mismatched = change(scope, replica, OperationId::new())?;
         mismatched.digest = ChangeDigest::new([0; 32]);
         let response = lgwks_std::task::block_on(service.push(
@@ -2256,7 +2293,7 @@ mod tests {
         ))?;
         assert!(
             matches!(
-                response.outcomes[0],
+                response.outcomes()[0],
                 PushOutcome::Rejected {
                     code: RejectionCode::InvalidChange,
                     ..
@@ -2266,7 +2303,7 @@ mod tests {
         );
         assert!(
             matches!(
-                response.outcomes[1],
+                response.outcomes()[1],
                 PushOutcome::Rejected {
                     code: RejectionCode::DigestMismatch,
                     ..
@@ -2453,7 +2490,7 @@ mod tests {
             operation,
             OperationDigest::new([request_byte; 32]),
             encoded.digest,
-            encoded.bytes,
+            encoded.as_bytes().to_vec(),
         ))
     }
 
@@ -2630,7 +2667,7 @@ mod tests {
         };
         assert!(first.more, "first page must report more documents");
         assert_eq!(
-            first.documents.len(),
+            first.documents().len(),
             logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS,
             "first page must be full"
         );
@@ -2643,9 +2680,14 @@ mod tests {
             return Err("continued baseline page must be available".into());
         };
         assert!(!second.more, "final page must not report more documents");
-        assert_eq!(second.documents.len(), 44, "final page must hold the tail");
         assert_eq!(
-            second.descriptor, first.descriptor,
+            second.documents().len(),
+            44,
+            "final page must hold the tail"
+        );
+        assert_eq!(
+            second.as_descriptor(),
+            first.as_descriptor(),
             "pages must share one descriptor"
         );
         assert!(
@@ -2749,7 +2791,7 @@ mod tests {
         let response = push_all(&service, replica, changes)?;
         assert!(
             response
-                .outcomes
+                .outcomes()
                 .iter()
                 .all(|outcome| matches!(outcome, PushOutcome::Accepted { .. })),
             "every fixture change must be accepted"
@@ -2778,7 +2820,7 @@ mod tests {
             return Err("page expected".into());
         };
         assert_eq!(
-            page.changes.len(),
+            page.changes().len(),
             3,
             "page must serve every retained change"
         );
@@ -2897,14 +2939,14 @@ mod tests {
             return Err("page expected".into());
         };
         assert_eq!(
-            first_page.changes.len(),
+            first_page.changes().len(),
             1,
             "first page must hold one change"
         );
         let stale_checkpoint = first_page.checkpoint;
         let second = envelope_with(scope, replica, OperationId::new(), 51)?;
         let tombstone = tombstone_envelope(scope, replica, OperationId::new(), 52)?;
-        let tombstone_bytes = tombstone.bytes.clone();
+        let tombstone_bytes = tombstone.as_bytes().to_vec();
         let fourth = envelope_with(scope, replica, OperationId::new(), 53)?;
         push_all(&service, replica, vec![second, tombstone, fourth])?;
         assert_eq!(
@@ -2964,12 +3006,13 @@ mod tests {
             return Err("recovery suffix page expected".into());
         };
         assert_eq!(
-            recovered.changes.len(),
+            recovered.changes().len(),
             2,
             "suffix must hold the tail changes"
         );
         assert_eq!(
-            recovered.changes[0].bytes, tombstone_bytes,
+            recovered.changes()[0].as_bytes().to_vec(),
+            tombstone_bytes,
             "suffix must replay the tombstone payload"
         );
         assert!(!recovered.more, "suffix page must be final");
@@ -3015,7 +3058,7 @@ mod tests {
         );
         let duplicate = push_all(&service, replica, vec![changes[0].clone()])?;
         assert!(
-            matches!(duplicate.outcomes[0], PushOutcome::Duplicate { .. }),
+            matches!(duplicate.outcomes()[0], PushOutcome::Duplicate { .. }),
             "exact retry after collection must remain a duplicate"
         );
         let mut conflicting = changes[1].clone();
@@ -3023,7 +3066,7 @@ mod tests {
         let conflict = push_all(&service, replica, vec![conflicting])?;
         assert!(
             matches!(
-                conflict.outcomes[0],
+                conflict.outcomes()[0],
                 PushOutcome::Rejected {
                     code: RejectionCode::OperationConflict,
                     ..
@@ -3045,9 +3088,10 @@ mod tests {
         else {
             return Err("page expected".into());
         };
-        assert_eq!(page.changes.len(), 1, "suffix must hold one change");
+        assert_eq!(page.changes().len(), 1, "suffix must hold one change");
         assert_eq!(
-            page.changes[0].operation, operations[2],
+            page.changes()[0].operation,
+            operations[2],
             "suffix must carry the uncollected operation"
         );
         assert!(!page.more, "suffix page must be final");

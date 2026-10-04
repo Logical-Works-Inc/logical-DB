@@ -225,9 +225,9 @@ pub struct Observation {
     /// Permitted handling of this observation.
     pub actionability: Actionability,
     /// Opaque payload bytes; non-empty and bounded.
-    pub value: Vec<u8>,
+    value: Vec<u8>,
     /// Outgoing edges, bounded to [`MAX_LINKS`].
-    pub links: Vec<TokenLink>,
+    links: Vec<TokenLink>,
 }
 
 impl Observation {
@@ -254,6 +254,23 @@ impl Observation {
             value,
             links,
         }
+    }
+
+    /// The bounded opaque payload bytes.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// The bounded outgoing edges of this observation.
+    #[must_use]
+    pub fn links(&self) -> &[TokenLink] {
+        &self.links
+    }
+
+    /// Replaces the payload, for composing an observation before validation.
+    pub fn set_value(&mut self, value: Vec<u8>) {
+        self.value = value;
     }
 
     /// Validates bounds on id, uncertainty, value, and links.
@@ -343,7 +360,7 @@ pub const fn authority_weight(tier: u8) -> f64 {
 #[non_exhaustive]
 pub struct MemoryClaim {
     /// Claim text; non-empty UTF-8 bounded to [`MAX_CLAIM_BYTES`].
-    pub claim: String,
+    claim: String,
     /// Epistemic grade of the claim.
     pub trust: TrustLevel,
     /// Claim confidence in `[0.0, 1.0]`.
@@ -351,6 +368,27 @@ pub struct MemoryClaim {
 }
 
 impl MemoryClaim {
+    /// Builds one trust-graded claim for validation.
+    #[must_use]
+    pub fn new(claim: String, trust: TrustLevel, confidence: f32) -> Self {
+        Self {
+            claim,
+            trust,
+            confidence,
+        }
+    }
+
+    /// The claim text.
+    #[must_use]
+    pub fn claim(&self) -> &str {
+        &self.claim
+    }
+
+    /// Replaces the claim text, for composition before validation.
+    pub fn set_claim(&mut self, claim: String) {
+        self.claim = claim;
+    }
+
     /// Validates claim bounds and confidence range.
     ///
     /// # Errors
@@ -506,8 +544,6 @@ pub enum CairnError {
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
-
     use super::*;
 
     fn observation() -> Observation {
@@ -795,7 +831,7 @@ mod tests {
         let huge_err = obs.validate();
         let want = too_large(MAX_VALUE_BYTES + 1, MAX_VALUE_BYTES);
         assert_eq!(huge_err, Err(want));
-        let bytes = *Uuid::now_v7().as_bytes();
+        let bytes = [0x5au8; 16];
         let mut id = [0u8; 32];
         id[..16].copy_from_slice(&bytes);
         id[16..].copy_from_slice(&bytes);

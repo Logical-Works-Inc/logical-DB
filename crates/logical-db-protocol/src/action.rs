@@ -248,12 +248,12 @@ mod tests {
     fn write_action_v1_has_a_portable_golden_encoding() -> Result<(), Box<dyn Error>> {
         let change = ChangeEnvelope {
             scope: Scope::new(
-                AccountId::from_uuid("01010101-0101-0101-0101-010101010101".parse()?),
-                SpaceId::from_uuid("02020202-0202-0202-0202-020202020202".parse()?),
+                AccountId::parse_canonical("01010101-0101-0101-0101-010101010101")?,
+                SpaceId::parse_canonical("02020202-0202-0202-0202-020202020202")?,
             ),
-            document: DocumentId::from_uuid("03030303-0303-0303-0303-030303030303".parse()?),
-            operation: OperationId::from_uuid("04040404-0404-0404-0404-040404040404".parse()?),
-            replica: ReplicaId::from_uuid("05050505-0505-0505-0505-050505050505".parse()?),
+            document: DocumentId::parse_canonical("03030303-0303-0303-0303-030303030303")?,
+            operation: OperationId::parse_canonical("04040404-0404-0404-0404-040404040404")?,
+            replica: ReplicaId::parse_canonical("05050505-0505-0505-0505-050505050505")?,
             request: OperationDigest::new([6; 32]),
             digest: ChangeDigest::new([7; 32]),
             bytes: vec![0, 1, 255],

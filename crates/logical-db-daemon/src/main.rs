@@ -18,7 +18,6 @@ use logical_db_model::{AccountId, Scope, SpaceId};
 use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
 use logical_db_service::{CheckpointCodec, LocalScopeAuthority};
 use logical_db_store_fdb::FdbServiceStore;
-use uuid::Uuid;
 
 /// Loopback standalone bearer verifier bound to one authenticated scope.
 struct BearerAuthenticator {
@@ -304,8 +303,8 @@ mod tests {
     /// Runs `scope`.
     fn scope(seed: u128) -> Scope {
         Scope::new(
-            AccountId::from_uuid(Uuid::from_u128(seed)),
-            SpaceId::from_uuid(Uuid::from_u128(seed.saturating_add(1))),
+            AccountId::from_fixture_u128(seed),
+            SpaceId::from_fixture_u128(seed.saturating_add(1)),
         )
     }
 
