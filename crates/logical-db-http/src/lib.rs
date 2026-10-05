@@ -491,10 +491,11 @@ mod tests {
         response::IntoResponse,
         routing::{get, post},
     };
+    use lgwks_bot::rt::task::JoinSet as TaskSet;
 
     mod deadlines;
 
-    async fn endpoint() -> Result<Url, Box<dyn std::error::Error>> {
+    async fn endpoint() -> Result<(Url, TaskSet<()>), Box<dyn std::error::Error>> {
         let mut exact = Vec::with_capacity(MAX_HTTP_BODY_BYTES);
         exact.push(0x5a);
         exact.extend_from_slice(&u32::try_from(MAX_HTTP_BODY_BYTES - 5)?.to_be_bytes());
@@ -589,13 +590,14 @@ mod tests {
             );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        // Keep the server task owned by this test; dropping the handle at test
-        // end aborts the loop instead of leaving a runtime task detached.
-        let _server = lgwks_bot::rt::task::spawn(async move {
+        // The server task is owned by the returned set; dropping the set at
+        // test end aborts the loop instead of leaving a runtime task detached.
+        let mut server = TaskSet::new();
+        server.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
-        Ok(format!("http://{address}/").parse()?)
+        Ok((format!("http://{address}/").parse()?, server))
     }
 
     fn test_runtime() -> Result<lgwks_bot::Runtime, Box<dyn std::error::Error>> {
@@ -678,7 +680,7 @@ mod tests {
     }
 
     async fn response_decoder_body() -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = endpoint().await?;
+        let (endpoint, _server) = endpoint().await?;
         let client = Client::new();
         let response = client.get(endpoint.join("ok")?).send().await?;
         assert_eq!(decode_response::<u8>(response).await?, 42);
@@ -732,8 +734,8 @@ mod tests {
     async fn pull_gone_body() -> Result<(), Box<dyn std::error::Error>> {
         use logical_db_model::{AccountId, OperationDigest, ReplicaId, Scope, SpaceId};
 
-        let mut transport =
-            HttpTransport::new(endpoint().await?, StaticBearer::new("integration")?)?;
+        let (endpoint, _server) = endpoint().await?;
+        let mut transport = HttpTransport::new(endpoint, StaticBearer::new("integration")?)?;
         let request = PullRequest::new(
             logical_db_protocol::PROTOCOL_VERSION,
             Scope::new(AccountId::new(), SpaceId::new()),
@@ -1074,9 +1076,10 @@ mod tests {
     }
 
     async fn cancel_then_succeed(slow: Url, fast: Url) -> Result<(), Box<dyn std::error::Error>> {
-        let pending = lgwks_bot::rt::task::spawn(pull_from(slow));
+        let mut pending: TaskSet<_> = TaskSet::new();
+        let handle = pending.spawn(pull_from(slow));
         lgwks_bot::rt::task::yield_now().await;
-        pending.abort();
+        handle.abort();
         let decoded = decode_forty_two(fast).await?;
         assert_eq!(decoded, 42, "the transport must stay usable");
         Ok(())

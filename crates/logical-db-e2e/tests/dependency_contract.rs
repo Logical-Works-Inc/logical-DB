@@ -18,15 +18,29 @@ fn repository_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         .to_path_buf())
 }
 
+/// The gate's verdict, or the capture-cleanup failure the collection carries.
+///
+/// A cleanup that could not be confirmed is a test failure here, never a
+/// silently dropped warning.
+fn settled<T>(
+    collected: lgwks_deps::metadata::Collected<T>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let (value, unresolved) = collected.into_parts();
+    match unresolved {
+        Some(cleanup) => Err(cleanup.into()),
+        None => Ok(value),
+    }
+}
+
 /// Every authored external edge is owned by an approved register entry.
 #[test]
 fn every_authored_external_edge_is_owned() -> Result<(), Box<dyn std::error::Error>> {
     let root = repository_root()?;
-    let (contract, refusals) = lgwks_deps::check_dependencies(&root)?;
+    let (contract, refusals) = settled(lgwks_deps::check_dependencies(&root)?)?;
     assert!(
         refusals.is_empty(),
         "{} semantic approvals do not cover every authored edge: {refusals:#?}",
-        contract.entries.len()
+        contract.entry_count()
     );
     assert!(
         contract.enforce,
@@ -113,7 +127,7 @@ fn gate_with(
     std::fs::write(&path, register)?;
     let outcome = lgwks_deps::check_dependencies_against(&repository_root()?, &path);
     std::fs::remove_file(&path)?;
-    Ok(outcome?)
+    settled(outcome?)
 }
 
 /// The refusals the gate reports for `register`, or the gate failure itself.
@@ -213,7 +227,7 @@ fn a_source_class_change_is_refused() -> Result<(), Box<dyn std::error::Error>> 
 #[test]
 fn an_approval_with_no_authored_edge_is_stale() -> Result<(), Box<dyn std::error::Error>> {
     let mutated = format!(
-        "{}\n[[approved]]\ncrate = \"logical-db-gate-dropped-uuid\"\ntier = \"boundary\"\nversion = \"=1.26.0\"\nowner = \"logical-db-model\"\ncapability = \"identity.unused\"\nsource = \"registry\"\nallowed_consumers = \"logical-db-model\"\nallowed_kinds = \"normal\"\nreason = \"Fixture proving stale authority is refused.\"\napproved_by = \"Director\"\napproved_on = \"2026-09-14\"\nreview = \"https://github.com/srinji-kaggss/logical-DB/pull/47\"\n",
+        "{}\n[[approved]]\ncrate = \"logical-db-gate-dropped-uuid\"\ntier = \"boundary\"\nversion = \"=1.26.0\"\nowner = \"logical-db-model\"\ncapability = \"identity.unused\"\nsource = \"registry\"\nlicense = \"MIT\"\nallowed_consumers = \"logical-db-model\"\nallowed_kinds = \"normal\"\nreason = \"Fixture proving stale authority is refused.\"\napproved_by = \"Director\"\napproved_on = \"2026-09-14\"\nreview = \"https://github.com/srinji-kaggss/logical-DB/pull/47\"\n",
         committed_register()?
     );
     let refusals = refusals_of(&mutated)?;
@@ -271,7 +285,7 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         .split("[[package]]")
         .find(|block| {
             block.contains("name = \"lgwks_std\"")
-                && block.contains("version = \"0.6.")
+                && block.contains("version = \"1.0.")
                 && block
                     .contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
         })
@@ -281,7 +295,7 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         .find(|line| line.starts_with("version = "))
         .ok_or("a version line on the registry estate edge")?;
     assert!(
-        version.contains("0.6."),
+        version.contains("1.0."),
         "the workspace estate edge is the current lgwks_std minor: {version}"
     );
     let manifest = std::fs::read_to_string(repository_root()?.join("Cargo.toml"))?;
@@ -294,7 +308,7 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         "the workspace estate edge must not fall back to a git pin: {declared}"
     );
     assert!(
-        declared.contains("version = \"0.6."),
+        declared.contains("version = \"1.0."),
         "the manifest requirement matches the current lgwks_std minor: {declared}"
     );
     assert!(
