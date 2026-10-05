@@ -677,7 +677,8 @@ mod tests {
         let address: SocketAddr = listener.local_addr()?;
         let stopped = Arc::new(lgwks_bot::rt::sync::Notify::new());
         let shutdown = Arc::clone(&stopped);
-        let serving = lgwks_bot::rt::task::spawn(async move {
+        let mut serving = lgwks_bot::rt::task::JoinSet::new();
+        serving.spawn(async move {
             let serve_result = axum::serve(listener, application)
                 .with_graceful_shutdown(async move { shutdown.notified().await })
                 .await;
@@ -689,7 +690,10 @@ mod tests {
 
         stopped.notify_waiters();
         lgwks_bot::rt::task::yield_now().await;
-        serving.await?;
+        serving
+            .join_next()
+            .await
+            .ok_or("the daemon serve task finished before shutdown")??;
 
         let rebound = std::net::TcpListener::bind(address);
         assert!(rebound.is_ok(), "the daemon kept its listener bound");
@@ -717,7 +721,8 @@ mod tests {
         let address: SocketAddr = listener.local_addr()?;
         let stopped = Arc::new(lgwks_bot::rt::sync::Notify::new());
         let shutdown = Arc::clone(&stopped);
-        let serving = lgwks_bot::rt::task::spawn(async move {
+        let mut serving = lgwks_bot::rt::task::JoinSet::new();
+        serving.spawn(async move {
             let serve_result = axum::serve(listener, application)
                 .with_graceful_shutdown(async move { shutdown.notified().await })
                 .await;
@@ -749,7 +754,10 @@ mod tests {
 
         stopped.notify_waiters();
         lgwks_bot::rt::task::yield_now().await;
-        serving.await?;
+        serving
+            .join_next()
+            .await
+            .ok_or("the daemon serve task finished before shutdown")??;
         Ok(())
     }
 

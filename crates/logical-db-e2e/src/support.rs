@@ -504,7 +504,7 @@ impl RetentionStore for MemoryServiceStore {
 }
 
 /// Binds a loopback listener on an ephemeral port and serves the journey
-/// composition, returning the address and the server task handle.
+/// composition, returning the address and the set that owns the server task.
 ///
 /// # Errors
 ///
@@ -517,7 +517,7 @@ impl RetentionStore for MemoryServiceStore {
 /// invariant, not a recoverable input condition.
 pub async fn serve_journey(
     store: std::sync::Arc<MemoryServiceStore>,
-) -> Result<(std::net::SocketAddr, lgwks_bot::rt::task::JoinHandle<()>), std::io::Error> {
+) -> Result<(std::net::SocketAddr, lgwks_bot::rt::task::JoinSet<()>), std::io::Error> {
     use logical_db_server::router;
     use logical_db_service::CheckpointCodec;
 
@@ -530,7 +530,8 @@ pub async fn serve_journey(
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = lgwks_bot::rt::task::spawn(async move {
+    let mut server = lgwks_bot::rt::task::JoinSet::new();
+    server.spawn(async move {
         let serve_result = axum::serve(listener, app).await;
         drop(serve_result);
     });

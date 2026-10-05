@@ -78,8 +78,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server =
-        lgwks_bot::rt::task::spawn(async move { axum::serve(listener, application).await });
+    let mut server = lgwks_bot::rt::task::JoinSet::new();
+    server.spawn(async move { axum::serve(listener, application).await });
     let endpoint: Url = format!("http://{address}/").parse()?;
     let mut transport =
         HttpTransport::new(endpoint.clone(), StaticBearer::new("recovery-fixture")?)?;
@@ -198,8 +198,8 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     })?;
 
     drop((first, transport));
-    server.abort();
-    drop(server.await);
+    server.abort_all();
+    drop(server.join_next().await);
     drop(prune_store);
     drop(network);
     fs::remove_file(&first_path)?;

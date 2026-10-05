@@ -1350,7 +1350,8 @@ mod tests {
             1,
             Duration::from_millis(50),
         );
-        let first = lgwks_bot::rt::task::spawn(
+        let mut first = lgwks_bot::rt::task::JoinSet::new();
+        first.spawn(
             app.clone()
                 .oneshot(request("/v1/changes:push", encode(&push)?)?),
         );
@@ -1366,7 +1367,14 @@ mod tests {
                 .ok_or("expected Some")?,
             "1"
         );
-        assert_eq!(first.await??.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            first
+                .join_next()
+                .await
+                .ok_or("expected the first push to finish")???
+                .status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
         Ok(())
     }
 

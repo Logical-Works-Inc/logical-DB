@@ -60,11 +60,11 @@ tower = { version = "=0.5.3", features = ["util"] }
 #
 # `json` re-exports the serde crate the estate owns, so logical-db derives
 # through `lgwks_std::json::{Serialize, Deserialize}` and never declares serde.
-lgwks_std = { version = "0.6.6", features = ["json", "hash"] }
-lgwks_bot = { version = "0.4.2", features = ["net", "signal"] }
+lgwks_std = { version = "1.0.0", features = ["json", "hash"] }
+lgwks_bot = { version = "1.0.0", features = ["net", "signal"] }
 # The dependency gate itself. `default-features = false` keeps the storefront's
 # Rust scanner out: the contract lane only needs `check_dependencies`.
-lgwks_deps = { version = "0.1.12", default-features = false }
+lgwks_deps = { version = "1.0.0", default-features = false }
 
 [workspace.lints.rust]
 improper_ctypes = "forbid"

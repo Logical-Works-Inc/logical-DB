@@ -110,7 +110,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -340,7 +341,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -401,7 +403,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -506,7 +509,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -650,7 +654,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -734,7 +739,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -832,7 +838,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -916,7 +923,8 @@ mod tests {
         );
         let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let server = lgwks_bot::rt::task::spawn(async move {
+        let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+        let server = server_tasks.spawn(async move {
             let serve_result = axum::serve(listener, app).await;
             drop(serve_result);
         });
@@ -1025,7 +1033,8 @@ mod tests {
                 );
                 let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
                 let address = listener.local_addr()?;
-                let server = lgwks_bot::rt::task::spawn(async move {
+                let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
+                let server = server_tasks.spawn(async move {
                     let serve_result = axum::serve(listener, app).await;
                     drop(serve_result);
                 });

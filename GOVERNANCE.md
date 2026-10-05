@@ -157,6 +157,40 @@ surface. Changing them is a governance change and follows these rules:
 Newest first. Each entry names what changed, the receipts, and what it does
 **not** claim.
 
+### 2026-10-05 — Estate 1.0.0 upgrade merged under a bounded license exception (PR #109)
+
+The lgwks 1.0.0 estate upgrade on `chore/estate-1-0-0` (PR #109)
+merges with a bounded exception the Director authorized on
+2026-10-05. The exception covers exactly the three license
+refusals the stricter estate gate reports, all unfixable from this
+repository:
+
+- `lgwks_bot` 1.0.0 declares `MPL-2.0`; `lgwks_deps` 1.0.0
+  hardcodes its accepted-licenses set and refuses `MPL-2.0` as an
+  inbound dependency license, and the `cargo deny` licenses lane
+  rejects the same identifier.
+- `foundationdb` and `foundationdb-tuple` 0.11.0 declare the
+  legacy slash form `MIT/Apache-2.0`; the estate gate compares the
+  declared expression against the register entry with exact
+  equality (`license_refusals` in `lgwks_deps`), and no valid SPDX
+  expression the register parser accepts can equal that declared
+  string.
+
+Replacement evidence: `evidence/ci-local-862cf43.md` — 13 of 15
+lanes pass; the tests lane fails only the two dependency-contract
+assertions that demand zero refusals, and the deny lane fails only
+`lgwks_bot`'s license. The register drift the 1.0.0 gate exposed
+otherwise is fixed in 862cf43 (`logical-db-cloud-contract` added
+to the `thiserror` and `uuid` consumer lists).
+
+Follow-up on the estate side (logicalworks-crates), as the Director
+stated: admit `MPL-2.0` inbound in the accepted set (a Director
+decision per `lgwks_deps`' own documentation) and normalize the
+declared slash form to its SPDX `OR` equivalent; then add `MPL-2.0`
+to `deny.toml`'s allow list here and close this exception. This
+entry claims neither hosted nor self-hosted CI execution nor a
+ratified license policy.
+
 ### 2026-09-21 — Governance suite, local CI, estate alignment
 
 This entry records the governance suite (`CODEBOOK.md`, `WORKFLOW.md`, this

@@ -722,8 +722,8 @@ async fn verify_http_action_binding(
     );
     let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server =
-        lgwks_bot::rt::task::spawn(async move { axum::serve(listener, application).await });
+    let mut server = lgwks_bot::rt::task::JoinSet::new();
+    server.spawn(async move { axum::serve(listener, application).await });
     let endpoint = format!("http://{address}/v1/changes:push");
     let client = reqwest::Client::new();
 
@@ -778,7 +778,7 @@ async fn verify_http_action_binding(
     {
         return Err(io::Error::other("rejected HTTP scope mutation created state").into());
     }
-    server.abort();
+    server.abort_all();
     Ok("PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated".to_owned())
 }
 
