@@ -1454,9 +1454,9 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d802fb3e317339b6eb3d5ed419ea6f6719946945a1bf6e15bb3c6b691f1bb27"
 dependencies = [
- "lgwks_deps",
+ "lgwks_deps 1.0.0",
  "lgwks_macros",
- "lgwks_std",
+ "lgwks_std 1.0.0",
 ]
 
 [[package]]
@@ -1466,11 +1466,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbdc3d19c21d0aaa0c8e450612734941a4b865a7a9da99bba66bcc67bc64da16"
 dependencies = [
  "bevy_ecs",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
  "tokio",
+]
+
+[[package]]
+name = "lgwks_deps"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24811df1fa247aff6547cdba55f271738dcc66a298e37afedf9e6a6a4f03c8e8"
+dependencies = [
+ "lgwks_std 2.1.0",
 ]
 
 [[package]]
@@ -1479,8 +1488,8 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46fca6aa9fe9ed077bb2b988eaead18e345d08d853fe8f333c96e6c217102f7a"
 dependencies = [
- "lgwks_deps",
- "lgwks_std",
+ "lgwks_deps 1.0.0",
+ "lgwks_std 1.0.0",
 ]
 
 [[package]]
@@ -1499,6 +1508,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+]
+
+[[package]]
+name = "lgwks_std"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6521bc7b1bdc9ca3a4e21c2b5a5deaf8f7820bfc68df3c701982bed17173dbf4"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1533,7 +1555,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "logical-db"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-cairn",
  "logical-db-crdt",
  "logical-db-episode",
@@ -1551,7 +1573,7 @@ dependencies = [
 name = "logical-db-cairn"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "thiserror",
  "uuid",
 ]
@@ -1560,7 +1582,7 @@ dependencies = [
 name = "logical-db-cloud-contract"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-model",
  "thiserror",
  "uuid",
@@ -1584,7 +1606,7 @@ dependencies = [
  "foundationdb",
  "foundationdb-tuple",
  "lgwks_bot",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1602,7 +1624,7 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
- "lgwks_deps",
+ "lgwks_deps 3.0.0",
  "logical-db",
  "logical-db-cairn",
  "logical-db-episode",
@@ -1620,7 +1642,7 @@ name = "logical-db-episode"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-cairn",
  "thiserror",
  "uuid",
@@ -1633,7 +1655,7 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-sync",
@@ -1646,7 +1668,7 @@ dependencies = [
 name = "logical-db-kv"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db",
  "logical-db-model",
  "thiserror",
@@ -1657,7 +1679,7 @@ dependencies = [
 name = "logical-db-model"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "thiserror",
  "uuid",
 ]
@@ -1674,7 +1696,7 @@ name = "logical-db-protocol"
 version = "0.1.0"
 dependencies = [
  "ciborium",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-model",
  "serde_bytes",
  "thiserror",
@@ -1687,7 +1709,7 @@ dependencies = [
  "axum",
  "ciborium",
  "lgwks_bot",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1700,7 +1722,7 @@ dependencies = [
 name = "logical-db-service"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-crdt",
  "logical-db-model",
  "logical-db-protocol",
@@ -1723,7 +1745,7 @@ version = "0.1.0"
 dependencies = [
  "foundationdb",
  "foundationdb-tuple",
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-service",
@@ -1735,7 +1757,7 @@ dependencies = [
 name = "logical-db-sync"
 version = "0.1.0"
 dependencies = [
- "lgwks_std",
+ "lgwks_std 1.0.0",
  "logical-db-model",
  "logical-db-protocol",
 ]
