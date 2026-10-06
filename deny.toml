@@ -30,6 +30,8 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
+    # The estate's own lgwks_bot (Director, 2026-10-05; GOVERNANCE.md, PR #109).
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",

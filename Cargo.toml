@@ -64,7 +64,7 @@ lgwks_std = { version = "1.0.0", features = ["json", "hash"] }
 lgwks_bot = { version = "1.0.0", features = ["net", "signal"] }
 # The dependency gate itself. `default-features = false` keeps the storefront's
 # Rust scanner out: the contract lane only needs `check_dependencies`.
-lgwks_deps = { version = "1.0.0", default-features = false }
+lgwks_deps = { version = "3.0.0", default-features = false }
 
 [workspace.lints.rust]
 improper_ctypes = "forbid"

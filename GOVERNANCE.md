@@ -157,6 +157,22 @@ surface. Changing them is a governance change and follows these rules:
 Newest first. Each entry names what changed, the receipts, and what it does
 **not** claim.
 
+### 2026-10-06 — License exception narrowed: MPL-2.0 accepted through lgwks_deps 3.0.0
+
+The dependency gate moves to `lgwks_deps` 3.0.0, which reads the accepted
+licence set from this register's `[policy] accepted_licenses` instead of a
+hardcoded list. The register now declares that set: `deny.toml`'s allow list
+plus `MPL-2.0`, which the Director admitted for the estate's own `lgwks_bot`
+(PR #109 entry below). `deny.toml` allows `MPL-2.0` for the same reason, so
+the `deny` lane passes and the `lgwks_bot` refusal is closed.
+
+Still open under the PR #109 exception: `foundationdb` and
+`foundationdb-tuple` 0.11.0 declare `MIT/Apache-2.0`. `lgwks_deps` 3.0.0
+refuses that slash form both as a register value (not an SPDX expression)
+and as a declared licence (one unknown token), so the two
+dependency-contract assertions that demand zero refusals stay red until the
+estate normalizes the slash form to `MIT OR Apache-2.0`.
+
 ### 2026-10-05 — Estate 1.0.0 upgrade merged under a bounded license exception (PR #109)
 
 The lgwks 1.0.0 estate upgrade on `chore/estate-1-0-0` (PR #109)
