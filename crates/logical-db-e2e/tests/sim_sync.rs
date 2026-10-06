@@ -8,7 +8,8 @@
 //! One seed controls every choice: which replica acts, which document it
 //! writes, and whether the network loses an exchange before the service
 //! commits it, loses the answer after the service committed it, or delivers it
-//! twice. Choices are drawn from a SplitMix64 stream over the seed, so a seed
+//! twice, or whether the clock jumps past the checkpoint lifetime so the next
+//! pull must resynchronize from scratch. Choices are drawn from a SplitMix64 stream over the seed, so a seed
 //! replays exactly and its trace hash proves it. The replicas are real embedded
 //! databases and the service is the real protocol service over the journey
 //! store; only the wire between them is simulated. After the fault phase the
@@ -46,6 +47,11 @@ const DOCUMENTS: usize = 4;
 const STEPS: u64 = 48;
 /// Healed rounds allowed before convergence is declared failed.
 const HEAL_ROUNDS: usize = 8;
+/// Lifetime of an issued checkpoint; a clock jump past it expires every
+/// checkpoint a replica holds.
+const CHECKPOINT_TTL_MS: u64 = 60_000;
+/// Index of the clock-jump counter in a run's fault tally.
+const CLOCK_JUMPS: usize = 4;
 /// Seeds the convergence campaign explores.
 const CAMPAIGN_SEEDS: u64 = 256;
 
@@ -182,7 +188,7 @@ struct Net<'world> {
     service: &'world Service,
     draws: &'world mut Draws,
     trace: &'world mut Trace,
-    faults: &'world mut [u64; 4],
+    faults: &'world mut [u64; 5],
     now_unix_ms: &'world mut u64,
     faulty: bool,
     /// Whether the last exchange was lost by the simulated network.
@@ -305,8 +311,10 @@ struct World {
     peer: PeerId,
     draws: Draws,
     trace: Trace,
-    faults: [u64; 4],
+    faults: [u64; 5],
     now_unix_ms: u64,
+    /// Cycles that found their checkpoint expired and resynchronized fully.
+    full_resyncs: u64,
     /// Last value each replica wrote to each document: the convergence oracle.
     model: BTreeMap<(usize, usize), i64>,
 }
@@ -314,7 +322,8 @@ struct World {
 /// Result of one seed: its trace hash and the faults it injected.
 struct Run {
     trace: u64,
-    faults: [u64; 4],
+    faults: [u64; 5],
+    full_resyncs: u64,
 }
 
 impl World {
@@ -336,14 +345,15 @@ impl World {
             service: ProtocolService::new(
                 MemoryServiceStore::default(),
                 Open,
-                CheckpointCodec::new([0x5e; 32], 60_000)?,
+                CheckpointCodec::new([0x5e; 32], CHECKPOINT_TTL_MS)?,
             ),
             replicas,
             documents: (0..DOCUMENTS).map(|_| DocumentId::new()).collect(),
             peer: PeerId::new(),
             draws: Draws::new(seed),
             trace: Trace::default(),
-            faults: [0; 4],
+            faults: [0; 5],
+            full_resyncs: 0,
             now_unix_ms: 1_000,
             model: BTreeMap::new(),
         })
@@ -385,6 +395,15 @@ impl World {
             .get(replica)
             .ok_or("replica out of range")?
             .database;
+        if faulty && self.draws.next().is_multiple_of(8) {
+            self.now_unix_ms = self
+                .now_unix_ms
+                .saturating_add(CHECKPOINT_TTL_MS.saturating_add(1));
+            if let Some(jumps) = self.faults.get_mut(CLOCK_JUMPS) {
+                *jumps = jumps.saturating_add(1);
+            }
+            self.trace.record(b"clock-jump");
+        }
         let mut net = Net {
             service: &self.service,
             draws: &mut self.draws,
@@ -402,8 +421,12 @@ impl World {
         let lost = net.lost;
         match outcome {
             Ok(report) => {
+                if report.full_resync {
+                    self.full_resyncs = self.full_resyncs.saturating_add(1);
+                }
                 self.trace
                     .record(b"synced")
+                    .record(&[u8::from(report.full_resync)])
                     .record(&u64::try_from(report.pushed)?.to_le_bytes())
                     .record(&u64::try_from(report.pulled)?.to_le_bytes());
                 Ok((report.pushed, report.pulled, report.more))
@@ -497,6 +520,7 @@ async fn simulate(seed: u64, label: &str) -> Result<Run, Failure> {
     Ok(Run {
         trace: world.trace.digest(),
         faults: world.faults,
+        full_resyncs: world.full_resyncs,
     })
 }
 
@@ -550,16 +574,28 @@ fn sim_sync_converges_under_seeded_network_faults() -> Result<(), Failure> {
     let seeds = (0..CAMPAIGN_SEEDS).collect::<Vec<_>>();
     let runs = run_seeds(&seeds, "campaign")?;
     assert_eq!(runs.len(), seeds.len(), "every seed must report");
-    let mut faults = [0_u64; 4];
+    let mut faults = [0_u64; 5];
+    let mut full_resyncs = 0_u64;
     for entry in &runs {
         for (total, count) in faults.iter_mut().zip(entry.1.faults) {
             *total = total.saturating_add(count);
         }
+        full_resyncs = full_resyncs.saturating_add(entry.1.full_resyncs);
     }
-    let [_clean, lost_requests, lost_responses, duplicates] = faults;
+    let [
+        _clean,
+        lost_requests,
+        lost_responses,
+        duplicates,
+        clock_jumps,
+    ] = faults;
     assert!(
-        lost_requests > 0 && lost_responses > 0 && duplicates > 0,
+        lost_requests > 0 && lost_responses > 0 && duplicates > 0 && clock_jumps > 0,
         "the campaign must inject every fault class: {faults:?}"
+    );
+    assert!(
+        full_resyncs > 0,
+        "clock jumps must drive the expired-checkpoint full resync path"
     );
     Ok(())
 }
