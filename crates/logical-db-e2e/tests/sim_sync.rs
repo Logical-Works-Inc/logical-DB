@@ -15,6 +15,9 @@
 //! store; only the wire between them is simulated. After the fault phase the
 //! network heals and every replica must hold exactly the model's state: each
 //! replica's last write to each document, nothing lost and nothing doubled.
+//! The service then seals a baseline at a seeded position and prunes the log
+//! below it, and a fresh replica joins under the same faults: it can only
+//! recover through the baseline, and it must converge to the same model.
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +26,7 @@ use std::{
     fmt,
     hash::{DefaultHasher, Hasher},
     path::PathBuf,
+    sync::Arc,
 };
 
 use logical_db::{
@@ -36,7 +40,8 @@ use logical_db::{
 use logical_db_e2e::support::MemoryServiceStore;
 use logical_db_model::{ActionDigest, Effect};
 use logical_db_service::{
-    Authority, CheckpointCodec, LocalGrant, ProtocolService, ServiceBaseline, ServicePull,
+    Authority, CheckpointCodec, ConsumedResult, LocalGrant, ProtocolService, PruneResult,
+    SealResult, ServiceBaseline, ServicePull, ServiceStore,
 };
 
 /// Replicas sharing one scope through one service.
@@ -55,7 +60,7 @@ const CLOCK_JUMPS: usize = 4;
 /// Seeds the convergence campaign explores.
 const CAMPAIGN_SEEDS: u64 = 256;
 
-type Service = ProtocolService<MemoryServiceStore, Open>;
+type Service = ProtocolService<Arc<MemoryServiceStore>, Open>;
 
 /// The simulation's authority: every justified request in the scope is
 /// granted, so every refusal the run sees comes from the protocol itself.
@@ -306,6 +311,11 @@ struct Replica {
 /// Everything one seed's run owns.
 struct World {
     service: Service,
+    /// The service's store, read for the frontier compaction seals through.
+    store: Arc<MemoryServiceStore>,
+    scope: Scope,
+    seed: u64,
+    label: String,
     replicas: Vec<Replica>,
     documents: Vec<DocumentId>,
     peer: PeerId,
@@ -315,6 +325,8 @@ struct World {
     now_unix_ms: u64,
     /// Cycles that found their checkpoint expired and resynchronized fully.
     full_resyncs: u64,
+    /// Cycles that installed a state-bearing baseline.
+    recoveries: u64,
     /// Last value each replica wrote to each document: the convergence oracle.
     model: BTreeMap<(usize, usize), i64>,
 }
@@ -324,39 +336,93 @@ struct Run {
     trace: u64,
     faults: [u64; 5],
     full_resyncs: u64,
+    recoveries: u64,
 }
 
 impl World {
     fn new(seed: u64, label: &str) -> Result<Self, Failure> {
-        let scope = Scope::new(AccountId::new(), SpaceId::new());
-        let mut replicas = Vec::with_capacity(REPLICAS);
-        for index in 0..REPLICAS {
-            let path = std::env::temp_dir().join(format!(
-                "logical-db-sim-{label}-{seed}-{index}-{}.redb",
-                std::process::id()
-            ));
-            let file = ScratchFile(path.clone());
-            replicas.push(Replica {
-                database: Database::open(&path, scope, ReplicaId::new())?,
-                _file: file,
-            });
-        }
-        Ok(Self {
+        let store = Arc::new(MemoryServiceStore::default());
+        let mut world = Self {
             service: ProtocolService::new(
-                MemoryServiceStore::default(),
+                Arc::clone(&store),
                 Open,
                 CheckpointCodec::new([0x5e; 32], CHECKPOINT_TTL_MS)?,
             ),
-            replicas,
+            store,
+            scope: Scope::new(AccountId::new(), SpaceId::new()),
+            seed,
+            label: label.to_owned(),
+            replicas: Vec::with_capacity(REPLICAS.saturating_add(1)),
             documents: (0..DOCUMENTS).map(|_| DocumentId::new()).collect(),
             peer: PeerId::new(),
             draws: Draws::new(seed),
             trace: Trace::default(),
             faults: [0; 5],
             full_resyncs: 0,
+            recoveries: 0,
             now_unix_ms: 1_000,
             model: BTreeMap::new(),
-        })
+        };
+        for _ in 0..REPLICAS {
+            world.join()?;
+        }
+        Ok(world)
+    }
+
+    /// Opens one more empty replica in the scope.
+    fn join(&mut self) -> Result<(), Failure> {
+        let path = std::env::temp_dir().join(format!(
+            "logical-db-sim-{}-{}-{}-{}.redb",
+            self.label,
+            self.seed,
+            self.replicas.len(),
+            std::process::id()
+        ));
+        let file = ScratchFile(path.clone());
+        self.replicas.push(Replica {
+            database: Database::open(&path, self.scope, ReplicaId::new())?,
+            _file: file,
+        });
+        Ok(())
+    }
+
+    /// Seals a baseline through a seeded position, marks it consumed and
+    /// prunes the log below it, so a replica that joins later must recover
+    /// from the baseline rather than from the log.
+    async fn compact(&mut self) -> Result<(), Failure> {
+        let frontier = self.store.frontier(self.scope).await?;
+        let span = usize::try_from(frontier)?;
+        if span == 0 {
+            return Err("compaction needs a non-empty log".into());
+        }
+        let through = u64::try_from(self.draws.below(span)?)?.saturating_add(1);
+        let now = self.now_unix_ms;
+        let request = OperationDigest::new(self.draws.bytes());
+        let sealed = self
+            .service
+            .seal_snapshot(self.scope, through, request, now)
+            .await?;
+        if !matches!(sealed, SealResult::Sealed { .. }) {
+            return Err(format!("seal through {through} of {frontier}: {sealed:?}").into());
+        }
+        let request = OperationDigest::new(self.draws.bytes());
+        let consumed = self
+            .service
+            .mark_consumed(self.scope, through, request, now)
+            .await?;
+        if !matches!(consumed, ConsumedResult::Advanced { .. }) {
+            return Err(format!("consume through {through}: {consumed:?}").into());
+        }
+        let request = OperationDigest::new(self.draws.bytes());
+        let pruned = self
+            .service
+            .prune(self.scope, through, None, request, now)
+            .await?;
+        if !matches!(pruned, PruneResult::Pruned(_)) {
+            return Err(format!("prune through {through}: {pruned:?}").into());
+        }
+        self.trace.record(b"compact").record(&through.to_le_bytes());
+        Ok(())
     }
 
     /// Replica `replica` writes `value` under its own key in `document`.
@@ -424,6 +490,9 @@ impl World {
                 if report.full_resync {
                     self.full_resyncs = self.full_resyncs.saturating_add(1);
                 }
+                if report.recovered {
+                    self.recoveries = self.recoveries.saturating_add(1);
+                }
                 self.trace
                     .record(b"synced")
                     .record(&[u8::from(report.full_resync)])
@@ -443,7 +512,7 @@ impl World {
     async fn heal(&mut self) -> Result<(), Failure> {
         for _round in 0..HEAL_ROUNDS {
             let mut moved = false;
-            for replica in 0..REPLICAS {
+            for replica in 0..self.replicas.len() {
                 loop {
                     let (pushed, pulled, more) = self.sync(replica, false).await?;
                     moved |= pushed > 0 || pulled > 0;
@@ -510,6 +579,13 @@ async fn simulate(seed: u64, label: &str) -> Result<Run, Failure> {
     }
     world.heal().await?;
     world.assert_converged()?;
+    world.compact().await?;
+    world.join()?;
+    for _attempt in 0..8 {
+        world.sync(REPLICAS, true).await?;
+    }
+    world.heal().await?;
+    world.assert_converged()?;
     for (&(document, writer), value) in &world.model {
         world
             .trace
@@ -521,6 +597,7 @@ async fn simulate(seed: u64, label: &str) -> Result<Run, Failure> {
         trace: world.trace.digest(),
         faults: world.faults,
         full_resyncs: world.full_resyncs,
+        recoveries: world.recoveries,
     })
 }
 
@@ -576,11 +653,13 @@ fn sim_sync_converges_under_seeded_network_faults() -> Result<(), Failure> {
     assert_eq!(runs.len(), seeds.len(), "every seed must report");
     let mut faults = [0_u64; 5];
     let mut full_resyncs = 0_u64;
+    let mut recoveries = 0_u64;
     for entry in &runs {
         for (total, count) in faults.iter_mut().zip(entry.1.faults) {
             *total = total.saturating_add(count);
         }
         full_resyncs = full_resyncs.saturating_add(entry.1.full_resyncs);
+        recoveries = recoveries.saturating_add(entry.1.recoveries);
     }
     let [
         _clean,
@@ -596,6 +675,10 @@ fn sim_sync_converges_under_seeded_network_faults() -> Result<(), Failure> {
     assert!(
         full_resyncs > 0,
         "clock jumps must drive the expired-checkpoint full resync path"
+    );
+    assert!(
+        recoveries > 0,
+        "replicas joining after a prune must recover through the baseline"
     );
     Ok(())
 }
