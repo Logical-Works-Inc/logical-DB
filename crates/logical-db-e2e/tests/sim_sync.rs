@@ -310,7 +310,8 @@ struct Replica {
 
 /// Everything one seed's run owns.
 struct World {
-    service: Service,
+    /// Shared by every tenant world built over it with [`World::sharing`].
+    service: Arc<Service>,
     /// The service's store, read for the frontier compaction seals through.
     store: Arc<MemoryServiceStore>,
     scope: Scope,
@@ -342,12 +343,33 @@ struct Run {
 impl World {
     fn new(seed: u64, label: &str) -> Result<Self, Failure> {
         let store = Arc::new(MemoryServiceStore::default());
+        let service = Arc::new(ProtocolService::new(
+            Arc::clone(&store),
+            Open,
+            CheckpointCodec::new([0x5e; 32], CHECKPOINT_TTL_MS)?,
+        ));
+        Self::over(service, store, seed, label)
+    }
+
+    /// A second tenant: a fresh scope with its own replicas, served by the
+    /// same service and store as `other`.
+    fn sharing(other: &Self, seed: u64, label: &str) -> Result<Self, Failure> {
+        Self::over(
+            Arc::clone(&other.service),
+            Arc::clone(&other.store),
+            seed,
+            label,
+        )
+    }
+
+    fn over(
+        service: Arc<Service>,
+        store: Arc<MemoryServiceStore>,
+        seed: u64,
+        label: &str,
+    ) -> Result<Self, Failure> {
         let mut world = Self {
-            service: ProtocolService::new(
-                Arc::clone(&store),
-                Open,
-                CheckpointCodec::new([0x5e; 32], CHECKPOINT_TTL_MS)?,
-            ),
+            service,
             store,
             scope: Scope::new(AccountId::new(), SpaceId::new()),
             seed,
@@ -471,7 +493,7 @@ impl World {
             self.trace.record(b"clock-jump");
         }
         let mut net = Net {
-            service: &self.service,
+            service: self.service.as_ref(),
             draws: &mut self.draws,
             trace: &mut self.trace,
             faults: &mut self.faults,
@@ -560,22 +582,49 @@ fn key(replica: usize) -> String {
 }
 
 /// Runs one seed end to end and returns its trace.
+impl World {
+    /// Each document is created by its owner and distributed over a clean
+    /// network, so the fault phase only ever edits documents every replica has.
+    async fn setup(&mut self) -> Result<(), Failure> {
+        for document in 0..DOCUMENTS {
+            self.write(document % REPLICAS, document, 0)?;
+        }
+        self.heal().await
+    }
+
+    /// One seeded fault-phase action: a faulty sync or a write.
+    async fn step(&mut self, step: u64) -> Result<(), Failure> {
+        let replica = self.draws.below(REPLICAS)?;
+        if self.draws.below(3)? == 0 {
+            self.sync(replica, true).await?;
+        } else {
+            let document = self.draws.below(DOCUMENTS)?;
+            self.write(replica, document, i64::try_from(step)?.saturating_add(1))?;
+        }
+        Ok(())
+    }
+
+    /// No replica of this tenant holds any document of `other`.
+    fn assert_isolated_from(&self, other: &Self) -> Result<(), Failure> {
+        for (index, replica) in self.replicas.iter().enumerate() {
+            for &foreign in &other.documents {
+                let leaked = replica
+                    .database
+                    .read(foreign, |reader| reader.get(&Object::root(), "replica-0"))?;
+                if leaked.is_some() {
+                    return Err(format!("replica {index} holds another tenant's document").into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 async fn simulate(seed: u64, label: &str) -> Result<Run, Failure> {
     let mut world = World::new(seed, label)?;
-    // Each document is created by its owner and distributed over a clean
-    // network, so the fault phase only ever edits documents every replica has.
-    for document in 0..DOCUMENTS {
-        world.write(document % REPLICAS, document, 0)?;
-    }
-    world.heal().await?;
+    world.setup().await?;
     for step in 0..STEPS {
-        let replica = world.draws.below(REPLICAS)?;
-        if world.draws.below(3)? == 0 {
-            world.sync(replica, true).await?;
-        } else {
-            let document = world.draws.below(DOCUMENTS)?;
-            world.write(replica, document, i64::try_from(step)?.saturating_add(1))?;
-        }
+        world.step(step).await?;
     }
     world.heal().await?;
     world.assert_converged()?;
@@ -601,6 +650,29 @@ async fn simulate(seed: u64, label: &str) -> Result<Run, Failure> {
     })
 }
 
+/// Two tenants share one service and store; their faulty schedules
+/// interleave. Each must converge to its own model and hold nothing of the
+/// other's.
+async fn simulate_tenants(seed: u64, label: &str) -> Result<(), Failure> {
+    let mut first = World::new(seed, &format!("{label}-a"))?;
+    let mut second = World::sharing(&first, seed ^ 0x7e7a_9e37, &format!("{label}-b"))?;
+    first.setup().await?;
+    second.setup().await?;
+    for step in 0..STEPS {
+        if first.draws.next().is_multiple_of(2) {
+            first.step(step).await?;
+        } else {
+            second.step(step).await?;
+        }
+    }
+    first.heal().await?;
+    second.heal().await?;
+    first.assert_converged()?;
+    second.assert_converged()?;
+    first.assert_isolated_from(&second)?;
+    second.assert_isolated_from(&first)
+}
+
 /// Parallel lanes. Every write commits with immediate durability, so one run
 /// is bound by fsync latency, not CPU; independent seeds run side by side,
 /// each lane on its own single-worker runtime, without changing any seed's
@@ -608,12 +680,18 @@ async fn simulate(seed: u64, label: &str) -> Result<Run, Failure> {
 const LANES: usize = 32;
 
 /// Runs every seed under `label` and returns the runs in seed order.
-fn run_seeds(seeds: &[u64], label: &str) -> Result<Vec<(u64, Run)>, Failure> {
+fn run_seeds<T, Job, Fut>(seeds: &[u64], label: &str, job: Job) -> Result<Vec<(u64, T)>, Failure>
+where
+    T: Send,
+    Job: Fn(u64, String) -> Fut + Sync,
+    Fut: Future<Output = Result<T, Failure>>,
+{
+    let job = &job;
     let lanes = std::thread::scope(|scope| {
         // Every lane is spawned before any is joined, so the lanes overlap.
         let mut handles = Vec::with_capacity(LANES);
         for lane in 0..LANES {
-            handles.push(scope.spawn(move || -> Result<Vec<(u64, Run)>, String> {
+            handles.push(scope.spawn(move || -> Result<Vec<(u64, T)>, String> {
                 let runtime = lgwks_bot::Builder::new()
                     .worker_threads(std::num::NonZeroUsize::new(1))
                     .build()
@@ -624,7 +702,7 @@ fn run_seeds(seeds: &[u64], label: &str) -> Result<Vec<(u64, Run)>, Failure> {
                     .step_by(LANES)
                     .map(|&seed| {
                         runtime
-                            .block_on(simulate(seed, label))
+                            .block_on(job(seed, label.to_owned()))
                             .map(|run| (seed, run))
                             .map_err(|error| format!("seed {seed}: {error}"))
                     })
@@ -649,7 +727,9 @@ fn run_seeds(seeds: &[u64], label: &str) -> Result<Vec<(u64, Run)>, Failure> {
 #[test]
 fn sim_sync_converges_under_seeded_network_faults() -> Result<(), Failure> {
     let seeds = (0..CAMPAIGN_SEEDS).collect::<Vec<_>>();
-    let runs = run_seeds(&seeds, "campaign")?;
+    let runs = run_seeds(&seeds, "campaign", |seed, label| async move {
+        simulate(seed, &label).await
+    })?;
     assert_eq!(runs.len(), seeds.len(), "every seed must report");
     let mut faults = [0_u64; 5];
     let mut full_resyncs = 0_u64;
@@ -686,8 +766,9 @@ fn sim_sync_converges_under_seeded_network_faults() -> Result<(), Failure> {
 #[test]
 fn sim_sync_same_seed_replays_the_same_trace() -> Result<(), Failure> {
     let seeds = (0..16).collect::<Vec<_>>();
-    let first = run_seeds(&seeds, "replay-a")?;
-    let second = run_seeds(&seeds, "replay-b")?;
+    let replay = |seed, label: String| async move { simulate(seed, &label).await };
+    let first = run_seeds(&seeds, "replay-a", replay)?;
+    let second = run_seeds(&seeds, "replay-b", replay)?;
     let mut traces = std::collections::BTreeSet::new();
     for (left, right) in first.iter().zip(&second) {
         let seed = left.0;
@@ -707,5 +788,15 @@ fn sim_sync_same_seed_replays_the_same_trace() -> Result<(), Failure> {
         seeds.len(),
         "distinct seeds must drive distinct schedules"
     );
+    Ok(())
+}
+
+#[test]
+fn sim_sync_tenants_sharing_a_service_stay_isolated() -> Result<(), Failure> {
+    let seeds = (0..64).collect::<Vec<_>>();
+    let runs = run_seeds(&seeds, "tenants", |seed, label| async move {
+        simulate_tenants(seed, &label).await
+    })?;
+    assert_eq!(runs.len(), seeds.len(), "every seed must report");
     Ok(())
 }
