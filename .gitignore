@@ -2,7 +2,8 @@
 # S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 # evidence/SOURCES.md.
 
-/target/
+# Build output at any depth (rust-guard leaves a compile lock in crates/*/target/).
+target/
 /.codegraph/
 /.keel/
 /keel-core/
