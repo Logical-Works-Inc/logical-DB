@@ -71,7 +71,7 @@ pub use logical_db_store::snapshot_restore::{
     RestorableProjection, RestoreStats, SnapshotInput, create_snapshot, restore_or_replay,
 };
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
-pub use logical_db_sync::{SyncLimits, SyncReport, Transport};
+pub use logical_db_sync::{SyncError, SyncLimits, SyncReport, Transport};
 
 /// Opt-in semantic vocabularies; off by default to keep the embedded minimal.
 #[cfg(feature = "semantics")]

@@ -43,7 +43,6 @@ impl Database {
             scope,
             replica,
             projections,
-            profile: logical_db_model::CapabilityProfile::embedded_local(),
         })
     }
 
@@ -98,7 +97,6 @@ impl Database {
                 scope,
                 replica,
                 projections,
-                profile: logical_db_model::CapabilityProfile::embedded_local(),
             },
             report,
         ))

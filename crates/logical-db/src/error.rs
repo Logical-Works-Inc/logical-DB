@@ -87,6 +87,9 @@ pub enum DatabaseError {
     /// Classified as [`DatabaseErrorKind::Other`].
     #[error("backend capability refused: {0}")]
     Model(#[from] logical_db_model::ModelError),
+    /// A durable counter or cursor did not fit its address type.
+    #[error("counter value is outside its addressable range")]
+    CounterOutOfRange(#[from] std::num::TryFromIntError),
     /// The durable store returned a commit outcome this replica does not recognize.
     ///
     /// Fail closed rather than guessing Applied versus Duplicate: the caller
