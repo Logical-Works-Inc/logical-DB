@@ -79,14 +79,28 @@ runs:
           wait "${fdb_pid}" 2>/dev/null || true
         }
         trap cleanup EXIT
-        # Each probe is bounded by fdbcli --timeout; each loop by 40 probes.
-        for _attempt in {1..40}; do
-          if "${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 2 --exec "configure new single memory"; then break; fi
+        # Every probe is bounded by fdbcli --timeout and every loop by a count.
+        # A fresh cluster needs longer than a short probe to recruit its roles,
+        # and a cut-off "configure new" retried as another "configure new" never
+        # converges, so creation gets one long bound and a database an earlier
+        # attempt already created counts as configured.
+        configured=0
+        for _attempt in {1..5}; do
+          created=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 60 --exec "configure new single memory" 2>&1 || true)
+          echo "${created}"
+          if [[ "${created}" == *"Database created"* || "${created}" == *"already exists"* ]]; then
+            configured=1
+            break
+          fi
         done
+        if [[ "${configured}" != 1 ]]; then
+          echo "fdb-lane: the single-memory cluster was never configured" >&2
+          exit 1
+        fi
         available=0
         status=""
-        for _attempt in {1..40}; do
-          status=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 2 --exec "status minimal" 2>&1 || true)
+        for _attempt in {1..30}; do
+          status=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "status minimal" 2>&1 || true)
           if [[ "${status}" == *"The database is available."* ]]; then
             echo "${status}"
             available=1
