@@ -11,13 +11,13 @@ version = 2
 # transition and an unreviewed extra transition, so this cannot become a
 # hand-maintained partial diagram.
 required_source = [
-  "crates/logical-db/src/lib.rs#Database::edit",
-  "crates/logical-db/src/lib.rs#Database::migrate_schema",
-  "crates/logical-db/src/lib.rs#Database::install_remote_page",
-  "crates/logical-db/src/lib.rs#Database::install_baseline",
-  "crates/logical-db-store/src/lib.rs#pub fn commit_local",
-  "crates/logical-db-store/src/lib.rs#pub fn apply_migration_page",
-  "crates/logical-db-store/src/lib.rs#pub fn install_remote_page",
+  "crates/logical-db/src/edit.rs#pub fn edit<T>(",
+  "crates/logical-db/src/schema.rs#pub fn migrate_schema(",
+  "crates/logical-db/src/sync.rs#pub fn install_remote_page(",
+  "crates/logical-db/src/sync.rs#pub fn install_baseline(",
+  "crates/logical-db-store/src/commit.rs#pub fn commit_local",
+  "crates/logical-db-store/src/schema.rs#pub fn apply_migration_page",
+  "crates/logical-db-store/src/remote.rs#pub fn install_remote_page",
   "crates/logical-db-sync/src/lib.rs#synchronize",
   "crates/logical-db-sync/src/lib.rs#install_recovery",
   "crates/logical-db-server/src/lib.rs#admit_request",
@@ -72,7 +72,7 @@ durability = "ephemeral"
 [[system]]
 name = "embedded.edit"
 owner = "logical-db"
-source = "crates/logical-db/src/lib.rs#Database::edit"
+source = "crates/logical-db/src/edit.rs#pub fn edit<T>("
 kind = "commit"
 reads = ["replica.state", "replica.outbox"]
 writes = ["replica.state", "replica.outbox"]
@@ -85,7 +85,7 @@ failure = "typed error leaves durable state unchanged"
 [[system]]
 name = "redb.commit"
 owner = "logical-db-store"
-source = "crates/logical-db-store/src/lib.rs#pub fn commit_local"
+source = "crates/logical-db-store/src/commit.rs#pub fn commit_local"
 kind = "commit"
 reads = ["replica.state", "replica.outbox"]
 writes = ["replica.state", "replica.outbox"]
@@ -98,7 +98,7 @@ failure = "typed error publishes no partial local transition"
 [[system]]
 name = "embedded.migrate"
 owner = "logical-db"
-source = "crates/logical-db/src/lib.rs#Database::migrate_schema"
+source = "crates/logical-db/src/schema.rs#pub fn migrate_schema("
 kind = "migration"
 reads = ["replica.state", "schema.generation", "migration.state"]
 writes = ["schema.generation", "migration.state"]
@@ -111,7 +111,7 @@ failure = "typed error preserves the prior cursor"
 [[system]]
 name = "redb.migration-page"
 owner = "logical-db-store"
-source = "crates/logical-db-store/src/lib.rs#pub fn apply_migration_page"
+source = "crates/logical-db-store/src/schema.rs#pub fn apply_migration_page"
 kind = "migration"
 reads = ["replica.state", "migration.state", "schema.generation"]
 writes = ["migration.state", "schema.generation"]
@@ -124,7 +124,7 @@ failure = "typed error retains the prior migration cursor"
 [[system]]
 name = "embedded.remote-page"
 owner = "logical-db"
-source = "crates/logical-db/src/lib.rs#Database::install_remote_page"
+source = "crates/logical-db/src/sync.rs#pub fn install_remote_page("
 kind = "replication"
 reads = ["replica.state", "sync.checkpoint"]
 writes = ["replica.state", "sync.checkpoint"]
@@ -137,7 +137,7 @@ failure = "typed error leaves documents and checkpoint unchanged"
 [[system]]
 name = "redb.remote-page"
 owner = "logical-db-store"
-source = "crates/logical-db-store/src/lib.rs#pub fn install_remote_page"
+source = "crates/logical-db-store/src/remote.rs#pub fn install_remote_page"
 kind = "replication"
 reads = ["replica.state", "sync.checkpoint"]
 writes = ["replica.state", "sync.checkpoint"]
@@ -150,7 +150,7 @@ failure = "typed error publishes no partial remote page"
 [[system]]
 name = "embedded.baseline-install"
 owner = "logical-db"
-source = "crates/logical-db/src/lib.rs#Database::install_baseline"
+source = "crates/logical-db/src/sync.rs#pub fn install_baseline("
 kind = "recovery"
 reads = ["replica.state", "sync.checkpoint"]
 writes = ["replica.state", "sync.checkpoint"]

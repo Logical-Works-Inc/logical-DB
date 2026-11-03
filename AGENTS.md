@@ -62,10 +62,10 @@ unproven.
 ## Gate
 
 ```sh
-./scripts/ci-local.sh              # full gate
-./scripts/ci-local.sh --fast       # compile + lint + fmt only
-./scripts/ci-local.sh --receipt    # also write evidence/ci-local-<sha>.md
+ci-local              # full gate (lgwks_deps 5.1.2: cargo install --locked lgwks_deps --version 5.1.2 --bin ci-local)
+ci-local --fast       # lockfile, compile, lint, fmt and scans
+ci-local --receipt    # also write evidence/ci-local-*.md
 ```
 
-That script is the one definition of the gate. CI runs the same commands in the
-same order.
+`scripts/gate-lanes.toml` is the one definition of the gate. CI runs the same
+commands.

@@ -36,9 +36,16 @@ uuid.workspace = true
 [dev-dependencies]
 ciborium.workspace = true
 lgwks_deps.workspace = true
+# The repository-contract tests read `cargo metadata` and the domain receipt
+# through the estate's JSON facade.
+lgwks_std.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
+# The repository-contract tests read `contract/*.toml` (docs/adr/0006).
+toml.workspace = true # gap: Logical-Works-Inc/logicalworks-crates#852
+# The CI routing test reads `.github/workflows/*.yml` (docs/adr/0006).
+yaml-rust2.workspace = true # gap: Logical-Works-Inc/logicalworks-crates#852
 
 # Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
 # network-boot FFI call, so it is one of the two crates that do not carry a

@@ -40,6 +40,10 @@ uuid = { version = "=1.26.1", features = ["serde", "v7"] } # gap: Logical-Works-
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
 foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] } # gap: Logical-Works-Inc/logicalworks-crates#851
 serde_bytes = "=0.11.19"
+# Estate first: the repository contracts are read through the estate once it
+# owns a TOML reader (docs/adr/0006).
+toml = "=1.1.8" # gap: Logical-Works-Inc/logicalworks-crates#852
+yaml-rust2 = { version = "=0.13.0", default-features = false } # gap: Logical-Works-Inc/logicalworks-crates#852
 ciborium = "=0.2.2"
 # FROZEN BOUNDARY (async surface): `reqwest` and `axum` are the async HTTP
 # client/server the estate does not yet supply. Every runtime *mechanic*

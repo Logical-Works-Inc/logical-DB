@@ -30,22 +30,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-      - name: verify rewrite evidence
-        run: python3 scripts/verify-rewrite.py
-      - name: falsify domain boundary gate
-        run: python3 scripts/test-domain-contract.py
+      - name: verify rewrite evidence, domain graph and runner routing
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" test -p logical-db-e2e --locked --test repository_contract
       - name: validate execution access graph
-        run: python3 scripts/test-access-graph.py
+        run: |
+          "$HOME/.cargo/bin/cargo" test -p logical-db-e2e --locked --test access_graph
       - name: reject hosted runner routing
         run: |
           actionlint
           shellcheck scripts/ci-emulated.sh scripts/ci-guest.sh scripts/ci-fdb-linux.sh scripts/ci-wine-runner.sh scripts/ci-windows-runtime.sh
           python3 scripts/ci-windows-runtime.py test
-          python3 scripts/verify-ci.py || {
-            python3 -m venv "$RUNNER_TEMP/ci-policy"
-            "$RUNNER_TEMP/ci-policy/bin/pip" install --disable-pip-version-check -r scripts/ci-requirements.txt
-            "$RUNNER_TEMP/ci-policy/bin/python" scripts/verify-ci.py
-          }
 
   # Legacy check names satisfy the existing main-branch protection rule.
   # They are status identifiers, not runner selectors: every job is self-hosted.
