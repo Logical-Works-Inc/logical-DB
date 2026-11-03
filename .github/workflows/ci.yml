@@ -6,6 +6,12 @@
 # every declared target. Every job names one pinned image label; self-hosted
 # routing is refused by crates/logical-db-e2e/tests/ci_routing.rs because a
 # public repository's workflows must never execute on the owner's machine.
+#
+# Every rust-cache restores on every ref and saves from main only: a pull
+# request run can read main's entries but never writes its own, so pull
+# requests cannot evict main from the 10 GiB repository cache and each one
+# starts from main's dependency build. ci_routing.rs refuses a rust-cache step
+# without that save rule.
 
 name: logical-db-v3
 
@@ -43,10 +49,20 @@ jobs:
         run: python3 scripts/test-domain-contract.py
       - name: validate execution access graph
         run: python3 scripts/test-access-graph.py
-      - name: lint workflows and shell
+      - name: install pinned workflow linter
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          "$(go env GOPATH)/bin/actionlint"
+          set -euo pipefail
+          release=https://github.com/rhysd/actionlint/releases/download/v1.7.12
+          asset=actionlint_1.7.12_linux_amd64.tar.gz
+          bin_dir="${RUNNER_TEMP}/actionlint"
+          mkdir -p "${bin_dir}"
+          curl --fail --location --retry 5 "${release}/${asset}" --output "${bin_dir}/${asset}"
+          curl --fail --location --retry 5 "${release}/actionlint_1.7.12_checksums.txt" --output "${bin_dir}/checksums.txt"
+          (cd "${bin_dir}" && sha256sum --check --ignore-missing checksums.txt)
+          tar -xzf "${bin_dir}/${asset}" -C "${bin_dir}" actionlint
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+      - name: lint workflows and shell
+        run: actionlint
 
   linux:
     name: linux / test-clippy
@@ -58,6 +74,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: compile all targets
         run: cargo check --workspace --all-targets --locked
       - name: test every crate but the journey crate
@@ -82,6 +100,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: dependency register
         run: cargo test -p logical-db-e2e --locked --test dependency_contract
       - name: replicas, real HTTP, crash, kill, and recovery journeys
@@ -97,6 +117,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: compile all targets
         run: cargo check --workspace --all-targets --locked
       - name: test runtime and restart journeys
@@ -119,6 +141,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: compile all targets
         run: cargo check --workspace --all-targets --locked
       - name: test runtime and restart journeys
@@ -161,6 +185,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fdb-lane
 
   fdb-linux:
@@ -172,4 +198,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fdb-lane

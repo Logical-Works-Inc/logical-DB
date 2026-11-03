@@ -87,6 +87,12 @@ The FDB lanes share one definition, `.github/actions/fdb-lane/action.yml`.
 Native Windows replaces the earlier Wine-emulated Windows-GNU lane, so Windows
 results are now native MSVC results.
 
+Every `rust-cache` step restores on every ref and saves from `main` only. The
+repository cache holds 10 GiB, a run on `main` cannot restore what a pull
+request saved, and one entry per Rust job measured about 3.6 GiB on 2026-11-03,
+so pull requests read `main`'s entries and never evict them.
+`ci_routing::every_rust_cache_saves_from_main_only` refuses a step without the rule.
+
 Linux is the correct rung wherever a test is `#![cfg(target_os = "linux")]` and
 installs a seccomp filter. On a non-Linux host such a test compiles to nothing
 and the suite reports green having verified nothing, which is silent coverage
