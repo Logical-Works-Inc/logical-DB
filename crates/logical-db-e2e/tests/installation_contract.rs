@@ -9,7 +9,7 @@
 
 const README: &str = include_str!("../../../README.md");
 const GIT_DEPENDENCY_PREFIX: &str =
-    "logical-db = { git = \"https://github.com/srinji-kaggss/logical-DB\", rev = \"";
+    "logical-db = { git = \"https://github.com/Logical-Works-Inc/logical-DB\", rev = \"";
 const JOURNEY: &str = "experience/journeys/embedded-git-consumer-v1.yaml";
 const REGISTRY_BOUNDARY: &str = "Crates.io installation is not supported yet:";
 

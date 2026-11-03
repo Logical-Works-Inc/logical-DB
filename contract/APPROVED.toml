@@ -34,7 +34,11 @@
 
 [policy]
 enforce = true
-repository = "https://github.com/srinji-kaggss/logical-DB"
+repository = "https://github.com/Logical-Works-Inc/logical-DB"
+# The licence set the gate judges every approval's declared licence against;
+# a register without it fails closed. MPL-2.0 is reachable only through the
+# one `lgwks_bot` approval below, and deny.toml admits it for `lgwks_bot` alone.
+accepted_licenses = "MIT, Apache-2.0, MPL-2.0"
 
 # ── The authority adapter ───────────────────────────────────────────────────
 # ── CRDT and storage engines ────────────────────────────────────────────────
@@ -183,7 +187,7 @@ review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 [[approved]]
 crate = "lgwks_bot"
 tier = "boundary"
-version = "^1.0.0"
+version = "^6.1.0"
 owner = "logical-db-server"
 capability = "async.runtime-surface"
 source = "registry"
@@ -198,13 +202,13 @@ review = "https://github.com/srinji-kaggss/logicalworks-crates/blob/main/docs/de
 [[approved]]
 crate = "lgwks_std"
 tier = "boundary"
-version = "^1.0.0"
+version = "^3.2.2"
 owner = "logical-db-model"
 capability = "estate.std-surface"
 source = "registry"
 license = "Apache-2.0"
-allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store-fdb,logical-db-sync"
-allowed_kinds = "normal"
+allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-e2e,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store-fdb,logical-db-sync"
+allowed_kinds = "normal,dev"
 reason = "The estate std+ core owns the json/serde re-export and hashing that logical-db derives and digests through; no crate here declares serde directly."
 approved_by = "Director"
 approved_on = "2026-10-04"
@@ -213,7 +217,7 @@ review = "https://github.com/srinji-kaggss/logical-DB/issues/93"
 [[approved]]
 crate = "lgwks_deps"
 tier = "boundary"
-version = "^1.0.0"
+version = "^5.1.2"
 owner = "logical-db-e2e"
 capability = "estate.dependency-gate"
 source = "registry"

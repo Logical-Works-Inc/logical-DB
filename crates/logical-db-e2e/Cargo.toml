@@ -33,6 +33,8 @@ uuid.workspace = true
 [dev-dependencies]
 ciborium.workspace = true
 lgwks_deps.workspace = true
+# `clean_room_evidence` reads `cargo metadata` through the estate JSON surface.
+lgwks_std.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
