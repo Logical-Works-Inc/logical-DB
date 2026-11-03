@@ -209,6 +209,43 @@ fn verify(text: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// The one save rule every rust-cache step carries.
+const MAIN_ONLY_SAVE: &str = "save-if: ${{ github.ref == 'refs/heads/main' }}";
+
+/// The rust-cache steps in `text` and the 1-based lines of those that may
+/// save from a ref other than main.
+///
+/// The repository cache holds 10 GiB and evicts least-recently-used entries;
+/// a pull request that saves its own entries pushes main's out, and a run on
+/// main cannot restore what a pull request saved, so every later run compiles
+/// cold. A step's fields are the lines indented deeper than its `- ` marker.
+fn rust_cache_steps(text: &str) -> (usize, Vec<usize>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut steps = 0_usize;
+    let mut unsaved = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let content = line.trim_start();
+        let step = match content.strip_prefix("- ") {
+            Some(item) => item,
+            None => content,
+        };
+        if !step.starts_with("uses: Swatinem/rust-cache@") {
+            continue;
+        }
+        steps = steps.saturating_add(1);
+        let marker = indent(line);
+        let saves_from_main = lines
+            .iter()
+            .skip(index.saturating_add(1))
+            .take_while(|field| field.trim().is_empty() || indent(field) > marker)
+            .any(|field| field.trim() == MAIN_ONLY_SAVE);
+        if !saves_from_main {
+            unsaved.push(index.saturating_add(1));
+        }
+    }
+    (steps, unsaved)
+}
+
 /// The repository root, two directories above this crate's manifest.
 fn repository_root() -> Result<PathBuf, Failure> {
     Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -247,6 +284,67 @@ fn committed_workflows_route_to_hosted_images() -> Result<(), Failure> {
     let expected: BTreeSet<String> = CHECK_NAMES.iter().map(|&name| name.to_owned()).collect();
     assert_eq!(names, expected, "published check names changed");
     Ok(())
+}
+
+/// Every committed rust-cache step saves from main only, so pull requests
+/// cannot evict main's entries from the repository cache.
+#[test]
+fn every_rust_cache_saves_from_main_only() -> Result<(), Failure> {
+    let directory = repository_root()?.join(".github").join("workflows");
+    let mut steps = 0_usize;
+    let mut findings = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let (found, unsaved) = rust_cache_steps(&std::fs::read_to_string(&path)?);
+        steps = steps.saturating_add(found);
+        findings.extend(
+            unsaved
+                .into_iter()
+                .map(|line| format!("{}:{line}", path.display())),
+        );
+    }
+    assert!(
+        steps > 0,
+        "no rust-cache step found under {}",
+        directory.display()
+    );
+    assert!(
+        findings.is_empty(),
+        "rust-cache steps without `{MAIN_ONLY_SAVE}`: {findings:?}"
+    );
+    Ok(())
+}
+
+/// A step without the rule, with another ref's rule, or with the rule in a
+/// later step is refused; the rule inside the step's own fields passes.
+#[test]
+fn rust_cache_save_rule_belongs_to_its_own_step() {
+    let saved = "    steps:\n      - uses: Swatinem/rust-cache@abc\n        with:\n          save-if: ${{ github.ref == 'refs/heads/main' }}\n      - run: cargo test\n";
+    assert_eq!(
+        rust_cache_steps(saved),
+        (1, Vec::new()),
+        "main-only save passes"
+    );
+    let bare = "    steps:\n      - uses: Swatinem/rust-cache@abc\n      - run: cargo test\n";
+    assert_eq!(rust_cache_steps(bare), (1, vec![2]), "no rule is refused");
+    let other_ref = "    steps:\n      - uses: Swatinem/rust-cache@abc\n        with:\n          save-if: ${{ github.ref == 'refs/heads/dev' }}\n";
+    assert_eq!(
+        rust_cache_steps(other_ref),
+        (1, vec![2]),
+        "another ref is refused"
+    );
+    let later_step = "    steps:\n      - uses: Swatinem/rust-cache@abc\n      - uses: other/action@abc\n        with:\n          save-if: ${{ github.ref == 'refs/heads/main' }}\n";
+    assert_eq!(
+        rust_cache_steps(later_step),
+        (1, vec![2]),
+        "a later step's rule is not this step's"
+    );
 }
 
 /// A pinned hosted label passes; the job key stands in for a missing name.
