@@ -34,6 +34,12 @@ allow = [
     "Unlicense",
     "Zlib",
 ]
+# MPL-2.0 is admitted for the estate async surface alone, never repo-wide: any
+# other MPL crate still fails this gate. Mirrored by the single `lgwks_bot`
+# approval in contract/APPROVED.toml.
+[[licenses.exceptions]]
+crate = "lgwks_bot"
+allow = ["MPL-2.0"]
 
 [bans]
 multiple-versions = "warn"

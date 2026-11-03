@@ -9,9 +9,9 @@ exactly one concern:
 
 | File | Concern |
 |---|---|
-| [`GOVERNANCE.md`](GOVERNANCE.md) | Authority, laws, gates, the completion ledger, and what is not claimed |
+| [`GOVERNANCE.md`](GOVERNANCE.md) | Authority, laws, gates, the completion ledger (split under `docs/governance/`), and what is not claimed |
 | [`CODEBOOK.md`](CODEBOOK.md) | Code rules: lint contract, anti-slop invariants, API shape, tests, dependencies |
-| [`WORKFLOW.md`](WORKFLOW.md) | Process: local CI, the delivery loop, evidence proportionality, agent economics |
+| [`WORKFLOW.md`](WORKFLOW.md) | Process: local CI, the delivery loop, evidence proportionality, agent economics (split under `docs/workflow/`) |
 | `AGENTS.md` (this file) | Product boundary and completion criteria |
 
 A second copy of a policy is a second policy, and the two drift. Do not
@@ -62,10 +62,11 @@ unproven.
 ## Gate
 
 ```sh
-./scripts/ci-local.sh              # full gate
-./scripts/ci-local.sh --fast       # compile + lint + fmt only
-./scripts/ci-local.sh --receipt    # also write evidence/ci-local-<sha>.md
+cargo run -p logical-db-e2e --bin ci_local                 # full gate
+cargo run -p logical-db-e2e --bin ci_local -- --fast       # compile + lint + fmt only
+cargo run -p logical-db-e2e --bin ci_local -- --receipt    # also write evidence/ci-local-<sha>.md
 ```
 
-That script is the one definition of the gate. CI runs the same commands in the
-same order.
+That binary is the one definition of the gate. CI runs the same commands on
+GitHub-hosted runners only; `ci_routing` refuses a self-hosted runner. External
+contributions are not accepted (`CONTRIBUTING.md`).

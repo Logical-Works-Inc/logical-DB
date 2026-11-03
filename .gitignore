@@ -3,6 +3,8 @@
 # evidence/SOURCES.md.
 
 /target/
+# Per-crate build output (the editor guard compiles single crates in place).
+/crates/*/target/
 /.codegraph/
 /.keel/
 /keel-core/
