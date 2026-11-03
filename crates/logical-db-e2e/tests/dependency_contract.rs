@@ -285,7 +285,7 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         .split("[[package]]")
         .find(|block| {
             block.contains("name = \"lgwks_std\"")
-                && block.contains("version = \"1.0.")
+                && block.contains("version = \"3.2.")
                 && block
                     .contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
         })
@@ -295,7 +295,7 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         .find(|line| line.starts_with("version = "))
         .ok_or("a version line on the registry estate edge")?;
     assert!(
-        version.contains("1.0."),
+        version.contains("3.2."),
         "the workspace estate edge is the current lgwks_std minor: {version}"
     );
     let manifest = std::fs::read_to_string(repository_root()?.join("Cargo.toml"))?;
@@ -308,7 +308,7 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         "the workspace estate edge must not fall back to a git pin: {declared}"
     );
     assert!(
-        declared.contains("version = \"1.0."),
+        declared.contains("version = \"3.2."),
         "the manifest requirement matches the current lgwks_std minor: {declared}"
     );
     assert!(

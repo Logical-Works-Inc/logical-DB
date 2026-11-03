@@ -35,6 +35,9 @@
 [policy]
 enforce = true
 repository = "https://github.com/srinji-kaggss/logical-DB"
+# SPDX identifiers this repository accepts. Every approved edge's declared
+# licence must be built from this set; a new licence is a reviewable diff here.
+accepted_licenses = "MIT, Apache-2.0, MPL-2.0"
 
 # ── The authority adapter ───────────────────────────────────────────────────
 # ── CRDT and storage engines ────────────────────────────────────────────────
@@ -101,6 +104,21 @@ reason = "Order-preserving tuple keys are the FoundationDB keyspace contract and
 approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+
+[[approved]]
+crate = "rusqlite"
+tier = "boundary"
+version = "=0.41.0"
+owner = "logical-db-store"
+capability = "storage.relational-projection"
+source = "registry"
+license = "MIT"
+allowed_consumers = "logical-db-store"
+allowed_kinds = "normal"
+reason = "The second parity engine for the relational projection (kernel SPEC 365-P absorption, issue #119 row 4): a file-backed SQLite table proving byte-identical canonical state with the redb-backed engine; std has no embedded SQL engine."
+approved_by = "Director"
+approved_on = "2026-11-03"
+review = "https://github.com/Logical-Works-Inc/logical-DB/issues/119"
 
 # ── Serialization and wire encoding ─────────────────────────────────────────
 # Derives route through `lgwks_std::json::{Serialize, Deserialize}`, the
@@ -183,7 +201,7 @@ review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 [[approved]]
 crate = "lgwks_bot"
 tier = "boundary"
-version = "^1.0.0"
+version = "^6.1.0"
 owner = "logical-db-server"
 capability = "async.runtime-surface"
 source = "registry"
@@ -198,12 +216,12 @@ review = "https://github.com/srinji-kaggss/logicalworks-crates/blob/main/docs/de
 [[approved]]
 crate = "lgwks_std"
 tier = "boundary"
-version = "^1.0.0"
+version = "^3.2.2"
 owner = "logical-db-model"
 capability = "estate.std-surface"
 source = "registry"
 license = "Apache-2.0"
-allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store-fdb,logical-db-sync"
+allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store,logical-db-store-fdb,logical-db-sync"
 allowed_kinds = "normal"
 reason = "The estate std+ core owns the json/serde re-export and hashing that logical-db derives and digests through; no crate here declares serde directly."
 approved_by = "Director"
@@ -213,7 +231,7 @@ review = "https://github.com/srinji-kaggss/logical-DB/issues/93"
 [[approved]]
 crate = "lgwks_deps"
 tier = "boundary"
-version = "^1.0.0"
+version = "^5.1.2"
 owner = "logical-db-e2e"
 capability = "estate.dependency-gate"
 source = "registry"

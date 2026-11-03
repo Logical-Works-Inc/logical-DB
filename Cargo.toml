@@ -60,11 +60,17 @@ tower = { version = "=0.5.3", features = ["util"] }
 #
 # `json` re-exports the serde crate the estate owns, so logical-db derives
 # through `lgwks_std::json::{Serialize, Deserialize}` and never declares serde.
-lgwks_std = { version = "1.0.0", features = ["json", "hash"] }
-lgwks_bot = { version = "1.0.0", features = ["net", "signal"] }
+lgwks_std = { version = "3.2.2", features = ["json", "hash"] }
+lgwks_bot = { version = "6.1.0", features = ["net", "signal"] }
 # The dependency gate itself. `default-features = false` keeps the storefront's
 # Rust scanner out: the contract lane only needs `check_dependencies`.
-lgwks_deps = { version = "1.0.0", default-features = false }
+lgwks_deps = { version = "5.1.2", default-features = false }
+# Row-4 kernel absorption (issue #119): the second parity engine the ported
+# projection contract needs. Exact pin with no default features, following
+# the redb boundary precedent. The durable snapshot query path uses
+# positional reads over the same LWMX bytes instead of mmap(2), so no
+# mapping edge is admitted: every crate here keeps forbid(unsafe_code).
+rusqlite = { version = "=0.41.0", default-features = false, features = ["bundled"] } # gap: Logical-Works-Inc/logicalworks-crates#828
 
 [workspace.lints.rust]
 improper_ctypes = "forbid"
