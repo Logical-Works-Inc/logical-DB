@@ -6,10 +6,14 @@
 
 How work moves through this repository. Code rules are in `CODEBOOK.md`.
 Authority, decisions, and the completion ledger are in `GOVERNANCE.md`. The
-agent entry point is `AGENTS.md`. Sections 3 to 6 live in
-[`docs/workflow/engineering.md`](docs/workflow/engineering.md) and sections 7 to
-11 in [`docs/workflow/delivery.md`](docs/workflow/delivery.md), under the
-120-line law.
+agent entry point is `AGENTS.md`.
+
+| Sections | Where |
+|---|---|
+| 1, 7, 10 — local CI, delivery by PR, runner map | this file |
+| 2–4 — delivery loop, research, one architecture | [docs/workflow/delivery.md](docs/workflow/delivery.md) |
+| 5–6 — change radius, evidence proportionality | [docs/workflow/evidence.md](docs/workflow/evidence.md) |
+| 8, 9, 11 — agent economics, data safety, WWFD | [docs/workflow/agents.md](docs/workflow/agents.md) |
 
 ---
 
@@ -19,61 +23,77 @@ Local CI is the gate. It runs every check a pull request needs, on this machine,
 without GitHub, and writes a receipt.
 
 ```sh
-cargo install --locked lgwks_deps --version 5.1.2 --bin ci-local   # once
-ci-local              # full gate
-ci-local --fast       # lockfile, compile, lint, fmt and scans
-ci-local --receipt    # also write evidence/ci-local-*.md
+cargo run -p logical-db-e2e --bin ci_local                 # full gate
+cargo run -p logical-db-e2e --bin ci_local -- --fast       # compile + lint + fmt only
+cargo run -p logical-db-e2e --bin ci_local -- --receipt    # also write evidence/ci-local-<sha>.md
 ```
 
-`scripts/gate-lanes.toml` is the single definition of "the gate", run by the
-estate's `ci-local`. `.github/workflows/ci.yml` calls the same commands, so a
-green local run and a green CI run are the same claim. When the two disagree,
-the workflow is wrong; fix the workflow and re-run locally. The repository
-contracts are Rust tests (`docs/adr/0006-contract-checks-in-rust.md`).
+`crates/logical-db-e2e/src/bin/ci_local.rs` is the single definition of "the
+gate". `.github/workflows/ci.yml` calls the same commands, so a green local run
+and a green CI run are the same claim. When the two disagree, the workflow is
+wrong; fix the workflow and re-run locally.
 
-Every job declares a literal self-hosted label list.
-`crates/logical-db-e2e/tests/repository_contract/ci_routing.rs` refuses hosted
-routing, unresolved `${{ }}` labels, aliases, and duplicate `runs-on` keys.
-
-The self-hosted runner is ephemeral: it registers when a job is queued, takes
-one job, deregisters, and exits. Nothing stays resident between runs. See §10 in
-`docs/workflow/delivery.md` for the per-repo runner map.
+The repository is public (Director, 2026-11-03), so CI runs on GitHub-hosted
+standard runners, which are free for public repositories: native Linux x86-64,
+macOS ARM64, and Windows x86-64. Every job names one pinned image label
+(`ubuntu-24.04`, `macos-15`, `windows-2025`). A self-hosted runner on a public
+repository executes whatever a workflow trigger supplies on the owner's
+machine, so `crates/logical-db-e2e/tests/ci_routing.rs` refuses self-hosted
+and moving labels, unresolved `${{ }}` labels, reusable-workflow jobs, YAML
+anchors, and duplicate keys.
 
 ---
 
-## 2. The delivery loop
+## 7. Work ends with a PR
 
-```
-1. Read the task and query WWFD            (1 min, mandatory)
-2. Find the best OSS implementations       (5 min, non-trivial work only)
-3. Navigate with CodeGraph                 (2 min, find code and callers)
-4. Implement to the codebook               (CODEBOOK.md)
-5. Test and verify                         (affected tests + regression tests)
-6. WWFD state sync, then PR                (mandatory before delivery)
-```
+- **Always commit.** Never leave verified-green work uncommitted and never end a
+  turn with it in the working tree. Uncommitted work has not carried forward.
+- Commit in small, individually-green steps.
+- **A local commit is not the finish line.** Work ends with a GitHub PR: branch,
+  commits, pushed, PR opened with its evidence. A branch with no PR is unfinished
+  work, and a green tree on `main` that was never proposed has not shipped.
+- The PR carries the receipts: gate commands and their results. Not a narrative
+  about them.
 
-**Rule 1, first tool call.** The first substantive tool call reads source you
-will edit, runs a build or test, writes source, or queries CodeGraph to navigate
-to the code you will edit. It is not reading this file, loading a skill, running
-`wwfd boot`, or producing a plan document.
+### Merge gate
 
-**Rule 2, five-minute code.** Within five minutes of session start you have
-written or modified a source file, run a build/test/lint command, or named a
-specific `file:line` and the exact change it needs.
+Source review may proceed against local receipts. Merge eligibility requires
+executed reproduction of the affected lanes on hosted CI. A bounded exception
+requires explicit Director authorization recorded in the governance ledger with
+its replacement evidence enumerated. A local PASS claim alone is never a
+satisfied execution gate.
 
-**Rule 3, narration ratio.** Process words must never exceed 20% of any
-response. Code, architecture decisions, error analysis, test results, and diffs
-are implementation words.
+Production completion additionally requires a ratified product scope and every
+applicable acceptance row satisfied. A green PR does not close unfinished
+roadmap issues. Do not copy historical checkmarks into a current release claim.
 
-**Rule 4, one repro then fix.** A prior CI failure is a defect verdict and the
-receipt already exists. One repro is authorized only when the cause is genuinely
-uncertain from the receipt alone. Fix the code, run the new state once.
+---
 
-**Rule 5, skill budget.** At most two skills loaded before the first code edit.
+## 10. Local CI and the runner map
 
-**Rule 6, table proportionality.** Product runtime changes get the full nine-axis
-SLO evidence matrix with measured evidence per axis. Config, docs, CI, README,
-and script changes get one line of receipt per file.
+| Lane | Runner | Proves |
+|---|---|---|
+| `clean-room evidence` | `ubuntu-24.04` | actionlint |
+| `linux / test-clippy` | `ubuntu-24.04` | compile, tests of every crate but `logical-db-e2e`, clippy, package isolation |
+| `linux / end-to-end journeys` | `ubuntu-24.04` | dependency register, domain graph and its JSON receipt (`repository_contract`), access graph, CI routing and its seeded sims, clean-room evidence, and the `logical-db-e2e` journeys (replicas over real HTTP, crash, kill, recovery) |
+| `macos / test-clippy` | `macos-15` (ARM64) | compile, tests, clippy |
+| `windows / test-clippy` | `windows-2025` (x86-64 MSVC) | compile, tests, clippy |
+| `rustfmt` | `ubuntu-24.04` | formatting |
+| `advisory, license, and source policy` | `ubuntu-24.04` | `cargo deny check` (cargo-deny 0.20.2) |
+| `official FDB client / daemon feature` | `macos-15` | FDB 7.3.77 feature lanes and live-cluster journeys |
+| `official FDB client / linux` | `ubuntu-24.04` | the same on Linux x86-64 |
 
-**Rule 7, refuse the theater.** No session-start rituals, no prophylactic skill
-loading, no re-reading source already held in context.
+The FDB lanes share one definition, `.github/actions/fdb-lane/action.yml`.
+Native Windows replaces the earlier Wine-emulated Windows-GNU lane, so Windows
+results are now native MSVC results.
+
+Every `rust-cache` step restores on every ref and saves from `main` only. The
+repository cache holds 10 GiB, a run on `main` cannot restore what a pull
+request saved, and one entry per Rust job measured about 3.6 GiB on 2026-11-03,
+so pull requests read `main`'s entries and never evict them.
+`ci_routing::every_rust_cache_saves_from_main_only` refuses a step without the rule.
+
+Linux is the correct rung wherever a test is `#![cfg(target_os = "linux")]` and
+installs a seccomp filter. On a non-Linux host such a test compiles to nothing
+and the suite reports green having verified nothing, which is silent coverage
+loss. macOS is a reduced rung for quick signal, not an equivalent one.

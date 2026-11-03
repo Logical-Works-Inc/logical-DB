@@ -34,9 +34,10 @@
 
 [policy]
 enforce = true
-repository = "https://github.com/srinji-kaggss/logical-DB"
-# SPDX identifiers this repository accepts. Every approved edge's declared
-# licence must be built from this set; a new licence is a reviewable diff here.
+repository = "https://github.com/Logical-Works-Inc/logical-DB"
+# The licence set the gate judges every approval's declared licence against;
+# a register without it fails closed. MPL-2.0 is reachable only through the
+# one `lgwks_bot` approval below, and deny.toml admits it for `lgwks_bot` alone.
 accepted_licenses = "MIT, Apache-2.0, MPL-2.0"
 
 # ── The authority adapter ───────────────────────────────────────────────────
@@ -221,8 +222,8 @@ owner = "logical-db-model"
 capability = "estate.std-surface"
 source = "registry"
 license = "Apache-2.0"
-allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store,logical-db-store-fdb,logical-db-sync"
-allowed_kinds = "normal"
+allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-e2e,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store,logical-db-store-fdb,logical-db-sync"
+allowed_kinds = "normal,dev"
 reason = "The estate std+ core owns the json/serde re-export and hashing that logical-db derives and digests through; no crate here declares serde directly."
 approved_by = "Director"
 approved_on = "2026-10-04"
@@ -254,21 +255,6 @@ license = "MIT OR Apache-2.0"
 allowed_consumers = "logical-db-e2e"
 allowed_kinds = "dev"
 reason = "The repository-contract tests read contract/*.toml; the estate has no general TOML reader (docs/adr/0006)."
-approved_by = "Director"
-approved_on = "2026-11-03"
-review = "https://github.com/Logical-Works-Inc/logicalworks-crates/issues/852"
-
-[[approved]]
-crate = "yaml-rust2"
-tier = "boundary"
-version = "=0.13.0"
-owner = "logical-db-e2e"
-capability = "contract.yaml-events"
-source = "registry"
-license = "MIT OR Apache-2.0"
-allowed_consumers = "logical-db-e2e"
-allowed_kinds = "dev"
-reason = "The CI routing test reads workflow YAML as parser events so duplicate keys and aliases are refused; the estate has no YAML reader (docs/adr/0006)."
 approved_by = "Director"
 approved_on = "2026-11-03"
 review = "https://github.com/Logical-Works-Inc/logicalworks-crates/issues/852"

@@ -28,7 +28,7 @@ members = [
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
-repository = "https://github.com/srinji-kaggss/logical-DB"
+repository = "https://github.com/Logical-Works-Inc/logical-DB"
 
 [workspace.dependencies]
 automerge = "=0.11.0"
@@ -43,7 +43,6 @@ serde_bytes = "=0.11.19"
 # Estate first: the repository contracts are read through the estate once it
 # owns a TOML reader (docs/adr/0006).
 toml = "=1.1.8" # gap: Logical-Works-Inc/logicalworks-crates#852
-yaml-rust2 = { version = "=0.13.0", default-features = false } # gap: Logical-Works-Inc/logicalworks-crates#852
 ciborium = "=0.2.2"
 # FROZEN BOUNDARY (async surface): `reqwest` and `axum` are the async HTTP
 # client/server the estate does not yet supply. Every runtime *mechanic*

@@ -1,4 +1,4 @@
-//! Seeded simulations of the CI routing contract.
+//! Seeded simulations of the hosted-runner routing gate.
 //!
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
@@ -7,11 +7,9 @@
 //! One seed drives every generated workflow, so a failing seed replays bit
 //! for bit and each run is checked by its trace hash.
 
-use crate::ci_routing::verify;
-use crate::workspace::ContractError;
+use super::verify;
 
-/// Seeded generator for the routing simulations (SplitMix64, so one seed
-/// replays the same workflows bit for bit).
+/// Seeded generator for the routing simulations (SplitMix64).
 struct Seeded(u64);
 
 impl Seeded {
@@ -53,51 +51,48 @@ fn fold(trace: u64, step: &str) -> u64 {
     })
 }
 
-/// Runner labels the simulations draw from, with whether each is a literal
-/// string label and whether it is the self-hosted marker.
-const LABELS: [(&str, bool, bool); 8] = [
-    ("self-hosted", true, true),
-    ("macOS", true, false),
-    ("ARM64", true, false),
-    ("ubuntu-latest", true, false),
-    ("Linux", true, false),
-    ("\"${{ matrix.os }}\"", false, false),
-    ("null", false, false),
-    ("\"self-hosted\"", true, true),
+/// Routes the simulations draw from, with whether the gate must accept each.
+const ROUTES: [(&str, bool); 9] = [
+    ("ubuntu-24.04", true),
+    ("macos-15", true),
+    ("windows-2025", true),
+    ("\"macos-15\"", true),
+    ("ubuntu-24.04 # pinned", true),
+    ("ubuntu-latest", false),
+    ("self-hosted", false),
+    ("\"${{ matrix.os }}\"", false),
+    ("[ubuntu-24.04]", false),
 ];
 
-/// One seeded run of random label lists judged against the routing model;
-/// returns the trace hash.
-fn label_run(seed: u64) -> u64 {
+/// One seeded run of random multi-job workflows judged against the routing
+/// model; returns the trace hash.
+fn route_run(seed: u64) -> u64 {
     let mut random = Seeded(seed);
     let mut trace = 0xCBF2_9CE4_8422_2325;
     for _ in 0..500 {
-        let count = random.between(1, 5);
-        let mut labels = Vec::with_capacity(count);
-        let (mut literal, mut hosted) = (true, false);
-        for _ in 0..count {
-            let pick = LABELS[random.below(LABELS.len())];
-            labels.push(pick.0);
-            literal &= pick.1;
-            hosted |= pick.2;
+        let mut accepted = true;
+        let mut lines = vec!["jobs:\n".to_owned()];
+        for job in 0..random.between(1, 5) {
+            let route = ROUTES[random.below(ROUTES.len())];
+            accepted &= route.1;
+            lines.push(format!("  job{job}:\n    runs-on: {}\n", route.0));
         }
-        let text = format!("jobs:\n  sim:\n    runs-on: [{}]\n", labels.join(", "));
+        let text = lines.concat();
         let passed = verify(&text).is_ok();
-        assert_eq!(passed, literal && hosted, "routing model disagrees: {text}");
+        assert_eq!(passed, accepted, "routing model disagrees: {text}");
         trace = fold(trace, &format!("{text}{passed}"));
     }
     trace
 }
 
 #[test]
-fn sim_seeded_label_lists_match_the_routing_model() {
+fn sim_seeded_routes_match_the_hosted_model() {
     for seed in 0..8 {
-        assert_eq!(label_run(seed), label_run(seed), "seed {seed} replays");
+        assert_eq!(route_run(seed), route_run(seed), "seed {seed} replays");
     }
 }
 
-/// One seeded run of multi-job workflows where one job repeats `runs-on`;
-/// returns the trace hash.
+/// One seeded run where one job repeats `runs-on`; returns the trace hash.
 fn duplicate_run(seed: u64) -> u64 {
     let mut random = Seeded(seed);
     let mut trace = 0xCBF2_9CE4_8422_2325;
@@ -106,10 +101,10 @@ fn duplicate_run(seed: u64) -> u64 {
         let twice = random.below(jobs);
         let mut lines = vec!["jobs:\n".to_owned()];
         for job in 0..jobs {
-            lines.push(format!("  job{job}:\n    runs-on: [self-hosted]\n"));
+            lines.push(format!("  job{job}:\n    runs-on: macos-15\n"));
             if job == twice {
-                let route = LABELS[random.below(LABELS.len())].0;
-                lines.push(format!("    runs-on: [{route}]\n"));
+                let route = ROUTES[random.below(ROUTES.len())].0;
+                lines.push(format!("    runs-on: {route}\n"));
             }
         }
         let text = lines.concat();
@@ -130,28 +125,30 @@ fn sim_seeded_duplicate_routes_are_always_refused() {
     }
 }
 
-/// One seeded run checking that the job count does not depend on job order;
-/// returns the trace hash.
-fn order_run(seed: u64) -> Result<u64, ContractError> {
+/// One seeded run checking that the published names do not depend on job
+/// order; returns the trace hash.
+fn order_run(seed: u64) -> Result<u64, String> {
     let mut random = Seeded(seed);
     let mut trace = 0xCBF2_9CE4_8422_2325;
     for _ in 0..200 {
         let mut jobs: Vec<String> = (0..random.between(1, 6))
-            .map(|job| format!("  job{job}:\n    runs-on: [self-hosted, macOS]\n"))
+            .map(|job| format!("  job{job}:\n    name: check {job}\n    runs-on: ubuntu-24.04\n"))
             .collect();
-        let forward = verify(&format!("jobs:\n{}", jobs.concat()))?;
+        let mut forward = verify(&format!("jobs:\n{}", jobs.concat()))?;
         for index in (1..jobs.len()).rev() {
             jobs.swap(index, random.between(0, index));
         }
-        let shuffled = verify(&format!("jobs:\n{}", jobs.concat()))?;
-        assert_eq!(forward, shuffled, "job order changed the count");
-        trace = fold(trace, &format!("{forward}{}", jobs.concat()));
+        let mut shuffled = verify(&format!("jobs:\n{}", jobs.concat()))?;
+        forward.sort();
+        shuffled.sort();
+        assert_eq!(forward, shuffled, "job order changed the published names");
+        trace = fold(trace, &format!("{forward:?}{}", jobs.concat()));
     }
     Ok(trace)
 }
 
 #[test]
-fn sim_seeded_job_order_never_changes_the_verdict() -> Result<(), ContractError> {
+fn sim_seeded_job_order_never_changes_the_names() -> Result<(), String> {
     for seed in 0..8 {
         assert_eq!(order_run(seed)?, order_run(seed)?, "seed {seed} replays");
     }

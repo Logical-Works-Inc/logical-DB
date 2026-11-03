@@ -1,45 +1,11 @@
-# Workflow: engineering practice
+# Workflow: change radius and evidence proportionality
 
 > Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 > S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
-> S33 S34 S35 S36 S37 S38 S39 S42 S43. Source URLs are in `../../evidence/SOURCES.md`.
+> S33 S34 S35 S36 S37 S38 S39 S42 S43. Source URLs are in `evidence/SOURCES.md`.
 
-Sections 3 to 6 of [`WORKFLOW.md`](../../WORKFLOW.md), split out under the
-120-line law. The numbering is kept so existing citations still resolve.
-
-## 3. RAG yourself into expertise
-
-Before implementing anything non-trivial, find two or three production OSS
-implementations of the same thing and study their structural decisions: module
-organization, trait design, error handling, concurrency primitives, tests. Five
-to ten minutes. Record what you are adopting and why, and what you rejected and
-why, in your first edit or message. Then implement at that level.
-
-Skip this for trivial changes under twenty lines with no new abstraction, bug
-fixes whose root cause is already identified, and config/docs/CI work.
-
-This is not copying code. It is studying architecture and making an informed
-decision. The mechanism is RAG for latent implementation expertise: reading real
-code activates specifics that prompts alone do not.
-
-## 4. One path, one opinion, one architecture
-
-A capability is either **the** architecture or it does not exist.
-
-- **No default-off parallel paths.** A feature flag that makes an implementation
-  a *candidate* is how work fails to carry forward: nothing exercises it, the
-  gate never compiles it, and it rots into a second opinion nobody chose. If it
-  is how the estate does the thing, it is on by default and the gate runs it.
-- **One implementation of a job.** Two builders, two executors, or two
-  "equivalent" entry points for the same work is one too many. Pick the right
-  one, make it the only one, delete the other including its tests, docs, and
-  feature flag.
-- **Unification beats a seam.** "Parallel seams, not demolition" governs *how* a
-  change lands while the tree stays green. It is not a licence to leave both
-  halves standing. The seam closes in the same task.
-- A storefront may keep capability features default-off, because selecting is
-  its stated purpose. A **consumer** states its opinion: it turns on what it
-  uses, in its own defaults, and the workspace gate compiles and tests it.
+Sections 5–6 of [WORKFLOW.md](../../WORKFLOW.md), moved verbatim under the
+120-line document law.
 
 ## 5. Compounding, buildable, surgical
 

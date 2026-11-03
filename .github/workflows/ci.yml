@@ -1,12 +1,23 @@
 # Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 # S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S42 S43. Source URLs
 # are in evidence/SOURCES.md.
+#
+# GitHub-hosted standard runners: free for this public repository and native on
+# every declared target. Every job names one pinned image label; self-hosted
+# routing is refused by crates/logical-db-e2e/tests/ci_routing.rs because a
+# public repository's workflows must never execute on the owner's machine.
+#
+# Every rust-cache restores on every ref and saves from main only: a pull
+# request run can read main's entries but never writes its own, so pull
+# requests cannot evict main from the 10 GiB repository cache and each one
+# starts from main's dependency build. ci_routing.rs refuses a rust-cache step
+# without that save rule.
 
 name: logical-db-v3
 
 on:
   push:
-    branches: [main, "rewrite/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -19,188 +30,170 @@ concurrency:
 
 env:
   CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
 
 jobs:
-  selfhosted-evidence:
+  evidence:
     name: clean-room evidence
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-      - name: verify rewrite evidence, domain graph and runner routing
+          persist-credentials: false
+      # The domain contract, its receipt and the access graph are Rust tests
+      # (`repository_contract`, `access_graph`) run by the journeys job.
+      - name: install pinned workflow linter
         run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/cargo" test -p logical-db-e2e --locked --test repository_contract
-      - name: validate execution access graph
-        run: |
-          "$HOME/.cargo/bin/cargo" test -p logical-db-e2e --locked --test access_graph
-      - name: reject hosted runner routing
-        run: |
-          actionlint
-          shellcheck scripts/ci-emulated.sh scripts/ci-guest.sh scripts/ci-fdb-linux.sh scripts/ci-wine-runner.sh scripts/ci-windows-runtime.sh
-          python3 scripts/ci-windows-runtime.py test
+          set -euo pipefail
+          release=https://github.com/rhysd/actionlint/releases/download/v1.7.12
+          asset=actionlint_1.7.12_linux_amd64.tar.gz
+          bin_dir="${RUNNER_TEMP}/actionlint"
+          mkdir -p "${bin_dir}"
+          curl --fail --location --retry 5 "${release}/${asset}" --output "${bin_dir}/${asset}"
+          curl --fail --location --retry 5 "${release}/actionlint_1.7.12_checksums.txt" --output "${bin_dir}/checksums.txt"
+          (cd "${bin_dir}" && sha256sum --check --ignore-missing checksums.txt)
+          tar -xzf "${bin_dir}/${asset}" -C "${bin_dir}" actionlint
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
+      - name: lint workflows and shell
+        run: actionlint
 
-  # Legacy check names satisfy the existing main-branch protection rule.
-  # They are status identifiers, not runner selectors: every job is self-hosted.
-  selfhosted-quality:
-    name: macos-latest / test-clippy
-    needs: selfhosted-evidence
-    runs-on: [self-hosted, macOS, ARM64]
+  linux:
+    name: linux / test-clippy
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: toolchain identity
-        run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          rustc --version --verbose
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: compile all targets
         run: cargo check --workspace --all-targets --locked
+      - name: test every crate but the journey crate
+        run: cargo test --workspace --exclude logical-db-e2e --locked
+      - name: lint with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: package isolation
+        run: |
+          failed=0
+          for crate in logical-db logical-db-cairn logical-db-crdt logical-db-daemon logical-db-episode logical-db-http logical-db-kv logical-db-model logical-db-platform logical-db-protocol logical-db-server logical-db-service logical-db-store logical-db-sync; do
+            cargo check -p "$crate" --all-targets --locked || failed=1
+          done
+          exit "$failed"
+
+  journeys:
+    name: linux / end-to-end journeys
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: dependency register
         run: cargo test -p logical-db-e2e --locked --test dependency_contract
+      - name: replicas, real HTTP, crash, kill, and recovery journeys
+        run: cargo test -p logical-db-e2e --locked
+
+  macos:
+    name: macos / test-clippy
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: compile all targets
+        run: cargo check --workspace --all-targets --locked
       - name: test runtime and restart journeys
         run: cargo test --workspace --locked
       - name: lint with warnings denied
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  selfhosted-format:
+  windows:
+    name: windows / test-clippy
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: keep checkout bytes identical to the committed blobs
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: compile all targets
+        run: cargo check --workspace --all-targets --locked
+      - name: test runtime and restart journeys
+        run: cargo test --workspace --locked
+      - name: lint with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  format:
     name: rustfmt
-    needs: selfhosted-evidence
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: rustfmt
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo fmt --all -- --check
-          rustfmt --check scripts/ci-windows-smoke.rs
+        run: cargo fmt --all -- --check
 
-  selfhosted-policy:
+  policy:
     name: advisory, license, and source policy
-    needs: selfhosted-evidence
-    runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: install pinned policy checker
-        run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          if ! command -v cargo-deny >/dev/null || [[ "$("$HOME/.cargo/bin/cargo-deny" --version 2>/dev/null)" != *"0.20.2"* ]]; then
-            "$HOME/.cargo/bin/cargo" install --locked cargo-deny --version 0.20.2
-          fi
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941
+        with:
+          tool: cargo-deny@0.20.2
       - name: enforce dependency policy
         run: cargo deny check
 
-  emulated-quality:
-    name: ${{ matrix.check-name }} / test-clippy
-    needs: selfhosted-evidence
-    runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {guest: linux, check-name: ubuntu-latest}
-          - {guest: windows, check-name: windows-latest}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: Linux x86-64 or Windows-GNU Wine runtime
-        run: bash scripts/ci-emulated.sh "${{ matrix.guest }}"
-
-  selfhosted-fdb-composition:
+  fdb-macos:
     name: official FDB client / daemon feature
-    needs: selfhosted-evidence
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: stage checksummed FoundationDB 7.3.77 arm64 client and server
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          fdb_cache="${HOME}/.cache/foundationdb-7.3.77-arm64"
-          libdir="${fdb_cache}/lib"
-          srvdir="${fdb_cache}/libexec"
-          clidir="${fdb_cache}/bin"
-          if [[ ! -x "${srvdir}/fdbserver" || ! -x "${clidir}/fdbcli" || ! -f "${libdir}/libfdb_c.dylib" ]]; then
-            fdb_root="${RUNNER_TEMP}/foundationdb-7.3.77"
-            mkdir -p "${fdb_root}"
-            pkg_asset="FoundationDB-7.3.77_arm64.pkg"
-            curl --fail --location --retry 5 \
-              "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}" \
-              --output "${fdb_root}/${pkg_asset}"
-            curl --fail --location --retry 5 \
-              "https://github.com/apple/foundationdb/releases/download/7.3.77/${pkg_asset}.sha256" \
-              --output "${fdb_root}/${pkg_asset}.sha256"
-            (cd "${fdb_root}" && shasum -a 256 --check "${pkg_asset}.sha256")
-            pkgutil --expand-full "${fdb_root}/${pkg_asset}" "${fdb_root}/expanded"
-            mkdir -p "${libdir}" "${srvdir}" "${clidir}"
-            cp -R "${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/lib/"* "${libdir}/"
-            cp -R "${fdb_root}/expanded/FoundationDB-server.pkg/Payload/usr/local/libexec/"* "${srvdir}/"
-            cp -R "${fdb_root}/expanded/FoundationDB-clients.pkg/Payload/usr/local/bin/"* "${clidir}/"
-            chmod +x "${srvdir}/fdbserver" "${clidir}/fdbcli"
-          fi
-          {
-            echo "FDB_LIBRARY_ROOT=${libdir}"
-            echo "FDB_SERVER_BIN=${srvdir}/fdbserver"
-            echo "FDB_CLI_BIN=${clidir}/fdbcli"
-          } >> "${GITHUB_ENV}"
-      - name: compile, lint, and test optional composition
-        shell: bash
-        run: |
-          export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
-          cargo check -p logical-db-store-fdb --features fdb --locked
-          cargo check -p logical-db-e2e --features fdb --all-targets --locked
-          cargo clippy -p logical-db-daemon --features fdb --all-targets --locked -- -D warnings
-          cargo clippy -p logical-db-e2e --features fdb --all-targets --locked -- -D warnings
-          cargo test -p logical-db-store-fdb --features fdb --locked
-          cargo test -p logical-db-daemon --features fdb --locked
-      - name: run retained FDB ambiguity journey
-        shell: bash
-        run: |
-          set -euo pipefail
-          export RUSTFLAGS="-L native=${FDB_LIBRARY_ROOT} -C link-arg=-Wl,-rpath,${FDB_LIBRARY_ROOT}"
-          live_root="${RUNNER_TEMP}/logical-db-fdb-live"
-          mkdir -p "${live_root}/data" "${live_root}/logs"
-          cluster_file="${live_root}/fdb.cluster"
-          echo "logicaldb:ci@127.0.0.1:4650" > "${cluster_file}"
-          "${FDB_SERVER_BIN}" \
-            -p 127.0.0.1:4650 -C "${cluster_file}" \
-            -d "${live_root}/data" -L "${live_root}/logs" \
-            --memory 1GiB --cache-memory 256MiB --storage-memory 256MiB &
-          fdb_pid=$!
-          cleanup() {
-            kill "${fdb_pid}" 2>/dev/null || true
-            wait "${fdb_pid}" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          for _attempt in {1..40}; do
-            if "${FDB_CLI_BIN}" -C "${cluster_file}" \
-              --exec "configure new single memory"; then break; fi
-            sleep 1
-          done
-          for _attempt in {1..40}; do
-            status=$("${FDB_CLI_BIN}" -C "${cluster_file}" \
-              --exec "status minimal" 2>&1 || true)
-            if grep --fixed-strings --line-regexp --quiet \
-              "The database is available." <<< "${status}"; then
-              echo "${status}"
-              break
-            fi
-            if [[ "${_attempt}" == 40 ]]; then
-              echo "${status}"
-              exit 1
-            fi
-            sleep 1
-          done
-          export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
-          cargo run -p logical-db-daemon --bin fdb-ambiguity-journey \
-            --features fdb --locked
-          cargo test -p logical-db-e2e --features fdb --locked \
-            --test fdb_recovery_composition -- --nocapture
-          cargo test -p logical-db-e2e --features fdb --locked \
-            --test fdb_process_kill_restore -- --nocapture
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fdb-lane
+
+  fdb-linux:
+    name: official FDB client / linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fdb-lane

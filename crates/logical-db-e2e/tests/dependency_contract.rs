@@ -280,24 +280,9 @@ fn an_enforcement_stand_down_is_reported_not_silently_honoured()
 #[test]
 fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
 -> Result<(), Box<dyn std::error::Error>> {
-    let lock = std::fs::read_to_string(repository_root()?.join("Cargo.lock"))?;
-    let estate = lock
-        .split("[[package]]")
-        .find(|block| {
-            block.contains("name = \"lgwks_std\"")
-                && block.contains("version = \"3.2.")
-                && block
-                    .contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
-        })
-        .ok_or("the workspace registry estate edge is in the lockfile")?;
-    let version = estate
-        .lines()
-        .find(|line| line.starts_with("version = "))
-        .ok_or("a version line on the registry estate edge")?;
-    assert!(
-        version.contains("3.2."),
-        "the workspace estate edge is the current lgwks_std minor: {version}"
-    );
+    // The pinned version is read from the manifest, never restated here: an
+    // estate upgrade moves one line in `Cargo.toml`, and this gate then demands
+    // the lockfile resolve exactly that release from the registry.
     let manifest = std::fs::read_to_string(repository_root()?.join("Cargo.toml"))?;
     let declared = manifest
         .lines()
@@ -307,9 +292,40 @@ fn an_estate_registry_edge_is_version_pinned_by_the_lockfile()
         !declared.contains("git = "),
         "the workspace estate edge must not fall back to a git pin: {declared}"
     );
+    let requirement = declared
+        .split_once("version = \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(version, _)| version)
+        .ok_or("the estate edge declares a registry version")?;
     assert!(
-        declared.contains("version = \"3.2."),
-        "the manifest requirement matches the current lgwks_std minor: {declared}"
+        requirement.split('.').count() == 3
+            && requirement
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "the estate edge names one exact release: {requirement}"
+    );
+    let lock = std::fs::read_to_string(repository_root()?.join("Cargo.lock"))?;
+    let pinned = format!("version = \"{requirement}\"");
+    let estate = lock
+        .split("[[package]]")
+        .find(|block| {
+            block.contains("name = \"lgwks_std\"")
+                && block.lines().any(|line| line == pinned)
+                && block
+                    .contains("source = \"registry+https://github.com/rust-lang/crates.io-index\"")
+        })
+        .ok_or("the lockfile resolves the declared lgwks_std release from the registry")?;
+    assert!(
+        estate
+            .lines()
+            .filter(|line| line.starts_with("version = "))
+            .count()
+            == 1,
+        "one resolved version on the registry estate edge: {estate}"
+    );
+    assert!(
+        lock.matches("name = \"lgwks_std\"").count() == 1,
+        "the lockfile carries exactly one lgwks_std"
     );
     assert!(
         !declared.contains("rev = "),

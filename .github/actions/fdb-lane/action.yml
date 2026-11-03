@@ -1,0 +1,121 @@
+# Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
+# S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. See evidence/SOURCES.md.
+#
+# The one FDB composition lane, shared by the Linux x86-64 and macOS ARM64
+# jobs: stage the checksummed official FoundationDB 7.3.77 client and server
+# for this host, compile, lint, and test the `fdb` feature, then run the
+# live-cluster journeys against a single-memory cluster the step owns and stops.
+name: fdb-lane
+description: Checksummed FoundationDB 7.3.77, fdb feature lanes, live-cluster journeys
+runs:
+  using: composite
+  steps:
+    - name: stage checksummed FoundationDB 7.3.77
+      shell: bash
+      run: |
+        set -euo pipefail
+        release=https://github.com/apple/foundationdb/releases/download/7.3.77
+        fdb_root="${RUNNER_TEMP}/logical-db-fdb-7.3.77"
+        mkdir -p "${fdb_root}"
+        fetch_checked() {
+          curl --fail --location --retry 5 "${release}/$1" --output "${fdb_root}/$1"
+          curl --fail --location --retry 5 "${release}/$1.sha256" --output "${fdb_root}/$1.sha256"
+          (cd "${fdb_root}" && shasum -a 256 --check "$1.sha256")
+        }
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)
+            for asset in libfdb_c.x86_64.so fdbserver.x86_64 fdbcli.x86_64; do fetch_checked "${asset}"; done
+            ln -sf libfdb_c.x86_64.so "${fdb_root}/libfdb_c.so"
+            chmod +x "${fdb_root}/fdbserver.x86_64" "${fdb_root}/fdbcli.x86_64"
+            lib_dir="${fdb_root}"
+            server_bin="${fdb_root}/fdbserver.x86_64"
+            cli_bin="${fdb_root}/fdbcli.x86_64"
+            ;;
+          Darwin-arm64)
+            pkg_asset=FoundationDB-7.3.77_arm64.pkg
+            fetch_checked "${pkg_asset}"
+            expanded="${fdb_root}/expanded"
+            pkgutil --expand-full "${fdb_root}/${pkg_asset}" "${expanded}"
+            lib_dir="${expanded}/FoundationDB-clients.pkg/Payload/usr/local/lib"
+            server_bin="${expanded}/FoundationDB-server.pkg/Payload/usr/local/libexec/fdbserver"
+            cli_bin="${expanded}/FoundationDB-clients.pkg/Payload/usr/local/bin/fdbcli"
+            chmod +x "${server_bin}" "${cli_bin}"
+            ;;
+          *)
+            echo "fdb-lane: unsupported host $(uname -s)-$(uname -m)" >&2
+            exit 2
+            ;;
+        esac
+        {
+          echo "FDB_SERVER_BIN=${server_bin}"
+          echo "FDB_CLI_BIN=${cli_bin}"
+          echo "RUSTFLAGS=-L native=${lib_dir} -C link-arg=-Wl,-rpath,${lib_dir}"
+        } >> "${GITHUB_ENV}"
+    - name: compile, lint, and test the fdb feature
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo check -p logical-db-store-fdb --features fdb --locked
+        cargo check -p logical-db-e2e --features fdb --all-targets --locked
+        cargo clippy -p logical-db-daemon --features fdb --all-targets --locked -- -D warnings
+        cargo clippy -p logical-db-e2e --features fdb --all-targets --locked -- -D warnings
+        cargo test -p logical-db-store-fdb --features fdb --locked
+        cargo test -p logical-db-daemon --features fdb --locked
+    - name: run the retained live-cluster journeys
+      shell: bash
+      run: |
+        set -euo pipefail
+        live_root=$(mktemp -d "${RUNNER_TEMP}/logical-db-fdb-live.XXXXXX")
+        mkdir -p "${live_root}/data" "${live_root}/logs"
+        cluster_file="${live_root}/fdb.cluster"
+        echo "logicaldb:ci@127.0.0.1:4650" > "${cluster_file}"
+        "${FDB_SERVER_BIN}" \
+          -p 127.0.0.1:4650 -C "${cluster_file}" \
+          -d "${live_root}/data" -L "${live_root}/logs" \
+          --memory 1GiB --cache-memory 256MiB --storage-memory 256MiB &
+        fdb_pid=$!
+        cleanup() {
+          kill "${fdb_pid}" 2>/dev/null || true
+          wait "${fdb_pid}" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+        # Every probe is bounded by fdbcli --timeout and every loop by a count.
+        # A fresh cluster needs longer than a short probe to recruit its roles,
+        # and a cut-off "configure new" retried as another "configure new" never
+        # converges, so creation gets one long bound and a database an earlier
+        # attempt already created counts as configured.
+        configured=0
+        for _attempt in {1..5}; do
+          created=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 60 --exec "configure new single memory" 2>&1 || true)
+          echo "${created}"
+          if [[ "${created}" == *"Database created"* || "${created}" == *"already exists"* ]]; then
+            configured=1
+            break
+          fi
+        done
+        if [[ "${configured}" != 1 ]]; then
+          echo "fdb-lane: the single-memory cluster was never configured" >&2
+          exit 1
+        fi
+        # Readiness is a committed transaction, not a status string: "status
+        # minimal" answers at once (often "available, but has issues" while a
+        # fresh cluster settles), so a loop of it spends no time at all. A
+        # write blocks until the cluster can commit it, bounded by --timeout.
+        usable=0
+        probe=""
+        for _attempt in {1..12}; do
+          probe=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "writemode on; set logicaldb-ci-probe ready; get logicaldb-ci-probe; clear logicaldb-ci-probe" 2>&1 || true)
+          if [[ "${probe}" == *"is \`ready"* ]]; then
+            usable=1
+            break
+          fi
+        done
+        if [[ "${usable}" != 1 ]]; then
+          echo "fdb-lane: the cluster never committed a probe transaction: ${probe}" >&2
+          exit 1
+        fi
+        "${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "status minimal" || true
+        export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
+        cargo run -p logical-db-daemon --bin fdb-ambiguity-journey --features fdb --locked
+        cargo test -p logical-db-e2e --features fdb --locked --test fdb_recovery_composition -- --nocapture
+        cargo test -p logical-db-e2e --features fdb --locked --test fdb_process_kill_restore -- --nocapture
