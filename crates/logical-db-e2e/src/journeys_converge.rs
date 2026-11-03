@@ -109,6 +109,8 @@ fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real()
 #[cfg(target_os = "windows")]
 async fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real_body()
 -> Result<(), JourneyError> {
+    use logical_db::Item;
+
     let application = {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
