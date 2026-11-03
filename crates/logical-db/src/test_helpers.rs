@@ -169,7 +169,7 @@ pub(crate) struct RestorePrefix<'a> {
 /// Replay restore prefix
 pub(crate) fn replay_restore_prefix(
     fixture: &RestorePrefix<'_>,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<usize, crate::tests_schema::TestError> {
     use logical_db_store::decode_export;
 
     let store = EmbeddedStore::open(fixture.target_path, fixture.replica)?;

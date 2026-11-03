@@ -40,6 +40,7 @@ mod views;
 pub use crate::db::Database;
 pub use crate::digest::content_digest;
 pub use crate::error::{DatabaseError, DatabaseErrorKind};
+pub use crate::identity::decode_identity_id;
 pub use crate::outcomes::{
     BatchEdit, DeleteOutcome, DeleteReceipt, DuplicateReceipt, EditOutcome, EditReceipt,
     MigrationReport, PendingChange, RemoteChange, RestoreReport,

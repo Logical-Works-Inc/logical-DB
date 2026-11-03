@@ -1730,6 +1730,7 @@ dependencies = [
  "logical-db-cairn",
  "logical-db-episode",
  "logical-db-http",
+ "logical-db-kv",
  "logical-db-model",
  "logical-db-protocol",
  "logical-db-server",
@@ -1773,7 +1774,6 @@ dependencies = [
  "logical-db",
  "logical-db-model",
  "thiserror",
- "uuid",
 ]
 
 [[package]]

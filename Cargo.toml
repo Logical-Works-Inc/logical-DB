@@ -34,9 +34,11 @@ repository = "https://github.com/srinji-kaggss/logical-DB"
 automerge = "=0.11.0"
 redb = "=4.2.0"
 thiserror = "=2.0.20"
-uuid = { version = "=1.26.1", features = ["serde", "v7"] }
+# Estate first: `lgwks_std::id::Uuid` replaces `uuid` once it serializes, has an
+# infallible v7 constructor, and packs as an FDB tuple (docs/adr/0005).
+uuid = { version = "=1.26.1", features = ["serde", "v7"] } # gap: Logical-Works-Inc/logicalworks-crates#851
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
-foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] }
+foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] } # gap: Logical-Works-Inc/logicalworks-crates#851
 serde_bytes = "=0.11.19"
 ciborium = "=0.2.2"
 # FROZEN BOUNDARY (async surface): `reqwest` and `axum` are the async HTTP

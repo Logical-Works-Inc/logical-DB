@@ -14,5 +14,6 @@ mod journeys_baseline;
 mod journeys_converge;
 #[cfg(test)]
 mod journeys_recovery;
+pub mod kv;
 pub mod support;
 pub mod views;

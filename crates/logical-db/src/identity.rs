@@ -6,12 +6,20 @@
 
 use super::error::DatabaseError;
 
-/// Decodes one model identifier from its durable bytes through the model's
-/// Deserialize contract, without naming the rival UUID crate.
+/// Decodes one model identifier from its sixteen network-order bytes through
+/// the model's Deserialize contract, without naming the rival UUID crate.
 ///
-/// The sixteen bytes ride a quoted simple-hex JSON string into the estate
-/// JSON decoder; the target type is inferred at each `from_uuid` call site.
-pub(crate) fn decode_identity_id<T>(bytes: &[u8]) -> Result<T, DatabaseError>
+/// The bytes ride a quoted simple-hex JSON string into the estate JSON
+/// decoder; the target type is inferred at each call site. The identity
+/// sidecar and every layer above the facade (the key-value cache's derived
+/// document, operation and index identities) build identifiers here, so there
+/// is one byte-to-identity path above the store.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::Io`] with `InvalidData` when the bytes do not
+/// decode as the requested identifier.
+pub fn decode_identity_id<T>(bytes: &[u8]) -> Result<T, DatabaseError>
 where
     T: for<'de> lgwks_std::json::Deserialize<'de>,
 {
@@ -19,7 +27,7 @@ where
     lgwks_std::json::from_str(&text).map_err(|error| {
         DatabaseError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("logical-db identity sidecar UUID is corrupt: {error}"),
+            format!("logical-db identity bytes are corrupt: {error}"),
         ))
     })
 }
