@@ -50,9 +50,17 @@ jobs:
       - name: validate execution access graph
         run: python3 scripts/test-access-graph.py
       - name: install pinned workflow linter
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941
-        with:
-          tool: actionlint@1.7.12
+        run: |
+          set -euo pipefail
+          release=https://github.com/rhysd/actionlint/releases/download/v1.7.12
+          asset=actionlint_1.7.12_linux_amd64.tar.gz
+          bin_dir="${RUNNER_TEMP}/actionlint"
+          mkdir -p "${bin_dir}"
+          curl --fail --location --retry 5 "${release}/${asset}" --output "${bin_dir}/${asset}"
+          curl --fail --location --retry 5 "${release}/actionlint_1.7.12_checksums.txt" --output "${bin_dir}/checksums.txt"
+          (cd "${bin_dir}" && sha256sum --check --ignore-missing checksums.txt)
+          tar -xzf "${bin_dir}/${asset}" -C "${bin_dir}" actionlint
+          echo "${bin_dir}" >> "${GITHUB_PATH}"
       - name: lint workflows and shell
         run: actionlint
 
