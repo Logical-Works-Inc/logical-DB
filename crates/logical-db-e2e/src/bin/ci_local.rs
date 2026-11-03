@@ -48,6 +48,14 @@ const ARTIFACT_PREFIXES: [&str; 5] = [
     "node_modules/",
     ".codegraph/",
 ];
+/// Contract lanes, each one `logical-db-e2e` integration-test binary: lane
+/// name, test binary, and arguments passed to the test harness.
+const E2E_LANES: [(&str, &str, &[&str]); 4] = [
+    ("domain-contract", "repository_contract", &[]),
+    ("access-graph", "access_graph", &[]),
+    ("evidence", "clean_room_evidence", &["--nocapture"]),
+    ("ci-routing", "ci_routing", &[]),
+];
 /// Lines from a suppression attribute in which its `reason` must appear.
 const REASON_WINDOW: usize = 7;
 
@@ -143,6 +151,17 @@ impl Gate {
     /// Runs this gate's cargo with `arguments`.
     fn cargo(&self, arguments: &[&str]) -> Result<Outcome, Failure> {
         self.command(&self.cargo, arguments)
+    }
+
+    /// Runs one `logical-db-e2e` integration-test binary, passing `extra`
+    /// through to the test harness.
+    fn e2e_test(&self, test: &str, extra: &[&str]) -> Result<Outcome, Failure> {
+        let mut arguments = vec!["test", "-p", "logical-db-e2e", "--locked", "--test", test];
+        if !extra.is_empty() {
+            arguments.push("--");
+            arguments.extend_from_slice(extra);
+        }
+        self.cargo(&arguments)
     }
 
     /// Runs Git at the root and returns its stdout.
@@ -405,37 +424,9 @@ fn run() -> Result<ExitCode, Failure> {
                 Ok(_) | Err(_) => Ok(Outcome::Skip("cargo-deny not installed")),
             }
         })?;
-        gate.lane("domain-graph", |gate| {
-            gate.command("python3", &["scripts/domain_contract.py"])
-        })?;
-        gate.lane("domain-contract", |gate| {
-            gate.command("python3", &["scripts/test-domain-contract.py"])
-        })?;
-        gate.lane("access-graph", |gate| {
-            gate.command("python3", &["scripts/test-access-graph.py"])
-        })?;
-        gate.lane("evidence", |gate| {
-            gate.cargo(&[
-                "test",
-                "-p",
-                "logical-db-e2e",
-                "--locked",
-                "--test",
-                "clean_room_evidence",
-                "--",
-                "--nocapture",
-            ])
-        })?;
-        gate.lane("ci-routing", |gate| {
-            gate.cargo(&[
-                "test",
-                "-p",
-                "logical-db-e2e",
-                "--locked",
-                "--test",
-                "ci_routing",
-            ])
-        })?;
+        for (lane, test, extra) in E2E_LANES {
+            gate.lane(lane, |gate| gate.e2e_test(test, extra))?;
+        }
         gate.lane("suppressions", suppressions)?;
         gate.lane("artifacts", artifacts)?;
     }

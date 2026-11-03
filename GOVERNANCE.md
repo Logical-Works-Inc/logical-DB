@@ -70,8 +70,8 @@ a workflow defect.
 | Format | `cargo fmt --all -- --check` | any diff |
 | FDB lanes | `cargo check/test` with `--features fdb` | any error |
 | Dependency policy | `cargo deny check` | advisories, bans, licenses, or sources fail |
-| Domain contract | `python3 scripts/test-domain-contract.py` | any refusal not exercised |
-| Access graph | `python3 scripts/test-access-graph.py` | any refusal not exercised |
+| Domain contract | `cargo test -p logical-db-e2e --test repository_contract` | an edge or owner refused, or a stale `evidence/domain-graph.json` |
+| Access graph | `cargo test -p logical-db-e2e --test access_graph` | any refusal not exercised |
 | Evidence | `cargo test -p logical-db-e2e --test clean_room_evidence` | any citation, ledger, manifest, dependency, or churn failure |
 | CI routing | `cargo test -p logical-db-e2e --test ci_routing` | self-hosted, moving, or unresolved runner routing |
 | Suppressions | every `#[allow]`/`#[expect]` carries `reason` | a reasonless suppression |
