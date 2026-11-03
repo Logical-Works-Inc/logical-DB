@@ -9,7 +9,10 @@ Logical-DB is developed by Logical Works. The source is public under the
 **external contributions are not accepted at this stage**.
 
 - Pull requests from outside the maintainer team are closed without review.
-  Forking is disabled for this repository.
+  GitHub interaction limits restrict pull requests, issues, and comments to
+  collaborators, and workflow runs on any fork pull request need maintainer
+  approval. A public repository can always be forked; a fork carries the
+  Apache-2.0 terms and nothing from it is merged here.
 - Issues, comments, and discussions are limited to maintainers.
 - Security reports are the one exception: send them privately as described in
   [SECURITY.md](SECURITY.md).

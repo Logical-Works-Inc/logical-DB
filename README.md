@@ -100,8 +100,8 @@ locally with `cargo run -p logical-db-e2e --bin ci_local`. See
 ## Contributing
 
 This repository is public to read, use, and audit. External contributions are
-not accepted at this stage: issues, pull requests, and forks are limited to the
-maintainers. See [CONTRIBUTING.md](CONTRIBUTING.md). Report a vulnerability
+not accepted at this stage: issues, pull requests, and comments are limited to
+the maintainers. See [CONTRIBUTING.md](CONTRIBUTING.md). Report a vulnerability
 privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
