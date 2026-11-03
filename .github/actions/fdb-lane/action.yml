@@ -97,20 +97,24 @@ runs:
           echo "fdb-lane: the single-memory cluster was never configured" >&2
           exit 1
         fi
-        available=0
-        status=""
-        for _attempt in {1..30}; do
-          status=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "status minimal" 2>&1 || true)
-          if [[ "${status}" == *"The database is available."* ]]; then
-            echo "${status}"
-            available=1
+        # Readiness is a committed transaction, not a status string: "status
+        # minimal" answers at once (often "available, but has issues" while a
+        # fresh cluster settles), so a loop of it spends no time at all. A
+        # write blocks until the cluster can commit it, bounded by --timeout.
+        usable=0
+        probe=""
+        for _attempt in {1..12}; do
+          probe=$("${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "writemode on; set logicaldb-ci-probe ready; get logicaldb-ci-probe; clear logicaldb-ci-probe" 2>&1 || true)
+          if [[ "${probe}" == *"is \`ready"* ]]; then
+            usable=1
             break
           fi
         done
-        if [[ "${available}" != 1 ]]; then
-          echo "${status}" >&2
+        if [[ "${usable}" != 1 ]]; then
+          echo "fdb-lane: the cluster never committed a probe transaction: ${probe}" >&2
           exit 1
         fi
+        "${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "status minimal" || true
         export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
         cargo run -p logical-db-daemon --bin fdb-ambiguity-journey --features fdb --locked
         cargo test -p logical-db-e2e --features fdb --locked --test fdb_recovery_composition -- --nocapture
