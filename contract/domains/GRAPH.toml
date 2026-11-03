@@ -7,8 +7,9 @@
 # and the global no-twin rule. The four product domains declare their own
 # records in `cloud.toml`, `cairn.toml`, `lem.toml`, and `forge.toml`; this
 # file adds the kernel, facade, adapter, and end-to-end harness layers that are
-# not product domains. `scripts/domain_contract.py` merges both and enforces
-# the result against `cargo metadata`.
+# not product domains. `crates/logical-db-e2e/tests/repository_contract/
+# domain_contract.rs` merges both and enforces the result against
+# `cargo metadata`.
 #
 # Authority: `docs/architecture/DEPENDENCY-RULES.md` and
 # `docs/architecture/DOMAIN-BOUNDARIES.md`. This file is the mechanical

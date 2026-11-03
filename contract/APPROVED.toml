@@ -106,6 +106,21 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[[approved]]
+crate = "rusqlite"
+tier = "boundary"
+version = "=0.41.0"
+owner = "logical-db-store"
+capability = "storage.relational-projection"
+source = "registry"
+license = "MIT"
+allowed_consumers = "logical-db-store"
+allowed_kinds = "normal"
+reason = "The second parity engine for the relational projection (kernel SPEC 365-P absorption, issue #119 row 4): a file-backed SQLite table proving byte-identical canonical state with the redb-backed engine; std has no embedded SQL engine."
+approved_by = "Director"
+approved_on = "2026-11-03"
+review = "https://github.com/Logical-Works-Inc/logical-DB/issues/119"
+
 # ── Serialization and wire encoding ─────────────────────────────────────────
 # Derives route through `lgwks_std::json::{Serialize, Deserialize}`, the
 # estate's re-export of the serde crate, so no logical-db crate declares
@@ -207,7 +222,7 @@ owner = "logical-db-model"
 capability = "estate.std-surface"
 source = "registry"
 license = "Apache-2.0"
-allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-e2e,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store-fdb,logical-db-sync"
+allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-e2e,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store,logical-db-store-fdb,logical-db-sync"
 allowed_kinds = "normal,dev"
 reason = "The estate std+ core owns the json/serde re-export and hashing that logical-db derives and digests through; no crate here declares serde directly."
 approved_by = "Director"
@@ -228,6 +243,21 @@ reason = "The retained dependency-register contract test runs the estate's own c
 approved_by = "Director"
 approved_on = "2026-10-04"
 review = "https://github.com/srinji-kaggss/logical-DB/issues/93"
+
+[[approved]]
+crate = "toml"
+tier = "boundary"
+version = "=1.1.8"
+owner = "logical-db-e2e"
+capability = "contract.toml-reader"
+source = "registry"
+license = "MIT OR Apache-2.0"
+allowed_consumers = "logical-db-e2e"
+allowed_kinds = "dev"
+reason = "The repository-contract tests read contract/*.toml; the estate has no general TOML reader (docs/adr/0006)."
+approved_by = "Director"
+approved_on = "2026-11-03"
+review = "https://github.com/Logical-Works-Inc/logicalworks-crates/issues/852"
 
 [[approved]]
 crate = "reqwest"

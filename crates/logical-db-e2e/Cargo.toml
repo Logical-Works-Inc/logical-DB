@@ -19,6 +19,9 @@ fdb = ["dep:logical-db-store-fdb", "logical-db-store-fdb/fdb"]
 axum.workspace = true
 lgwks_bot.workspace = true
 logical-db = { version = "0.1.0", path = "../logical-db", features = ["http", "semantics"] }
+# The adapter layer (`[layers.adapter]`): `src/kv.rs` drives the cache journey
+# the `kv_journey` binary ships.
+logical-db-kv = { version = "0.1.0", path = "../logical-db-kv" }
 # The journey harness is a composition layer (`contract/domains/GRAPH.toml`
 # `[layers.e2e]`) and may import implementation crates from an allowed domain.
 # These four are what `src/support.rs` names directly: the shared in-memory
@@ -33,11 +36,14 @@ uuid.workspace = true
 [dev-dependencies]
 ciborium.workspace = true
 lgwks_deps.workspace = true
-# `clean_room_evidence` reads `cargo metadata` through the estate JSON surface.
+# `clean_room_evidence` and the repository-contract tests read `cargo metadata`
+# and the domain receipt through the estate JSON surface.
 lgwks_std.workspace = true
 logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
 logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
+# The repository-contract tests read `contract/*.toml` (docs/adr/0006).
+toml.workspace = true # gap: Logical-Works-Inc/logicalworks-crates#852
 
 # Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
 # network-boot FFI call, so it is one of the two crates that do not carry a

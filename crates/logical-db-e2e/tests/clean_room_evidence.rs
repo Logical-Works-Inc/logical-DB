@@ -9,8 +9,8 @@
 //! URL; the internal crate graph keeps its one-way edges; the four domain
 //! manifests are complete (`manifest`); and at least 85% of the clean-room
 //! baseline is replaced by file count, by bytes, and by lines (`churn`). The
-//! domain allowed-edge graph and its committed receipt are enforced by
-//! `scripts/domain_contract.py`.
+//! domain allowed-edge graph and its committed receipt are enforced by the
+//! `repository_contract` test (docs/adr/0006).
 //!
 //! The one exemption is `LICENSE`: the Apache License 2.0 is fixed legal text
 //! and cannot carry a citation header without ceasing to be the license. It is
@@ -92,6 +92,7 @@ const ALLOWED_INTERNAL_DEPENDENCIES: &[(&str, &[&str])] = &[
             "logical-db-episode",
             "logical-db",
             "logical-db-http",
+            "logical-db-kv",
             "logical-db-model",
             "logical-db-protocol",
             "logical-db-server",

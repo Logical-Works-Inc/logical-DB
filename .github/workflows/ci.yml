@@ -43,12 +43,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: domain ownership, allowed edges, and committed receipt
-        run: python3 scripts/domain_contract.py
-      - name: falsify domain boundary gate
-        run: python3 scripts/test-domain-contract.py
-      - name: validate execution access graph
-        run: python3 scripts/test-access-graph.py
+      # The domain contract, its receipt and the access graph are Rust tests
+      # (`repository_contract`, `access_graph`) run by the journeys job.
       - name: install pinned workflow linter
         run: |
           set -euo pipefail

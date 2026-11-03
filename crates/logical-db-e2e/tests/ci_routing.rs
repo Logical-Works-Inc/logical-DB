@@ -413,6 +413,9 @@ fn block_scalar_content_is_not_routing() {
     );
 }
 
+#[path = "ci_routing/sim_routing.rs"]
+mod sim_routing;
+
 /// A workflow with no jobs routes nothing and is refused.
 #[test]
 fn missing_jobs_fail() {
