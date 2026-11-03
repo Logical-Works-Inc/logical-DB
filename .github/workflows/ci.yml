@@ -60,10 +60,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: compile all targets
         run: cargo check --workspace --all-targets --locked
-      - name: dependency register
-        run: cargo test -p logical-db-e2e --locked --test dependency_contract
-      - name: test runtime and restart journeys
-        run: cargo test --workspace --locked
+      - name: test every crate but the journey crate
+        run: cargo test --workspace --exclude logical-db-e2e --locked
       - name: lint with warnings denied
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: package isolation
@@ -73,6 +71,21 @@ jobs:
             cargo check -p "$crate" --all-targets --locked || failed=1
           done
           exit "$failed"
+
+  journeys:
+    name: linux / end-to-end journeys
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - name: dependency register
+        run: cargo test -p logical-db-e2e --locked --test dependency_contract
+      - name: replicas, real HTTP, crash, kill, and recovery journeys
+        run: cargo test -p logical-db-e2e --locked
 
   macos:
     name: macos / test-clippy

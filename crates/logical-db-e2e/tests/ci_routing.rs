@@ -27,9 +27,10 @@ type Failure = Box<dyn std::error::Error>;
 const HOSTED_IMAGES: [&str; 3] = ["ubuntu-24.04", "macos-15", "windows-2025"];
 
 /// Check names the workflow publishes; a renamed or dropped lane fails here.
-const CHECK_NAMES: [&str; 8] = [
+const CHECK_NAMES: [&str; 9] = [
     "advisory, license, and source policy",
     "clean-room evidence",
+    "linux / end-to-end journeys",
     "linux / test-clippy",
     "macos / test-clippy",
     "official FDB client / daemon feature",

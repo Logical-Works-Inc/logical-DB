@@ -74,7 +74,8 @@ roadmap issues. Do not copy historical checkmarks into a current release claim.
 | Lane | Runner | Proves |
 |---|---|---|
 | `clean-room evidence` | `ubuntu-24.04` | domain graph and receipt, falsifiers, access graph, actionlint |
-| `linux / test-clippy` | `ubuntu-24.04` | compile, dependency register, tests, clippy, package isolation |
+| `linux / test-clippy` | `ubuntu-24.04` | compile, tests of every crate but `logical-db-e2e`, clippy, package isolation |
+| `linux / end-to-end journeys` | `ubuntu-24.04` | dependency register and the `logical-db-e2e` journeys (replicas over real HTTP, crash, kill, recovery) |
 | `macos / test-clippy` | `macos-15` (ARM64) | compile, tests, clippy |
 | `windows / test-clippy` | `windows-2025` (x86-64 MSVC) | compile, tests, clippy |
 | `rustfmt` | `ubuntu-24.04` | formatting |
