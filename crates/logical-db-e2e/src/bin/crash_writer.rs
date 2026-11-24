@@ -5,43 +5,30 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
-#![expect(
-    clippy::print_stderr,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
-#![expect(
-    clippy::exit,
-    reason = "the crash fixture must exit without running destructors, and a failed run must exit nonzero; this fixture never prints to stdout"
-)]
 
-use logical_db::{
-    AccountId, Database, DocumentId, Object, OperationDigest, OperationId, ReplicaId, Scalar,
-    Scope, SpaceId,
+use std::{mem::ManuallyDrop, process::ExitCode};
+
+use logical_db::{Database, DocumentId, Object, OperationDigest, OperationId, Scalar};
+use logical_db_e2e::{
+    fixture::{FixtureError, FixtureReplica},
+    support::parse_identifier,
 };
-use std::error::Error;
-use uuid::Uuid;
 
-/// Reports a failed fixture run on stderr and exits nonzero.
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("crash_writer: {error}");
-        std::process::exit(1);
-    }
-}
+/// Exit status of a run that committed its edit and skipped every destructor.
+const CRASHED_AFTER_COMMIT: u8 = 71;
 
-/// Commits one edit, then exits without running destructors.
-fn run() -> Result<(), Box<dyn Error>> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    let [path, account, space, replica, document]: [String; 5] = arguments
-        .try_into()
-        .map_err(|_| "expected path, account, space, replica, and document arguments")?;
-    let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&account)?),
-        SpaceId::from_uuid(Uuid::parse_str(&space)?),
-    );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(&replica)?);
-    let document = DocumentId::from_uuid(Uuid::parse_str(&document)?);
-    let database = Database::open(&path, scope, replica)?;
+/// Commits one edit, then ends the process without running the replica's
+/// destructor: the handle is held in `ManuallyDrop`, so returning from `main`
+/// leaves the database exactly as a killed process would.
+fn main() -> Result<ExitCode, FixtureError> {
+    let fixture = FixtureReplica::from_arguments(std::env::args().skip(1))?;
+    let document = parse_identifier::<DocumentId>(fixture.last(), "document")
+        .map_err(FixtureError::Identifier)?;
+    let database = ManuallyDrop::new(Database::open(
+        fixture.path(),
+        fixture.scope(),
+        fixture.replica(),
+    )?);
     database.edit(
         document,
         OperationId::new(),
@@ -54,5 +41,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         },
     )?;
-    std::process::exit(71);
+    if database.pending_changes(0, 1)?.is_empty() {
+        return Err(FixtureError::NotCommitted);
+    }
+    Ok(ExitCode::from(CRASHED_AFTER_COMMIT))
 }

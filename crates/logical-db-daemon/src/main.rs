@@ -4,21 +4,23 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
-#![expect(
-    clippy::print_stderr,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
-use std::{error::Error, io, net::SocketAddr};
+use std::{
+    error::Error,
+    fmt, io,
+    net::{Ipv4Addr, SocketAddr},
+    sync::{Arc, Mutex},
+};
 
 use axum::http::HeaderValue;
 use foundationdb::directory::{Directory, DirectoryLayer};
 use foundationdb_tuple::Subspace;
 use lgwks_std::hash::keyed;
+use lgwks_std::json::serde::de::DeserializeOwned;
+use logical_db_daemon::boot_network;
 use logical_db_model::{AccountId, Scope, SpaceId};
 use logical_db_server::{AuthenticationError, Authenticator, SystemClock, router};
 use logical_db_service::{CheckpointCodec, LocalScopeAuthority};
 use logical_db_store_fdb::FdbServiceStore;
-use uuid::Uuid;
 
 /// Loopback standalone bearer verifier bound to one authenticated scope.
 struct BearerAuthenticator {
@@ -65,7 +67,6 @@ impl Authenticator for BearerAuthenticator {
         verifier_message.extend_from_slice(token);
         let computed = keyed(&self.key, &verifier_message);
         if !logical_db_service::tags_equal(computed.as_bytes(), &self.expected_tag) {
-            eprintln!("logical-db-daemon: bearer verification failed");
             return Err(AuthenticationError::Unauthorized);
         }
         let expires_at = now_unix_ms
@@ -100,36 +101,27 @@ fn required(name: &'static str) -> Result<String, io::Error> {
 /// Parses a 64-character hexadecimal checkpoint key, refusing the all-zero key.
 fn parse_key(value: &str) -> Result<[u8; 32], io::Error> {
     if value.len() != 64 {
-        eprintln!(
-            "logical-db-daemon: checkpoint key length was {}",
-            value.len()
-        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "checkpoint key must contain 64 hexadecimal characters",
+            format!(
+                "checkpoint key must contain 64 hexadecimal characters, found {}",
+                value.len()
+            ),
         ));
     }
-    let mut key = [0; 32];
-    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
-    if !remainder.is_empty() {
-        eprintln!("logical-db-daemon: checkpoint key ended in a partial octet");
-        return Err(io::Error::new(
+    let octets = lgwks_std::hex::decode(value).map_err(|error| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            "checkpoint key must contain complete hexadecimal octets",
-        ));
-    }
-    for (index, pair) in pairs.iter().enumerate() {
-        let pair = std::str::from_utf8(pair)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        key[index] = u8::from_str_radix(pair, 16).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid checkpoint key octet {index}: {error}"),
-            )
-        })?;
-    }
-    if key == [0; 32] {
-        eprintln!("logical-db-daemon: checkpoint key was all zero");
+            format!("invalid checkpoint key: {error}"),
+        )
+    })?;
+    let key = <[u8; 32]>::try_from(octets).map_err(|octets| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("checkpoint key must be 32 octets, found {}", octets.len()),
+        )
+    })?;
+    if key.iter().all(|octet| *octet == 0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "checkpoint key must be nonzero",
@@ -155,44 +147,74 @@ fn validate_bearer_token(token: &[u8]) -> Result<(), io::Error> {
     if valid {
         Ok(())
     } else {
-        eprintln!(
-            "logical-db-daemon: rejected bearer token length {} or invalid alphabet",
-            token.len()
-        );
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "bearer token must be 32..=4096 RFC 6750 b64token bytes",
+            format!(
+                "bearer token must be 32..=4096 RFC 6750 b64token bytes, found length {}",
+                token.len()
+            ),
         ))
     }
 }
 
-/// Runs `parse_non_nil_uuid`.
-fn parse_non_nil_uuid(value: &str, name: &'static str) -> Result<Uuid, io::Error> {
-    let value = Uuid::parse_str(value)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{name}: {error}")))?;
-    if value.is_nil() {
-        eprintln!("logical-db-daemon: rejected nil UUID for {name}");
+/// Returns whether `id` is the nil UUID, all 128 bits zero (RFC 9562 section 5.9).
+fn is_nil(id: &lgwks_std::id::Uuid) -> bool {
+    *id.as_bytes() == [0_u8; 16]
+}
+
+/// Parses one identifier through the identifier type's own serde contract
+/// (RFC 9562 UUID text) and refuses the nil UUID, so the daemon carries no
+/// UUID crate of its own.
+fn parse_identifier<T: DeserializeOwned>(
+    value: &str,
+    name: &'static str,
+    is_nil: fn(&T) -> bool,
+) -> Result<T, io::Error> {
+    let invalid = |error: lgwks_std::json::Error| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{name}: {error}"))
+    };
+    let quoted = lgwks_std::json::to_string(value).map_err(invalid)?;
+    let identifier: T = lgwks_std::json::from_str(&quoted).map_err(invalid)?;
+    if is_nil(&identifier) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, name));
     }
-    Ok(value)
+    Ok(identifier)
 }
 
 /// Runs `shutdown_signal`.
-async fn shutdown_signal() {
+async fn shutdown_signal() -> Result<(), io::Error> {
     #[cfg(unix)]
     {
-        if let Ok(mut terminate) = lgwks_bot::rt::signal::unix::signal(
+        let mut terminate = lgwks_bot::rt::signal::unix::signal(
             lgwks_bot::rt::signal::unix::SignalKind::terminate(),
-        ) {
-            lgwks_bot::select! {
-                _ = lgwks_bot::rt::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
-            return;
+        )?;
+        lgwks_bot::rt::select! {
+            interrupt = lgwks_bot::rt::signal::ctrl_c() => interrupt,
+            _ = terminate.recv() => Ok(()),
         }
     }
-    if let Err(error) = lgwks_bot::rt::signal::ctrl_c().await {
-        eprintln!("logical-db-daemon: ctrl-c signal listener failed: {error}");
+    #[cfg(not(unix))]
+    {
+        lgwks_bot::rt::signal::ctrl_c().await
+    }
+}
+
+/// Holds the first shutdown-listener failure so `service_main` can report it.
+type SignalFailure = Arc<Mutex<Option<io::Error>>>;
+
+/// Records a shutdown-listener failure for the composition root.
+fn record_signal_failure(slot: &SignalFailure, error: io::Error) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = Some(error),
+        Err(poisoned) => *poisoned.into_inner() = Some(error),
+    }
+}
+
+/// Takes the recorded shutdown-listener failure, if any.
+fn take_signal_failure(slot: &SignalFailure) -> Option<io::Error> {
+    match slot.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
     }
 }
 
@@ -208,42 +230,98 @@ fn ensure_loopback(address: &SocketAddr) -> Result<(), io::Error> {
     }
 }
 
+/// Why the daemon refused to start or stopped serving, one variant per layer.
+#[derive(Debug)]
+enum DaemonError {
+    /// Configuration, socket, listener or shutdown-signal I/O failed.
+    Io(io::Error),
+    /// `LOGICAL_DB_BIND` is set but is not a socket address.
+    Bind(std::net::AddrParseError),
+    /// `LOGICAL_DB_BIND` is set but is not Unicode.
+    Setting(std::env::VarError),
+    /// The FoundationDB client refused the network, cluster or transaction.
+    Fdb(foundationdb::FdbError),
+    /// The directory-allocation transaction failed to commit.
+    Commit(foundationdb::TransactionCommitError),
+    /// The FoundationDB service store refused its root.
+    Store(logical_db_store_fdb::FdbStoreError),
+    /// The checkpoint codec refused its key or lifetime.
+    Checkpoint(logical_db_service::CheckpointError),
+}
+
+impl fmt::Display for DaemonError {
+    /// Names the failing layer and its cause for the operator.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Io(ref error) => write!(formatter, "daemon I/O failed: {error}"),
+            Self::Bind(ref error) => write!(formatter, "LOGICAL_DB_BIND is invalid: {error}"),
+            Self::Setting(ref error) => write!(formatter, "LOGICAL_DB_BIND is unreadable: {error}"),
+            Self::Fdb(ref error) => write!(formatter, "FoundationDB failed: {error}"),
+            Self::Commit(ref error) => write!(formatter, "FoundationDB commit failed: {error}"),
+            Self::Store(ref error) => write!(formatter, "service store refused: {error}"),
+            Self::Checkpoint(ref error) => write!(formatter, "checkpoint codec refused: {error}"),
+        }
+    }
+}
+
+impl Error for DaemonError {}
+
+/// Implements `From` for each `DaemonError` source, keeping its variant.
+macro_rules! daemon_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for DaemonError {
+            /// Adapts the source failure without discarding it.
+            fn from(error: $source) -> Self {
+                Self::$variant(error)
+            }
+        })+
+    };
+}
+
+daemon_error_from! {
+    io::Error => Io,
+    std::net::AddrParseError => Bind,
+    std::env::VarError => Setting,
+    foundationdb::FdbError => Fdb,
+    foundationdb::TransactionCommitError => Commit,
+    logical_db_store_fdb::FdbStoreError => Store,
+    logical_db_service::CheckpointError => Checkpoint,
+}
+
 /// Runs `main`.
-fn main() -> Result<(), Box<dyn Error>> {
-    lgwks_bot::Runtime::new()?.block_on(service_main())
+fn main() -> Result<(), DaemonError> {
+    lgwks_bot::rt::runtime::Builder::new()
+        .build()?
+        .block_on(service_main())
 }
 
 /// Runs `service_main`.
-async fn service_main() -> Result<(), Box<dyn Error>> {
-    let bind = std::env::var("LOGICAL_DB_BIND").unwrap_or_else(|error| {
-        eprintln!("logical-db-daemon: LOGICAL_DB_BIND defaulted: {error}");
-        "127.0.0.1:8080".into()
-    });
-    let address: SocketAddr = bind.parse()?;
+async fn service_main() -> Result<(), DaemonError> {
+    let address: SocketAddr = match std::env::var("LOGICAL_DB_BIND") {
+        Ok(bind) => bind.parse()?,
+        Err(std::env::VarError::NotPresent) => SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
+        Err(error @ std::env::VarError::NotUnicode(_)) => return Err(error.into()),
+    };
     ensure_loopback(&address)?;
     let cluster_file = required("LOGICAL_DB_FDB_CLUSTER_FILE")?;
     let bearer = required("LOGICAL_DB_BEARER_TOKEN")?;
     let key = parse_key(&required("LOGICAL_DB_CHECKPOINT_KEY_HEX")?)?;
     let scope = Scope::new(
-        AccountId::from_uuid(parse_non_nil_uuid(
+        parse_identifier(
             &required("LOGICAL_DB_ACCOUNT_ID")?,
             "LOGICAL_DB_ACCOUNT_ID must be a non-nil UUID",
-        )?),
-        SpaceId::from_uuid(parse_non_nil_uuid(
+            |account: &AccountId| is_nil(&account.as_uuid()),
+        )?,
+        parse_identifier(
             &required("LOGICAL_DB_SPACE_ID")?,
             "LOGICAL_DB_SPACE_ID must be a non-nil UUID",
-        )?),
+            |space: &SpaceId| is_nil(&space.as_uuid()),
+        )?,
     );
 
-    #[expect(
-        unsafe_code,
-        reason = "FoundationDB network-boot FFI is the one reviewed unsafe leaf in this binary; the safe surface forbids unsafe_code at the crate root"
-    )]
-    // SAFETY: FoundationDB requires exactly one network bootstrap per process.
-    // This composition root calls it once, retains the returned guard until the
-    // listener and all database-owning router state have been dropped, and does
-    // not expose the guard or any FFI handle through its safe public libraries.
-    let network = unsafe { foundationdb::boot() };
+    // The one network boot of this process. `network` outlives the listener and
+    // every database-owning router state, and is dropped last, below.
+    let network = boot_network(Vec::new())?;
     let database = foundationdb::Database::new_compat(Some(&cluster_file)).await?;
     let transaction = database.create_trx()?;
     let allocated = DirectoryLayer::default()
@@ -267,543 +345,21 @@ async fn service_main() -> Result<(), Box<dyn Error>> {
     let checkpoints = CheckpointCodec::new(key, 86_400_000)?;
     let application = router(store, authentication, checkpoints, SystemClock::new());
     let listener = lgwks_bot::rt::net::TcpListener::bind(address).await?;
+    let signal_failure = SignalFailure::default();
+    let recorder = Arc::clone(&signal_failure);
     axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            if let Err(error) = shutdown_signal().await {
+                record_signal_failure(&recorder, error);
+            }
+        })
         .await?;
     drop(network);
-    Ok(())
+    match take_signal_failure(&signal_failure) {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fmt,
-        future::{Future, ready},
-    };
-
-    use logical_db_crdt::{Document, Object, Scalar};
-    use logical_db_model::{
-        ActionDigest, DocumentId, Effect, OperationDigest, OperationId, ReplicaId,
-        SnapshotArtifact, SnapshotBaseline, SnapshotRecord,
-    };
-    use logical_db_protocol::{
-        BaselineRequest, ChangeEnvelope, PROTOCOL_VERSION, PageAction, PullRequest, PushOutcome,
-        PushRequest, RecoveryAction, RejectionCode,
-    };
-    use logical_db_service::{
-        AcceptResult, Authority, BaselinePageResult, CheckpointCodec, ConsumedResult,
-        ExecutionGrant, PageResult, ProtocolService, PruneResult, RetentionStore, SealResult,
-        ServiceError, ServiceStore,
-    };
-
-    use super::*;
-
-    /// KEY
-    const KEY: [u8; 32] = [0x5a; 32];
-
-    /// Runs `scope`.
-    fn scope(seed: u128) -> Scope {
-        Scope::new(
-            AccountId::from_uuid(Uuid::from_u128(seed)),
-            SpaceId::from_uuid(Uuid::from_u128(seed.saturating_add(1))),
-        )
-    }
-
-    /// Runs `action`.
-    fn action(seed: u8) -> ActionDigest {
-        ActionDigest::new([seed; 32])
-    }
-
-    /// Store double that must never be contacted: the default composition
-    /// refuses write and sync authorization before any durable work.
-    struct RefusedStore;
-
-    /// Typed sentinel returned if the default composition ever reaches the store.
-    #[derive(Debug)]
-    /// StoreContacted
-    struct StoreContacted {
-        /// Store method that must never run under the default composition.
-        method: &'static str,
-    }
-
-    impl fmt::Display for StoreContacted {
-        /// Names the store method the default composition must never reach.
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "default composition refuses before the store is contacted: {}",
-                self.method
-            )
-        }
-    }
-
-    impl Error for StoreContacted {}
-
-    impl ServiceStore for RefusedStore {
-        type Error = StoreContacted;
-
-        /// Runs `accept`.
-        fn accept(
-            &self,
-            _change: &ChangeEnvelope,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<AcceptResult, Self::Error>> + Send {
-            ready(Err(StoreContacted { method: "accept" }))
-        }
-
-        /// Runs `frontier`.
-        fn frontier(&self, _scope: Scope) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-            ready(Ok(0))
-        }
-
-        /// Runs `page`.
-        fn page(
-            &self,
-            _action: PageAction,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<PageResult, Self::Error>> + Send {
-            ready(Err(StoreContacted { method: "page" }))
-        }
-    }
-
-    impl RetentionStore for RefusedStore {
-        /// Runs `consumed_through`.
-        fn consumed_through(
-            &self,
-            _scope: Scope,
-        ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-            ready(Err(StoreContacted {
-                method: "consumed_through",
-            }))
-        }
-
-        /// Runs `snapshot_baseline`.
-        fn snapshot_baseline(
-            &self,
-            _scope: Scope,
-        ) -> impl Future<Output = Result<Option<SnapshotRecord>, Self::Error>> + Send {
-            ready(Err(StoreContacted {
-                method: "snapshot_baseline",
-            }))
-        }
-
-        /// Runs `build_snapshot`.
-        fn build_snapshot(
-            &self,
-            _scope: Scope,
-            _through: u64,
-        ) -> impl Future<Output = Result<SnapshotArtifact, Self::Error>> + Send {
-            ready(Err(StoreContacted {
-                method: "build_snapshot",
-            }))
-        }
-
-        /// Runs `read_baseline_page`.
-        fn read_baseline_page(
-            &self,
-            _action: &RecoveryAction,
-            _descriptor: &SnapshotBaseline,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<BaselinePageResult, Self::Error>> + Send {
-            ready(Err(StoreContacted {
-                method: "read_baseline_page",
-            }))
-        }
-
-        /// Runs `seal_snapshot`.
-        fn seal_snapshot(
-            &self,
-            _scope: Scope,
-            _artifact: &SnapshotArtifact,
-            _request: OperationDigest,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<SealResult, Self::Error>> + Send {
-            ready(Err(StoreContacted {
-                method: "seal_snapshot",
-            }))
-        }
-
-        /// Runs `mark_consumed`.
-        fn mark_consumed(
-            &self,
-            _scope: Scope,
-            _through: u64,
-            _request: OperationDigest,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<ConsumedResult, Self::Error>> + Send {
-            ready(Err(StoreContacted {
-                method: "mark_consumed",
-            }))
-        }
-
-        /// Runs `prune`.
-        fn prune(
-            &self,
-            _scope: Scope,
-            _up_to: u64,
-            _min_live: Option<u64>,
-            _request: OperationDigest,
-            _grant: &impl ExecutionGrant,
-        ) -> impl Future<Output = Result<PruneResult, Self::Error>> + Send {
-            ready(Err(StoreContacted { method: "prune" }))
-        }
-    }
-
-    /// Runs `default_push_request`.
-    fn default_push_request(
-        scope: Scope,
-        replica: ReplicaId,
-    ) -> Result<(PushRequest, OperationId), Box<dyn Error>> {
-        let mut document = Document::new();
-        let ((), mut changes) =
-            document.edit(|editor| editor.put(&Object::root(), "field", Scalar::Integer(7)))?;
-        let encoded = changes.pop().ok_or("expected one encoded change")?;
-        let operation = OperationId::new();
-        let request = PushRequest::new(
-            PROTOCOL_VERSION,
-            replica,
-            vec![ChangeEnvelope::new(
-                scope,
-                DocumentId::new(),
-                replica,
-                operation,
-                OperationDigest::new([8; 32]),
-                encoded.digest,
-                encoded.bytes,
-            )],
-        );
-        Ok((request, operation))
-    }
-
-    /// Runs `test_runtime`.
-    fn test_runtime() -> Result<lgwks_bot::Runtime, Box<dyn Error>> {
-        Ok(lgwks_bot::Builder::new()
-            .worker_threads(std::num::NonZeroUsize::new(2))
-            .build()?)
-    }
-
-    #[test]
-    /// Runs `default_composition_refuses_writes_and_sync_end_to_end`.
-    fn default_composition_refuses_writes_and_sync_end_to_end() -> Result<(), Box<dyn Error>> {
-        test_runtime()?.block_on(default_composition_body())
-    }
-
-    /// Runs `default_composition_body`.
-    async fn default_composition_body() -> Result<(), Box<dyn Error>> {
-        let expected_scope = scope(41);
-        let authentication =
-            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", expected_scope)?;
-        let policy = authentication
-            .authenticate(
-                &HeaderValue::from_static("Bearer correct-correct-correct-correct-0041"),
-                1_000,
-            )
-            .map_err(|error| io::Error::other(format!("default authentication: {error:?}")))?;
-        let service =
-            ProtocolService::new(RefusedStore, policy, CheckpointCodec::new([7; 32], 60_000)?);
-        let replica = ReplicaId::new();
-        let (push, operation) = default_push_request(expected_scope, replica)?;
-        let response = service.push(&push, 2_000).await?;
-        assert!(
-            matches!(
-                response.outcomes.as_slice(),
-                [PushOutcome::Rejected {
-                    operation: outcome,
-                    code: RejectionCode::Forbidden
-                }] if *outcome == operation
-            ),
-            "an unauthenticated-default write must reject as forbidden, got {response:?}"
-        );
-        let pull = PullRequest::new(
-            PROTOCOL_VERSION,
-            expected_scope,
-            replica,
-            OperationDigest::new([3; 32]),
-            None,
-            16,
-            1_048_576,
-        );
-        assert!(
-            matches!(
-                service.pull(&pull, 2_000).await,
-                Err(ServiceError::Forbidden)
-            ),
-            "an unauthenticated-default pull must refuse as forbidden"
-        );
-        Ok(())
-    }
-
-    #[test]
-    /// Runs `checkpoint_key_parser_rejects_ambiguous_or_weak_values`.
-    fn checkpoint_key_parser_rejects_ambiguous_or_weak_values() -> Result<(), Box<dyn Error>> {
-        assert_eq!(
-            parse_key(&"5a".repeat(32))?,
-            KEY,
-            "canonical key must parse"
-        );
-        for invalid in ["", "5a", &"0".repeat(64), &"zz".repeat(32)] {
-            assert!(
-                parse_key(invalid).is_err(),
-                "weak key {invalid:?} must refuse"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    /// Runs `bearer_authentication_is_exact_and_constant_time_verified`.
-    fn bearer_authentication_is_exact_and_constant_time_verified() -> Result<(), Box<dyn Error>> {
-        let expected_scope = scope(11);
-        let authentication =
-            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0001", expected_scope)?;
-        let policy = authentication.authenticate(
-            &HeaderValue::from_static("Bearer correct-correct-correct-correct-0001"),
-            1_000,
-        )?;
-        assert!(
-            policy
-                .authorize(expected_scope, Effect::Write, action(1), 0, 60_999)
-                .is_none(),
-            "local authority must refuse write"
-        );
-        assert!(
-            policy
-                .authorize(expected_scope, Effect::Sync, action(2), 0, 60_999)
-                .is_none(),
-            "local authority must refuse sync"
-        );
-        assert!(
-            policy
-                .authorize(scope(20), Effect::Write, action(3), 0, 60_999)
-                .is_none(),
-            "local authority must refuse a foreign scope"
-        );
-        assert!(
-            policy
-                .authorize(expected_scope, Effect::Read, action(4), 0, 60_999)
-                .is_some(),
-            "local authority must admit an in-scope read"
-        );
-        assert!(
-            policy
-                .authorize(expected_scope, Effect::Write, action(5), 0, 61_000)
-                .is_none(),
-            "local authority must refuse write at the expiry boundary"
-        );
-        assert!(
-            authentication
-                .authenticate(&HeaderValue::from_static("Bearer incorrect"), 1_000)
-                .is_err(),
-            "an incorrect bearer must be refused"
-        );
-        assert!(
-            authentication
-                .authenticate(
-                    &HeaderValue::from_static("Basic correct-correct-correct-correct-0001"),
-                    1_000,
-                )
-                .is_err(),
-            "a non-bearer scheme must be refused"
-        );
-        Ok(())
-    }
-
-    #[test]
-    /// Runs `policy_expiry_cannot_overflow`.
-    fn policy_expiry_cannot_overflow() -> Result<(), Box<dyn Error>> {
-        let authentication =
-            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0001", scope(30))?;
-        assert!(
-            authentication
-                .authenticate(
-                    &HeaderValue::from_static("Bearer correct-correct-correct-correct-0001"),
-                    u64::MAX,
-                )
-                .is_err(),
-            "expiry computation must fail closed rather than wrap"
-        );
-        Ok(())
-    }
-
-    #[test]
-    /// Runs `daemon_binds_only_to_loopback`.
-    fn daemon_binds_only_to_loopback() -> Result<(), Box<dyn Error>> {
-        for loopback in ["127.0.0.1:8080", "[::1]:8080"] {
-            let address: SocketAddr = loopback.parse()?;
-            assert!(ensure_loopback(&address).is_ok(), "loopback must bind");
-        }
-        for public in ["0.0.0.0:8080", "192.0.2.1:8080", "[::]:8080"] {
-            let address: SocketAddr = public.parse()?;
-            assert!(
-                ensure_loopback(&address).is_err(),
-                "public plaintext bind must refuse {public}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    /// Runs `daemon_configuration_rejects_weak_tokens_and_nil_scope_axes`.
-    fn daemon_configuration_rejects_weak_tokens_and_nil_scope_axes() {
-        for invalid in [b"short".as_slice(), b"contains a space________________"] {
-            assert!(validate_bearer_token(invalid).is_err());
-        }
-        assert!(validate_bearer_token(b"valid-valid-valid-valid-valid-token").is_ok());
-        assert!(validate_bearer_token(b"valid-valid-valid-valid-valid=====").is_ok());
-        assert!(validate_bearer_token(b"valid-valid-valid=====invalid____").is_err());
-        assert!(parse_non_nil_uuid(&Uuid::nil().to_string(), "nil").is_err());
-        assert!(parse_non_nil_uuid(&Uuid::now_v7().to_string(), "valid").is_ok());
-    }
-
-    #[test]
-    /// Runs `the_daemon_starts_serves_and_releases_its_listener_on_shutdown`.
-    fn the_daemon_starts_serves_and_releases_its_listener_on_shutdown() -> Result<(), Box<dyn Error>>
-    {
-        test_runtime()?.block_on(daemon_lifecycle_body())
-    }
-
-    /// Runs `daemon_lifecycle_body`.
-    async fn daemon_lifecycle_body() -> Result<(), Box<dyn Error>> {
-        use std::{net::SocketAddr, sync::Arc};
-        let authentication =
-            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", scope(41))?;
-        let application = router(
-            RefusedStore,
-            authentication,
-            CheckpointCodec::new(KEY, 86_400_000)?,
-            SystemClock::new(),
-        );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address: SocketAddr = listener.local_addr()?;
-        let stopped = Arc::new(lgwks_bot::rt::sync::Notify::new());
-        let shutdown = Arc::clone(&stopped);
-        let mut serving = lgwks_bot::rt::task::JoinSet::new();
-        serving.spawn(async move {
-            let serve_result = axum::serve(listener, application)
-                .with_graceful_shutdown(async move { shutdown.notified().await })
-                .await;
-            drop(serve_result);
-        });
-
-        let status = unauthenticated_push_status(address)?;
-        assert!(status.starts_with("HTTP/1.1 4"), "daemon served {status}");
-
-        stopped.notify_waiters();
-        lgwks_bot::rt::task::yield_now().await;
-        serving
-            .join_next()
-            .await
-            .ok_or("the daemon serve task finished before shutdown")??;
-
-        let rebound = std::net::TcpListener::bind(address);
-        assert!(rebound.is_ok(), "the daemon kept its listener bound");
-        Ok(())
-    }
-
-    #[test]
-    /// Runs `recovery_is_refused_before_the_baseline_store_is_contacted`.
-    fn recovery_is_refused_before_the_baseline_store_is_contacted() -> Result<(), Box<dyn Error>> {
-        test_runtime()?.block_on(recovery_refusal_body())
-    }
-
-    /// Runs `recovery_refusal_body`.
-    async fn recovery_refusal_body() -> Result<(), Box<dyn Error>> {
-        use std::{net::SocketAddr, sync::Arc};
-        let authentication =
-            BearerAuthenticator::new(KEY, b"correct-correct-correct-correct-0041", scope(41))?;
-        let application = router(
-            RefusedStore,
-            authentication,
-            CheckpointCodec::new(KEY, 86_400_000)?,
-            SystemClock::new(),
-        );
-        let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address: SocketAddr = listener.local_addr()?;
-        let stopped = Arc::new(lgwks_bot::rt::sync::Notify::new());
-        let shutdown = Arc::clone(&stopped);
-        let mut serving = lgwks_bot::rt::task::JoinSet::new();
-        serving.spawn(async move {
-            let serve_result = axum::serve(listener, application)
-                .with_graceful_shutdown(async move { shutdown.notified().await })
-                .await;
-            drop(serve_result);
-        });
-
-        // A well-formed recovery request with the correct bearer and scope:
-        // every earlier boundary (representation, authentication, protocol
-        // validation) passes, so only the recovery authorization may refuse.
-        // `frontier` is read before authorization by design; any contact with
-        // the retention surface trips the RefusedStore sentinel instead.
-        let request = BaselineRequest::new(
-            PROTOCOL_VERSION,
-            scope(41),
-            ReplicaId::new(),
-            OperationDigest::new([4; 32]),
-            None,
-            None,
-        );
-        let mut body = Vec::new();
-        ciborium::into_writer(&request, &mut body)?;
-        let status = post_status(
-            address,
-            "/v1/recovery:baseline",
-            &body,
-            "Bearer correct-correct-correct-correct-0041",
-        )?;
-        assert_eq!(status, "HTTP/1.1 403 Forbidden", "daemon served {status}");
-
-        stopped.notify_waiters();
-        lgwks_bot::rt::task::yield_now().await;
-        serving
-            .join_next()
-            .await
-            .ok_or("the daemon serve task finished before shutdown")??;
-        Ok(())
-    }
-
-    /// Runs `unauthenticated_push_status`.
-    fn unauthenticated_push_status(
-        address: std::net::SocketAddr,
-    ) -> Result<String, Box<dyn Error>> {
-        post_status(address, "/v1/changes:push", b"", "")
-    }
-
-    /// Runs `post_status`.
-    fn post_status(
-        address: std::net::SocketAddr,
-        path: &str,
-        body: &[u8],
-        authorization: &str,
-    ) -> Result<String, Box<dyn Error>> {
-        use std::{
-            io::{Read, Write},
-            net::TcpStream,
-            time::Duration,
-        };
-        let authorization_line = if authorization.is_empty() {
-            String::new()
-        } else {
-            format!("authorization: {authorization}\r\n")
-        };
-        let mut stream = TcpStream::connect(address)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let head = format!(
-            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\n\
-             content-type: application/vnd.logical-db.v1+cbor\r\n\
-             accept: application/vnd.logical-db.v1+cbor\r\n\
-             {authorization_line}\
-             content-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        stream.write_all(&head)?;
-        stream.write_all(body)?;
-        let mut response = Vec::new();
-        drop(stream.read_to_end(&mut response));
-        Ok(String::from_utf8_lossy(&response)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned())
-    }
-}
+mod tests;

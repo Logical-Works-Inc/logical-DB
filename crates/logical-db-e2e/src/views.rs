@@ -14,13 +14,80 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use logical_db::{
-    AccountId, Database, DocumentId, FileProjectionIndex, IndexId, IndexValue, Item, Object,
-    OperationDigest, OperationId, Projection, ProjectionAction, ProjectionError,
+    AccountId, Database, DatabaseError, DocumentId, FileProjectionIndex, IndexId, IndexValue, Item,
+    Object, OperationDigest, OperationId, Projection, ProjectionAction, ProjectionError,
     ProjectionSemantics, RedbSnapshotStore, RelationalProjection, ReplicaId, RestorableProjection,
-    RestoreStats, Scalar, Scope, SnapshotEnvelope, SnapshotInput, SnapshotMetadata, SnapshotStore,
-    SpaceId, SqliteRelationalProjection, create_snapshot, query_snapshot, restore_or_replay,
-    snapshot_row_count, verify_snapshot_integrity,
+    RestoreStats, Scalar, Scope, SnapshotEnvelope, SnapshotEnvelopeError, SnapshotError,
+    SnapshotInput, SnapshotMetadata, SnapshotStore, SpaceId, SqliteRelationalProjection,
+    create_snapshot, query_snapshot, restore_or_replay, snapshot_row_count,
+    verify_snapshot_integrity,
 };
+
+/// Typed failures of the projection-view journeys, one variant per source.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ViewsError {
+    /// The facade refused an open, an edit or a view query.
+    Database(DatabaseError),
+    /// A snapshot file or byte reader refused.
+    Snapshot(SnapshotError),
+    /// A sealed envelope or its backend refused.
+    Envelope(SnapshotEnvelopeError),
+    /// A relational projection engine refused.
+    Projection(ProjectionError),
+    /// A fixture file operation failed.
+    Io(std::io::Error),
+    /// A projection that must hold rows was empty.
+    NoRows,
+    /// A listing that must name a snapshot was empty.
+    NoListing,
+}
+
+impl std::fmt::Display for ViewsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Database(ref error) => write!(formatter, "facade refused: {error}"),
+            Self::Snapshot(ref error) => write!(formatter, "snapshot refused: {error}"),
+            Self::Envelope(ref error) => write!(formatter, "envelope refused: {error}"),
+            Self::Projection(ref error) => write!(formatter, "projection refused: {error}"),
+            Self::Io(ref error) => write!(formatter, "fixture file failed: {error}"),
+            Self::NoRows => formatter.write_str("projection holds no rows"),
+            Self::NoListing => formatter.write_str("snapshot listing is empty"),
+        }
+    }
+}
+
+impl std::error::Error for ViewsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match *self {
+            Self::Database(ref error) => Some(error),
+            Self::Snapshot(ref error) => Some(error),
+            Self::Envelope(ref error) => Some(error),
+            Self::Projection(ref error) => Some(error),
+            Self::Io(ref error) => Some(error),
+            Self::NoRows | Self::NoListing => None,
+        }
+    }
+}
+
+/// Implements `From` for each wrapped source so `?` keeps its typed cause.
+macro_rules! views_error_from {
+    ($($source:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$source> for ViewsError {
+            fn from(error: $source) -> Self {
+                Self::$variant(error)
+            }
+        })+
+    };
+}
+
+views_error_from!(
+    DatabaseError => Database,
+    SnapshotError => Snapshot,
+    SnapshotEnvelopeError => Envelope,
+    ProjectionError => Projection,
+    std::io::Error => Io,
+);
 
 /// Builds one unique temporary database path for a named fixture.
 #[must_use]
@@ -41,7 +108,7 @@ pub(crate) fn unique_suffix() -> String {
 pub(crate) fn open_kind_replica(
     path: &std::path::Path,
     scope: Scope,
-) -> Result<(Database, IndexId), Box<dyn std::error::Error>> {
+) -> Result<(Database, IndexId), ViewsError> {
     let kind = IndexId::new();
     let projection = Projection::new(kind, ProjectionSemantics::V1, |reader| {
         Ok(match reader.get(&Object::root(), "kind")? {
@@ -58,7 +125,7 @@ pub(crate) fn put_kind(
     database: &Database,
     document: DocumentId,
     kind: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), ViewsError> {
     let tag = String::from(kind);
     database.edit(
         document,
@@ -76,10 +143,18 @@ pub(crate) fn put_kind(
 /// restore path treats opaquely.
 #[must_use]
 pub(crate) fn test_row(i: u64) -> [u8; 32] {
+    let words = [
+        i,
+        i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        i.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+    ];
     let mut row = [0_u8; 32];
-    row[..8].copy_from_slice(&i.to_le_bytes());
-    row[8..16].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
-    row[16..24].copy_from_slice(&i.wrapping_mul(0xBF58_476D_1CE4_E5B9).to_le_bytes());
+    for (slot, byte) in row
+        .iter_mut()
+        .zip(words.into_iter().flat_map(u64::to_le_bytes))
+    {
+        *slot = byte;
+    }
     row
 }
 
@@ -87,8 +162,7 @@ pub(crate) fn test_row(i: u64) -> [u8; 32] {
 pub(crate) fn assert_restorable<P: RestorableProjection>() {}
 
 /// Hybrid queries, durable snapshots, and tenant isolation agree end to end.
-pub fn projection_views_agree_across_live_and_snapshot_paths()
--> Result<(), Box<dyn std::error::Error>> {
+pub fn projection_views_agree_across_live_and_snapshot_paths() -> Result<(), ViewsError> {
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let path = db_path("views");
     let (database, kind) = open_kind_replica(&path, scope)?;
@@ -174,7 +248,8 @@ pub fn projection_views_agree_across_live_and_snapshot_paths()
         "the second tenant sees only its own row"
     );
     assert_eq!(
-        stranger_hits[0].document, other,
+        stranger_hits.first().map(|hit| hit.document),
+        Some(other),
         "isolation must hold on the hybrid path"
     );
     let home_hits = database.query_indexed_hybrid(kind, "shared", &[], 8)?;
@@ -194,8 +269,7 @@ pub fn projection_views_agree_across_live_and_snapshot_paths()
 
 /// Sealed envelopes survive a backend round-trip and restore plus tail
 /// replay converges across engines; any refusal falls back to genesis.
-pub fn snapshot_envelope_round_trip_restores_across_engines()
--> Result<(), Box<dyn std::error::Error>> {
+pub fn snapshot_envelope_round_trip_restores_across_engines() -> Result<(), ViewsError> {
     assert_restorable::<RelationalProjection>();
     assert_restorable::<SqliteRelationalProjection>();
 
@@ -209,16 +283,16 @@ pub fn snapshot_envelope_round_trip_restores_across_engines()
     for i in 0..100_u64 {
         mem.apply(ProjectionAction::Apply(test_row(i)))?;
     }
-    let last_row = *mem.state().last().ok_or("rows should exist")?;
+    let last_row = *mem.state().last().ok_or(ViewsError::NoRows)?;
     let sealed = create_snapshot(
         &store,
         scope,
-        SnapshotInput::new(projection, [9_u8; 32], &mem, last_row, 99, 1_700_000_000),
+        &SnapshotInput::new(projection, [9_u8; 32], &mem, last_row, 99, 1_700_000_000),
     )?;
     sealed.verify()?;
     assert_eq!(
         sealed.compute_hash()?,
-        sealed.hash,
+        sealed.hash(),
         "seal must embed the recomputed hash"
     );
 
@@ -227,11 +301,11 @@ pub fn snapshot_envelope_round_trip_restores_across_engines()
     for i in 0..10_u64 {
         tamper_mem.apply(ProjectionAction::Apply(test_row(i)))?;
     }
-    let tamper_last = *tamper_mem.state().last().ok_or("rows should exist")?;
+    let tamper_last = *tamper_mem.state().last().ok_or(ViewsError::NoRows)?;
     let direct = create_snapshot(
         &store,
         tamper_scope,
-        SnapshotInput::new(
+        &SnapshotInput::new(
             projection,
             [4_u8; 32],
             &tamper_mem,
@@ -242,7 +316,8 @@ pub fn snapshot_envelope_round_trip_restores_across_engines()
     )?;
     direct.verify()?;
     assert_ne!(
-        direct.hash, sealed.hash,
+        direct.hash(),
+        sealed.hash(),
         "a distinct scope and frontier seals a distinct envelope"
     );
     assert!(
@@ -255,12 +330,9 @@ pub fn snapshot_envelope_round_trip_restores_across_engines()
 
     let listed: Vec<SnapshotMetadata> = store.list_snapshots(scope, projection)?;
     assert_eq!(listed.len(), 1, "one snapshot listed");
-    assert_eq!(listed[0].hash, sealed.hash, "listing names the sealed hash");
-    assert_eq!(
-        listed[0].account,
-        scope.account(),
-        "listing is tenant-scoped"
-    );
+    let listing = listed.first().ok_or(ViewsError::NoListing)?;
+    assert_eq!(listing.hash, sealed.hash(), "listing names the sealed hash");
+    assert_eq!(listing.account, scope.account(), "listing is tenant-scoped");
 
     let mut tail = RelationalProjection::new();
     for i in 0..200_u64 {
@@ -269,16 +341,15 @@ pub fn snapshot_envelope_round_trip_restores_across_engines()
     let full_checkpoint = tail.checkpoint();
 
     let sqlite_seed = SqliteRelationalProjection::new()?;
-    let replay = |restored: &mut SqliteRelationalProjection, after: u64| -> Result<u64, String> {
-        let mut applied = 0_u64;
-        for i in (after.saturating_add(1))..200 {
-            restored
-                .apply(ProjectionAction::Apply(test_row(i)))
-                .map_err(|error| error.to_string())?;
-            applied = applied.saturating_add(1);
-        }
-        Ok(applied)
-    };
+    let replay =
+        |restored: &mut SqliteRelationalProjection, after: u64| -> Result<u64, ProjectionError> {
+            let mut applied = 0_u64;
+            for i in (after.saturating_add(1))..200 {
+                restored.apply(ProjectionAction::Apply(test_row(i)))?;
+                applied = applied.saturating_add(1);
+            }
+            Ok(applied)
+        };
     let (restored, stats): (SqliteRelationalProjection, RestoreStats) =
         restore_or_replay(&store, scope, projection, sqlite_seed, replay)?;
     assert!(stats.from_snapshot, "must take the snapshot path");
@@ -292,7 +363,7 @@ pub fn snapshot_envelope_round_trip_restores_across_engines()
         store.load_latest_snapshot(Scope::new(AccountId::new(), SpaceId::new()), IndexId::new())?;
     assert!(missing.is_none(), "cold start answers none");
 
-    let deleted = store.delete_snapshot(scope, projection, &sealed.hash)?;
+    let deleted = store.delete_snapshot(scope, projection, &sealed.hash())?;
     assert!(deleted, "delete must report the removal");
     let after: Option<SnapshotEnvelope> = store.load_latest_snapshot(scope, projection)?;
     assert!(after.is_none(), "the snapshot must be gone after delete");

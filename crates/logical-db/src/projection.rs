@@ -50,6 +50,7 @@ impl ProjectionSemantics {
         }
     }
 
+    /// Declares projection semantics by a caller-computed 32-byte fingerprint.
     #[must_use]
     pub const fn digest(digest: [u8; 32]) -> Self {
         Self::Digest(digest)
@@ -88,6 +89,17 @@ pub struct Projection {
     pub(crate) semantics: ProjectionSemantics,
     /// Deterministic projection function computing one row per document.
     pub(crate) function: Arc<ProjectionFunction>,
+}
+
+impl std::fmt::Debug for Projection {
+    /// Shows the index and semantics; the projection closure has no rendering.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Projection")
+            .field("index", &self.index)
+            .field("semantics", &self.semantics)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Projection {

@@ -13,18 +13,27 @@ const GIT_DEPENDENCY_PREFIX: &str =
 const JOURNEY: &str = "experience/journeys/embedded-git-consumer-v1.yaml";
 const REGISTRY_BOUNDARY: &str = "Crates.io installation is not supported yet:";
 
+/// What the README must carry for the installation contract to hold.
+#[derive(Debug)]
+enum InstallationContract {
+    /// The README names no public Git-source dependency.
+    MissingDependency,
+    /// The README Git dependency never closes its revision string.
+    UnclosedRevision,
+}
+
 /// The README pins an immutable Git rev and states the crates.io boundary.
 #[test]
-fn documented_embedded_installation_is_immutable_and_explicit()
--> Result<(), Box<dyn std::error::Error>> {
+fn documented_embedded_installation_is_immutable_and_explicit() -> Result<(), InstallationContract>
+{
     let dependency = README
         .find(GIT_DEPENDENCY_PREFIX)
-        .map(|offset| &README[offset.saturating_add(GIT_DEPENDENCY_PREFIX.len())..])
-        .ok_or("README must name the public Git-source dependency")?;
+        .and_then(|offset| README.get(offset.saturating_add(GIT_DEPENDENCY_PREFIX.len())..))
+        .ok_or(InstallationContract::MissingDependency)?;
     let revision = dependency
         .split_once('"')
         .map(|(revision, _)| revision)
-        .ok_or("README Git dependency must close its revision string")?;
+        .ok_or(InstallationContract::UnclosedRevision)?;
 
     assert_eq!(revision.len(), 40, "README must pin a full Git revision");
     assert!(

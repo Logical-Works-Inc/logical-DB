@@ -20,30 +20,39 @@ pub(super) fn take<'bytes>(
     let end = cursor
         .checked_add(count)
         .ok_or(ModelError::InvalidNamespaceCheckpointEncoding)?;
-    if end > bytes.len() {
-        return Err(ModelError::InvalidNamespaceCheckpointEncoding);
-    }
-    let slice = &bytes[*cursor..end];
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or(ModelError::InvalidNamespaceCheckpointEncoding)?;
     *cursor = end;
     Ok(slice)
 }
 
+/// Copies exactly `N` bytes at `cursor` into an array, advancing past them.
+fn take_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], ModelError> {
+    let raw = take(bytes, cursor, N)?;
+    match raw.first_chunk::<N>() {
+        Some(array) => Ok(*array),
+        None => Err(ModelError::InvalidNamespaceCheckpointEncoding),
+    }
+}
+
 /// Reads a big-endian `u16` at `cursor`, advancing past it.
 pub(super) fn take_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, ModelError> {
-    let raw = take(bytes, cursor, 2)?;
-    raw.try_into()
-        .map(u16::from_be_bytes)
-        .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)
+    take_array::<2>(bytes, cursor).map(u16::from_be_bytes)
+}
+
+/// Reads a big-endian `u64` at `cursor`, advancing past it.
+pub(super) fn take_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, ModelError> {
+    take_array::<8>(bytes, cursor).map(u64::from_be_bytes)
 }
 
 /// Reads a big-endian `u32` length at `cursor`, returning it as `usize`.
 pub(super) fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<usize, ModelError> {
-    let raw = take(bytes, cursor, 4)?;
-    let value: u32 = raw
-        .try_into()
-        .map(u32::from_be_bytes)
-        .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)?;
-    usize::try_from(value).map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)
+    let value = take_array::<4>(bytes, cursor).map(u32::from_be_bytes)?;
+    let Ok(length) = usize::try_from(value) else {
+        return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+    };
+    Ok(length)
 }
 
 /// Reads a length-prefixed, bounded UTF-8 namespace name at `cursor`.
@@ -56,8 +65,9 @@ pub(super) fn take_namespace<'bytes>(
         return Err(ModelError::InvalidNamespaceCheckpointEncoding);
     }
     let name_bytes = take(bytes, cursor, name_len)?;
-    let namespace = core::str::from_utf8(name_bytes)
-        .map_err(|_error| ModelError::InvalidNamespaceCheckpointEncoding)?;
+    let Ok(namespace) = core::str::from_utf8(name_bytes) else {
+        return Err(ModelError::InvalidNamespaceCheckpointEncoding);
+    };
     if validate_namespace(namespace).is_err() {
         return Err(ModelError::InvalidNamespaceCheckpointEncoding);
     }

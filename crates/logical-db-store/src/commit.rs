@@ -66,7 +66,10 @@ impl EmbeddedStore {
             }
         }
 
-        let scope = commits[0].change.scope;
+        let Some(first) = commits.first() else {
+            return Ok(Vec::new());
+        };
+        let scope = first.change.scope;
         if commits.iter().any(|commit| commit.change.scope != scope) {
             return Err(StoreError::MixedBatchScope);
         }
@@ -116,19 +119,23 @@ impl EmbeddedStore {
         if let Some(next) = stored_event {
             event_sequence = next;
         }
-        for (index, commit) in commits.iter().enumerate() {
-            if outcomes[index].is_some() {
+        for ((commit, outcome), current_revision) in commits
+            .iter()
+            .zip(outcomes.iter_mut())
+            .zip(current_revisions.iter().copied())
+        {
+            if outcome.is_some() {
                 continue;
             }
             commit_local_member(
                 &mut table,
                 scope,
                 commit,
-                current_revisions[index],
+                current_revision,
                 &mut sequence,
                 &mut event_sequence,
             )?;
-            outcomes[index] = Some(CommitOutcome::Applied { sequence });
+            *outcome = Some(CommitOutcome::Applied { sequence });
         }
         table.insert(sequence_key.as_slice(), sequence.to_be_bytes().as_slice())?;
         table.insert(

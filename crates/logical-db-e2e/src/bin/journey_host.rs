@@ -14,25 +14,29 @@
 //! makes no availability claim. `scripts/external-tape.sh` owns its lifetime.
 
 #![forbid(unsafe_code)]
-#![expect(
-    clippy::print_stdout,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
 
-use std::{error::Error, sync::Arc};
+use std::io::{self, Write};
 
-use logical_db_e2e::support::{MemoryServiceStore, serve_journey};
+use logical_db_e2e::support::{Allow, BLACK_BOX_TOKEN, TestAuthentication, serve_journey};
 
 /// Boots the async runtime and serves the journey composition on stdio.
-fn main() -> Result<(), Box<dyn Error>> {
-    lgwks_bot::Runtime::new()?.block_on(run())
+fn main() -> Result<(), io::Error> {
+    lgwks_bot::rt::runtime::Builder::new()
+        .build()?
+        .block_on(run())
 }
 
 /// Serves the journey composition until the orchestrator terminates it.
-async fn run() -> Result<(), Box<dyn Error>> {
-    let store = Arc::new(MemoryServiceStore::default());
-    let (address, _server) = serve_journey(store).await?;
-    println!("READY {address}");
+async fn run() -> Result<(), io::Error> {
+    // The loopback host admits every justified request of the external tape.
+    let authentication = TestAuthentication::new(
+        BLACK_BOX_TOKEN,
+        Allow::when(|_scope, _effect, _action| true),
+    );
+    let (address, _server) = serve_journey(authentication).await?;
+    let ready = format!("READY {address}\n");
+    io::stdout().lock().write_all(ready.as_bytes())?;
+    io::stdout().lock().flush()?;
     // Serve until the orchestrator terminates this process. A park, not a
     // poll: the composition is push-driven by the listener.
     std::future::pending::<()>().await;

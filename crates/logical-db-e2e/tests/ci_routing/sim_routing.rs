@@ -64,16 +64,24 @@ const ROUTES: [(&str, bool); 9] = [
     ("[ubuntu-24.04]", false),
 ];
 
+/// One random route from `ROUTES`.
+fn pick(random: &mut Seeded) -> Result<(&'static str, bool), String> {
+    ROUTES
+        .get(random.below(ROUTES.len()))
+        .copied()
+        .ok_or_else(|| String::from("the route table is empty"))
+}
+
 /// One seeded run of random multi-job workflows judged against the routing
 /// model; returns the trace hash.
-fn route_run(seed: u64) -> u64 {
+fn route_run(seed: u64) -> Result<u64, String> {
     let mut random = Seeded(seed);
     let mut trace = 0xCBF2_9CE4_8422_2325;
     for _ in 0..500 {
         let mut accepted = true;
         let mut lines = vec!["jobs:\n".to_owned()];
         for job in 0..random.between(1, 5) {
-            let route = ROUTES[random.below(ROUTES.len())];
+            let route = pick(&mut random)?;
             accepted &= route.1;
             lines.push(format!("  job{job}:\n    runs-on: {}\n", route.0));
         }
@@ -82,18 +90,30 @@ fn route_run(seed: u64) -> u64 {
         assert_eq!(passed, accepted, "routing model disagrees: {text}");
         trace = fold(trace, &format!("{text}{passed}"));
     }
-    trace
+    Ok(trace)
 }
 
+/// Trace hashes the eight routing seeds are recorded to produce.
+const ROUTE_TRACES: [u64; 8] = [
+    15_527_158_201_742_439_996,
+    11_610_121_709_553_523_693,
+    1_860_396_468_875_387_211,
+    9_488_995_942_999_093_036,
+    17_054_839_118_388_252_087,
+    15_018_096_628_801_540_247,
+    13_779_219_139_797_196_038,
+    12_165_654_579_172_442_523,
+];
+
 #[test]
-fn sim_seeded_routes_match_the_hosted_model() {
-    for seed in 0..8 {
-        assert_eq!(route_run(seed), route_run(seed), "seed {seed} replays");
-    }
+fn sim_seeded_routes_match_the_hosted_model() -> Result<(), String> {
+    let traces = (0..8).map(route_run).collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(traces, ROUTE_TRACES, "the seeded routing traces drifted");
+    Ok(())
 }
 
 /// One seeded run where one job repeats `runs-on`; returns the trace hash.
-fn duplicate_run(seed: u64) -> u64 {
+fn duplicate_run(seed: u64) -> Result<u64, String> {
     let mut random = Seeded(seed);
     let mut trace = 0xCBF2_9CE4_8422_2325;
     for _ in 0..200 {
@@ -103,7 +123,7 @@ fn duplicate_run(seed: u64) -> u64 {
         for job in 0..jobs {
             lines.push(format!("  job{job}:\n    runs-on: macos-15\n"));
             if job == twice {
-                let route = ROUTES[random.below(ROUTES.len())].0;
+                let route = pick(&mut random)?.0;
                 lines.push(format!("    runs-on: {route}\n"));
             }
         }
@@ -111,18 +131,29 @@ fn duplicate_run(seed: u64) -> u64 {
         assert!(verify(&text).is_err(), "a repeated route passed: {text}");
         trace = fold(trace, &text);
     }
-    trace
+    Ok(trace)
 }
 
+/// Trace hashes the eight duplicate-route seeds are recorded to produce.
+const DUPLICATE_TRACES: [u64; 8] = [
+    5_534_339_750_850_967_104,
+    4_225_096_689_064_756_014,
+    2_534_249_685_225_342_736,
+    12_934_025_125_381_992_754,
+    10_169_927_609_492_529_383,
+    13_155_441_310_882_868_163,
+    13_219_231_022_566_044_647,
+    6_105_573_747_571_741_408,
+];
+
 #[test]
-fn sim_seeded_duplicate_routes_are_always_refused() {
-    for seed in 0..8 {
-        assert_eq!(
-            duplicate_run(seed),
-            duplicate_run(seed),
-            "seed {seed} replays"
-        );
-    }
+fn sim_seeded_duplicate_routes_are_always_refused() -> Result<(), String> {
+    let traces = (0..8).map(duplicate_run).collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        traces, DUPLICATE_TRACES,
+        "the seeded duplicate-route traces drifted"
+    );
+    Ok(())
 }
 
 /// One seeded run checking that the published names do not depend on job
@@ -147,10 +178,21 @@ fn order_run(seed: u64) -> Result<u64, String> {
     Ok(trace)
 }
 
+/// Trace hashes the eight job-order seeds are recorded to produce.
+const ORDER_TRACES: [u64; 8] = [
+    3_832_367_768_932_028_718,
+    13_272_724_353_154_442_240,
+    7_342_661_507_178_649_085,
+    1_148_926_430_498_069_578,
+    16_407_217_790_768_270_686,
+    7_283_517_801_777_653_501,
+    7_830_018_899_742_664_031,
+    164_595_972_867_186_719,
+];
+
 #[test]
 fn sim_seeded_job_order_never_changes_the_names() -> Result<(), String> {
-    for seed in 0..8 {
-        assert_eq!(order_run(seed)?, order_run(seed)?, "seed {seed} replays");
-    }
+    let traces = (0..8).map(order_run).collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(traces, ORDER_TRACES, "the seeded order traces drifted");
     Ok(())
 }

@@ -16,30 +16,33 @@
 mod fdb_harness;
 
 use std::{
+    collections::HashSet,
     error::Error,
     fs, io,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use fdb_harness::{FixtureAuthenticator, read_floor, read_frontier, seal_consume_and_prune};
+use fdb_harness::{
+    open_stores, read_floor, read_frontier, run_journey, seal_consume_and_prune, seed_documents,
+    seeded_value, serve, sync_until_frontier,
+};
 use logical_db::{
-    AccountId, BatchEdit, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId,
-    ReplicaId, Scalar, Scope, SpaceId, SyncLimits,
-    http::{HttpTransport, StaticBearer, Url},
+    AccountId, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId, ReplicaId,
+    Scalar, Scope, SpaceId, SyncLimits,
+    http::{HttpTransport, StaticBearer},
     transport::{BaselineRequest, BaselineResult, Checkpoint, PullRequest, PullResult, Transport},
 };
+use logical_db_daemon::boot_network;
 use logical_db_model::MAX_BASELINE_PAGE_DOCUMENTS;
-use logical_db_server::{Clock, router};
-use logical_db_service::CheckpointCodec;
-use logical_db_store_fdb::{
-    FdbServiceStore,
-    foundationdb::{Database as FdbDatabase, api::FdbApiBuilder},
-    foundationdb_tuple::Subspace,
-};
+use logical_db_protocol::PROTOCOL_VERSION;
+use logical_db_server::Clock;
 
+/// A clock the journey advances by hand, so checkpoint expiry needs no sleep.
+#[derive(Debug)]
 struct RecoveryClock(Arc<AtomicU64>);
 
 impl Clock for RecoveryClock {
@@ -48,57 +51,60 @@ impl Clock for RecoveryClock {
     }
 }
 
+/// One journey's replica paths, removed once the journey passes.
+#[derive(Debug)]
+struct Paths {
+    /// The seeding replica.
+    first: PathBuf,
+    /// The fresh replica that recovers from the baseline.
+    second: PathBuf,
+    /// The replica whose checkpoint expires.
+    expired: PathBuf,
+}
+
+impl Paths {
+    /// Fresh temporary paths unique to this run.
+    fn new() -> Self {
+        let run = ReplicaId::new();
+        let path = |role: &str| {
+            std::env::temp_dir().join(format!("logical-db-fdb-recovery-{role}-{run}.redb"))
+        };
+        Self {
+            first: path("first"),
+            second: path("second"),
+            expired: path("expired"),
+        }
+    }
+
+    /// Removes every replica file.
+    fn remove(&self) -> io::Result<()> {
+        fs::remove_file(&self.first)?;
+        fs::remove_file(&self.second)?;
+        fs::remove_file(&self.expired)
+    }
+}
+
 /// The composition entry that drives the FDB recovery journey.
 #[test]
 fn fdb_recovery_composition() -> Result<(), Box<dyn Error>> {
-    lgwks_bot::Runtime::new()?.block_on(journey())
+    run_journey(journey())
 }
 
 /// Drives the expired-checkpoint recovery journey against a real FDB cluster.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one ordered end-to-end journey; splitting hides the ordering"
-)]
 async fn journey() -> Result<(), Box<dyn Error>> {
     let cluster_file = std::env::var("LOGICAL_DB_FDB_CLUSTER_FILE")?;
-    #[expect(
-        unsafe_code,
-        reason = "the FDB network boot is this journey's FFI seam"
-    )]
-    // SAFETY: this dedicated process boots exactly one FDB network and retains
-    // the auto-stop guard beyond every database, store, and future.
-    let network = unsafe { FdbApiBuilder::default().build()?.boot()? };
-    let http_database = FdbDatabase::new_compat(Some(&cluster_file)).await?;
-    let prune_database = FdbDatabase::new_compat(Some(&cluster_file)).await?;
-    let root = Subspace::from_bytes(
-        format!("logical-db/recovery-composition/{}/", uuid::Uuid::now_v7()).into_bytes(),
-    );
-    let service_store = FdbServiceStore::new(http_database, root.clone())?;
-    let prune_store = FdbServiceStore::new(prune_database, root)?;
+    // The one network boot of this process; dropped after every store below.
+    let network = boot_network(Vec::new())?;
+    let (service_store, prune_store) = open_stores(&cluster_file, "recovery-composition").await?;
     let now = Arc::new(AtomicU64::new(1_000));
-    let application = router(
-        service_store,
-        FixtureAuthenticator,
-        CheckpointCodec::new([0x27; 32], 60_000)?,
-        RecoveryClock(Arc::clone(&now)),
-    );
-    let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let mut server = lgwks_bot::rt::task::JoinSet::new();
-    server.spawn(async move { axum::serve(listener, application).await });
-    let endpoint: Url = format!("http://{address}/").parse()?;
-    let mut transport = HttpTransport::new(endpoint, StaticBearer::new("recovery-fixture")?)?;
+    let (_endpoint, mut transport, mut server) =
+        serve(service_store, [0x27; 32], RecoveryClock(Arc::clone(&now))).await?;
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let peer = PeerId::new();
-    let run = uuid::Uuid::now_v7();
-    let first_path = std::env::temp_dir().join(format!("logical-db-fdb-recovery-first-{run}.redb"));
-    let second_path =
-        std::env::temp_dir().join(format!("logical-db-fdb-recovery-second-{run}.redb"));
-    let expired_path =
-        std::env::temp_dir().join(format!("logical-db-fdb-recovery-expired-{run}.redb"));
+    let paths = Paths::new();
     let expired_id = ReplicaId::new();
-    let expired = Database::open(&expired_path, scope, expired_id)?;
+    let expired = Database::open(&paths.expired, scope, expired_id)?;
     expired
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
         .await?;
@@ -109,65 +115,76 @@ async fn journey() -> Result<(), Box<dyn Error>> {
     let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
     // The first document of page two is deleted on the seeding replica, so its
     // tombstone crosses the page boundary inside the sealed baseline.
-    let tombstoned = documents[MAX_BASELINE_PAGE_DOCUMENTS];
+    let tombstoned = *documents
+        .get(MAX_BASELINE_PAGE_DOCUMENTS)
+        .ok_or("the seed spans two baseline pages")?;
 
-    let first = Database::open(&first_path, scope, ReplicaId::new())?;
-    for (batch, chunk) in documents.chunks(150).enumerate() {
-        let edits = chunk
-            .iter()
-            .enumerate()
-            .map(|(offset, document)| {
-                let index = batch.saturating_mul(150).saturating_add(offset);
-                let value = i64::try_from(
-                    index
-                        .checked_rem(1_000)
-                        .ok_or("seed modulus must be non-zero")?,
-                )?;
-                Ok(BatchEdit::new(
-                    *document,
-                    OperationId::new(),
-                    logical_db::OperationDigest::new(
-                        [u8::try_from(
-                            index
-                                .checked_rem(256)
-                                .ok_or("digest modulus must be non-zero")?,
-                        )?; 32],
-                    ),
-                    move |editor| editor.put(&Object::root(), "state", Scalar::Integer(value)),
-                ))
-            })
-            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-        first.edit_many(edits)?;
-    }
+    let first = Database::open(&paths.first, scope, ReplicaId::new())?;
+    seed_documents(&first, &documents)?;
     first.delete(
         tombstoned,
         OperationId::new(),
         OperationDigest::new([0x7a; 32]),
     )?;
     let seeded_target = u64::try_from(total.saturating_add(1))?;
-    for _round in 0..8 {
-        first
-            .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-            .await?;
-        if read_frontier(&prune_store, scope).await? == seeded_target {
-            break;
-        }
+    sync_until_frontier(
+        &first,
+        peer,
+        &mut transport,
+        &prune_store,
+        scope,
+        seeded_target,
+    )
+    .await?;
+    seal_consume_and_prune(&prune_store, scope, seeded_target).await?;
+
+    now.store(61_001, Ordering::SeqCst);
+    let identity = (scope, peer, expired_id);
+    let expired =
+        recover_expired(expired, &paths, identity, old_checkpoint, &mut transport).await?;
+    let second = Database::open(&paths.second, scope, ReplicaId::new())?;
+    let report = second
+        .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+        .await?;
+    if !report.recovered {
+        return Err(io::Error::other(
+            "fresh replica did not require recovery (no baseline installed)",
+        )
+        .into());
     }
-    let seeded = read_frontier(&prune_store, scope).await?;
-    if seeded != seeded_target {
+    verify_replicas_agree(&second, &expired, &documents, tombstoned)?;
+    verify_range_walk(&mut transport, scope, total).await?;
+
+    let floor = read_floor(&prune_store, scope).await?;
+    let frontier = read_frontier(&prune_store, scope).await?;
+    if frontier != seeded_target || floor != seeded_target {
         return Err(io::Error::other(format!(
-            "first replica did not seed every document (frontier={seeded} target={seeded_target})"
+            "prune did not retain the sealed baseline (frontier={frontier} floor={floor})"
         ))
         .into());
     }
 
-    seal_consume_and_prune(&prune_store, scope, seeded_target).await?;
+    drop((first, second, expired));
+    server.abort_all();
+    while server.join_next().await.is_some() {}
+    drop(prune_store);
+    drop(network);
+    paths.remove()?;
+    Ok(())
+}
 
-    // Expire a real server-issued checkpoint without sleeping or changing the
-    // production codec. This client last pulled before the pruned log existed.
-    now.store(61_001, Ordering::SeqCst);
+/// Expires a real server-issued checkpoint (the clock moved past its idle
+/// timeout; nothing sleeps) and proves the replica recovers from the baseline,
+/// persists a fresh checkpoint, and is served changes with it again.
+async fn recover_expired(
+    expired: Database,
+    paths: &Paths,
+    (scope, peer, expired_id): (Scope, PeerId, ReplicaId),
+    old_checkpoint: Vec<u8>,
+    transport: &mut HttpTransport<StaticBearer>,
+) -> Result<Database, Box<dyn Error>> {
     let pull = PullRequest::new(
-        logical_db_protocol::PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
         scope,
         expired_id,
         OperationDigest::new([0x6e; 32]),
@@ -183,7 +200,7 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         "an expired checkpoint pull must demand a baseline"
     );
     let recovered = expired
-        .synchronize(peer, &mut transport, SyncLimits::default(), || false)
+        .synchronize(peer, transport, SyncLimits::default(), || false)
         .await?;
     assert!(
         recovered.recovered,
@@ -197,40 +214,36 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         "a recovery must publish a fresh checkpoint id"
     );
     drop(expired);
-    let expired = Database::open(&expired_path, scope, expired_id)?;
+    let expired = Database::open(&paths.expired, scope, expired_id)?;
     assert_eq!(
         expired.checkpoint(peer)?,
         Some(replacement.clone()),
         "the reopened store must serve the recovered checkpoint"
     );
+    let resumed = PullRequest::new(
+        pull.protocol,
+        pull.scope,
+        pull.replica,
+        pull.request,
+        Some(Checkpoint::from_wire(replacement)?),
+        pull.max_changes,
+        pull.max_bytes,
+    );
     assert!(
-        matches!(
-            transport
-                .pull(PullRequest::new(
-                    pull.protocol,
-                    pull.scope,
-                    pull.replica,
-                    pull.request,
-                    Some(Checkpoint::from_wire(replacement)?),
-                    pull.max_changes,
-                    pull.max_bytes,
-                ))
-                .await?,
-            PullResult::Page(_)
-        ),
+        matches!(transport.pull(resumed).await?, PullResult::Page(_)),
         "the replacement checkpoint must serve changes again"
     );
+    Ok(expired)
+}
 
-    let second = Database::open(&second_path, scope, ReplicaId::new())?;
-    let report = second
-        .synchronize(peer, &mut transport, SyncLimits::default(), || false)
-        .await?;
-    if !report.recovered {
-        return Err(io::Error::other(
-            "fresh replica did not require recovery (no baseline installed)",
-        )
-        .into());
-    }
+/// The fresh and the expired replica hold the same seeded state and both keep
+/// the boundary tombstone.
+fn verify_replicas_agree(
+    second: &Database,
+    expired: &Database,
+    documents: &[DocumentId],
+    tombstoned: DocumentId,
+) -> Result<(), Box<dyn Error>> {
     if !second.is_deleted(tombstoned)? {
         return Err(io::Error::other("recovered replica lost a boundary tombstone").into());
     }
@@ -251,29 +264,30 @@ async fn journey() -> Result<(), Box<dyn Error>> {
                     io::Error::other("recovered replica resurrected a boundary tombstone").into(),
                 );
             }
-        } else {
-            let expected = i64::try_from(
-                index
-                    .checked_rem(1_000)
-                    .ok_or("observation modulus must be non-zero")?,
-            )?;
-            if observed != Some(Some(Item::Scalar(Scalar::Integer(expected)))) {
-                return Err(io::Error::other(format!(
-                    "recovered replica lost a seeded value at index={index} observed={observed:?}"
-                ))
-                .into());
-            }
+        } else if observed != Some(Some(Item::Scalar(Scalar::Integer(seeded_value(index)?)))) {
+            return Err(io::Error::other(format!(
+                "recovered replica lost a seeded value at index={index} observed={observed:?}"
+            ))
+            .into());
         }
     }
-    // Range-reader boundary: page the public route by cursor and prove the FDB
-    // continuation splits at the page limit, advances, and loses or duplicates
-    // no document.
-    let mut seen = std::collections::HashSet::new();
+    Ok(())
+}
+
+/// Range-reader boundary: pages the public route by cursor and proves the FDB
+/// continuation splits at the page limit, advances, and loses or duplicates no
+/// document.
+async fn verify_range_walk(
+    transport: &mut HttpTransport<StaticBearer>,
+    scope: Scope,
+    total: usize,
+) -> Result<(), Box<dyn Error>> {
+    let mut seen = HashSet::new();
     let mut cursor: Option<DocumentId> = None;
-    let mut pages = 0usize;
+    let mut pages = 0_usize;
     loop {
         let request = BaselineRequest::new(
-            logical_db_protocol::PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
             scope,
             ReplicaId::new(),
             OperationDigest::new([0x11; 32]),
@@ -284,24 +298,24 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             return Err(io::Error::other("range walk lost the sealed baseline").into());
         };
         page.validate_page(scope)?;
-        if page.documents.len() > MAX_BASELINE_PAGE_DOCUMENTS {
+        if page.documents().len() > MAX_BASELINE_PAGE_DOCUMENTS {
             return Err(io::Error::other(format!(
                 "a page exceeded the document limit (len={})",
-                page.documents.len()
+                page.documents().len()
             ))
             .into());
         }
         pages = pages.saturating_add(1);
-        for document in &page.documents {
+        for document in page.documents() {
             assert!(
-                seen.insert(document.document),
+                seen.insert(document.document()),
                 "baseline repeated a document"
             );
         }
-        let Some(next) = page.next_document else {
+        let Some(next) = page.next_document() else {
             break;
         };
-        if !page.more {
+        if !page.more() {
             return Err(io::Error::other("a final page carried a continuation cursor").into());
         }
         if cursor.is_some_and(|previous| next <= previous) {
@@ -322,23 +336,5 @@ async fn journey() -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
-
-    let floor = read_floor(&prune_store, scope).await?;
-    let frontier = read_frontier(&prune_store, scope).await?;
-    if frontier != seeded_target || floor != seeded_target {
-        return Err(io::Error::other(format!(
-            "prune did not retain the sealed baseline (frontier={frontier} floor={floor})"
-        ))
-        .into());
-    }
-
-    drop((first, second, expired));
-    server.abort_all();
-    drop(server.join_next().await);
-    drop(prune_store);
-    drop(network);
-    fs::remove_file(&first_path)?;
-    fs::remove_file(&second_path)?;
-    fs::remove_file(&expired_path)?;
     Ok(())
 }

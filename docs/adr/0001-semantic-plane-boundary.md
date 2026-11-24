@@ -5,7 +5,14 @@
 > S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Source URLs are in
 > `evidence/SOURCES.md`.
 
-- **Status:** accepted for the Logical-DB development workspace
+## Status
+
+Superseded 2026-11-24 (#135): `logical-db-cairn`, `logical-db-episode` and
+the `semantics` feature were deleted with no caller; the needs moved to #143
+and #145. Kept as the historical record.
+
+## Context
+
 - **Date:** 2026-09-12
 - **Scope:** `logical-db-cairn`, `logical-db-episode`, the `logical-db`
   `semantics` feature, the E2E harness, and their documentation

@@ -9,15 +9,15 @@
 
 /// Hybrid queries, durable snapshots, and tenant isolation agree end to end.
 #[test]
-fn projection_views_agree_across_live_and_snapshot_paths() -> Result<(), Box<dyn std::error::Error>>
-{
+fn projection_views_agree_across_live_and_snapshot_paths()
+-> Result<(), logical_db_e2e::views::ViewsError> {
     logical_db_e2e::views::projection_views_agree_across_live_and_snapshot_paths()
 }
 
 /// Sealed envelopes survive a backend round-trip and restore plus tail replay
 /// converges across engines; any refusal falls back to genesis with a reason.
 #[test]
-fn snapshot_envelope_round_trip_restores_across_engines() -> Result<(), Box<dyn std::error::Error>>
-{
+fn snapshot_envelope_round_trip_restores_across_engines()
+-> Result<(), logical_db_e2e::views::ViewsError> {
     logical_db_e2e::views::snapshot_envelope_round_trip_restores_across_engines()
 }

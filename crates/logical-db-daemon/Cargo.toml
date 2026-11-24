@@ -15,36 +15,149 @@ name = "logical-db-daemon"
 path = "src/main.rs"
 required-features = ["fdb"]
 
-[[bin]]
-name = "fdb-ambiguity-journey"
-path = "src/ambiguity.rs"
-required-features = ["fdb"]
-
 [features]
 default = []
-fdb = ["dep:foundationdb", "dep:foundationdb-tuple", "dep:logical-db-store-fdb"]
+fdb = [
+  "dep:axum",
+  "dep:foundationdb",
+  "dep:foundationdb-tuple",
+  "dep:lgwks_bot",
+  "dep:lgwks_std",
+  "dep:logical-db-model",
+  "dep:logical-db-server",
+  "dep:logical-db-service",
+  "dep:logical-db-store-fdb",
+]
 
 [dependencies]
-axum.workspace = true
-ciborium.workspace = true
+axum = { workspace = true, optional = true }
 foundationdb = { workspace = true, optional = true }
 foundationdb-tuple = { workspace = true, optional = true }
-logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model", optional = true }
+logical-db-server = { version = "0.1.0", path = "../logical-db-server", optional = true }
+logical-db-service = { version = "0.1.0", path = "../logical-db-service", optional = true }
+lgwks_bot = { workspace = true, optional = true }
+lgwks_std = { workspace = true, optional = true }
+logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", features = ["fdb"], optional = true }
+
+[dev-dependencies]
+ciborium.workspace = true
 logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
-logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
-logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
-lgwks_bot.workspace = true
-lgwks_std.workspace = true
-logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", features = ["fdb"], optional = true }
-reqwest.workspace = true
-uuid.workspace = true
 
-# Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
-# network-boot FFI call, so it is one of the two crates that do not carry a
-# root `#![forbid(unsafe_code)]`; it relies on the workspace `unsafe_code =
-# "deny"` plus a scoped, documented attribute at the boot site. Cargo forbids
-# combining this inherit line with a member-local override, so the exception
-# lives here as an attribute, not as a duplicated lint table.
-[lints]
-workspace = true
+# The workspace lint table, copied whole: identical but for `unsafe_code`.
+# This crate owns the one FoundationDB client-network boot, an `unsafe fn` in
+# foundationdb 0.11, isolated in `src/fdb_boot.rs` behind a safe fn (rust-guard
+# LINT_EXCEPTIONS register entry for this manifest). Cargo refuses an inherit
+# line plus a member override, so the table is copied rather than inherited.
+[lints.rust]
+improper_ctypes = "forbid"
+improper_ctypes_definitions = "forbid"
+unsafe_code = "allow"
+unused_must_use = "forbid"
+elided_lifetimes_in_paths = "forbid"
+let_underscore_drop = "forbid"
+missing_debug_implementations = "forbid"
+missing_docs = "forbid"
+non_ascii_idents = "forbid"
+redundant_lifetimes = "forbid"
+trivial_casts = "forbid"
+trivial_numeric_casts = "forbid"
+unnameable_types = "forbid"
+unreachable_pub = "forbid"
+unused_lifetimes = "forbid"
+
+[lints.clippy]
+allow_attributes = "forbid"
+allow_attributes_without_reason = "forbid"
+arithmetic_side_effects = "forbid"
+as_conversions = "forbid"
+assigning_clones = "forbid"
+await_holding_lock = "forbid"
+await_holding_refcell_ref = "forbid"
+borrow_as_ptr = "forbid"
+cast_possible_truncation = "forbid"
+cast_precision_loss = "forbid"
+cast_sign_loss = "forbid"
+clone_on_ref_ptr = "forbid"
+dbg_macro = "forbid"
+empty_drop = "forbid"
+exhaustive_enums = "forbid"
+exhaustive_structs = "forbid"
+exit = "deny"
+expect_fun_call = "forbid"
+expect_used = "forbid"
+explicit_deref_methods = "forbid"
+fallible_impl_from = "forbid"
+filetype_is_file = "forbid"
+float_cmp = "forbid"
+fn_params_excessive_bools = "forbid"
+format_push_string = "forbid"
+get_unwrap = "forbid"
+host_endian_bytes = "forbid"
+implicit_clone = "forbid"
+indexing_slicing = "forbid"
+infinite_loop = "forbid"
+integer_division = "forbid"
+iter_over_hash_type = "forbid"
+large_futures = "forbid"
+large_include_file = "forbid"
+large_stack_arrays = "forbid"
+let_underscore_future = "forbid"
+let_underscore_must_use = "forbid"
+let_underscore_untyped = "forbid"
+lossy_float_literal = "forbid"
+manual_contains = "forbid"
+map_entry = "forbid"
+map_err_ignore = "forbid"
+match_wildcard_for_single_variants = "forbid"
+mem_forget = "forbid"
+mem_replace_with_default = "forbid"
+min_ident_chars = "forbid"
+missing_assert_message = "forbid"
+missing_docs_in_private_items = "forbid"
+missing_safety_doc = "forbid"
+mod_module_files = "forbid"
+modulo_arithmetic = "forbid"
+multiple_unsafe_ops_per_block = "forbid"
+must_use_candidate = "forbid"
+mutex_atomic = "forbid"
+mutex_integer = "forbid"
+needless_collect = "forbid"
+needless_lifetimes = "forbid"
+needless_pass_by_value = "forbid"
+needless_range_loop = "forbid"
+panic = "forbid"
+panicking_unwrap = "forbid"
+partial_pub_fields = "forbid"
+pattern_type_mismatch = "forbid"
+print_stderr = "deny"
+print_stdout = "deny"
+ptr_arg = "forbid"
+pub_underscore_fields = "forbid"
+rc_buffer = "forbid"
+rc_mutex = "forbid"
+redundant_clone = "forbid"
+ref_option_ref = "forbid"
+slow_vector_initialization = "forbid"
+str_to_string = "forbid"
+string_add = "forbid"
+string_slice = "forbid"
+todo = "forbid"
+too_many_lines = "forbid"
+transmute_ptr_to_ref = "forbid"
+try_err = "forbid"
+unchecked_time_subtraction = "forbid"
+undocumented_unsafe_blocks = "forbid"
+unimplemented = "forbid"
+unnecessary_wraps = "forbid"
+unreachable = "forbid"
+unused_async = "forbid"
+unused_io_amount = "forbid"
+unused_result_ok = "forbid"
+unwrap_in_result = "forbid"
+unwrap_or_default = "forbid"
+unwrap_used = "forbid"
+verbose_file_reads = "forbid"
+wildcard_dependencies = "forbid"
+wildcard_imports = "forbid"

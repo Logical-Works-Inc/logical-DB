@@ -5,5 +5,6 @@
 //! `evidence/SOURCES.md`.
 
 pub use logical_db_http::{
-    CredentialError, CredentialProvider, HttpError, HttpTransport, StaticBearer, Url,
+    Authorization, CredentialError, CredentialProvider, Endpoint, HttpError, HttpTransport,
+    StaticBearer,
 };

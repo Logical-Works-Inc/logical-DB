@@ -42,7 +42,7 @@ fn writer_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     hasher.update(&first);
     cleanup(&path)?;
     cleanup(&rebuild_path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Insertion order never leaks into the durable bytes.
@@ -91,7 +91,7 @@ fn order_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     hasher.update(&forward_bytes);
     cleanup(&forward_path)?;
     cleanup(&shuffled_path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// In-memory and byte-reader answers agree on every seeded query shape.
@@ -142,7 +142,7 @@ fn parity_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         }
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// A fault sweep across every seeded offset is refused, never misread.
@@ -168,7 +168,9 @@ fn fault_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
                     .map_err(|error| format!("sim fault offset overflow: {error}"))?
                     .checked_rem(faulty.len().max(1))
                     .ok_or("sim fault window empty")?;
-                faulty[at] ^= 0xFF;
+                *faulty
+                    .get_mut(at)
+                    .ok_or("sim fault offset outside the snapshot")? ^= 0xFF;
             }
             1 => {
                 let half = faulty
@@ -183,7 +185,7 @@ fn fault_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
                 }
             }
             3 => {
-                faulty.push(rng.bytes32()[0]);
+                faulty.extend(rng.bytes32().into_iter().take(1));
             }
             _ => {
                 let at = usize::try_from(rng.next_u64())
@@ -199,7 +201,7 @@ fn fault_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(&[u8::from(refused)]);
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Truncation at seeded lengths always fails closed.
@@ -234,7 +236,7 @@ fn truncation_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(&[u8::from(refused)]);
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Empty, single-row, and single-term indexes round-trip exactly.
@@ -269,7 +271,7 @@ fn edge_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     assert_eq!(hits.len(), 1, "the single term resolves");
     hasher.update(&single_bytes);
     cleanup(&single_path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// A large index keeps parity on sampled queries.
@@ -302,7 +304,7 @@ fn large_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(&found.to_le_bytes());
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Over-long vector seeds are refused on every index shape.
@@ -330,5 +332,5 @@ fn oversized_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(&extra_bytes.to_le_bytes());
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }

@@ -5,7 +5,7 @@
 //! `evidence/SOURCES.md`.
 
 use crate::codec::{
-    decode_migration, decode_revision, decode_uuid, encode_migration, schema_value,
+    decode_migration, decode_revision, decode_uuid_after, encode_migration, schema_value,
 };
 use crate::error::StoreError;
 use crate::indexes::{replace_indexes, validate_indexes};
@@ -209,7 +209,7 @@ impl EmbeddedStore {
                 break;
             };
             let document =
-                decode_uuid(&key.value()[range.prefix.len()..]).map(DocumentId::from_uuid)?;
+                decode_uuid_after(key.value(), range.prefix.len()).map(DocumentId::from_uuid)?;
             let revision = stored_revision(&table, scope, document)?;
             documents.push(MigrationDocument {
                 document,
@@ -281,7 +281,7 @@ impl EmbeddedStore {
                     let error = StoreError::CorruptInternalValue;
                     return Err(error);
                 }
-                decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)
+                decode_uuid_after(key.value(), row_prefix.len()).map(DocumentId::from_uuid)
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         if expected_documents.len() != documents.len()
@@ -340,8 +340,10 @@ impl EmbeddedStore {
             start.extend_from_slice(document.as_uuid().as_bytes());
             start.push(0);
         }
-        let mut remaining_entries = table.range(start.as_slice()..end.as_slice())?;
-        let has_remaining = remaining_entries.next().transpose()?.is_some();
+        let has_remaining = {
+            let mut remaining_entries = table.range(start.as_slice()..end.as_slice())?;
+            remaining_entries.next().transpose()?.is_some()
+        };
         if has_remaining {
             let error = StoreError::MigrationIncomplete;
             return Err(error);

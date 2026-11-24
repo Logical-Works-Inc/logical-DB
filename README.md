@@ -5,10 +5,9 @@
 > S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
 > `evidence/SOURCES.md`.
 
-Logical-DB is one product with four independently developed domains: the
-sovereign Cloud Plane, Cairn ontology/evidence, LEM/ORIGIN agent memory, and
-Forge operations. They share versioned contracts rather than ambient mutable
-authority. The current public facade is an embedded structured-state API: each
+Logical-DB is a local-first structured-data substrate: one typed model across
+an embeddable replica and a multi-tenant synchronization service. Applications
+own presentation, workflows, and semantic schemas. The current public facade is an embedded structured-state API: each
 app owns an immediately durable replica and may exchange immutable causal
 changes through an optional FoundationDB-backed relay.
 
@@ -85,7 +84,7 @@ let notes = database.query_index(kind, &IndexValue::Text("note".into()), None, 1
 # Ok::<(), logical_db::DatabaseError>(())
 ```
 
-Opening, schema migration, the `http` and `semantics` features, deployment
+Opening, schema migration, the `http` feature, deployment
 shapes, the wire boundary, and delivery status are in
 [docs/EMBEDDING.md](docs/EMBEDDING.md).
 

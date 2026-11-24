@@ -5,8 +5,13 @@
 > S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
 > `evidence/SOURCES.md`.
 
-- **Status:** authorized; migration in progress — not canonical until the
-  ADR-0001 migration proof lands
+## Status
+
+Superseded 2026-11-24 (#135): the in-workspace Cairn and LEM ports were
+deleted with no caller; the needs moved to #143 and #145.
+
+## Context
+
 - **Date:** 2026-09-16
 - **Authority:** Director authorization recorded 2026-09-16 ("properly
   bring in the code from Cairn and Logical-Event-Memory repos") and the

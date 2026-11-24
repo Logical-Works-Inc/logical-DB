@@ -9,7 +9,7 @@
 //! state bytes, timestamps, and fault selection; the same seed always hashes
 //! the same trace.
 
-use logical_db_store::snapshot_envelope::{SnapshotEnvelope, SnapshotEnvelopeError, SnapshotStore};
+use logical_db_store::snapshot_envelope::{SnapshotEnvelope, SnapshotStore};
 
 #[path = "sim_harness.rs"]
 mod harness;
@@ -59,75 +59,18 @@ fn round_trip_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         envelope.verify()?;
         assert_eq!(
             envelope.compute_hash()?,
-            envelope.hash,
+            envelope.hash(),
             "seal must embed the recomputed hash"
         );
-        hasher.update(&envelope.hash);
+        hasher.update(&envelope.hash());
         hasher.update(&envelope.compute_hash()?);
     }
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
-/// Mutating any sealed field breaks verification.
-#[test]
-fn sim_every_field_tamper_breaks_seal() -> Result<(), Box<dyn std::error::Error>> {
-    check([0x41BB_0001_u64, 0x41BB_0002_u64], tamper_trace)
-}
-
-/// Trace for [`sim_every_field_tamper_breaks_seal`].
-fn tamper_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let (mut rng, mut hasher) = opened(seed, TRACE_DOMAIN, b"tamper");
-    for _ in 0..6 {
-        let base = seal_frontier(&mut rng, 64)?;
-        let field = rng
-            .below(9)
-            .map_err(|error| format!("sim field overflow: {error}"))?;
-        let mut forged = base;
-        match field {
-            0 => forged.account = harness::fresh_account(&mut rng)?,
-            1 => forged.space = harness::fresh_space(&mut rng)?,
-            2 => forged.projection = harness::fresh_projection(&mut rng)?,
-            3 => forged.semantics[0] ^= 0xFF,
-            4 => forged.checkpoint[0] ^= 0xFF,
-            5 => forged.last_row[0] ^= 0xFF,
-            6 => forged.last_seq ^= 0xFFFF,
-            7 => forged.created_at_secs = forged.created_at_secs.wrapping_add(1),
-            _ => forged.hash[0] ^= 0xFF,
-        }
-        let error = forged.verify();
-        assert!(
-            matches!(error, Err(SnapshotEnvelopeError::Tampered { .. })),
-            "tampered field {field} must fail verification, got {error:?}"
-        );
-        hasher.update(&field.to_le_bytes());
-    }
-    Ok(trace_tag(hasher))
-}
-
-/// A future schema version is refused by the version gate.
-#[test]
-fn sim_future_version_refused() -> Result<(), Box<dyn std::error::Error>> {
-    check([0x41CC_0001_u64, 0x41CC_0002_u64], version_trace)
-}
-
-/// Trace for [`sim_future_version_refused`].
-fn version_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let (mut rng, mut hasher) = opened(seed, TRACE_DOMAIN, b"version");
-    let own = harness::fixture(&mut rng, "envelope-version")?;
-    for _ in 0..4 {
-        let mut envelope = seal_frontier(&mut rng, 16)?;
-        envelope.schema_version = 999;
-        envelope.hash = envelope.compute_hash()?;
-        let error = own.store.save_snapshot(&envelope);
-        assert!(
-            matches!(error, Err(SnapshotEnvelopeError::VersionMismatch { .. })),
-            "a future version must be refused at save, got {error:?}"
-        );
-        hasher.update(&envelope.schema_version.to_le_bytes());
-    }
-    harness::cleanup(&own.path)?;
-    Ok(trace_tag(hasher))
-}
+// The field-tamper, future-version, and unsealed-mutation sims forge envelopes
+// by writing sealed fields, which only the crate itself may do; they live in
+// `src/tests/envelope.rs` beside the private fields they mutate.
 
 /// Storage round-trips preserve the envelope and bind the key hash.
 #[test]
@@ -154,34 +97,10 @@ fn storage_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             .ok_or("saved snapshot should load")?;
         assert_eq!(restored, envelope, "storage round-trip preserves bytes");
         restored.verify()?;
-        hasher.update(&restored.hash);
+        hasher.update(&restored.hash());
     }
     harness::cleanup(&own.path)?;
-    Ok(trace_tag(hasher))
-}
-
-/// A mutated-after-seal envelope never serializes for storage.
-#[test]
-fn sim_unsealed_mutation_never_persists() -> Result<(), Box<dyn std::error::Error>> {
-    check([0x41EE_0001_u64, 0x41EE_0002_u64], unsealed_trace)
-}
-
-/// Trace for [`sim_unsealed_mutation_never_persists`].
-fn unsealed_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let (mut rng, mut hasher) = opened(seed, TRACE_DOMAIN, b"unsealed");
-    let own = harness::fixture(&mut rng, "envelope-unsealed")?;
-    for _ in 0..4 {
-        let mut envelope = seal_frontier(&mut rng, 32)?;
-        envelope.hash[0] ^= 0xFF;
-        let error = own.store.save_snapshot(&envelope);
-        assert!(
-            error.is_err(),
-            "a mutated-after-seal envelope must never persist, got {error:?}"
-        );
-        hasher.update(&[u8::from(error.is_err())]);
-    }
-    harness::cleanup(&own.path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Timestamps and sequences ride the seal without breaking determinism.
@@ -213,10 +132,10 @@ fn frontier_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         harness::TIME_BASE.wrapping_add(60),
     )?
     .1;
-    assert_ne!(first.hash, second.hash, "frontiers must separate seals");
+    assert_ne!(first.hash(), second.hash(), "frontiers must separate seals");
     first.verify()?;
     second.verify()?;
-    hasher.update(&first.hash);
-    hasher.update(&second.hash);
-    Ok(trace_tag(hasher))
+    hasher.update(&first.hash());
+    hasher.update(&second.hash());
+    Ok(trace_tag(&hasher))
 }

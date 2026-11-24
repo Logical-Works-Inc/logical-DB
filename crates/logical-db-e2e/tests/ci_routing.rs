@@ -81,10 +81,8 @@ fn indent(line: &str) -> usize {
         .saturating_sub(line.trim_start_matches(' ').len())
 }
 
-/// The jobs one workflow routes, refusing anything not literally hosted.
-///
-/// Returns the published job names (`name:` or the job key).
-fn verify(text: &str) -> Result<Vec<String>, String> {
+/// The jobs one workflow declares, refusing structure that could hide a route.
+fn parse_jobs(text: &str) -> Result<Vec<Job>, String> {
     if text.contains('\t') {
         return Err(String::from("tabs make YAML indentation ambiguous"));
     }
@@ -178,6 +176,14 @@ fn verify(text: &str) -> Result<Vec<String>, String> {
             _ => {}
         }
     }
+    Ok(jobs)
+}
+
+/// The jobs one workflow routes, refusing anything not literally hosted.
+///
+/// Returns the published job names (`name:` or the job key).
+fn verify(text: &str) -> Result<Vec<String>, String> {
+    let jobs = parse_jobs(text)?;
     if jobs.is_empty() {
         return Err(String::from("workflow must declare jobs"));
     }

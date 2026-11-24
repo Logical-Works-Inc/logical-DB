@@ -91,13 +91,18 @@ fn a_pre_migration_push_request_round_trips_byte_for_byte() -> Result<(), Box<dy
     ))?;
     let decoded: PushRequest = ciborium::from_reader(wire.as_slice())?;
     assert_eq!(
-        decoded.protocol, PROTOCOL_VERSION,
+        decoded.protocol(),
+        PROTOCOL_VERSION,
         "the protocol version must decode unchanged"
     );
-    assert_eq!(decoded.changes.len(), 1, "one change must decode");
+    assert_eq!(decoded.changes().len(), 1, "one change must decode");
+    let change = decoded
+        .changes()
+        .first()
+        .ok_or("the decoded push must carry its change")?;
     assert_eq!(
-        decoded.changes[0].bytes,
-        vec![1, 2, 3],
+        change.bytes(),
+        [1, 2, 3],
         "the change bytes must decode unchanged"
     );
     assert_eq!(decoded.validate(), Ok(()), "the decoded push must validate");

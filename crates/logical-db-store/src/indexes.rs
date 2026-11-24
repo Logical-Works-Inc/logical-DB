@@ -4,7 +4,7 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 
-use crate::codec::decode_uuid;
+use crate::codec::decode_uuid_after;
 use crate::error::StoreError;
 use crate::keys::{
     MAX_INDEX_VALUE_BYTES, MAX_INDEXES_PER_DOCUMENT, index_reverse_prefix, is_at_most,
@@ -51,7 +51,8 @@ pub(crate) fn replace_indexes(
             let error = StoreError::CorruptInternalValue;
             return Err(error);
         }
-        let index = decode_uuid(&reverse_key[reverse_prefix.len()..]).map(IndexId::from_uuid)?;
+        let index =
+            decode_uuid_after(&reverse_key, reverse_prefix.len()).map(IndexId::from_uuid)?;
         table.remove(key_index_row(scope, index, &encoded_value, document).as_slice())?;
         table.remove(reverse_key.as_slice())?;
     }

@@ -137,6 +137,38 @@ pub fn kv_cache_journey(dir: &Path) -> Result<Vec<&'static str>, KvJourneyError>
     ensure(writer.get("draft")?.is_none(), "expired entry reads absent")?;
     receipt.push("put, get and expiry-aware read: pass");
 
+    batch_and_scan(&writer, &mut receipt)?;
+
+    let size = TIER_THRESHOLD_BYTES
+        .checked_add(MAX_BLOB_CHUNK_BYTES)
+        .ok_or(KvJourneyError::Diverged("tiered size overflows"))?;
+    let avatar = vec![0x5A_u8; size];
+    writer.put("avatar", &avatar, None)?;
+    ensure(
+        writer.evict_expired(10)? == 1,
+        "eviction reclaims the expired draft",
+    )?;
+    ensure(writer.delete("profile")?, "delete removes a live key")?;
+    ensure(writer.get("profile")?.is_none(), "deleted key reads absent")?;
+    receipt.push("tiered put, eviction and delete: pass");
+
+    let reader = KvCache::open(dir.join("reader.redb"), scope, ReplicaId::new(), NAMESPACE)?;
+    sync_to_reader(&writer, &reader, &mut receipt)?;
+    transfer_blob(&writer, &reader, &avatar, &mut receipt)?;
+
+    ensure(writer.delete("avatar")?, "delete the tiered key")?;
+    ensure(
+        writer.sweep_blobs()? == 1,
+        "sweep reclaims the unreferenced blob",
+    )?;
+    receipt.push("blob sweep after delete: pass");
+
+    migrate_existing_replica(dir, scope, &mut receipt)?;
+    Ok(receipt)
+}
+
+/// Writes a batch, retries it exactly, and scans the prefix in key order.
+fn batch_and_scan(writer: &KvCache, receipt: &mut Vec<&'static str>) -> Result<(), KvJourneyError> {
     writer.put_many(&[
         BatchPut::new("k1", b"one".to_vec(), None),
         BatchPut::new("k2", b"two".to_vec(), None),
@@ -158,26 +190,23 @@ pub fn kv_cache_journey(dir: &Path) -> Result<Vec<&'static str>, KvJourneyError>
         "scan carries values",
     )?;
     receipt.push("atomic batch, idempotent retry and prefix scan: pass");
+    Ok(())
+}
 
-    let size = TIER_THRESHOLD_BYTES
-        .checked_add(MAX_BLOB_CHUNK_BYTES)
-        .ok_or(KvJourneyError::Diverged("tiered size overflows"))?;
-    let avatar = vec![0x5A_u8; size];
-    writer.put("avatar", &avatar, None)?;
-    ensure(
-        writer.evict_expired(10)? == 1,
-        "eviction reclaims the expired draft",
-    )?;
-    ensure(writer.delete("profile")?, "delete removes a live key")?;
-    ensure(writer.get("profile")?.is_none(), "deleted key reads absent")?;
-    receipt.push("tiered put, eviction and delete: pass");
-
-    let reader = KvCache::open(dir.join("reader.redb"), scope, ReplicaId::new(), NAMESPACE)?;
+/// Installs the writer's pending page on a cold reader with its namespace
+/// cursor, then checks the cursor, newest-first order and slot classification.
+fn sync_to_reader(
+    writer: &KvCache,
+    reader: &KvCache,
+    receipt: &mut Vec<&'static str>,
+) -> Result<(), KvJourneyError> {
     let peer = PeerId::new();
     let pending = writer.database().pending_changes(0, PAGE)?;
     let page: Vec<RemoteChange> = pending
         .iter()
-        .map(|change| RemoteChange::new(change.document, change.digest, change.bytes().to_vec()))
+        .map(|change| {
+            RemoteChange::new(change.document(), change.digest(), change.bytes().to_vec())
+        })
         .collect();
     let mut checkpoints = NamespaceCheckpoints::new();
     checkpoints.insert(NAMESPACE, NamespaceCheckpoint::new(vec![1], 1_000)?)?;
@@ -201,7 +230,7 @@ pub fn kv_cache_journey(dir: &Path) -> Result<Vec<&'static str>, KvJourneyError>
     )?;
     let classified = pending
         .iter()
-        .map(|change| reader.document_namespace(change.document))
+        .map(|change| reader.document_namespace(change.document()))
         .collect::<Result<Vec<_>, _>>()?;
     ensure(
         classified
@@ -211,7 +240,16 @@ pub fn kv_cache_journey(dir: &Path) -> Result<Vec<&'static str>, KvJourneyError>
         "every synced slot classifies into its namespace",
     )?;
     receipt.push("sync, namespace cursor and newest-first catch-up: pass");
+    Ok(())
+}
 
+/// Pulls the tiered blob to the reader in bounded chunks and reads it whole.
+fn transfer_blob(
+    writer: &KvCache,
+    reader: &KvCache,
+    avatar: &[u8],
+    receipt: &mut Vec<&'static str>,
+) -> Result<(), KvJourneyError> {
     let reference = reader
         .blob_reference("avatar")?
         .ok_or(KvJourneyError::Diverged(
@@ -230,18 +268,19 @@ pub fn kv_cache_journey(dir: &Path) -> Result<Vec<&'static str>, KvJourneyError>
         offset = offset.saturating_add(u64::try_from(chunk.len())?);
     }
     ensure(
-        reader.get("avatar")?.as_deref() == Some(avatar.as_slice()),
+        reader.get("avatar")?.as_deref() == Some(avatar),
         "chunked blob reads whole",
     )?;
     receipt.push("bounded chunked blob transfer: pass");
+    Ok(())
+}
 
-    ensure(writer.delete("avatar")?, "delete the tiered key")?;
-    ensure(
-        writer.sweep_blobs()? == 1,
-        "sweep reclaims the unreferenced blob",
-    )?;
-    receipt.push("blob sweep after delete: pass");
-
+/// Migrates the schema of an existing empty replica and serves the cache from it.
+fn migrate_existing_replica(
+    dir: &Path,
+    scope: Scope,
+    receipt: &mut Vec<&'static str>,
+) -> Result<(), KvJourneyError> {
     let legacy = dir.join("legacy.redb");
     let replica = ReplicaId::new();
     drop(Database::open(&legacy, scope, replica)?);
@@ -253,5 +292,5 @@ pub fn kv_cache_journey(dir: &Path) -> Result<Vec<&'static str>, KvJourneyError>
         "migrated replica serves the cache",
     )?;
     receipt.push("schema migration onto an existing replica: pass");
-    Ok(receipt)
+    Ok(())
 }

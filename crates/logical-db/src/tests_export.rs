@@ -92,7 +92,7 @@ fn export_then_restore_reproduces_reads_indexes_and_cursors_exactly() -> Result<
     assert!(
         source_events
             .windows(2)
-            .all(|pair| pair[0].sequence() + 1 == pair[1].sequence())
+            .all(|pair| matches!(*pair, [ref earlier, ref later] if earlier.sequence() + 1 == later.sequence()))
     );
     let source_pending = source.pending_changes(0, 256)?;
     assert_eq!(source_pending.len(), 5);
@@ -112,9 +112,9 @@ fn export_then_restore_reproduces_reads_indexes_and_cursors_exactly() -> Result<
             resumed: false,
         }
     );
-    assert_eq!(read_kind(&target, first).as_deref(), Some("task"));
-    assert_eq!(read_kind(&target, third).as_deref(), Some("task"));
-    assert_eq!(read_kind(&target, second), None);
+    assert_eq!(read_kind(&target, first)?.as_deref(), Some("task"));
+    assert_eq!(read_kind(&target, third)?.as_deref(), Some("task"));
+    assert_eq!(read_kind(&target, second)?, None);
     assert!(target.is_deleted(second)?);
     assert!(!target.is_deleted(first)?);
     assert!(!target.is_deleted(third)?);
@@ -137,7 +137,7 @@ fn export_then_restore_reproduces_reads_indexes_and_cursors_exactly() -> Result<
     assert!(
         restored_pending
             .iter()
-            .all(|change| change.replica == target.replica())
+            .all(|change| change.replica() == target.replica())
     );
     assert_eq!(target.restore_cursor()?, None);
     drop(target);
@@ -210,8 +210,8 @@ fn interrupted_restore_resumes_to_completion_on_retry() -> Result<(), TestError>
             resumed: true,
         }
     );
-    assert_eq!(read_kind(&target, first).as_deref(), Some("task"));
-    assert_eq!(read_kind(&target, second).as_deref(), Some("note"));
+    assert_eq!(read_kind(&target, first)?.as_deref(), Some("task"));
+    assert_eq!(read_kind(&target, second)?.as_deref(), Some("note"));
     let restored_pending = target.pending_changes(0, 256)?;
     assert_eq!(
         pending_identity(&restored_pending),
@@ -220,7 +220,7 @@ fn interrupted_restore_resumes_to_completion_on_retry() -> Result<(), TestError>
     assert!(
         restored_pending
             .iter()
-            .all(|change| change.replica == target.replica())
+            .all(|change| change.replica() == target.replica())
     );
     assert_eq!(target.changes_since(0, 256)?, source_events);
     assert_eq!(target.restore_cursor()?, None);
@@ -292,21 +292,24 @@ fn export_replays_synchronized_changes_with_synthesized_bindings() -> Result<(),
     assert_eq!(report.entries, 4);
     assert_eq!(report.applied, 4);
     assert!(!report.resumed);
-    assert_eq!(read_kind(&target, remote_edited).as_deref(), Some("note"));
-    assert_eq!(read_kind(&target, local).as_deref(), Some("task"));
-    assert_eq!(read_kind(&target, remote_deleted), None);
+    assert_eq!(read_kind(&target, remote_edited)?.as_deref(), Some("note"));
+    assert_eq!(read_kind(&target, local)?.as_deref(), Some("task"));
+    assert_eq!(read_kind(&target, remote_deleted)?, None);
     assert!(target.is_deleted(remote_deleted)?);
     assert_eq!(target.changes_since(0, 256)?, source_events);
     let restored_pending = target.pending_changes(0, 256)?;
     assert_eq!(restored_pending.len(), 4);
+    let (first_restored, replayed) = restored_pending
+        .split_first()
+        .ok_or("four changes were restored")?;
     assert_eq!(
-        pending_identity(&restored_pending[..1]),
+        pending_identity(std::slice::from_ref(first_restored)),
         pending_identity(&source_local_pending)
     );
-    for change in &restored_pending[1..] {
-        let (operation, request) = restore_operation(change.document, change.digest)?;
-        assert_eq!(change.operation, operation);
-        assert_eq!(change.request, request);
+    for change in replayed {
+        let (operation, request) = restore_operation(change.document(), change.digest());
+        assert_eq!(change.operation(), operation);
+        assert_eq!(change.request(), request);
     }
     assert_eq!(target.restore_cursor()?, None);
     drop(target);
@@ -334,12 +337,13 @@ fn corrupt_backup_is_refused_with_live_state_untouched() -> Result<(), TestError
     let live_title = live.read(live_document, |reader| reader.get(&Object::root(), "title"))?;
 
     let (backup_scope, mut entries, documents) = decode_export(&payload)?;
-    let tampered = entries[0].clone();
-    entries[0] = ExportEntry::new(
-        tampered.document,
-        tampered.operation,
-        tampered.request,
-        tampered.digest,
+    let first_entry = entries.first_mut().ok_or("the export carries entries")?;
+    let tampered = first_entry.clone();
+    *first_entry = ExportEntry::new(
+        tampered.document(),
+        tampered.operation(),
+        tampered.request(),
+        tampered.change().0,
         vec![0xFF],
     );
     let digest_damaged = encode_export(backup_scope, &entries, &documents)?;
@@ -356,7 +360,7 @@ fn corrupt_backup_is_refused_with_live_state_untouched() -> Result<(), TestError
     ));
 
     let mut magic_damaged = payload;
-    magic_damaged[0] ^= 0xff;
+    *magic_damaged.first_mut().ok_or("the payload has a magic")? ^= 0xff;
     assert!(matches!(
         live.restore(&magic_damaged),
         Err(DatabaseError::Store(_))
@@ -395,7 +399,7 @@ fn oversized_and_unknown_version_payloads_refused_before_allocation() -> Result<
         Err(DatabaseError::Store(StoreError::InvalidExportSize(_)))
     ));
     let mut future = payload;
-    future[4] = 2;
+    *future.get_mut(4).ok_or("the payload has a version byte")? = 2;
     assert!(matches!(
         live.restore(&future),
         Err(DatabaseError::Store(StoreError::UnknownExportVersion(2)))
@@ -441,9 +445,14 @@ fn export_includes_tombstones_and_restored_state_stays_converged() -> Result<(),
     let (_, entries, documents) = decode_export(&payload)?;
     assert_eq!(entries.len(), 2);
     assert_eq!(documents.len(), 1);
-    assert_eq!(documents[0].document, document);
-    assert!(documents[0].tombstone);
-    assert!(entries.iter().any(|entry| entry.digest == receipt.digest));
+    let exported = documents.first().ok_or("one document was exported")?;
+    assert_eq!(exported.document(), document);
+    assert!(exported.is_tombstone());
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.change().0 == receipt.digest)
+    );
     drop(source);
 
     let target = Database::open(&target_path, scope, ReplicaId::new())?;
@@ -461,8 +470,10 @@ fn export_includes_tombstones_and_restored_state_stays_converged() -> Result<(),
         .ok_or("expected conflicts")?;
     assert_eq!(candidates.len(), 1);
     assert_eq!(
-        candidates[0].value,
-        Item::Scalar(Scalar::String("v1".into()))
+        candidates
+            .first()
+            .map(logical_db_crdt::ConflictValue::value),
+        Some(&Item::Scalar(Scalar::String("v1".into())))
     );
 
     let converged = Database::open(&converge_path, scope, ReplicaId::new())?;

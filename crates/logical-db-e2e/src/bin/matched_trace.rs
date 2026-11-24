@@ -35,22 +35,73 @@
 //! performance documentation benchmarks, and it keeps the two arms comparable.
 
 #![forbid(unsafe_code)]
-#![expect(
-    clippy::print_stderr,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
-#![expect(
-    clippy::print_stdout,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
 
-use std::{error::Error, fs, io, path::PathBuf, time::Instant};
+use std::{
+    fmt, fs,
+    io::{self, Write as _},
+    num::TryFromIntError,
+    path::PathBuf,
+    time::Instant,
+};
 
 use logical_db::{
-    AccountId, BackendClass, Capability, CapabilityProfile, Database, DeleteOutcome, DocumentId,
-    EditOutcome, IndexId, IndexValue, Item, Object, OperationDigest, OperationId, Projection,
-    ProjectionSemantics, ReplicaId, Scalar, Scope, SpaceId, content_digest,
+    AccountId, Database, DatabaseError, DeleteOutcome, DocumentId, EditOutcome, IndexId,
+    IndexValue, Item, Object, OperationDigest, OperationId, Projection, ProjectionSemantics,
+    ReplicaId, Scalar, Scope, SpaceId, content_digest,
 };
+
+/// Every failure the harness reports, typed by the layer that broke.
+#[derive(Debug)]
+enum TraceError {
+    /// Argument parsing, the report file, or the replica file failed.
+    Io(io::Error),
+    /// The embedded replica refused an operation.
+    Database(DatabaseError),
+    /// A count or duration did not fit its integer width.
+    Width(TryFromIntError),
+    /// The replica answered, but not with what the trace requires.
+    Expectation(&'static str),
+}
+
+impl fmt::Display for TraceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Io(ref error) => write!(formatter, "trace i/o failed: {error}"),
+            Self::Database(ref error) => write!(formatter, "trace replica failed: {error}"),
+            Self::Width(ref error) => write!(formatter, "trace count out of range: {error}"),
+            Self::Expectation(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for TraceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match *self {
+            Self::Io(ref error) => Some(error),
+            Self::Database(ref error) => Some(error),
+            Self::Width(ref error) => Some(error),
+            Self::Expectation(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for TraceError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<DatabaseError> for TraceError {
+    fn from(error: DatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<TryFromIntError> for TraceError {
+    fn from(error: TryFromIntError) -> Self {
+        Self::Width(error)
+    }
+}
 
 /// Default trace length: the one-million-operation trace named in the ruling.
 const DEFAULT_OPERATIONS: u64 = 1_000_000;
@@ -62,6 +113,8 @@ const DEFAULT_BATCH: u64 = 32;
 const DEFAULT_RUNS: u32 = 3;
 /// Facade atomic-batch ceiling, mirrored so the knob cannot exceed the contract.
 const MAX_BATCH: u64 = 256;
+/// Why CPU seconds and peak RSS are reported as `null` on both arms.
+const UNMEASURED_RESOURCES: &str = "std exposes no portable process-CPU or RSS API; adding a platform crate is a separate lgwks-deps decision";
 /// Index identity used by the trace's deterministic projection.
 const TRACE_INDEX_SEED: [u8; 16] = *b"ldb-trace-index1";
 
@@ -92,8 +145,7 @@ impl Config {
         let mut output = None;
 
         let mut index = 1;
-        while index < arguments.len() {
-            let flag = arguments[index].as_str();
+        while let Some(flag) = arguments.get(index).map(String::as_str) {
             let mut value = || -> Result<String, io::Error> {
                 index = index.saturating_add(1);
                 arguments.get(index).cloned().ok_or_else(|| {
@@ -109,8 +161,11 @@ impl Config {
                 "--documents" => documents = number(&value()?, flag)?,
                 "--batch" => batch = number(&value()?, flag)?,
                 "--runs" => {
-                    runs = u32::try_from(number(&value()?, flag)?).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--runs is out of range")
+                    runs = u32::try_from(number(&value()?, flag)?).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("--runs is out of range: {error}"),
+                        )
                     })?;
                 }
                 "--out" => output = Some(PathBuf::from(value()?)),
@@ -166,6 +221,7 @@ fn number(text: &str, flag: &str) -> Result<u64, io::Error> {
 }
 
 /// Metrics from one complete trace run on one fresh replica.
+#[derive(Default)]
 struct RunMetrics {
     /// Microseconds from open to first durable commit.
     cold_start_micros: u64,
@@ -193,8 +249,9 @@ struct RunMetrics {
 struct TraceReport {
     /// Profile arm this report measures.
     profile: &'static str,
-    /// Backend class of the profile arm.
-    backend_class: BackendClass,
+    /// Backend class of the profile arm: `embedded-local` or
+    /// `distributed-transactional`.
+    backend_class: &'static str,
     /// Outcome class: `measured`, or an explicit unmeasured reason.
     status: &'static str,
     /// Total operations the trace committed.
@@ -205,26 +262,8 @@ struct TraceReport {
     operations_per_commit: u64,
     /// Measured repetitions folded into this report.
     runs: u32,
-    /// Microseconds from open to first durable commit.
-    cold_start_micros: u64,
-    /// Microseconds spent reopening and replaying after a simulated crash.
-    recovery_reopen_micros: u64,
-    /// Median durable-commit latency in microseconds.
-    p50_latency_micros: u64,
-    /// 99th-percentile durable-commit latency in microseconds.
-    p99_latency_micros: u64,
-    /// Completed operations per second.
-    throughput_ops_per_second: u64,
-    /// Durable bytes written during the measured run.
-    durable_bytes: u64,
-    /// Operations that reached a durable commit.
-    committed_operations: u64,
-    /// Duplicate retries the store recognized and absorbed.
-    duplicate_retries_honored: u64,
-    /// Index queries that returned exactly the expected document.
-    index_queries_matched: u64,
-    /// Tombstoned documents verified as absent on read.
-    tombstones_verified: u64,
+    /// The median run's metrics; all zero for an unmeasured arm.
+    metrics: RunMetrics,
     /// Process CPU seconds for the measured run, when the platform exposes them.
     cpu_seconds: Option<f64>,
     /// Peak resident set size in bytes, when the platform exposes it.
@@ -273,32 +312,32 @@ impl TraceReport {
                 "}}\n"
             ),
             self.profile,
-            self.backend_class.name(),
+            self.backend_class,
             self.status,
             self.operations,
             self.documents,
             self.operations_per_commit,
             self.runs,
-            self.cold_start_micros,
-            self.recovery_reopen_micros,
-            self.p50_latency_micros,
-            self.p99_latency_micros,
-            self.throughput_ops_per_second,
-            self.durable_bytes,
+            self.metrics.cold_start_micros,
+            self.metrics.recovery_reopen_micros,
+            self.metrics.p50_commit_micros,
+            self.metrics.p99_commit_micros,
+            self.metrics.throughput_ops_per_second,
+            self.metrics.durable_bytes,
             cpu,
             rss,
             self.unmeasured_reason,
-            self.committed_operations,
-            self.duplicate_retries_honored,
-            self.index_queries_matched,
-            self.tombstones_verified,
+            self.metrics.committed_operations,
+            self.metrics.duplicate_retries_honored,
+            self.metrics.index_queries_matched,
+            self.metrics.tombstones_verified,
             self.detail,
         )
     }
 }
 
 /// Parses the trace flags, runs the selected profile, and emits the report.
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), TraceError> {
     let arguments = std::env::args().collect::<Vec<_>>();
     let config = Config::parse(&arguments)?;
     let report = match config.profile.as_str() {
@@ -314,10 +353,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let json = report.to_json();
-    print!("{json}");
+    io::stdout().lock().write_all(json.as_bytes())?;
     if let Some(path) = config.output.as_ref() {
         fs::write(path, &json)?;
-        eprintln!("matched-trace: wrote {}", path.display());
+        let note = format!("matched-trace: wrote {}\n", path.display());
+        io::stderr().lock().write_all(note.as_bytes())?;
     }
     if report.status != "measured" {
         return Err(io::Error::other(format!(
@@ -341,22 +381,20 @@ fn trace_projection(index: IndexId) -> Projection {
 
 /// Deterministic index identity shared by every run of the trace.
 fn trace_index() -> IndexId {
-    IndexId::from_uuid(uuid::Uuid::from_bytes(TRACE_INDEX_SEED))
+    IndexId::from_uuid(lgwks_std::id::Uuid::from(TRACE_INDEX_SEED))
 }
 
-/// Nearest-rank percentile of an already-sorted slice.
-fn percentile(sorted: &[u64], percentile: u64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let len = u64::try_from(sorted.len()).unwrap_or(u64::MAX);
-    let rank = percentile.saturating_mul(len).div_ceil(100);
-    let bounded = rank.clamp(1, len);
-    sorted[usize::try_from(bounded.saturating_sub(1)).unwrap_or(0)]
+/// Nearest-rank percentile of an already-sorted slice; `None` when empty.
+fn percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
+    let rank = percentile
+        .saturating_mul(sorted.len())
+        .div_ceil(100)
+        .clamp(1, sorted.len().max(1));
+    sorted.get(rank.saturating_sub(1)).copied()
 }
 
 /// Runs the embedded profile `config.runs` times and folds the run metrics.
-fn run_embedded(config: &Config) -> Result<TraceReport, Box<dyn Error>> {
+fn run_embedded(config: &Config) -> Result<TraceReport, TraceError> {
     let mut runs = Vec::with_capacity(usize::try_from(config.runs)?);
     for _ in 0..config.runs {
         runs.push(one_embedded_run(config)?);
@@ -365,7 +403,12 @@ fn run_embedded(config: &Config) -> Result<TraceReport, Box<dyn Error>> {
     // the headline number, and every reported metric comes from one real run
     // rather than a mix of different runs.
     runs.sort_by_key(|metrics| metrics.throughput_ops_per_second);
-    let median = &runs[runs.len().checked_div(2).unwrap_or(0)];
+    let middle = runs
+        .len()
+        .checked_div(2)
+        .filter(|middle| *middle < runs.len())
+        .ok_or(TraceError::Expectation("at least one run is measured"))?;
+    let median = runs.swap_remove(middle);
 
     let detail = format!(
         "redb embedded replica; {} operations per durable commit; median of {} runs",
@@ -373,32 +416,68 @@ fn run_embedded(config: &Config) -> Result<TraceReport, Box<dyn Error>> {
     );
     Ok(TraceReport {
         profile: "embedded",
-        backend_class: BackendClass::EmbeddedLocal,
+        backend_class: "embedded-local",
         status: "measured",
         operations: config.operations,
         documents: config.documents,
         operations_per_commit: config.batch,
         runs: config.runs,
-        cold_start_micros: median.cold_start_micros,
-        recovery_reopen_micros: median.recovery_reopen_micros,
-        p50_latency_micros: median.p50_commit_micros,
-        p99_latency_micros: median.p99_commit_micros,
-        throughput_ops_per_second: median.throughput_ops_per_second,
-        durable_bytes: median.durable_bytes,
-        committed_operations: median.committed_operations,
-        duplicate_retries_honored: median.duplicate_retries_honored,
-        index_queries_matched: median.index_queries_matched,
-        tombstones_verified: median.tombstones_verified,
+        metrics: median,
         cpu_seconds: None,
         peak_rss_bytes: None,
-        unmeasured_reason: "std exposes no portable process-CPU or RSS API; adding a platform crate is a separate lgwks-deps decision",
+        unmeasured_reason: UNMEASURED_RESOURCES,
         detail,
     })
 }
 
+/// Builds the `size` edits of one batch starting at trace ordinal `serial`.
+///
+/// Document selection is round-robin over the fixed set, so a batch never
+/// repeats a document and the sequence is identical on every profile.
+fn trace_batch(
+    documents: &[DocumentId],
+    serial: u64,
+    size: u64,
+) -> Result<Vec<logical_db::BatchEdit>, TraceError> {
+    let count = u64::try_from(documents.len())?;
+    let mut edits = Vec::with_capacity(usize::try_from(size)?);
+    for step in 0..size {
+        let ordinal = serial.saturating_add(step);
+        let slot = ordinal
+            .checked_rem(count)
+            .ok_or(TraceError::Expectation("the document count is nonzero"))?;
+        let document = *documents
+            .get(usize::try_from(slot)?)
+            .ok_or(TraceError::Expectation(
+                "the slot is below the document count",
+            ))?;
+        let sequence = i64::try_from(ordinal)?;
+        let kind = if ordinal.is_multiple_of(4) {
+            "note"
+        } else {
+            "record"
+        };
+        let request = content_digest(
+            document,
+            "kind",
+            &Scalar::String(format!("{kind}-{ordinal}")),
+        );
+        edits.push(logical_db::BatchEdit::new(
+            document,
+            OperationId::new(),
+            request,
+            move |editor| {
+                editor.put(&Object::root(), "kind", Scalar::String(kind.into()))?;
+                editor.put(&Object::root(), "seq", Scalar::Integer(sequence))
+            },
+        ));
+    }
+    Ok(edits)
+}
+
 /// Runs the full trace once against a fresh replica and returns its metrics.
-fn one_embedded_run(config: &Config) -> Result<RunMetrics, Box<dyn Error>> {
-    let path = std::env::temp_dir().join(format!("logical-db-trace-{}.redb", uuid::Uuid::now_v7()));
+fn one_embedded_run(config: &Config) -> Result<RunMetrics, TraceError> {
+    let path = std::env::temp_dir().join(format!("logical-db-trace-{:?}.redb", OperationId::new()));
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let index = trace_index();
     let replica = ReplicaId::new();
@@ -407,64 +486,30 @@ fn one_embedded_run(config: &Config) -> Result<RunMetrics, Box<dyn Error>> {
     let started = Instant::now();
     let database =
         Database::open_with_schema(&path, scope, replica, 1, vec![trace_projection(index)])?;
-    let cold_start_micros = micros(started.elapsed());
+    let cold_start_micros = micros(started.elapsed())?;
 
     let documents = (0..config.documents)
         .map(|_| DocumentId::new())
         .collect::<Vec<_>>();
 
     let batch_count = config.operations.div_ceil(config.batch);
-    let mut commit_latencies =
-        Vec::with_capacity(usize::try_from(batch_count).unwrap_or(usize::MAX));
+    let mut commit_latencies = Vec::with_capacity(usize::try_from(batch_count)?);
     let mut committed = 0_u64;
     let mut serial = 0_u64;
 
-    // One batch commits one bounded atomic transaction. Document selection is
-    // round-robin over the fixed set, so a batch never repeats a document and
-    // the sequence is identical on every profile.
+    // One batch commits one bounded atomic transaction.
     while serial < config.operations {
         let size = config.batch.min(config.operations.saturating_sub(serial));
-        let mut edits = Vec::with_capacity(usize::try_from(size).unwrap_or(usize::MAX));
-        for step in 0..size {
-            let ordinal = serial.saturating_add(step);
-            let document = documents
-                [usize::try_from(ordinal.checked_rem(config.documents).unwrap_or(0)).unwrap_or(0)];
-            let kind = if ordinal.is_multiple_of(4) {
-                "note"
-            } else {
-                "record"
-            };
-            let request = content_digest(
-                document,
-                "kind",
-                &Scalar::String(format!("{kind}-{ordinal}")),
-            );
-            edits.push(logical_db::BatchEdit::new(
-                document,
-                OperationId::new(),
-                request,
-                move |editor| {
-                    editor.put(&Object::root(), "kind", Scalar::String(kind.into()))?;
-                    editor.put(
-                        &Object::root(),
-                        "seq",
-                        Scalar::Integer(i64::try_from(ordinal).unwrap_or(i64::MAX)),
-                    )
-                },
-            ));
-        }
+        let edits = trace_batch(&documents, serial, size)?;
         let commit_started = Instant::now();
         let outcomes = database.edit_many(edits)?;
-        commit_latencies.push(micros(commit_started.elapsed()));
-        committed = committed.saturating_add(
-            u64::try_from(
-                outcomes
-                    .iter()
-                    .filter(|outcome| matches!(outcome, EditOutcome::Applied(_)))
-                    .count(),
-            )
-            .unwrap_or(u64::MAX),
-        );
+        commit_latencies.push(micros(commit_started.elapsed())?);
+        committed = committed.saturating_add(u64::try_from(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(**outcome, EditOutcome::Applied(_)))
+                .count(),
+        )?);
         serial = serial.saturating_add(size);
     }
 
@@ -486,11 +531,10 @@ fn one_embedded_run(config: &Config) -> Result<RunMetrics, Box<dyn Error>> {
     let reopen_started = Instant::now();
     let reopened =
         Database::open_with_schema(&path, scope, replica, 1, vec![trace_projection(index)])?;
-    let recovery_reopen_micros = micros(reopen_started.elapsed());
-    assert!(
-        reopened.is_deleted(probe_document)?,
-        "tombstone must survive reopen"
-    );
+    let recovery_reopen_micros = micros(reopen_started.elapsed())?;
+    if !reopened.is_deleted(probe_document)? {
+        return Err(TraceError::Expectation("the tombstone must survive reopen"));
+    }
     drop(reopened);
     fs::remove_file(&path)?;
 
@@ -500,12 +544,14 @@ fn one_embedded_run(config: &Config) -> Result<RunMetrics, Box<dyn Error>> {
         .operations
         .saturating_mul(1_000_000)
         .checked_div(total_commit_micros)
-        .unwrap_or(0);
+        .ok_or(TraceError::Expectation("commits took measurable time"))?;
+    let no_commits = TraceError::Expectation("at least one commit is measured");
     Ok(RunMetrics {
         cold_start_micros,
         recovery_reopen_micros,
-        p50_commit_micros: percentile(&commit_latencies, 50),
-        p99_commit_micros: percentile(&commit_latencies, 99),
+        p50_commit_micros: percentile(&commit_latencies, 50).ok_or(no_commits)?,
+        p99_commit_micros: percentile(&commit_latencies, 99)
+            .ok_or(TraceError::Expectation("at least one commit is measured"))?,
         throughput_ops_per_second: throughput,
         durable_bytes,
         committed_operations: committed,
@@ -524,14 +570,14 @@ fn verify_semantics(
     database: &Database,
     index: IndexId,
     probe_document: DocumentId,
-) -> Result<(u64, u64, u64), Box<dyn Error>> {
+) -> Result<(u64, u64, u64), TraceError> {
     let probe_request = OperationDigest::new([0xAB; 32]);
     let probe_operation = OperationId::new();
     let first = database.edit(probe_document, probe_operation, probe_request, |editor| {
         editor.put(&Object::root(), "kind", Scalar::String("retry".into()))
     })?;
     if !matches!(first, EditOutcome::Applied(_)) {
-        return Err(io::Error::other("probe edit must apply").into());
+        return Err(TraceError::Expectation("the probe edit must apply"));
     }
     let mut duplicates = 0_u64;
     let retry = database.edit(probe_document, probe_operation, probe_request, |editor| {
@@ -550,11 +596,7 @@ fn verify_semantics(
     if matches!(delete, DeleteOutcome::Applied(_)) && database.is_deleted(probe_document)? {
         tombstones = tombstones.saturating_add(1);
     }
-    Ok((
-        duplicates,
-        u64::try_from(rows.len()).unwrap_or(u64::MAX),
-        tombstones,
-    ))
+    Ok((duplicates, u64::try_from(rows.len())?, tombstones))
 }
 
 /// Distributed-profile arm.
@@ -565,25 +607,16 @@ fn verify_semantics(
 fn run_distributed(config: &Config) -> TraceReport {
     let mut report = TraceReport {
         profile: "distributed",
-        backend_class: BackendClass::DistributedTransactional,
+        backend_class: "distributed-transactional",
         status: "unavailable",
         operations: config.operations,
         documents: config.documents,
         operations_per_commit: config.batch,
         runs: config.runs,
-        cold_start_micros: 0,
-        recovery_reopen_micros: 0,
-        p50_latency_micros: 0,
-        p99_latency_micros: 0,
-        throughput_ops_per_second: 0,
-        durable_bytes: 0,
-        committed_operations: 0,
-        duplicate_retries_honored: 0,
-        index_queries_matched: 0,
-        tombstones_verified: 0,
+        metrics: RunMetrics::default(),
         cpu_seconds: None,
         peak_rss_bytes: None,
-        unmeasured_reason: "std exposes no portable process-CPU or RSS API; adding a platform crate is a separate lgwks-deps decision",
+        unmeasured_reason: UNMEASURED_RESOURCES,
         detail: String::new(),
     };
     #[cfg(feature = "fdb")]
@@ -601,25 +634,11 @@ fn run_distributed(config: &Config) -> TraceReport {
     report
 }
 
-/// Converts a measured duration to microseconds, saturating at `u64::MAX`.
-fn micros(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+/// Converts a measured duration to whole microseconds.
+///
+/// # Errors
+///
+/// [`TraceError::Width`] past `u64::MAX` microseconds (about 584,000 years).
+fn micros(duration: std::time::Duration) -> Result<u64, TraceError> {
+    Ok(u64::try_from(duration.as_micros())?)
 }
-
-/// Compile-time check that the trace's declared guarantees exist on the
-/// embedded class, so the harness cannot measure a profile that does not claim
-/// what it exercises.
-const _: () = {
-    assert!(
-        CapabilityProfile::embedded_local().supports(Capability::DurableLocalCommit),
-        "embedded profile must claim durable local commit"
-    );
-    assert!(
-        CapabilityProfile::embedded_local().supports(Capability::CausalConvergence),
-        "embedded profile must claim causal convergence"
-    );
-    assert!(
-        CapabilityProfile::embedded_local().supports(Capability::ExportRestore),
-        "embedded profile must claim export and restore"
-    );
-};

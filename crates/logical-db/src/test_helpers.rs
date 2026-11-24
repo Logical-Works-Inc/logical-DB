@@ -12,7 +12,7 @@ use logical_db_model::{
     ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId, IndexValue, OperationDigest,
     OperationId, ReplicaId, Scope,
 };
-use logical_db_store::{EmbeddedStore, LocalChange, LocalCommit};
+use logical_db_store::{EmbeddedStore, LocalCommit};
 
 use super::outcomes::{PendingChange, RemoteChange};
 use super::projection::{Projection, ProjectionSemantics};
@@ -31,10 +31,8 @@ pub(crate) fn path() -> std::path::PathBuf {
 pub(crate) fn remote_page(changes: &[PendingChange]) -> Vec<RemoteChange> {
     changes
         .iter()
-        .map(|change| RemoteChange {
-            document: change.document,
-            digest: change.digest,
-            bytes: change.bytes.clone(),
+        .map(|change| {
+            RemoteChange::new(change.document(), change.digest(), change.bytes().to_vec())
         })
         .collect()
 }
@@ -53,10 +51,10 @@ impl crate::transport::Transport for AcceptingTransport {
     ) -> impl std::future::Future<Output = Result<crate::transport::PushResponse, Self::Error>>
     {
         let outcomes = request
-            .changes
+            .changes()
             .iter()
             .map(|change| crate::transport::PushOutcome::Accepted {
-                operation: change.operation,
+                operation: change.operation(),
             })
             .collect();
         std::future::ready(Ok(crate::transport::PushResponse::new(
@@ -113,16 +111,18 @@ pub(crate) fn kind_entry(index: IndexId, kind: &str) -> Vec<IndexEntry> {
     vec![IndexEntry::new(index, IndexValue::Text(kind.into()))]
 }
 
-/// Read kind
-pub(crate) fn read_kind(database: &super::db::Database, document: DocumentId) -> Option<String> {
-    database
-        .read(document, |reader| reader.get(&Object::root(), "kind"))
-        .ok()?
+/// Reads the root `kind` string; a read failure propagates to the test.
+pub(crate) fn read_kind(
+    database: &super::db::Database,
+    document: DocumentId,
+) -> Result<Option<String>, super::error::DatabaseError> {
+    Ok(database
+        .read(document, |reader| reader.get(&Object::root(), "kind"))?
         .and_then(|item| item)
         .and_then(|item| match item {
             Item::Scalar(Scalar::String(value)) => Some(value),
             _ => None,
-        })
+        }))
 }
 
 /// Compares the durable outbox cursor content, excluding the presenting
@@ -144,11 +144,11 @@ pub(crate) fn pending_identity(
         .map(|change| {
             (
                 change.sequence,
-                change.document,
-                change.operation,
-                change.request,
-                change.digest,
-                change.bytes.clone(),
+                change.document(),
+                change.operation(),
+                change.request(),
+                change.digest(),
+                change.bytes().to_vec(),
             )
         })
         .collect()
@@ -179,30 +179,24 @@ pub(crate) fn replay_restore_prefix(
     let mut states: BTreeMap<DocumentId, Document> = BTreeMap::new();
     let mut revisions: BTreeMap<DocumentId, Option<DocumentRevision>> = BTreeMap::new();
     for entry in entries.iter().take(fixture.prefix) {
-        let state = states.entry(entry.document).or_default();
+        let state = states.entry(entry.document()).or_default();
+        let (digest, bytes) = entry.change();
         state.apply(std::slice::from_ref(&EncodedChange::new(
-            entry.digest,
-            entry.bytes().to_vec(),
+            digest,
+            bytes.to_vec(),
         )))?;
         let tombstone = state.is_deleted()?;
         let snapshot = state.save()?;
-        let expected = revisions.get(&entry.document).copied().flatten();
+        let expected = revisions.get(&entry.document()).copied().flatten();
         let indexes = kind_entry(
             fixture.index,
-            if entry.document == fixture.first {
+            if entry.document() == fixture.first {
                 "note"
             } else {
                 "task"
             },
         );
-        let change = LocalChange::new(
-            fixture.scope,
-            entry.document,
-            entry.operation,
-            entry.request,
-            entry.digest,
-            entry.bytes(),
-        )?;
+        let change = entry.local_change(fixture.scope)?;
         store.commit_local(LocalCommit::new(
             change, expected, &snapshot, &indexes, tombstone,
         ))?;
@@ -210,7 +204,7 @@ pub(crate) fn replay_restore_prefix(
             Some(revision) => revision.next().ok_or("expected Some")?,
             None => DocumentRevision::new(1),
         };
-        revisions.insert(entry.document, Some(next));
+        revisions.insert(entry.document(), Some(next));
     }
     store.restore_advance(
         fixture.scope,

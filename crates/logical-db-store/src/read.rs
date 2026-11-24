@@ -6,7 +6,7 @@
 
 use crate::codec::{
     decode_baseline_event, decode_event, decode_operation, decode_outbox, decode_revision,
-    decode_sequence_key_for_kind, decode_u64, decode_uuid,
+    decode_sequence_key_for_kind, decode_u64, decode_uuid_after,
 };
 use crate::error::StoreError;
 use crate::indexes::{decode_index_text, encode_index_value};
@@ -18,12 +18,12 @@ use crate::keys::{
 };
 use crate::store::{EmbeddedStore, ensure_not_migrating};
 use crate::types::{
-    ChangeEvent, CommittedOperation, ExportDocument, ExportScanPage, IndexHit, OutboxEntry,
-    StoredSnapshot, TextIndexPage,
+    ChangeEvent, CommittedOperation, ExportScanPage, IndexHit, OutboxEntry, StoredSnapshot,
+    TextIndexPage,
 };
 use logical_db_model::{
     ChangeDigest, DocumentId, IndexId, IndexValue, MAX_CHANGE_BYTES, MAX_SNAPSHOT_BYTES,
-    OperationId, Scope,
+    OperationId, Scope, SnapshotDocument,
 };
 use redb::{ReadableDatabase, ReadableTable};
 
@@ -336,7 +336,7 @@ impl EmbeddedStore {
                     return Err(error);
                 }
                 let document =
-                    decode_uuid(&key.value()[row_prefix.len()..]).map(DocumentId::from_uuid)?;
+                    decode_uuid_after(key.value(), row_prefix.len()).map(DocumentId::from_uuid)?;
                 let reverse = table
                     .get(key_index_reverse(scope, document, index).as_slice())?
                     .ok_or(StoreError::CorruptInternalValue)?;
@@ -406,11 +406,11 @@ impl EmbeddedStore {
                 return Err(error);
             }
             let document =
-                decode_uuid(&key.value()[document_start..]).map(DocumentId::from_uuid)?;
+                decode_uuid_after(key.value(), document_start).map(DocumentId::from_uuid)?;
             let reverse = table
                 .get(key_index_reverse(scope, document, index).as_slice())?
                 .ok_or(StoreError::CorruptInternalValue)?;
-            if reverse.value() != &key.value()[row_prefix.len()..document_start] {
+            if Some(reverse.value()) != key.value().get(row_prefix.len()..document_start) {
                 let error = StoreError::CorruptInternalValue;
                 return Err(error);
             }
@@ -432,16 +432,16 @@ pub(crate) fn export_document(
     key: &[u8],
     prefix_length: usize,
     snapshot: &[u8],
-) -> Result<ExportDocument, StoreError> {
-    let document = decode_uuid(&key[prefix_length..]).map(DocumentId::from_uuid)?;
+) -> Result<SnapshotDocument, StoreError> {
+    let document = decode_uuid_after(key, prefix_length).map(DocumentId::from_uuid)?;
     let tombstone = table
         .get(key_tombstone(scope, document).as_slice())?
         .is_some_and(|value| value.value() == [1_u8]);
-    Ok(ExportDocument {
+    Ok(SnapshotDocument::new(
         document,
+        snapshot.to_vec(),
         tombstone,
-        snapshot: snapshot.to_vec(),
-    })
+    ))
 }
 
 /// Checks that a stored operation receipt still matches its change and outbox rows.

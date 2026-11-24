@@ -99,10 +99,12 @@ fn round_trip_put_get_delete_and_prefix_scan_without_caller_identity() -> Result
     );
     let first = cache.scan("", None, 1)?;
     assert_eq!(first.len(), 1);
-    let rest = cache.scan("", Some(&first[0].key), 10)?;
+    let first_key = &first.first().ok_or("scan of one returned an entry")?.key;
+    let rest = cache.scan("", Some(first_key), 10)?;
     assert!(
         rest.iter()
-            .all(|entry| entry.key.as_str() > first[0].key.as_str())
+            .all(|entry| entry.key.as_str() > first_key.as_str()),
+        "the continuation scan must start after the first key"
     );
     assert_eq!(first.len() + rest.len(), 2);
     cleanup(&db_path)?;

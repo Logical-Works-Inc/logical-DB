@@ -10,12 +10,32 @@
 //! the same trace.
 
 use logical_db_store::projection_relational::{RelationalProjection, SqliteRelationalProjection};
-use logical_db_store::snapshot_envelope::SnapshotStore;
-use logical_db_store::snapshot_restore::{RestorableProjection, RestoreStats, restore_or_replay};
+use logical_db_store::snapshot_envelope::SnapshotEnvelopeError;
+use logical_db_store::snapshot_restore::{
+    RestorableProjection, RestoreStats, SnapshotInput, create_snapshot, restore_or_replay,
+};
 
 #[path = "sim_harness.rs"]
 mod harness;
 use harness::{Fixture, apply_rows, check};
+
+/// A projection whose checkpoint claim never matches its own state, so a
+/// sealed snapshot of it lies about the checkpoint it covers.
+struct LyingProjection(RelationalProjection);
+
+impl RestorableProjection for LyingProjection {
+    fn checkpoint(&self) -> [u8; 32] {
+        [0xFF_u8; 32]
+    }
+
+    fn serialize_state(&self) -> Vec<u8> {
+        RestorableProjection::serialize_state(&self.0)
+    }
+
+    fn restore_from_state(bytes: &[u8]) -> Result<Self, SnapshotEnvelopeError> {
+        <RelationalProjection as RestorableProjection>::restore_from_state(bytes).map(Self)
+    }
+}
 
 /// Trace domain: this file's traces never collide with another file's.
 const TRACE_DOMAIN: &[u8] = b"ldb.sim.snapshot-restore.v1";
@@ -197,24 +217,29 @@ fn lying_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             .map_err(|error| format!("sim rows overflow: {error}"))?,
     );
     let rows_len = usize::try_from(rows).map_err(|error| format!("sim rows overflow: {error}"))?;
-    let (_mem, mut envelope) = harness::seal_rows(
+    let mut honest = RelationalProjection::new();
+    apply_rows(&mut honest, rows)?;
+    let liar = LyingProjection(honest);
+    let last_seq = rows.saturating_sub(1);
+    create_snapshot(
         &case.own.store,
         case.own.scope,
-        case.own.projection,
-        rows,
-        [9_u8; 32],
-        harness::TIME_BASE,
+        &SnapshotInput::new(
+            case.own.projection,
+            [9_u8; 32],
+            &liar,
+            harness::test_row(last_seq),
+            last_seq,
+            harness::TIME_BASE,
+        ),
     )?;
-    envelope.checkpoint = [0xFF_u8; 32];
-    envelope.hash = envelope.compute_hash()?;
-    case.own.store.save_snapshot(&envelope)?;
     let (restored, stats) = restore_with_genesis(&case.own, rows)?;
     assert!(!stats.from_snapshot, "a lying envelope must fall back");
     assert!(
-        stats
-            .fallback_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("checkpoint mismatch")),
+        matches!(
+            stats.fallback_reason.as_deref(),
+            Some(reason) if reason.contains("checkpoint mismatch")
+        ),
         "the reason must name the checkpoint mismatch"
     );
     assert_eq!(restored.state().len(), rows_len, "genesis replays all");
@@ -260,10 +285,10 @@ fn tail_failure_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>>
     if attempt == 0 {
         assert!(!stats.from_snapshot, "a failing tail must fall back");
         assert!(
-            stats
-                .fallback_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("tail replay")),
+            matches!(
+                stats.fallback_reason.as_deref(),
+                Some(reason) if reason.contains("tail replay")
+            ),
             "the reason must name the tail replay"
         );
     } else {
@@ -373,9 +398,10 @@ fn metadata_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         semantics,
         created_at,
     )?;
-    assert_eq!(envelope.semantics, semantics, "semantics ride the seal");
+    assert_eq!(envelope.semantics(), semantics, "semantics ride the seal");
     assert_eq!(
-        envelope.created_at_secs, created_at,
+        envelope.created_at_secs(),
+        created_at,
         "timestamps ride the seal"
     );
     let (restored, stats) = restore_with_empty_tail(&case.own)?;
@@ -385,7 +411,7 @@ fn metadata_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         mem.checkpoint(),
         "state restores under any metadata"
     );
-    case.hasher.update(&envelope.hash);
+    case.hasher.update(&envelope.hash());
     case.finish()
 }
 

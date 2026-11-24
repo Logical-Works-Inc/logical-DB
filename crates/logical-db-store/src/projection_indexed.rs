@@ -236,10 +236,12 @@ pub(crate) fn derive_vector(terms: &[String]) -> [i32; VECTOR_DIM] {
         hasher.update(VECTOR_DERIVE_DOMAIN);
         hasher.update(term.as_bytes());
         let digest = hasher.finalize();
-        let bytes = digest.as_bytes();
-        let dim = usize::from(bytes[0]) % VECTOR_DIM;
-        let weight = i16::from_le_bytes([bytes[1], bytes[2]]);
-        out[dim] = out[dim].saturating_add(i32::from(weight));
+        let [lead, low, high, ..] = *digest.as_bytes();
+        let dim = usize::from(lead) % VECTOR_DIM;
+        let weight = i16::from_le_bytes([low, high]);
+        if let Some(slot) = out.get_mut(dim) {
+            *slot = slot.saturating_add(i32::from(weight));
+        }
     }
     out
 }
@@ -358,14 +360,13 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_splits_and_lowers() -> Result<(), Box<dyn std::error::Error>> {
+    fn tokenize_splits_and_lowers() {
         assert_eq!(
             tokenize("Hello, world!  hello"),
             vec![String::from("hello"), String::from("world")],
             "tokenizer must split and lowercase"
         );
         assert!(tokenize("").is_empty(), "empty input tokenizes to nothing");
-        Ok(())
     }
 
     #[test]
@@ -379,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_seed_too_long_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    fn vector_seed_too_long_rejected() {
         let projection = IndexedProjection::new();
         let oversized = VECTOR_DIM.saturating_add(1);
         let seed = vec![1_i32; oversized];
@@ -388,11 +389,10 @@ mod tests {
             matches!(error, Err(IndexedError::SeedTooLong { .. })),
             "over-long seed must be refused, got {error:?}"
         );
-        Ok(())
     }
 
     #[test]
-    fn lwmx_families_cover_inserted_rows() -> Result<(), Box<dyn std::error::Error>> {
+    fn lwmx_families_cover_inserted_rows() {
         let mut projection = IndexedProjection::new();
         let hash = row(1);
         let terms = vec![String::from("alpha"), String::from("beta")];
@@ -407,7 +407,6 @@ mod tests {
             "the row vector must reach the durable writer families"
         );
         assert_eq!(projection.len(), 1, "one row indexed");
-        Ok(())
     }
 
     #[test]
@@ -430,7 +429,11 @@ mod tests {
 
         let results = projection.query("alpha", &[], 8)?;
         assert_eq!(results.len(), 1, "one row carries the term");
-        assert_eq!(results[0].hash, row(1), "the matching row ranks first");
+        assert_eq!(
+            results.first().map(|scored| scored.hash),
+            Some(row(1)),
+            "the matching row ranks first"
+        );
 
         let results = projection.query("absent", &[], 8)?;
         assert!(results.is_empty(), "unknown terms match nothing");
@@ -445,10 +448,12 @@ mod tests {
         }
         let results = projection.query("shared", &[], 5)?;
         assert_eq!(results.len(), 5, "top-k bounds the answer to five");
-        for scored in &results {
-            let _ = scored.score;
-            let _ = scored.hash;
-        }
+        assert!(
+            results
+                .iter()
+                .all(|scored| (0..20_u8).any(|index| row(index) == scored.hash)),
+            "every ranked hash names an inserted row"
+        );
         Ok(())
     }
 

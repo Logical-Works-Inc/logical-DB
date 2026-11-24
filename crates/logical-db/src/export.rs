@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lgwks_std::hash::blake3;
 use logical_db_crdt::{Document, EncodedChange};
-use logical_db_model::{DocumentId, DocumentRevision};
+use logical_db_model::{DocumentId, DocumentRevision, SnapshotDocument};
 use logical_db_store::{
-    ChangeEvent, ExportDocument, ExportEntry, LocalChange, LocalCommit, StoreError, decode_export,
-    encode_export, restore_operation,
+    ChangeEvent, ExportEntry, LocalCommit, StoreError, decode_export, encode_export,
+    restore_operation,
 };
 
 use super::db::Database;
@@ -89,7 +89,7 @@ impl Database {
                     .ok_or(DatabaseError::MissingChange(digest))?;
                 let (operation, request) = match bindings.get(&(document, digest)) {
                     Some(binding) => *binding,
-                    None => restore_operation(document, digest)?,
+                    None => restore_operation(document, digest),
                 };
                 entries.push(ExportEntry::new(
                     document, operation, request, digest, bytes,
@@ -109,12 +109,8 @@ impl Database {
             }
             let complete = page.documents().len() < 64;
             for document in page.documents() {
-                documents.push(ExportDocument::new(
-                    document.document,
-                    document.tombstone,
-                    document.snapshot().to_vec(),
-                ));
-                scan = Some(document.document);
+                documents.push(document.clone());
+                scan = Some(document.document());
             }
             if complete {
                 break;
@@ -165,7 +161,7 @@ impl Database {
             let revision = self
                 .store
                 .load_snapshot(self.scope, *document)?
-                .map(|snapshot| snapshot.revision);
+                .map(|snapshot| snapshot.revision());
             loaded.insert(*document, revision);
         }
         self.check_restore_replay(&documents, &entries)?;
@@ -205,40 +201,39 @@ impl Database {
     /// Check restore replay
     fn check_restore_replay(
         &self,
-        documents: &[ExportDocument],
+        documents: &[SnapshotDocument],
         entries: &[ExportEntry],
     ) -> Result<(), DatabaseError> {
         let mut duplicate = BTreeSet::new();
         for entry in entries {
-            if let Some(committed) = self.store.operation(self.scope, entry.operation)? {
-                if committed.document != entry.document
-                    || committed.request != entry.request
-                    || committed.digest != entry.digest
-                {
+            if let Some(committed) = self.store.operation(self.scope, entry.operation())? {
+                if !entry.binds_to(&committed) {
                     return Err(StoreError::OperationConflict.into());
                 }
+                let (digest, bytes) = entry.change();
                 let stored = self
                     .store
-                    .load_change(self.scope, entry.document, entry.digest)?
-                    .ok_or(DatabaseError::MissingChange(entry.digest))?;
-                if stored.as_slice() != entry.bytes() {
+                    .load_change(self.scope, entry.document(), digest)?
+                    .ok_or(DatabaseError::MissingChange(digest))?;
+                if stored.as_slice() != bytes {
                     return Err(StoreError::OperationConflict.into());
                 }
-                duplicate.insert(entry.operation);
+                duplicate.insert(entry.operation());
             }
         }
         let mut states: BTreeMap<DocumentId, Document> = BTreeMap::new();
         let mut last_flag = BTreeMap::new();
         for entry in entries {
-            let state = states.entry(entry.document).or_default();
+            let state = states.entry(entry.document()).or_default();
+            let (digest, bytes) = entry.change();
             state.apply(std::slice::from_ref(&EncodedChange::new(
-                entry.digest,
-                entry.bytes().to_vec(),
+                digest,
+                bytes.to_vec(),
             )))?;
-            last_flag.insert(entry.document, state.is_deleted()?);
+            last_flag.insert(entry.document(), state.is_deleted()?);
         }
         for document in documents {
-            if last_flag.get(&document.document) != Some(&document.tombstone) {
+            if last_flag.get(&document.document()) != Some(&document.is_tombstone()) {
                 return Err(StoreError::InvalidExport.into());
             }
         }
@@ -256,7 +251,7 @@ impl Database {
         let mut states: BTreeMap<DocumentId, Document> = BTreeMap::new();
         let mut applied = 0_usize;
         for (offset, entry) in entries.iter().enumerate() {
-            let state = states.entry(entry.document).or_default();
+            let state = states.entry(entry.document()).or_default();
             let did_apply = self.replay_restore_entry(entry, offset, start, state, current)?;
             applied = applied.saturating_add(usize::from(did_apply));
             let next = u64::try_from(offset.saturating_add(1))?;
@@ -274,9 +269,10 @@ impl Database {
         state: &mut Document,
         current: &mut BTreeMap<DocumentId, Option<DocumentRevision>>,
     ) -> Result<bool, DatabaseError> {
+        let (digest, bytes) = entry.change();
         state.apply(std::slice::from_ref(&EncodedChange::new(
-            entry.digest,
-            entry.bytes().to_vec(),
+            digest,
+            bytes.to_vec(),
         )))?;
         if offset < start {
             return Ok(false);
@@ -288,15 +284,8 @@ impl Database {
             self.project(state)?
         };
         let snapshot = state.save()?;
-        let expected = current.get(&entry.document).copied().flatten();
-        let change = LocalChange::new(
-            self.scope,
-            entry.document,
-            entry.operation,
-            entry.request,
-            entry.digest,
-            entry.bytes(),
-        )?;
+        let expected = current.get(&entry.document()).copied().flatten();
+        let change = entry.local_change(self.scope)?;
         let outcome = self.store.commit_local(LocalCommit::new(
             change, expected, &snapshot, &indexes, tombstoned,
         ))?;
@@ -307,7 +296,7 @@ impl Database {
             Some(revision) => revision.next().ok_or(StoreError::RevisionExhausted)?,
             None => DocumentRevision::new(1),
         };
-        current.insert(entry.document, Some(next));
+        current.insert(entry.document(), Some(next));
         Ok(true)
     }
 
@@ -334,44 +323,41 @@ fn export_identity(payload: &[u8]) -> [u8; 32] {
 
 /// Check restore coverage
 fn check_restore_coverage(
-    documents: &[ExportDocument],
+    documents: &[SnapshotDocument],
     entries: &[ExportEntry],
 ) -> Result<BTreeSet<DocumentId>, DatabaseError> {
     let documented = documents
         .iter()
-        .map(|document| document.document)
+        .map(|document| document.document())
         .collect::<BTreeSet<_>>();
     let mut covered = BTreeSet::new();
     for entry in entries {
-        if !documented.contains(&entry.document) {
+        if !documented.contains(&entry.document()) {
             return Err(StoreError::InvalidExport.into());
         }
-        covered.insert(entry.document);
+        covered.insert(entry.document());
     }
     if covered != documented {
         return Err(StoreError::InvalidExport.into());
     }
     let mut bindings = BTreeMap::new();
     for entry in entries {
-        let binding = (
-            entry.document,
-            entry.request,
-            entry.digest,
-            entry.bytes().to_vec(),
-        );
-        if let Some(previous) = bindings.insert(entry.operation, binding.clone()) {
-            if previous == binding {
+        // An operation seen twice is a duplicated entry when the whole entry
+        // repeats, and an identity reused for different work otherwise.
+        if let Some(previous) = bindings.insert(entry.operation(), entry) {
+            if previous == entry {
                 return Err(StoreError::InvalidExport.into());
             }
             return Err(StoreError::OperationConflict.into());
         }
     }
     for entry in entries {
-        EncodedChange::new(entry.digest, entry.bytes().to_vec()).validate()?;
+        let (digest, bytes) = entry.change();
+        EncodedChange::new(digest, bytes.to_vec()).validate()?;
     }
     for document in documents {
         let mut state = Document::load(document.snapshot())?;
-        if state.is_deleted()? != document.tombstone {
+        if state.is_deleted()? != document.is_tombstone() {
             return Err(StoreError::InvalidExport.into());
         }
     }

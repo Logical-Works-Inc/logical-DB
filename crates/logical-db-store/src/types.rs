@@ -8,11 +8,11 @@ use crate::error::StoreError;
 use crate::keys::is_nonempty_bounded;
 use logical_db_model::{
     ChangeDigest, DocumentId, DocumentRevision, IndexEntry, MAX_CHANGE_BYTES, OperationDigest,
-    OperationId, Scope,
+    OperationId, Scope, SnapshotDocument,
 };
 
 /// A validated local CRDT change without any transport-layer representation.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct LocalChange<'a> {
     /// Owning account and application space.
     pub(crate) scope: Scope,
@@ -25,10 +25,16 @@ pub struct LocalChange<'a> {
     /// Immutable CRDT change identity.
     pub(crate) digest: ChangeDigest,
     /// Canonical CRDT change bytes.
-    pub bytes: &'a [u8],
+    pub(crate) bytes: &'a [u8],
 }
 
 impl<'a> LocalChange<'a> {
+    /// Returns the canonical CRDT change bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     /// Creates one bounded local change after CRDT validation.
     ///
     /// # Errors
@@ -59,7 +65,7 @@ impl<'a> LocalChange<'a> {
 }
 
 /// Atomic local transition from one document state to the next.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct LocalCommit<'a> {
     /// Immutable change and its logical routing metadata.
@@ -108,10 +114,16 @@ pub struct StoredSnapshot {
     /// Complete verified Automerge snapshot bytes.
     pub(crate) bytes: Vec<u8>,
     /// Last locally committed change identity.
-    pub revision: DocumentRevision,
+    pub(crate) revision: DocumentRevision,
 }
 
 impl StoredSnapshot {
+    /// Returns the last locally committed change identity.
+    #[must_use]
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
     /// Borrows the complete verified snapshot bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -120,7 +132,7 @@ impl StoredSnapshot {
 }
 
 /// One immutable remote change to install with a materialized snapshot.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct RemoteChange<'a> {
     /// Document receiving the change.
@@ -147,7 +159,7 @@ impl<'a> RemoteChange<'a> {
 }
 
 /// One remotely merged document transition inside an atomic pull page.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct RemoteDocument<'a> {
     /// Changed document.
@@ -205,10 +217,16 @@ pub struct TextIndexPage {
     /// Rows in key order.
     pub(crate) rows: Vec<(DocumentId, String)>,
     /// Opaque resume key; `None` when the scan is exhausted.
-    pub next: Option<Vec<u8>>,
+    pub(crate) next: Option<Vec<u8>>,
 }
 
 impl TextIndexPage {
+    /// Borrows the opaque resume key; `None` when the scan is exhausted.
+    #[must_use]
+    pub fn next(&self) -> Option<&[u8]> {
+        self.next.as_deref()
+    }
+
     /// Borrows the rows in key order.
     #[must_use]
     pub fn rows(&self) -> &[(DocumentId, String)] {
@@ -281,14 +299,26 @@ impl ChangeEvent {
 #[non_exhaustive]
 pub struct MigrationDocument {
     /// Document ordered by its portable identifier.
-    pub document: DocumentId,
+    pub(crate) document: DocumentId,
     /// Revision that must still be current when replacement indexes commit.
-    pub revision: DocumentRevision,
+    pub(crate) revision: DocumentRevision,
     /// Complete verified snapshot used to compute replacement projections.
     pub(crate) snapshot: Vec<u8>,
 }
 
 impl MigrationDocument {
+    /// Returns the document ordered by its portable identifier.
+    #[must_use]
+    pub const fn document(&self) -> DocumentId {
+        self.document
+    }
+
+    /// Returns the revision that must still be current when indexes commit.
+    #[must_use]
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
     /// Borrows the complete verified snapshot.
     #[must_use]
     pub fn snapshot(&self) -> &[u8] {
@@ -301,12 +331,18 @@ impl MigrationDocument {
 #[non_exhaustive]
 pub struct MigrationPage {
     /// Durable cursor that must still identify the migration when applied.
-    pub after: Option<DocumentId>,
+    pub(crate) after: Option<DocumentId>,
     /// Ordered documents following `after`.
     pub(crate) documents: Vec<MigrationDocument>,
 }
 
 impl MigrationPage {
+    /// Returns the durable cursor the page was read from.
+    #[must_use]
+    pub const fn after(&self) -> Option<DocumentId> {
+        self.after
+    }
+
     /// Borrows the ordered documents following `after`.
     #[must_use]
     pub fn documents(&self) -> &[MigrationDocument] {
@@ -315,7 +351,7 @@ impl MigrationPage {
 }
 
 /// Replacement materialized rows for one migration document.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct MigrationIndexes<'a> {
     /// Document whose complete index set is replaced.
@@ -350,26 +386,69 @@ impl<'a> MigrationIndexes<'a> {
 #[non_exhaustive]
 pub struct ExportEntry {
     /// Document changed by the replayed commit.
-    pub document: DocumentId,
+    pub(crate) document: DocumentId,
     /// Original retryable logical operation identity, reused for exact retry.
-    pub operation: OperationId,
+    pub(crate) operation: OperationId,
     /// Canonical caller request identity bound to the operation.
-    pub request: OperationDigest,
+    pub(crate) request: OperationDigest,
     /// Immutable CRDT change identity.
-    pub digest: ChangeDigest,
+    pub(crate) digest: ChangeDigest,
     /// Canonical CRDT change bytes.
     pub(crate) bytes: Vec<u8>,
 }
 
 impl ExportEntry {
-    /// Borrows the canonical CRDT change bytes.
+    /// Returns the document changed by the replayed commit.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+    pub const fn document(&self) -> DocumentId {
+        self.document
     }
-}
 
-impl ExportEntry {
+    /// Returns the original retryable logical operation identity.
+    #[must_use]
+    pub const fn operation(&self) -> OperationId {
+        self.operation
+    }
+
+    /// Returns the caller request identity bound to the operation.
+    #[must_use]
+    pub const fn request(&self) -> OperationDigest {
+        self.request
+    }
+
+    /// Reports whether an already committed operation is this exact entry:
+    /// the same document, caller request and CRDT change. A mismatch is an
+    /// operation identity reused for different work.
+    #[must_use]
+    pub fn binds_to(&self, committed: &CommittedOperation) -> bool {
+        committed.document == self.document
+            && committed.request == self.request
+            && committed.digest == self.digest
+    }
+
+    /// Returns the immutable CRDT change hash and the canonical bytes it names.
+    #[must_use]
+    pub fn change(&self) -> (ChangeDigest, &[u8]) {
+        (self.digest, &self.bytes)
+    }
+
+    /// Stages this entry as the bounded local change a restore replays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidChangeSize`] when the bytes are empty or
+    /// exceed the immutable change ceiling.
+    pub fn local_change(&self, scope: Scope) -> Result<LocalChange<'_>, StoreError> {
+        LocalChange::new(
+            scope,
+            self.document,
+            self.operation,
+            self.request,
+            self.digest,
+            &self.bytes,
+        )
+    }
+
     /// Builds one ordered commit entry for a versioned logical export.
     ///
     /// `#[non_exhaustive]` makes a struct expression impossible outside this
@@ -392,53 +471,26 @@ impl ExportEntry {
     }
 }
 
-/// One document snapshot carried by a versioned logical export.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct ExportDocument {
-    /// Document ordered by its portable identifier.
-    pub document: DocumentId,
-    /// Whether the exported snapshot carries a first-class tombstone.
-    pub tombstone: bool,
-    /// Complete verified snapshot after the last exported change.
-    pub(crate) snapshot: Vec<u8>,
-}
-
-impl ExportDocument {
-    /// Builds one document snapshot entry for a versioned logical export.
-    ///
-    /// `#[non_exhaustive]` makes a struct expression impossible outside this
-    /// crate, so external callers compose export documents through here.
-    #[must_use]
-    pub fn new(document: DocumentId, tombstone: bool, snapshot: Vec<u8>) -> Self {
-        Self {
-            document,
-            tombstone,
-            snapshot,
-        }
-    }
-
-    /// Borrows the complete verified snapshot.
-    #[must_use]
-    pub fn snapshot(&self) -> &[u8] {
-        &self.snapshot
-    }
-}
-
 /// One bounded document page of a resumable logical export scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ExportScanPage {
     /// Durable cursor the page was read from.
-    pub after: Option<DocumentId>,
+    pub(crate) after: Option<DocumentId>,
     /// Ordered documents following `after`.
-    pub(crate) documents: Vec<ExportDocument>,
+    pub(crate) documents: Vec<SnapshotDocument>,
 }
 
 impl ExportScanPage {
+    /// Returns the durable cursor the page was read from.
+    #[must_use]
+    pub const fn after(&self) -> Option<DocumentId> {
+        self.after
+    }
+
     /// Borrows the ordered documents following `after`.
     #[must_use]
-    pub fn documents(&self) -> &[ExportDocument] {
+    pub fn documents(&self) -> &[SnapshotDocument] {
         &self.documents
     }
 }

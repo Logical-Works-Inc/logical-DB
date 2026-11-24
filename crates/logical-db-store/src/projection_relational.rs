@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn misaligned_blob_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    fn misaligned_blob_is_refused() {
         let error = RelationalProjection::restore_from_state(&[1_u8; 31]);
         assert!(
             matches!(error, Err(ProjectionError::Malformed(_))),
@@ -582,11 +582,10 @@ mod tests {
             matches!(error, Err(ProjectionError::Malformed(_))),
             "33 bytes must be refused, got {error:?}"
         );
-        Ok(())
     }
 
     #[test]
-    fn duplicate_blob_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    fn duplicate_blob_is_refused() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&row(7));
         blob.extend_from_slice(&row(7));
@@ -595,6 +594,5 @@ mod tests {
             matches!(error, Err(ProjectionError::Malformed(_))),
             "duplicated row must be refused, got {error:?}"
         );
-        Ok(())
     }
 }

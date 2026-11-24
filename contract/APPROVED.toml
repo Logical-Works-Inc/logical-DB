@@ -31,8 +31,17 @@
 # `lgwks_deps` behind it, so no logical-db crate names `tokio` or `futures`.
 # Every entry below is a boundary that has no estate equivalent yet, with the
 # reason naming what the standard library or the estate cannot do.
+#
+# Schema 3 (lgwks_deps 8, logicalworks-crates#788): every approval carries an
+# `[approved.retire]` mortgage. Costs were measured 2026-11-24 on the toronto
+# build box with RUSTC_WRAPPER unset, one fresh target directory per edge:
+# `cargo build --locked -q -p <crate>@<version>` wall time, the unique package
+# count of `cargo tree --locked -p <crate>@<version> -e normal --prefix none`,
+# and the summed size of every built `.rlib`. The closure is built alone, so
+# shared packages count toward each edge: every number is an upper bound.
 
 [policy]
+schema = 3
 enforce = true
 repository = "https://github.com/Logical-Works-Inc/logical-DB"
 # The licence set the gate judges every approval's declared licence against;
@@ -40,7 +49,6 @@ repository = "https://github.com/Logical-Works-Inc/logical-DB"
 # one `lgwks_bot` approval below, and deny.toml admits it for `lgwks_bot` alone.
 accepted_licenses = "MIT, Apache-2.0, MPL-2.0"
 
-# ── The authority adapter ───────────────────────────────────────────────────
 # ── CRDT and storage engines ────────────────────────────────────────────────
 # The local-first merge engine and the embedded durable store are the product's
 # core state machines. They are not general primitives, so they stay as
@@ -49,7 +57,7 @@ accepted_licenses = "MIT, Apache-2.0, MPL-2.0"
 [[approved]]
 crate = "automerge"
 tier = "boundary"
-version = "=0.11.0"
+version = "=0.12.0"
 owner = "logical-db-crdt"
 capability = "crdt.merge-engine"
 source = "registry"
@@ -61,10 +69,16 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[approved.retire]
+replacement = "std::collections"
+blocker = "No estate CRDT merge engine exists; the owner is logical_db_crdt::view, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 67.453, crates = 42, binary_bytes = 106285792, measured = "2026-11-24", command = "cargo build --locked -q -p automerge@0.12.0 in a fresh target dir; cargo tree --locked -p automerge@0.12.0 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "redb"
 tier = "boundary"
-version = "=4.2.0"
+version = "=5.0.0"
 owner = "logical-db-store"
 capability = "storage.embedded-keyspace"
 source = "registry"
@@ -75,6 +89,12 @@ reason = "A crash-safe embedded B-tree keyspace is not provided by std and is a 
 approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+
+[approved.retire]
+replacement = "std::fs"
+blocker = "No estate crash-safe embedded keyspace exists; the owner is logical_db_store::store, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 25.076, crates = 2, binary_bytes = 39792500, measured = "2026-11-24", command = "cargo build --locked -q -p redb@5.0.0 in a fresh target dir; cargo tree --locked -p redb@5.0.0 -e normal; summed rlib bytes" }
+review = "2027-02-24"
 
 [[approved]]
 crate = "foundationdb"
@@ -91,6 +111,12 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[approved.retire]
+replacement = "std::net"
+blocker = "No estate distributed transactional store exists; the owner is logical_db_store_fdb::runtime, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 44.588, crates = 17, binary_bytes = 1384748, measured = "2026-11-24", command = "cargo build --locked -q -p logical-db-store-fdb with and without --features fdb in fresh target dirs; the deltas of wall time, cargo tree -e normal packages and rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "foundationdb-tuple"
 tier = "boundary"
@@ -106,10 +132,16 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[approved.retire]
+replacement = "std::cmp"
+blocker = "No estate codec writes order-preserving tuple keys; the owner is logical_db_store_fdb::runtime, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 9.441, crates = 8, binary_bytes = 1462938, measured = "2026-11-24", command = "cargo build --locked -q -p foundationdb-tuple@0.11.0 in a fresh target dir; cargo tree --locked -p foundationdb-tuple@0.11.0 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "rusqlite"
 tier = "boundary"
-version = "=0.41.0"
+version = "=0.43.0"
 owner = "logical-db-store"
 capability = "storage.relational-projection"
 source = "registry"
@@ -120,6 +152,12 @@ reason = "The second parity engine for the relational projection (kernel SPEC 36
 approved_by = "Director"
 approved_on = "2026-11-03"
 review = "https://github.com/Logical-Works-Inc/logical-DB/issues/119"
+
+[approved.retire]
+replacement = "std::fs"
+blocker = "No estate embedded SQL engine exists; the owner is logical_db_store::projection_relational, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 27.590, crates = 7, binary_bytes = 4464906, measured = "2026-11-24", command = "cargo build --locked -q -p rusqlite@0.43.0 in a fresh target dir; cargo tree --locked -p rusqlite@0.43.0 -e normal; summed rlib bytes" }
+review = "2027-02-24"
 
 # ── Serialization and wire encoding ─────────────────────────────────────────
 # Derives route through `lgwks_std::json::{Serialize, Deserialize}`, the
@@ -142,6 +180,12 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[approved.retire]
+replacement = "std::vec"
+blocker = "The estate serde facade has no byte-string adapter; the owner is logical_db_protocol::wire, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 6.135, crates = 2, binary_bytes = 353202, measured = "2026-11-24", command = "cargo build --locked -q -p serde_bytes@0.11.19 in a fresh target dir; cargo tree --locked -p serde_bytes@0.11.19 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "ciborium"
 tier = "boundary"
@@ -150,59 +194,76 @@ owner = "logical-db-server"
 capability = "encoding.cbor"
 source = "registry"
 license = "Apache-2.0"
-allowed_consumers = "logical-db-server,logical-db-http,logical-db-daemon,logical-db-protocol,logical-db-e2e,logical-db-episode"
+allowed_consumers = "logical-db-server,logical-db-http,logical-db-daemon,logical-db-protocol,logical-db-e2e"
 allowed_kinds = "normal,dev"
 reason = "The versioned wire format is CBOR and std has no deterministic CBOR codec."
 approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[approved.retire]
+replacement = "std::io"
+blocker = "No estate deterministic CBOR codec exists; the owner is logical_db_protocol::wire, which lgwks_deps 8 cannot name (logicalworks-crates#1153)."
+cost = { cold_build_s = 31.092, crates = 15, binary_bytes = 1342318, measured = "2026-11-24", command = "cargo build --locked -q -p ciborium@0.2.2 in a fresh target dir; cargo tree --locked -p ciborium@0.2.2 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 # ── Identity, errors, and hashing ───────────────────────────────────────────
-# UUIDv7 identities, typed library errors, and the SHA-256/HMAC credential
-# check. The estate offers `lgwks_std::id::Uuid`, manual `std::error::Error`
-# impls, and BLAKE3-only hashing; each mismatch is recorded as its own
-# boundary rather than silently claimed as adopted.
+# Model identities are `lgwks_std::id::Uuid`. The `uuid` crate stays only where
+# FoundationDB tuple keys pack `uuid::Uuid` and where the crash fixtures mint
+# names; typed library errors derive through `thiserror`.
 
 [[approved]]
 crate = "uuid"
 tier = "boundary"
-version = "=1.26.1"
-owner = "logical-db-model"
+version = "=1.29.3"
+owner = "logical-db-store-fdb"
 capability = "identity.uuid-v7"
 source = "registry"
 license = "Apache-2.0 OR MIT"
-allowed_consumers = "logical-db,logical-db-model,logical-db-store,logical-db-store-fdb,logical-db-kv,logical-db-episode,logical-db-daemon,logical-db-e2e,logical-db-cairn,logical-db-cloud-contract,logical-db-http"
+allowed_consumers = "logical-db-store-fdb,logical-db-e2e"
 allowed_kinds = "normal,dev"
-reason = "Time-ordered UUIDv7 identities and their parse contract are not provided by the standard library."
+reason = "FoundationDB tuple keys pack the uuid crate's type, which the estate identifier does not implement."
 approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+
+[approved.retire]
+replacement = "std::primitive"
+blocker = "foundationdb-tuple packs uuid::Uuid keys and lgwks_std::id has no tuple bridge (logicalworks-crates#851); the owner logical_db_model::identifier is unnameable (#1153)."
+cost = { cold_build_s = 8.544, crates = 6, binary_bytes = 1464874, measured = "2026-11-24", command = "cargo build --locked -q -p uuid@1.29.3 in a fresh target dir; cargo tree --locked -p uuid@1.29.3 -e normal; summed rlib bytes" }
+review = "2027-02-24"
 
 [[approved]]
 crate = "thiserror"
 tier = "boundary"
-version = "=2.0.20"
+version = "=2.0.21"
 owner = "logical-db-model"
 capability = "error.derive"
 source = "registry"
 license = "MIT OR Apache-2.0"
-allowed_consumers = "logical-db,logical-db-model,logical-db-protocol,logical-db-store,logical-db-store-fdb,logical-db-kv,logical-db-episode,logical-db-cairn,logical-db-cloud-contract,logical-db-crdt,logical-db-platform,logical-db-service,logical-db-http"
-allowed_kinds = "normal"
-reason = "Typed public error enums need Display and source derives that the standard library does not generate."
+allowed_consumers = "logical-db,logical-db-model,logical-db-protocol,logical-db-store,logical-db-store-fdb,logical-db-kv,logical-db-crdt,logical-db-platform,logical-db-service,logical-db-http"
+allowed_kinds = "normal,dev"
+reason = "Typed public error enums need Display and source derives that the standard library does not generate. The dev edge is logical-db-store-fdb's unit tests, which build the adapter's error types without the fdb feature."
 approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
-# ── Async HTTP client and server ────────────────────────────────────────────
-# `lgwks_bot` owns the runtime, but the estate has no async HTTP client or
-# server. Both are frozen boundaries with the reason recorded: the estate's
-# blocking client follows redirects and reads bodies unbounded, which would
-# regress this transport's security bounds.
+[approved.retire]
+replacement = "std::error"
+blocker = "Hand-written Display and source impls for every typed error enum would repeat what the derive generates."
+cost = { cold_build_s = 11.830, crates = 6, binary_bytes = 33304, measured = "2026-11-24", command = "cargo build --locked -q -p thiserror@2.0.21 in a fresh target dir; cargo tree --locked -p thiserror@2.0.21 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
+# ── Async runtime and HTTP server ───────────────────────────────────────────
+# `lgwks_bot` owns the runtime. The HTTP client is the estate's
+# `lgwks_std::http` (redirects off, bounded whole-body reads, pooled), run on
+# the estate blocking pool, so no client crate is registered here. The estate
+# has no HTTP server yet, so `axum` stays a frozen boundary.
 
 [[approved]]
 crate = "lgwks_bot"
 tier = "boundary"
-version = "^6.1.0"
+version = "^10.0.3"
 owner = "logical-db-server"
 capability = "async.runtime-surface"
 source = "registry"
@@ -214,25 +275,37 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logicalworks-crates/blob/main/docs/dependency-doctrine.md"
 
+[approved.retire]
+replacement = "std::thread"
+blocker = "The async server and sync transport need the estate runtime; std has no async executor."
+cost = { cold_build_s = 151.011, crates = 136, binary_bytes = 110547396, measured = "2026-11-24", command = "cargo build --locked -q -p lgwks_bot@10.0.3 in a fresh target dir; cargo tree --locked -p lgwks_bot@10.0.3 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "lgwks_std"
 tier = "boundary"
-version = "^3.2.2"
+version = "^5.0.0"
 owner = "logical-db-model"
 capability = "estate.std-surface"
 source = "registry"
 license = "Apache-2.0"
-allowed_consumers = "logical-db,logical-db-cairn,logical-db-cloud-contract,logical-db-daemon,logical-db-e2e,logical-db-episode,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store,logical-db-store-fdb,logical-db-sync"
+allowed_consumers = "logical-db,logical-db-daemon,logical-db-e2e,logical-db-http,logical-db-kv,logical-db-model,logical-db-protocol,logical-db-server,logical-db-service,logical-db-store,logical-db-store-fdb,logical-db-sync"
 allowed_kinds = "normal,dev"
-reason = "The estate std+ core owns the json/serde re-export and hashing that logical-db derives and digests through; no crate here declares serde directly."
+reason = "The estate std+ core owns the json/serde re-export, hashing, identifiers and the bounded HTTP client that logical-db reaches through; no crate here declares serde directly."
 approved_by = "Director"
 approved_on = "2026-10-04"
 review = "https://github.com/srinji-kaggss/logical-DB/issues/93"
 
+[approved.retire]
+replacement = "std::io"
+blocker = "std has no JSON facade, keyed hash, UUIDv7 or bounded HTTP client; the estate std+ core supplies them."
+cost = { cold_build_s = 50.165, crates = 86, binary_bytes = 36139002, measured = "2026-11-24", command = "cargo build --locked -q -p lgwks_std@5.0.0 in a fresh target dir; cargo tree --locked -p lgwks_std@5.0.0 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "lgwks_deps"
 tier = "boundary"
-version = "^5.1.2"
+version = "^8.0.0"
 owner = "logical-db-e2e"
 capability = "estate.dependency-gate"
 source = "registry"
@@ -244,35 +317,11 @@ approved_by = "Director"
 approved_on = "2026-10-04"
 review = "https://github.com/srinji-kaggss/logical-DB/issues/93"
 
-[[approved]]
-crate = "toml"
-tier = "boundary"
-version = "=1.1.8"
-owner = "logical-db-e2e"
-capability = "contract.toml-reader"
-source = "registry"
-license = "MIT OR Apache-2.0"
-allowed_consumers = "logical-db-e2e"
-allowed_kinds = "dev"
-reason = "The repository-contract tests read contract/*.toml; the estate has no general TOML reader (docs/adr/0006)."
-approved_by = "Director"
-approved_on = "2026-11-03"
-review = "https://github.com/Logical-Works-Inc/logicalworks-crates/issues/852"
-
-[[approved]]
-crate = "reqwest"
-tier = "boundary"
-version = "=0.13.5"
-owner = "logical-db-http"
-capability = "net.async-http-client"
-source = "registry"
-license = "MIT OR Apache-2.0"
-allowed_consumers = "logical-db-http,logical-db-daemon"
-allowed_kinds = "normal"
-reason = "The thin client needs redirect suppression, a bounded streaming body, pooling, and system proxy that std lacks."
-approved_by = "Director"
-approved_on = "2026-09-13"
-review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+[approved.retire]
+replacement = "std::process"
+blocker = "The dependency-register test runs the estate check_dependencies verdict, which std does not provide."
+cost = { cold_build_s = 115.507, crates = 134, binary_bytes = 29596602, measured = "2026-11-24", command = "cargo build --locked -q -p lgwks_deps@8.0.0 in a fresh target dir; cargo tree --locked -p lgwks_deps@8.0.0 -e normal; summed rlib bytes" }
+review = "2027-02-24"
 
 [[approved]]
 crate = "axum"
@@ -289,6 +338,12 @@ approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
 
+[approved.retire]
+replacement = "std::net"
+blocker = "No estate HTTP server exists for the bounded CBOR ingress router."
+cost = { cold_build_s = 42.504, crates = 52, binary_bytes = 10087240, measured = "2026-11-24", command = "cargo build --locked -q -p axum@0.8.9 in a fresh target dir; cargo tree --locked -p axum@0.8.9 -e normal; summed rlib bytes" }
+review = "2027-02-24"
+
 [[approved]]
 crate = "tower"
 tier = "boundary"
@@ -303,3 +358,9 @@ reason = "The ingress middleware test harness composes axum services with tower'
 approved_by = "Director"
 approved_on = "2026-09-13"
 review = "https://github.com/srinji-kaggss/logical-DB/pull/45"
+
+[approved.retire]
+replacement = "std::net"
+blocker = "The ingress test harness composes axum services, and no estate service combinator exists."
+cost = { cold_build_s = 26.924, crates = 27, binary_bytes = 844834, measured = "2026-11-24", command = "cargo build --locked -q -p tower@0.5.3 in a fresh target dir; cargo tree --locked -p tower@0.5.3 -e normal; summed rlib bytes" }
+review = "2027-02-24"

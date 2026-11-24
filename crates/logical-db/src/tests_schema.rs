@@ -317,7 +317,7 @@ fn write_legacy_v1_schema_fixture(
     let ((), changes) =
         state.edit(|editor| editor.put(&Object::root(), "kind", Scalar::String("note".into())))?;
     assert_eq!(changes.len(), 1);
-    let change = &changes[0];
+    let change = changes.first().ok_or("one change was produced")?;
     let indexes = [IndexEntry::new(index, IndexValue::Text("legacy-v1".into()))];
     let snapshot = state.save()?;
     let local_change = LocalChange::new(
@@ -325,8 +325,8 @@ fn write_legacy_v1_schema_fixture(
         document,
         OperationId::new(),
         OperationDigest::new([0x4c; 32]),
-        change.digest,
-        &change.bytes,
+        change.digest(),
+        change.as_bytes(),
     )?;
     let outcome = store.commit_local(LocalCommit::new(
         local_change,
@@ -388,7 +388,7 @@ fn legacy_v1_schema_fixture_is_refused_then_migrated_rebuilt_and_reopened() -> R
         reopened.query_index(index, &IndexValue::Text("note".into()), None, 10)?,
         vec![document]
     );
-    assert_eq!(read_kind(&reopened, document).as_deref(), Some("note"));
+    assert_eq!(read_kind(&reopened, document)?.as_deref(), Some("note"));
     drop(reopened);
     fs::remove_file(path)?;
     Ok(())
@@ -409,7 +409,7 @@ fn projection_digest_is_invariant_to_declaration_order_and_reopens_durably() -> 
             Ok(None)
         }),
     ];
-    let reverse = vec![forward[1].clone(), forward[0].clone()];
+    let reverse: Vec<_> = forward.iter().rev().cloned().collect();
     assert_eq!(
         projection_digest(4, &forward)?,
         projection_digest(4, &reverse)?
@@ -431,7 +431,7 @@ fn projection_digest_is_invariant_to_declaration_order_and_reopens_durably() -> 
         )?;
     }
     let database = Database::open_with_schema(&path, scope, replica, 4, reverse)?;
-    assert_eq!(read_kind(&database, document).as_deref(), Some("note"));
+    assert_eq!(read_kind(&database, document)?.as_deref(), Some("note"));
     drop(database);
     fs::remove_file(path)?;
     Ok(())

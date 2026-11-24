@@ -59,13 +59,13 @@ impl FileProjectionIndex {
                 .write(true)
                 .truncate(true)
                 .open(&tmp)
-                .map_err(|error| io_error("open snapshot tmp", error))?;
+                .map_err(|error| io_error("open snapshot tmp", &error))?;
             file.write_all(&bytes)
-                .map_err(|error| io_error("write snapshot", error))?;
+                .map_err(|error| io_error("write snapshot", &error))?;
             file.sync_all()
-                .map_err(|error| io_error("fsync snapshot", error))?;
+                .map_err(|error| io_error("fsync snapshot", &error))?;
         }
-        std::fs::rename(&tmp, path).map_err(|error| io_error("rename snapshot", error))?;
+        std::fs::rename(&tmp, path).map_err(|error| io_error("rename snapshot", &error))?;
         if let Some(dir) = path.parent()
             && let Ok(handle) = std::fs::File::open(dir)
         {
@@ -83,10 +83,10 @@ impl FileProjectionIndex {
     /// NOT verified; call [`Self::verify_integrity`] to pay that cost.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, SnapshotError> {
         let path = path.as_ref();
-        let file = std::fs::File::open(path).map_err(|error| io_error("open snapshot", error))?;
+        let file = std::fs::File::open(path).map_err(|error| io_error("open snapshot", &error))?;
         let byte_len = file
             .metadata()
-            .map_err(|error| io_error("stat snapshot", error))?
+            .map_err(|error| io_error("stat snapshot", &error))?
             .len();
         let header = read_exact_at(&file, 0, super::projection_snapshot::HEADER_LEN)?;
         let row_count = parse_header(&header, file_len(byte_len)?)?.fact_count;
@@ -140,21 +140,8 @@ impl FileProjectionIndex {
     ///
     /// Returns [`SnapshotError`] for I/O failures or a hash mismatch.
     pub fn verify_integrity(&self) -> Result<(), SnapshotError> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = self.reopen()?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| io_error("seek snapshot", error))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|error| io_error("read snapshot", error))?;
+        let bytes = read_exact_at(&self.file, 0, file_len(self.byte_len)?)?;
         verify_snapshot_integrity(&bytes)
-    }
-
-    /// Reopens the snapshot file for a full streaming read.
-    fn reopen(&self) -> Result<std::fs::File, SnapshotError> {
-        self.file
-            .try_clone()
-            .map_err(|error| io_error("clone snapshot handle", error))
     }
 
     /// Returns the number of indexed rows.
@@ -181,19 +168,19 @@ fn read_exact_at(file: &std::fs::File, offset: u64, len: usize) -> Result<Vec<u8
     use std::io::{Read, Seek, SeekFrom};
     let mut handle = file
         .try_clone()
-        .map_err(|error| io_error("clone snapshot handle", error))?;
+        .map_err(|error| io_error("clone snapshot handle", &error))?;
     handle
         .seek(SeekFrom::Start(offset))
-        .map_err(|error| io_error("seek snapshot", error))?;
+        .map_err(|error| io_error("seek snapshot", &error))?;
     let mut window = vec![0_u8; len];
     handle
         .read_exact(&mut window)
-        .map_err(|error| io_error("read snapshot window", error))?;
+        .map_err(|error| io_error("read snapshot window", &error))?;
     Ok(window)
 }
 
 /// One refusal constructor for file I/O failures.
-fn io_error(at: &'static str, error: std::io::Error) -> SnapshotError {
+fn io_error(at: &'static str, error: &std::io::Error) -> SnapshotError {
     SnapshotError::Io {
         at,
         reason: error.to_string(),
@@ -250,22 +237,9 @@ impl SnapshotWindow for WindowReader<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::projection_indexed::IndexedProjection;
+    use super::super::projection_snapshot::tests::{queries, synthetic_index};
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Builds a synthetic index without I/O.
-    fn synthetic_index(count: u8) -> IndexedProjection {
-        let mut projection = IndexedProjection::new();
-        for index in 0..count {
-            let mut hash = [0_u8; 32];
-            hash[0] = index;
-            hash[1] = index.wrapping_mul(7);
-            let terms = vec![String::from("shared"), format!("term{index}")];
-            projection.insert(hash, terms);
-        }
-        projection
-    }
 
     /// One unique temporary snapshot path for a named fixture.
     fn snapshot_path(name: &str) -> std::path::PathBuf {
@@ -275,17 +249,6 @@ mod tests {
             "ldb-snap-{name}-{}-{sequence}.lwmx",
             std::process::id()
         ))
-    }
-
-    /// Sample queries shared by the parity tests.
-    fn queries() -> Vec<(String, Vec<i32>, usize)> {
-        vec![
-            (String::from("shared"), vec![], 10),
-            (String::from("term3"), vec![], 5),
-            (String::from("shared term7"), vec![1, 2, 3], 8),
-            (String::from("absent"), vec![], 8),
-            (String::new(), vec![5, 0, 0, 9], 8),
-        ]
     }
 
     #[test]
@@ -330,8 +293,7 @@ mod tests {
         FileProjectionIndex::build(&path, &projection)?;
 
         let mut bytes = std::fs::read(&path)?;
-        let last = bytes.len().saturating_sub(1);
-        bytes[last] ^= 0xFF;
+        *bytes.last_mut().ok_or("snapshot file is empty")? ^= 0xFF;
         std::fs::write(&path, &bytes)?;
 
         let index = FileProjectionIndex::open(&path)?;

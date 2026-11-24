@@ -7,7 +7,9 @@
 use std::collections::BTreeSet;
 
 use logical_db_crdt::{CrdtError, Document, Editor, EncodedChange};
-use logical_db_model::{ChangeDigest, DocumentId, DocumentRevision, OperationDigest, OperationId};
+use logical_db_model::{
+    ChangeDigest, DocumentId, DocumentRevision, IndexEntry, OperationDigest, OperationId,
+};
 use logical_db_store::{CommitOutcome, LocalChange, LocalCommit, StoreError};
 
 use super::db::Database;
@@ -84,6 +86,33 @@ impl Database {
             .map_err(DatabaseError::Store)
     }
 
+    /// Saves the successor snapshot and commits its one change atomically.
+    fn commit_successor(
+        &self,
+        (document, operation, request): (DocumentId, OperationId, OperationDigest),
+        change: &EncodedChange,
+        state: &mut Document,
+        expected_revision: Option<DocumentRevision>,
+        indexes: &[IndexEntry],
+        tombstone: bool,
+    ) -> Result<CommitOutcome, DatabaseError> {
+        let snapshot = state.save()?;
+        let local_change = self.stage_local_change(
+            document,
+            operation,
+            request,
+            change.digest(),
+            change.as_bytes(),
+        )?;
+        Ok(self.store.commit_local(LocalCommit::new(
+            local_change,
+            expected_revision,
+            &snapshot,
+            indexes,
+            tombstone,
+        ))?)
+    }
+
     /// Applies one structured CRDT transaction and atomically saves its
     /// snapshot, immutable change, idempotency identity, and outbox entry.
     ///
@@ -135,7 +164,7 @@ impl Database {
             return Ok(EditOutcome::Duplicate(receipt));
         }
         let stored = self.store.load_snapshot(self.scope, document)?;
-        let actual_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let actual_revision = stored.as_ref().map(|snapshot| snapshot.revision());
         if required_revision.is_some_and(|expected| actual_revision != Some(expected)) {
             return Err(StoreError::StaleDocument.into());
         }
@@ -152,25 +181,23 @@ impl Database {
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
         let indexes = self.project(&mut state)?;
-        let snapshot = state.save()?;
-        let local_change =
-            self.stage_local_change(document, operation, request, change.digest, &change.bytes)?;
-        let outcome = self.store.commit_local(LocalCommit::new(
-            local_change,
+        let outcome = self.commit_successor(
+            (document, operation, request),
+            &change,
+            &mut state,
             actual_revision,
-            &snapshot,
             &indexes,
             false,
-        ))?;
+        )?;
         match outcome {
             CommitOutcome::Applied { sequence } => Ok(EditOutcome::Applied(EditReceipt {
                 value,
                 sequence,
-                digest: change.digest,
+                digest: change.digest(),
             })),
             CommitOutcome::Duplicate { sequence } => Ok(EditOutcome::Duplicate(DuplicateReceipt {
                 sequence,
-                digest: change.digest,
+                digest: change.digest(),
             })),
             // Fail closed on a future commit outcome rather than assuming the
             // enum is closed outside the defining crate.
@@ -185,7 +212,7 @@ impl Database {
         edit: BatchEdit,
     ) -> Result<PreparedBatchEdit, DatabaseError> {
         let stored = self.store.load_snapshot(self.scope, edit.document)?;
-        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision());
         let mut state = match stored {
             Some(snapshot) => Document::load(snapshot.bytes())?,
             None => Document::new(),
@@ -205,8 +232,8 @@ impl Database {
             document: edit.document,
             operation: edit.operation,
             request: edit.request,
-            digest: change.digest,
-            bytes: change.bytes,
+            digest: change.digest(),
+            bytes: change.into_bytes(),
             expected_revision,
             snapshot,
             indexes,
@@ -246,17 +273,13 @@ impl Database {
             duplicates.push(self.existing_batch_operation(edit)?);
         }
         let mut prepared = Vec::with_capacity(edits.len());
-        for (index, edit) in edits.into_iter().enumerate() {
-            if duplicates[index].is_some() {
-                continue;
-            }
-            prepared.push(self.prepare_batch_edit(index, edit)?);
-        }
-        let mut results: Vec<Option<EditOutcome<()>>> =
-            (0..duplicates.len()).map(|_| None).collect();
-        for (index, duplicate) in duplicates.into_iter().enumerate() {
+        let mut results: Vec<Option<EditOutcome<()>>> = Vec::with_capacity(edits.len());
+        for (index, (edit, duplicate)) in edits.into_iter().zip(duplicates).enumerate() {
             if let Some(duplicate) = duplicate {
-                results[index] = Some(EditOutcome::Duplicate(duplicate));
+                results.push(Some(EditOutcome::Duplicate(duplicate)));
+            } else {
+                prepared.push(self.prepare_batch_edit(index, edit)?);
+                results.push(None);
             }
         }
         if prepared.is_empty() {
@@ -285,7 +308,10 @@ impl Database {
         }
         let outcomes = self.store.commit_local_batch(&commits)?;
         for (outcome, edit) in outcomes.into_iter().zip(prepared) {
-            results[edit.index] = Some(match outcome {
+            let slot = results
+                .get_mut(edit.index)
+                .ok_or(DatabaseError::ChangeCardinality(edit.index))?;
+            *slot = Some(match outcome {
                 CommitOutcome::Applied { sequence } => EditOutcome::Applied(EditReceipt {
                     value: (),
                     sequence,
@@ -336,7 +362,7 @@ impl Database {
             return Ok(DeleteOutcome::Duplicate(receipt));
         }
         let stored = self.store.load_snapshot(self.scope, document)?;
-        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision);
+        let expected_revision = stored.as_ref().map(|snapshot| snapshot.revision());
         let mut state = match stored {
             Some(snapshot) => Document::load(snapshot.bytes())?,
             None => Document::new(),
@@ -346,25 +372,23 @@ impl Database {
             return Err(DatabaseError::ChangeCardinality(changes.len()));
         }
         let change = changes.pop().ok_or(DatabaseError::ChangeCardinality(0))?;
-        let snapshot = state.save()?;
-        let local_change =
-            self.stage_local_change(document, operation, request, change.digest, &change.bytes)?;
-        let outcome = self.store.commit_local(LocalCommit::new(
-            local_change,
+        let outcome = self.commit_successor(
+            (document, operation, request),
+            &change,
+            &mut state,
             expected_revision,
-            &snapshot,
             &[],
             true,
-        ))?;
+        )?;
         match outcome {
             CommitOutcome::Applied { sequence } => Ok(DeleteOutcome::Applied(DeleteReceipt {
                 sequence,
-                digest: change.digest,
+                digest: change.digest(),
             })),
             CommitOutcome::Duplicate { sequence } => {
                 Ok(DeleteOutcome::Duplicate(DuplicateReceipt {
                     sequence,
-                    digest: change.digest,
+                    digest: change.digest(),
                 }))
             }
             // Fail closed on a future commit outcome rather than assuming the
@@ -523,8 +547,10 @@ mod tests {
             ),
         ])?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(matches!(applied[0], EditOutcome::Applied(_)));
-        assert!(matches!(applied[1], EditOutcome::Applied(_)));
+        assert!(matches!(
+            applied.as_slice(),
+            &[EditOutcome::Applied(_), EditOutcome::Applied(_)]
+        ));
 
         let duplicate_calls = std::sync::Arc::clone(&calls);
         let third_calls = std::sync::Arc::clone(&calls);
@@ -549,8 +575,10 @@ mod tests {
             ),
         ])?;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert!(matches!(retried[0], EditOutcome::Duplicate(_)));
-        assert!(matches!(retried[1], EditOutcome::Applied(_)));
+        assert!(matches!(
+            retried.as_slice(),
+            &[EditOutcome::Duplicate(_), EditOutcome::Applied(_)]
+        ));
         drop(database);
         fs::remove_file(path)?;
         Ok(())
@@ -649,8 +677,10 @@ mod tests {
             .ok_or("expected conflicts")?;
         assert_eq!(candidates.len(), 1);
         assert_eq!(
-            candidates[0].value,
-            Item::Scalar(Scalar::String("v1".into()))
+            candidates
+                .first()
+                .map(logical_db_crdt::ConflictValue::value),
+            Some(&Item::Scalar(Scalar::String("v1".into())))
         );
         drop(database);
         fs::remove_file(db_path)?;

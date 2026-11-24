@@ -52,30 +52,22 @@ fn row_identity(document: DocumentId) -> [u8; 32] {
     row
 }
 
-/// Recovers the document from a [`row_identity`] row identity.
-///
-/// # Errors
-///
-/// Returns [`DatabaseError::ProjectionView`] when the row bytes do not
-/// decode, which cannot happen for rows this module wrote.
-fn document_of_row(hash: &[u8; 32]) -> Result<DocumentId, DatabaseError> {
+/// Recovers the document from a [`row_identity`] row identity: its first
+/// sixteen bytes are the document UUID.
+fn document_of_row(hash: &[u8; 32]) -> DocumentId {
     let mut raw = [0_u8; 16];
     raw.copy_from_slice(&hash[..16]);
-    Ok(DocumentId::from_uuid(super::identity::decode_identity_id(
-        &raw,
-    )?))
+    DocumentId::from_uuid(lgwks_std::id::Uuid::from(raw))
 }
 
 /// Maps scored index matches back to ranked document hits.
 ///
 /// Both the live hybrid query and the durable snapshot query share this
 /// fold instead of repeating it.
-fn ranked_hits(matches: Vec<IndexedMatch>) -> Result<Vec<IndexedHit>, DatabaseError> {
+fn ranked_hits(matches: Vec<IndexedMatch>) -> Vec<IndexedHit> {
     matches
         .into_iter()
-        .map(|scored| {
-            document_of_row(&scored.hash).map(|document| IndexedHit::new(document, scored.score))
-        })
+        .map(|scored| IndexedHit::new(document_of_row(&scored.hash), scored.score))
         .collect()
 }
 
@@ -93,10 +85,10 @@ impl Database {
             for &(document, ref text) in page.rows() {
                 projection.insert(row_identity(document), tokenize(text));
             }
-            if page.next.is_none() {
+            if page.next().is_none() {
                 break;
             }
-            cursor = page.next;
+            cursor = page.next().map(<[u8]>::to_vec);
         }
         Ok(projection)
     }
@@ -124,8 +116,11 @@ impl Database {
         if projection.is_empty() {
             return Ok(Vec::new());
         }
-        let matches = projection.query(query_text, vector_seed, top_k)?;
-        ranked_hits(matches)
+        Ok(ranked_hits(projection.query(
+            query_text,
+            vector_seed,
+            top_k,
+        )?))
     }
 
     /// Builds a durable indexed snapshot for one index at `path`.
@@ -169,7 +164,6 @@ impl Database {
         top_k: usize,
     ) -> Result<Vec<IndexedHit>, DatabaseError> {
         let index = FileProjectionIndex::open(path)?;
-        let matches = index.query(query_text, vector_seed, top_k)?;
-        ranked_hits(matches)
+        Ok(ranked_hits(index.query(query_text, vector_seed, top_k)?))
     }
 }

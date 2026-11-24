@@ -11,7 +11,6 @@ use crate::types::{CommitOutcome, LocalChange, LocalCommit, MigrationIndexes, Mi
 use logical_db_model::{
     ChangeDigest, DocumentId, IndexEntry, IndexId, IndexValue, OperationDigest, OperationId, Scope,
 };
-use std::error::Error;
 
 /// Typed failure for store unit tests: every fallible fixture step names its
 /// error instead of erasing it behind a box.
@@ -23,6 +22,19 @@ pub(crate) enum TestError {
     /// Fixture file cleanup failed.
     #[error("fixture cleanup failed: {0}")]
     Io(std::io::Error),
+    /// A fixture worker thread panicked; the payload is kept for inspection.
+    #[error("fixture worker thread panicked")]
+    Panicked(Box<dyn std::any::Any + Send>),
+    /// A fixture counter did not fit its byte seed.
+    #[error("fixture counter exceeds its byte seed: {0}")]
+    Width(std::num::TryFromIntError),
+}
+
+impl From<std::num::TryFromIntError> for TestError {
+    /// Adapts a counter overflow without discarding its cause.
+    fn from(error: std::num::TryFromIntError) -> Self {
+        Self::Width(error)
+    }
 }
 
 impl From<StoreError> for TestError {
@@ -117,7 +129,7 @@ pub(crate) fn seed_migration_documents(
     scope: Scope,
     index: IndexId,
     documents: [DocumentId; 3],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TestError> {
     store.bind_schema(scope, 1, [1; 32])?;
     for (offset, document) in documents.into_iter().enumerate() {
         store.commit_local(LocalCommit {

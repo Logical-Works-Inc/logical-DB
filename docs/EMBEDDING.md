@@ -33,17 +33,6 @@ CredentialProvider, StaticBearer}` without coupling an app to internal crates.
 Custom transports implement the facade-exported `logical_db::transport::Transport`
 using its versioned push/pull types.
 
-Hosts that model semantic observations may enable the facade's `semantics`
-feature to reuse the bounded, non-authoritative `logical-db-cairn` vocabulary
-and `logical-db-episode` local model through the same `Database` API. This is
-not the canonical CAIRN ingestion path or the durable ORIGIN episode database,
-and its v1 SHA-256 snapshot is not the locked LEM v0 BLAKE3 wire. A reviewed
-versioned adapter is required for external LEM consumption. The feature stays
-off by default so embedded replicas keep their minimal footprint, and
-`logical-db-e2e` carries a network-free journey proving an episode snapshot
-round-trips through a document with its evidence-subset guard intact. See
-`docs/adr/0001-semantic-plane-boundary.md`.
-
 ## Deployment shapes
 
 - **Embedded only:** app → `logical-db` → Automerge + redb. No daemon, network,
@@ -76,19 +65,10 @@ The product definition of record is
 substrate unifying Logical-DB (durable state), Cairn (observations), and
 LEM (episodic memory) — an embeddable, local-first ontology substrate
 with dedupe-from-first-write, full reversibility, and citation-bearing
-agent memory. The 2026-09-16 companion review of Apple CloudKit lives in
-[review-cloudkit.md](review-cloudkit.md).
+agent memory.
 
-Delivered and evidenced: the clean-room rewrite gates (verifier, one-way
-crate DAG, mutation campaigns, FDB unknown-commit injection), the
-recovery stack through pruning and process-kill restore (PRs #48–#53,
-live-cluster receipts in `evidence/`), the bounded HTTP transport
-deadline (PR #57), and GitHub-hosted Linux, macOS, and Windows quality and
-FDB CI lanes (2026-11-03). Retired: the facade-to-daemon journey, whose
-confirmation model was unsound. Still gating production release: the
-recovery-acceptance checklist (#28), the checked access graph (#25), the
-Cairn+LEM migration proof (PRD WP2, ADR-0002), and the deployment/load
-journeys in `REWRITE_MANIFEST.md`, which remains the mechanical authority.
-
-See [GOVERNANCE.md](../GOVERNANCE.md) for delivered evidence, open acceptance
-work, and the Director decisions needed to reconcile historical scope contracts.
+Delivered: the one-way crate graph, FDB unknown-commit injection, the recovery
+stack through pruning and process-kill restore, the bounded HTTP deadline, and
+GitHub-hosted Linux, macOS, Windows and FDB CI lanes. Each has a named test in
+[INVARIANTS.md](../INVARIANTS.md). Still gating release: multi-node FDB
+failover, public ingress and sustained load. Open work is in GitHub issues.

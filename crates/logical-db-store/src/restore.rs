@@ -4,7 +4,7 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 
-use crate::codec::{decode_revision, decode_u64, malformed_store};
+use crate::codec::{decode_revision, decode_u64, fill, take};
 use crate::error::StoreError;
 use crate::keys::{DATA, RESTORE_MARKER_BYTES, key_restore, key_revision};
 use crate::store::{EmbeddedStore, ensure_not_migrating};
@@ -167,21 +167,18 @@ impl EmbeddedStore {
 
 /// Encodes one durable restore cursor.
 pub(crate) fn encode_restore_cursor(cursor: RestoreCursor) -> [u8; RESTORE_MARKER_BYTES] {
-    let mut value = [0_u8; RESTORE_MARKER_BYTES];
-    value[..32].copy_from_slice(&cursor.payload);
-    value[32..].copy_from_slice(&cursor.next.to_be_bytes());
-    value
+    fill(cursor.payload.into_iter().chain(cursor.next.to_be_bytes()))
 }
 
 /// Decodes and validates one durable restore cursor.
 pub(crate) fn decode_restore_cursor(bytes: &[u8]) -> Result<RestoreCursor, StoreError> {
     if bytes.len() != RESTORE_MARKER_BYTES {
-        let error = StoreError::CorruptInternalValue;
-        return Err(error);
+        return Err(StoreError::CorruptInternalValue);
     }
-    let payload: [u8; 32] = bytes[..32].try_into().map_err(malformed_store)?;
+    let mut rest = bytes;
+    let payload = take::<32>(&mut rest)?;
     Ok(RestoreCursor {
         payload,
-        next: decode_u64(&bytes[32..])?,
+        next: decode_u64(rest)?,
     })
 }

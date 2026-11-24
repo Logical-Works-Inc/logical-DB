@@ -9,6 +9,7 @@
 //! them instead of repeating them. One seed still drives every input of
 //! every trace; the same seed always hashes the same trace.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lgwks_std::hash::Hasher;
@@ -23,10 +24,11 @@ use logical_db_store::snapshot_file::FileProjectionIndex;
 use logical_db_store::snapshot_restore::{SnapshotInput, create_snapshot, restore_or_replay};
 
 /// Creation-time base every sim derives its timestamps from.
-pub const TIME_BASE: u64 = 1_700_000_000;
+pub(crate) const TIME_BASE: u64 = 1_700_000_000;
 
 /// Deterministic xorshift64: the only randomness the sims use.
-pub struct XorShift {
+#[derive(Debug)]
+pub(crate) struct XorShift {
     /// Current state, never zero.
     state: u64,
 }
@@ -34,7 +36,7 @@ pub struct XorShift {
 impl XorShift {
     /// Creates the generator; a zero seed maps to a fixed nonzero start.
     #[must_use]
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
                 0x243F_6A88_85A3_08D3
@@ -46,7 +48,7 @@ impl XorShift {
 
     /// Returns the next pseudorandom word.
     #[must_use]
-    pub fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut mixer = self.state;
         mixer ^= mixer << 13;
         mixer ^= mixer >> 7;
@@ -61,7 +63,7 @@ impl XorShift {
     ///
     /// Returns a draw exhaustion when `bound` is zero, which the
     /// `debug_assert` plus every caller passing a nonzero bound excludes.
-    pub fn below(&mut self, bound: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    pub(crate) fn below(&mut self, bound: u64) -> Result<u64, Box<dyn std::error::Error>> {
         debug_assert!(bound > 0, "sim bound must be nonzero");
         self.next_u64()
             .checked_rem(bound)
@@ -71,7 +73,7 @@ impl XorShift {
 
     /// Returns 32 seeded bytes.
     #[must_use]
-    pub fn bytes32(&mut self) -> [u8; 32] {
+    pub(crate) fn bytes32(&mut self) -> [u8; 32] {
         let mut out = [0_u8; 32];
         for chunk in out.chunks_mut(8) {
             chunk.copy_from_slice(&self.next_u64().to_le_bytes());
@@ -82,17 +84,23 @@ impl XorShift {
 
 /// One deterministic row identity from a sequence number.
 #[must_use]
-pub fn test_row(i: u64) -> [u8; 32] {
+pub(crate) fn test_row(i: u64) -> [u8; 32] {
+    let words = [
+        i,
+        i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        i.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+        0,
+    ];
     let mut row = [0_u8; 32];
-    row[..8].copy_from_slice(&i.to_le_bytes());
-    row[8..16].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
-    row[16..24].copy_from_slice(&i.wrapping_mul(0xBF58_476D_1CE4_E5B9).to_le_bytes());
+    for (chunk, word) in row.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
     row
 }
 
 /// One unique temporary path for this run.
 #[must_use]
-pub fn temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
+pub(crate) fn temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let sequence = COUNTER.fetch_add(1, Ordering::SeqCst);
     std::env::temp_dir().join(format!(
@@ -103,7 +111,7 @@ pub fn temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 
 /// Opens a seeded RNG plus a domain-tagged trace hasher.
 #[must_use]
-pub fn opened(seed: u64, domain: &[u8], tag: &[u8]) -> (XorShift, Hasher) {
+pub(crate) fn opened(seed: u64, domain: &[u8], tag: &[u8]) -> (XorShift, Hasher) {
     let mut hasher = Hasher::new();
     hasher.update(domain);
     hasher.update(tag);
@@ -112,12 +120,12 @@ pub fn opened(seed: u64, domain: &[u8], tag: &[u8]) -> (XorShift, Hasher) {
 
 /// Finalizes a trace hash.
 #[must_use]
-pub fn trace_tag(hasher: Hasher) -> [u8; 32] {
+pub(crate) fn trace_tag(hasher: &Hasher) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
 /// Runs one trace twice per seed and asserts identical trace hashes.
-pub fn check(
+pub(crate) fn check(
     seeds: [u64; 2],
     trace: impl Fn(u64) -> Result<[u8; 32], Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -163,14 +171,16 @@ fn apply_test_row_sqlite(
 }
 
 /// Replays rows `after+1..total` into a relational projection.
-pub fn replay_all(total: u64) -> impl FnMut(&mut RelationalProjection, u64) -> Result<u64, String> {
+pub(crate) fn replay_all(
+    total: u64,
+) -> impl FnMut(&mut RelationalProjection, u64) -> Result<u64, String> {
     move |restored: &mut RelationalProjection, after: u64| -> Result<u64, String> {
         replay_rows(restored, after, total, apply_test_row)
     }
 }
 
 /// Replays rows `after+1..total` into a Sqlite-backed relational projection.
-pub fn replay_all_sqlite(
+pub(crate) fn replay_all_sqlite(
     total: u64,
 ) -> impl FnMut(&mut SqliteRelationalProjection, u64) -> Result<u64, String> {
     move |restored: &mut SqliteRelationalProjection, after: u64| -> Result<u64, String> {
@@ -180,7 +190,7 @@ pub fn replay_all_sqlite(
 
 /// Replays rows `0..rows` into a relational projection, ignoring the tail
 /// cursor: the genesis path.
-pub fn replay_genesis(
+pub(crate) fn replay_genesis(
     rows: u64,
 ) -> impl FnMut(&mut RelationalProjection, u64) -> Result<u64, String> {
     move |restored: &mut RelationalProjection, _after: u64| -> Result<u64, String> {
@@ -194,7 +204,10 @@ pub fn replay_genesis(
 /// # Errors
 ///
 /// Returns a seed length overflow that cannot happen for sim spreads.
-pub fn seed_vec(rng: &mut XorShift, len: usize) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+pub(crate) fn seed_vec(
+    rng: &mut XorShift,
+    len: usize,
+) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
         let bits = rng.next_u64() & 0x7FFF_FFFF;
@@ -210,7 +223,7 @@ pub fn seed_vec(rng: &mut XorShift, len: usize) -> Result<Vec<i32>, Box<dyn std:
 /// # Errors
 ///
 /// Returns a count overflow that cannot happen for sim spreads.
-pub fn count(
+pub(crate) fn count(
     rng: &mut XorShift,
     base: usize,
     spread: u64,
@@ -225,7 +238,7 @@ pub fn count(
 /// # Errors
 ///
 /// Returns a length overflow that cannot happen for sim counts.
-pub fn seeded_index(
+pub(crate) fn seeded_index(
     rng: &mut XorShift,
     rows: usize,
 ) -> Result<IndexedProjection, Box<dyn std::error::Error>> {
@@ -254,7 +267,7 @@ pub fn seeded_index(
 /// # Errors
 ///
 /// Returns a file I/O failure.
-pub fn build_snapshot(
+pub(crate) fn build_snapshot(
     projection: &IndexedProjection,
 ) -> Result<(std::path::PathBuf, Vec<u8>), Box<dyn std::error::Error>> {
     let path = temp_path("snap", "lwmx");
@@ -268,7 +281,7 @@ pub fn build_snapshot(
 /// # Errors
 ///
 /// Returns a file I/O failure.
-pub fn cleanup(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn cleanup(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_file(path)?;
     Ok(())
 }
@@ -279,7 +292,7 @@ pub fn cleanup(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// Returns [`ProjectionError`] past the row budget, which the sim counts
 /// never reach.
-pub fn apply_rows(
+pub(crate) fn apply_rows(
     projection: &mut RelationalProjection,
     count: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -291,15 +304,15 @@ pub fn apply_rows(
 
 /// One isolated snapshot store with its scope and projection identity.
 #[non_exhaustive]
-pub struct Fixture {
+pub(crate) struct Fixture {
     /// Temporary store path, removed by the trace when done.
-    pub path: std::path::PathBuf,
+    pub(crate) path: std::path::PathBuf,
     /// The dedicated snapshot store.
-    pub store: RedbSnapshotStore,
+    pub(crate) store: RedbSnapshotStore,
     /// The isolated tenant scope.
-    pub scope: Scope,
+    pub(crate) scope: Scope,
     /// The projected index identity.
-    pub projection: IndexId,
+    pub(crate) projection: IndexId,
 }
 
 /// Opens one isolated snapshot store for a trace.
@@ -307,7 +320,10 @@ pub struct Fixture {
 /// # Errors
 ///
 /// Returns a backend failure when the store file cannot be opened.
-pub fn fixture(rng: &mut XorShift, prefix: &str) -> Result<Fixture, Box<dyn std::error::Error>> {
+pub(crate) fn fixture(
+    rng: &mut XorShift,
+    prefix: &str,
+) -> Result<Fixture, Box<dyn std::error::Error>> {
     let path = temp_path(prefix, "redb");
     let store = RedbSnapshotStore::open(&path)?;
     Ok(Fixture {
@@ -323,13 +339,13 @@ pub fn fixture(rng: &mut XorShift, prefix: &str) -> Result<Fixture, Box<dyn std:
 /// Traces that share the open/verify/finish skeleton run through one of
 /// these instead of repeating it, so the skeleton exists exactly once.
 #[non_exhaustive]
-pub struct Case {
+pub(crate) struct Case {
     /// The seeded RNG driving every input of the trace.
-    pub rng: XorShift,
+    pub(crate) rng: XorShift,
     /// The trace hasher accumulating the seeded trace.
-    pub hasher: Hasher,
+    pub(crate) hasher: Hasher,
     /// The isolated snapshot store with its scope and projection.
-    pub own: Fixture,
+    pub(crate) own: Fixture,
 }
 
 impl Case {
@@ -338,7 +354,7 @@ impl Case {
     /// # Errors
     ///
     /// Returns a backend failure when the store file cannot be opened.
-    pub fn open(
+    pub(crate) fn open(
         seed: u64,
         domain: &[u8],
         tag: &[u8],
@@ -354,29 +370,49 @@ impl Case {
     /// # Errors
     ///
     /// Returns a file I/O failure.
-    pub fn finish(self) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    pub(crate) fn finish(self) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         cleanup(&self.own.path)?;
-        Ok(trace_tag(self.hasher))
+        Ok(trace_tag(&self.hasher))
+    }
+}
+
+impl std::fmt::Debug for Fixture {
+    /// Names the fixture by path and tenant; the open store has no useful text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Fixture")
+            .field("path", &self.path)
+            .field("scope", &self.scope)
+            .field("projection", &self.projection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Case {
+    /// Names the case by its generator and fixture; the hasher holds no state
+    /// worth printing.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Case")
+            .field("rng", &self.rng)
+            .field("own", &self.own)
+            .finish_non_exhaustive()
     }
 }
 
 /// Formats 16 seeded bytes as quoted hyphenated lowercase hex: the canonical
 /// UUID text form the model's Deserialize contract parses. Quoted, because
 /// the estate JSON owner parses JSON documents, not bare strings.
-fn quoted(rng: &mut XorShift) -> String {
-    let bytes = rng.bytes32();
-    let hex: String = bytes[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!(
-        "\"{}-{}-{}-{}-{}\"",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
+fn quoted(rng: &mut XorShift) -> Result<String, std::fmt::Error> {
+    let mut text = String::from('"');
+    for (index, byte) in rng.bytes32().into_iter().take(16).enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            text.push('-');
+        }
+        write!(text, "{byte:02x}")?;
+    }
+    text.push('"');
+    Ok(text)
 }
 
 /// One fresh isolated tenant scope, derived from the seed.
@@ -384,10 +420,10 @@ fn quoted(rng: &mut XorShift) -> String {
 /// # Errors
 ///
 /// Returns the model's parse refusal, which the canonical text never triggers.
-pub fn fresh_scope(rng: &mut XorShift) -> Result<Scope, Box<dyn std::error::Error>> {
+pub(crate) fn fresh_scope(rng: &mut XorShift) -> Result<Scope, Box<dyn std::error::Error>> {
     Ok(Scope::new(
-        lgwks_std::json::from_str(&quoted(rng))?,
-        lgwks_std::json::from_str(&quoted(rng))?,
+        lgwks_std::json::from_str(&quoted(rng)?)?,
+        lgwks_std::json::from_str(&quoted(rng)?)?,
     ))
 }
 
@@ -396,8 +432,8 @@ pub fn fresh_scope(rng: &mut XorShift) -> Result<Scope, Box<dyn std::error::Erro
 /// # Errors
 ///
 /// Returns the model's parse refusal, which the canonical text never triggers.
-pub fn fresh_projection(rng: &mut XorShift) -> Result<IndexId, Box<dyn std::error::Error>> {
-    Ok(lgwks_std::json::from_str(&quoted(rng))?)
+pub(crate) fn fresh_projection(rng: &mut XorShift) -> Result<IndexId, Box<dyn std::error::Error>> {
+    Ok(lgwks_std::json::from_str(&quoted(rng)?)?)
 }
 
 /// One fresh isolated account identity, derived from the seed.
@@ -405,8 +441,8 @@ pub fn fresh_projection(rng: &mut XorShift) -> Result<IndexId, Box<dyn std::erro
 /// # Errors
 ///
 /// Returns the model's parse refusal, which the canonical text never triggers.
-pub fn fresh_account(rng: &mut XorShift) -> Result<AccountId, Box<dyn std::error::Error>> {
-    Ok(lgwks_std::json::from_str(&quoted(rng))?)
+pub(crate) fn fresh_account(rng: &mut XorShift) -> Result<AccountId, Box<dyn std::error::Error>> {
+    Ok(lgwks_std::json::from_str(&quoted(rng)?)?)
 }
 
 /// One fresh isolated space identity, derived from the seed.
@@ -414,8 +450,8 @@ pub fn fresh_account(rng: &mut XorShift) -> Result<AccountId, Box<dyn std::error
 /// # Errors
 ///
 /// Returns the model's parse refusal, which the canonical text never triggers.
-pub fn fresh_space(rng: &mut XorShift) -> Result<SpaceId, Box<dyn std::error::Error>> {
-    Ok(lgwks_std::json::from_str(&quoted(rng))?)
+pub(crate) fn fresh_space(rng: &mut XorShift) -> Result<SpaceId, Box<dyn std::error::Error>> {
+    Ok(lgwks_std::json::from_str(&quoted(rng)?)?)
 }
 
 /// Seals `rows` relational rows at one frontier and persists the envelope.
@@ -423,7 +459,7 @@ pub fn fresh_space(rng: &mut XorShift) -> Result<SpaceId, Box<dyn std::error::Er
 /// # Errors
 ///
 /// Returns a backend or envelope failure when sealing or saving fails.
-pub fn seal_rows(
+pub(crate) fn seal_rows(
     store: &RedbSnapshotStore,
     scope: Scope,
     projection: IndexId,
@@ -440,7 +476,7 @@ pub fn seal_rows(
     let envelope = create_snapshot(
         store,
         scope,
-        SnapshotInput::new(
+        &SnapshotInput::new(
             projection,
             semantics,
             &mem,
@@ -485,7 +521,7 @@ fn harness_self_check() -> Result<(), Box<dyn std::error::Error>> {
         TIME_BASE,
     )?;
     envelope.verify()?;
-    hasher.update(&envelope.hash);
+    hasher.update(&envelope.hash());
     cleanup(&own.path)?;
     let mut probe = Case::open(7, b"ldb.sim.harness.v1", b"self-check-case", "self-check")?;
     probe.hasher.update(&probe.rng.next_u64().to_le_bytes());
@@ -528,5 +564,9 @@ fn harness_self_check() -> Result<(), Box<dyn std::error::Error>> {
         tag.iter().any(|byte| *byte != 0),
         "the self-check trace is non-degenerate"
     );
-    Ok(())
+    check([0x5EED_0001, 0x5EED_0002], |seed| {
+        let (mut twice, mut twice_hasher) = opened(seed, b"ldb.sim.harness.v1", b"check-twice");
+        twice_hasher.update(&twice.next_u64().to_le_bytes());
+        Ok(trace_tag(&twice_hasher))
+    })
 }

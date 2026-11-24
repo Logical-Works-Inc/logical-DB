@@ -9,7 +9,6 @@ pub use crate::{
 };
 pub use logical_db_crdt::{Editor, Item, Object, Reader, Scalar};
 pub use logical_db_model::{
-    AccountId, BackendClass, Capability, CapabilityProfile, ChangeDigest, DocumentId, IndexEntry,
-    IndexId, IndexValue, OperationDigest, OperationId, ReplicaId, Scope, SpaceId,
-    common_guarantees,
+    AccountId, ChangeDigest, DocumentId, IndexEntry, IndexId, IndexValue, OperationDigest,
+    OperationId, ReplicaId, Scope, SpaceId,
 };

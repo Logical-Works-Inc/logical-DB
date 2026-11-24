@@ -19,7 +19,9 @@ use logical_db_service::{
     ServiceStore,
 };
 
-use crate::support::{FixedClock, Grant, MemoryServiceStore, TestAuthentication};
+use crate::support::{
+    Allow, BLACK_BOX_TOKEN, FixedClock, Grant, MemoryServiceStore, TestAuthentication,
+};
 
 static HARNESS_PATH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -32,7 +34,7 @@ pub(crate) enum JourneyError {
     /// The embedded replica refused or failed the operation.
     Db(logical_db::DatabaseError),
     /// The in-memory service refused or failed the operation.
-    Service(logical_db_model::ModelError),
+    Service(crate::support::MemoryStoreError),
     /// Fixture file or socket I/O failed.
     Io(std::io::Error),
     /// An integer conversion exceeded its addressable range.
@@ -41,8 +43,21 @@ pub(crate) enum JourneyError {
     Fixture(String),
     /// A synchronization round failed.
     Sync(logical_db::SyncError<logical_db::DatabaseError, logical_db_http::HttpError>),
-    /// A shared helper erased its failure before this layer existed.
-    Harness(Box<dyn std::error::Error>),
+    /// The checkpoint codec refused its key or lifetime.
+    Checkpoint(logical_db_service::CheckpointError),
+    /// The HTTP transport refused its endpoint or failed a request.
+    Http(logical_db_http::HttpError),
+    /// The bearer credential was refused.
+    Credential(logical_db_http::CredentialError),
+    /// The model refused a snapshot artifact or identity.
+    Model(logical_db_model::ModelError),
+}
+
+impl From<logical_db_model::ModelError> for JourneyError {
+    /// Adapts a model refusal without discarding its variant.
+    fn from(error: logical_db_model::ModelError) -> Self {
+        Self::Model(error)
+    }
 }
 
 impl From<logical_db::DatabaseError> for JourneyError {
@@ -52,9 +67,9 @@ impl From<logical_db::DatabaseError> for JourneyError {
     }
 }
 
-impl From<logical_db_model::ModelError> for JourneyError {
+impl From<crate::support::MemoryStoreError> for JourneyError {
     /// Adapts a service refusal without discarding its variant.
-    fn from(error: logical_db_model::ModelError) -> Self {
+    fn from(error: crate::support::MemoryStoreError) -> Self {
         Self::Service(error)
     }
 }
@@ -91,6 +106,27 @@ impl From<logical_db::SyncError<logical_db::DatabaseError, logical_db_http::Http
     }
 }
 
+impl From<logical_db_service::CheckpointError> for JourneyError {
+    /// Adapts a checkpoint codec refusal without discarding its variant.
+    fn from(error: logical_db_service::CheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
+impl From<logical_db_http::HttpError> for JourneyError {
+    /// Adapts a transport refusal without discarding its variant.
+    fn from(error: logical_db_http::HttpError) -> Self {
+        Self::Http(error)
+    }
+}
+
+impl From<logical_db_http::CredentialError> for JourneyError {
+    /// Adapts a credential refusal without discarding its variant.
+    fn from(error: logical_db_http::CredentialError) -> Self {
+        Self::Credential(error)
+    }
+}
+
 impl std::fmt::Display for JourneyError {
     /// Renders the failing journey step for the test runner.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,7 +137,12 @@ impl std::fmt::Display for JourneyError {
             Self::Int(ref error) => write!(formatter, "journey integer conversion failed: {error}"),
             Self::Sync(ref error) => write!(formatter, "journey synchronization failed: {error}"),
             Self::Fixture(ref message) => write!(formatter, "journey fixture failed: {message}"),
-            Self::Harness(ref error) => write!(formatter, "journey harness failed: {error}"),
+            Self::Checkpoint(ref error) => {
+                write!(formatter, "journey checkpoint codec failed: {error}")
+            }
+            Self::Http(ref error) => write!(formatter, "journey transport failed: {error}"),
+            Self::Credential(ref error) => write!(formatter, "journey credential failed: {error}"),
+            Self::Model(ref error) => write!(formatter, "journey model refused: {error}"),
         }
     }
 }
@@ -136,8 +177,8 @@ pub(crate) fn pair_case(
 }
 
 /// Builds the two-thread runtime every async journey runs on.
-pub(crate) fn test_runtime() -> Result<lgwks_bot::Runtime, JourneyError> {
-    Ok(lgwks_bot::Builder::new()
+pub(crate) fn test_runtime() -> Result<lgwks_bot::rt::runtime::Runtime, JourneyError> {
+    Ok(lgwks_bot::rt::runtime::Builder::new()
         .worker_threads(std::num::NonZeroUsize::new(2))
         .build()?)
 }
@@ -157,25 +198,29 @@ pub(crate) async fn serve_test_router(
 ) -> Result<
     (
         HttpTransport<StaticBearer>,
-        lgwks_bot::rt::task::JoinSet<()>,
+        lgwks_bot::rt::task::JoinSet<std::io::Result<()>>,
     ),
-    Box<dyn std::error::Error>,
+    JourneyError,
 > {
     let app = router(
         Arc::clone(&store),
-        TestAuthentication,
+        TestAuthentication::new(
+            BLACK_BOX_TOKEN,
+            Allow::when(|_scope, _effect, _action| true),
+        ),
         CheckpointCodec::new(codec_seed, idle_timeout_ms)?,
         FixedClock,
     );
-    let listener = lgwks_bot::rt::net::TcpListener::bind("127.0.0.1:0").await?;
+    // An ephemeral loopback port: the journey owns the only client.
+    let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+    let listener = lgwks_bot::rt::net::TcpListener::bind(loopback).await?;
     let address = listener.local_addr()?;
     let mut server_tasks = lgwks_bot::rt::task::JoinSet::new();
-    server_tasks.spawn(async move {
-        let serve_result = axum::serve(listener, app).await;
-        drop(serve_result);
-    });
-    let endpoint = format!("http://{address}/").parse()?;
-    let transport = HttpTransport::new(endpoint, StaticBearer::new("black-box")?)?;
+    // The serve outcome stays in the set, so a journey that joins it sees why the server stopped.
+    server_tasks.spawn(async move { axum::serve(listener, app).await });
+    let endpoint = logical_db_http::Endpoint::parse(&format!("http://{address}/"))?;
+    let bearer = StaticBearer::new(BLACK_BOX_TOKEN)?;
+    let transport = HttpTransport::new(endpoint, bearer)?;
     Ok((transport, server_tasks))
 }
 
@@ -192,7 +237,7 @@ pub(crate) fn assert_converged(
     database: &Database,
     document: DocumentId,
     index: IndexId,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), JourneyError> {
     let values = database.read(document, |reader| {
         Ok((
             reader.get(&Object::root(), "left")?,
@@ -234,7 +279,7 @@ pub(crate) fn assert_converged(
 pub(crate) async fn seal_consume_and_prune(
     store: &MemoryServiceStore,
     scope: Scope,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), JourneyError> {
     seal_consume_and_prune_through(store, scope, 1).await
 }
 
@@ -242,64 +287,58 @@ pub(crate) async fn seal_consume_and_prune_through(
     store: &MemoryServiceStore,
     scope: Scope,
     through: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), JourneyError> {
     let artifact = store.build_snapshot(scope, through).await?;
     let frontier = store.frontier(scope).await?;
     let seal_request = OperationDigest::new([0x52; 32]);
-    assert!(matches!(
-        store
-            .seal_snapshot(
-                scope,
-                &artifact,
-                seal_request,
-                &Grant {
-                    scope,
-                    effect: Effect::Sync,
-                    action: seal_snapshot_action(scope, seal_request, &artifact.baseline),
-                    frontier,
-                },
-            )
-            .await
-            ?,
-        SealResult::Sealed { position } if position == through
-    ));
+    let seal_action = seal_snapshot_action(scope, seal_request, artifact.baseline());
+    let sealed = store
+        .seal_snapshot(
+            scope,
+            &artifact,
+            seal_request,
+            &Grant::new(scope, Effect::Sync, seal_action, frontier),
+        )
+        .await?;
+    if sealed != (SealResult::Sealed { position: through }) {
+        return Err(JourneyError::Fixture(format!("seal ended as {sealed:?}")));
+    }
     let consumed_request = OperationDigest::new([0x53; 32]);
-    assert!(matches!(
-        store
-            .mark_consumed(
-                scope,
-                through,
-                consumed_request,
-                &Grant {
-                    scope,
-                    effect: Effect::Sync,
-                    action: mark_consumed_action(scope, consumed_request, through),
-                    frontier,
-                },
-            )
-            .await
-            ?,
-        ConsumedResult::Advanced { consumed_through } if consumed_through == through
-    ));
+    let consumed_action = mark_consumed_action(scope, consumed_request, through);
+    let consumed = store
+        .mark_consumed(
+            scope,
+            through,
+            consumed_request,
+            &Grant::new(scope, Effect::Sync, consumed_action, frontier),
+        )
+        .await?;
+    if consumed
+        != (ConsumedResult::Advanced {
+            consumed_through: through,
+        })
+    {
+        return Err(JourneyError::Fixture(format!(
+            "consume ended as {consumed:?}"
+        )));
+    }
     let prune_request = OperationDigest::new([0x54; 32]);
-    assert!(matches!(
-        store
-            .prune(
+    let pruned = store
+        .prune(
+            scope,
+            through,
+            None,
+            prune_request,
+            &Grant::new(
                 scope,
-                through,
-                None,
-                prune_request,
-                &Grant {
-                    scope,
-                    effect: Effect::Sync,
-                    action: prune_action(scope, prune_request, through, None),
-                    frontier,
-                },
-            )
-            .await
-            ?,
-        PruneResult::Pruned(PruneReceipt { pruned_through, floor, .. })
-            if pruned_through == through && floor == through
-    ));
+                Effect::Sync,
+                prune_action(scope, prune_request, through, None),
+                frontier,
+            ),
+        )
+        .await?;
+    if pruned != PruneResult::Pruned(PruneReceipt::new(through, through)) {
+        return Err(JourneyError::Fixture(format!("prune ended as {pruned:?}")));
+    }
     Ok(())
 }

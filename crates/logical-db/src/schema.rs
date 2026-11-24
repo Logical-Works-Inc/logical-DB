@@ -161,7 +161,7 @@ fn prepare_migration_documents(
     for document in documents {
         let mut state = Document::load(document.snapshot())?;
         let indexes = project_with(projections, &mut state)?;
-        prepared.push((document.document, document.revision, indexes));
+        prepared.push((document.document(), document.revision(), indexes));
     }
     Ok(prepared)
 }
@@ -187,6 +187,6 @@ fn migrate_schema_batch(
             MigrationIndexes::new(document, revision, indexes)
         })
         .collect::<Vec<_>>();
-    store.apply_migration_page(scope, schema_version, digest, page.after, &updates)?;
+    store.apply_migration_page(scope, schema_version, digest, page.after(), &updates)?;
     Ok(Some(updates.len()))
 }
