@@ -116,6 +116,6 @@ runs:
         fi
         "${FDB_CLI_BIN}" -C "${cluster_file}" --timeout 10 --exec "status minimal" || true
         export LOGICAL_DB_FDB_CLUSTER_FILE="${cluster_file}"
-        cargo run -p logical-db-daemon --bin fdb-ambiguity-journey --features fdb --locked
+        cargo test -p logical-db-e2e --features fdb --locked --test fdb_ambiguity -- --nocapture
         cargo test -p logical-db-e2e --features fdb --locked --test fdb_recovery_composition -- --nocapture
         cargo test -p logical-db-e2e --features fdb --locked --test fdb_process_kill_restore -- --nocapture

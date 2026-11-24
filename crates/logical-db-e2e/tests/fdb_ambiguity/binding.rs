@@ -12,7 +12,7 @@ use std::{
 };
 
 use logical_db::Transport as _;
-use logical_db::http::{Endpoint, HttpTransport, StaticBearer};
+use logical_db::http::{Endpoint, HttpError, HttpTransport, StaticBearer};
 use logical_db_e2e::support::{Allow, TestAuthentication};
 use logical_db_model::{
     AccountId, DocumentId, Effect, OperationDigest, OperationId, ReplicaId, Scope, SpaceId,
@@ -102,8 +102,24 @@ pub(super) async fn verify_http_action_binding(
     Ok("PASS fdb-action-binding canonical=accepted retry=duplicate mutations=forbidden scope=isolated".to_owned())
 }
 
-/// Pushes one change through the product HTTP transport, retrying only the
-/// failures the transport itself classifies as retryable.
+/// Whether the journey retries an exact push after `error`: anything the
+/// transport calls retryable, and every 5xx (see `push_over_http`).
+pub(super) const fn journey_retries(error: &HttpError) -> bool {
+    error.is_retryable()
+        || matches!(
+            *error,
+            HttpError::Status {
+                code: 500..=599,
+                ..
+            }
+        )
+}
+
+/// Pushes one change through the product HTTP transport. It retries what the
+/// transport classifies as retryable, plus any 5xx: client buggify injects FDB
+/// errors the store classifies as permanent, and the server answers those
+/// with 500. The product transport fails closed on 500; this journey retries
+/// the exact idempotent push and asserts only the outcome it finally reaches.
 async fn push_over_http(
     transport: &mut HttpTransport<StaticBearer>,
     change: &ChangeEnvelope,
@@ -119,7 +135,7 @@ async fn push_over_http(
                     .cloned()
                     .ok_or_else(|| io::Error::other("HTTP push returned no outcome").into());
             }
-            Err(error) if error.is_retryable() => last_error = Some(error),
+            Err(error) if journey_retries(&error) => last_error = Some(error),
             Err(error) => return Err(error.into()),
         }
     }

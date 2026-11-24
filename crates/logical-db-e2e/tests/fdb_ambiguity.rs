@@ -21,6 +21,8 @@ mod recovery;
 mod retention;
 #[path = "fdb_ambiguity/retries.rs"]
 mod retries;
+#[path = "fdb_ambiguity/sim_push_retry.rs"]
+mod sim_push_retry;
 
 use std::{error::Error, io};
 

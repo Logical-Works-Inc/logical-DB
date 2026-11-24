@@ -128,6 +128,8 @@ async fn seal_first_baseline(
     // The descriptor is recomputed by the only public constructor, so the
     // corruption is a tampered document payload: the artifact is internally
     // consistent but disagrees with the durable log the store materializes.
+    // The store rebuilds the artifact from the log and refuses the mismatch
+    // as `BaselineCoverage` (`seal_transaction`), writing nothing.
     let tampered = artifact_one
         .documents()
         .iter()
@@ -154,7 +156,7 @@ async fn seal_first_baseline(
         .await;
     if !matches!(
         corrupt_result,
-        Err(FdbStoreError::Corruption(FdbDataError::BaselineCorrupt))
+        Err(FdbStoreError::Corruption(FdbDataError::BaselineCoverage))
     ) {
         return Err(io::Error::other(format!(
             "corrupt baseline seal result was {corrupt_result:?}"
@@ -258,6 +260,6 @@ async fn finish_baseline_retention(
         return Err(io::Error::other("pruned checkpoint was not behind the floor").into());
     }
     Ok(format!(
-        "PASS fdb-live-baseline-retention seeded=2 consumed=2 missing=refused corrupt=typed-baseline-corrupt baseline1=sealed baseline2=sealed prune=2 frontier={final_frontier} floor={final_floor} page_after=0=behind-floor scope=isolated"
+        "PASS fdb-live-baseline-retention seeded=2 consumed=2 missing=refused tampered=typed-baseline-coverage baseline1=sealed baseline2=sealed prune=2 frontier={final_frontier} floor={final_floor} page_after=0=behind-floor scope=isolated"
     ))
 }
