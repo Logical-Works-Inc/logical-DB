@@ -22,6 +22,8 @@ fdb = [
   "dep:foundationdb",
   "dep:foundationdb-tuple",
   "dep:lgwks_bot",
+  "dep:lgwks_std",
+  "dep:logical-db-model",
   "dep:logical-db-server",
   "dep:logical-db-service",
   "dep:logical-db-store-fdb",
@@ -31,11 +33,11 @@ fdb = [
 axum = { workspace = true, optional = true }
 foundationdb = { workspace = true, optional = true }
 foundationdb-tuple = { workspace = true, optional = true }
-logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
+logical-db-model = { version = "0.1.0", path = "../logical-db-model", optional = true }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server", optional = true }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service", optional = true }
 lgwks_bot = { workspace = true, optional = true }
-lgwks_std.workspace = true
+lgwks_std = { workspace = true, optional = true }
 logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", features = ["fdb"], optional = true }
 
 [dev-dependencies]

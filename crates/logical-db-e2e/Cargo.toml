@@ -14,9 +14,7 @@ repository.workspace = true
 [features]
 default = []
 fdb = [
-    "dep:logical-db-store-fdb",
     "logical-db-store-fdb/fdb",
-    "dep:logical-db-daemon",
     "logical-db-daemon/fdb",
 ]
 
@@ -39,16 +37,16 @@ logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
-logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", optional = true }
-# The FDB journeys boot the client network through the daemon's one safe
-# `boot_network`, so this crate writes no `unsafe` of its own.
-logical-db-daemon = { version = "0.1.0", path = "../logical-db-daemon", optional = true }
-uuid.workspace = true
 
 [dev-dependencies]
+logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb" }
+# The FDB journeys boot the client network through the daemon's one safe
+# `boot_network`, so this crate writes no `unsafe` of its own.
+logical-db-daemon = { version = "0.1.0", path = "../logical-db-daemon" }
 ciborium.workspace = true
 lgwks_deps.workspace = true
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
+uuid.workspace = true
 
 # Inherits the workspace anti-pattern contract unchanged.
 [lints]

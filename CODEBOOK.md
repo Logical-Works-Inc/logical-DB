@@ -56,7 +56,9 @@ the Director owns; this file only records how it lands in this repo.
 
 - Black-box journeys drive public APIs and real processes: kill, restart,
   corrupt input, dropped network. Half the suite is deterministic simulation
-  driven by one seed (`tests/sim_sync.rs`).
+  driven by one seed. The sync simulation is the `sim_sync` bin
+  (`crates/logical-db-e2e/src/bin/sim_sync.rs`, its wire in
+  `sim_sync/sim_net.rs`); `sim_sync <seed>` replays one seed's trace.
 - Every assert checks a real value and carries a message.
 - Every private item carries a `///` doc (`missing_docs_in_private_items`).
 
@@ -66,7 +68,9 @@ Estate first: `std`, then `lgwks_std` (JSON, hash, ids), `lgwks_bot` (async,
 HTTP, sockets), `lgwks_deps`. JSON is `lgwks_std::json`; do not declare
 `serde`. A third-party crate needs a gap issue on the estate crates repo, cited
 on its manifest line. `cargo deny check` refuses advisories, unknown licences
-and git sources (`deny.toml`).
+and git sources (`deny.toml`). An edge only tests compile is a dev edge; an
+edge only a feature compiles is optional behind that feature (ADR-0007). Cargo
+warns on any other unused edge, and a warning is a finding.
 
 ## Comments and names
 

@@ -33,9 +33,9 @@ use logical_db_protocol::{
 use logical_db_server::{AuthenticationError, Authenticator, Clock, router};
 use logical_db_service::{
     AcceptResult, Authority, BaselinePageResult, BaselinePageSlice, CheckpointCodec,
-    ConsumedResult, ExecutionGrant, PageResult, PruneReceipt, PruneRefusal, PruneResult,
-    RetentionStore, SealResult, ServiceStore, SnapshotMaterializationError, StoredPage,
-    materialize_snapshot, prune_decision,
+    ConsumedResult, ExecutionGrant, PageResult, ProtocolService, PruneReceipt, PruneRefusal,
+    PruneResult, RetentionStore, SealResult, ServiceStore, SnapshotMaterializationError,
+    StoredPage, materialize_snapshot, prune_decision,
 };
 
 /// A grant that authorizes exactly the scope, effect, action, and frontier it
@@ -185,7 +185,7 @@ struct RetentionState {
 /// Why the in-memory journey store refused to answer.
 #[derive(Debug)]
 #[non_exhaustive]
-pub(crate) enum MemoryStoreError {
+pub enum MemoryStoreError {
     /// A writer panicked while holding the store lock.
     Poisoned,
     /// A count or position did not fit its integer type.
@@ -284,10 +284,14 @@ impl Ledger {
     }
 }
 
+/// The real protocol service over the shared in-memory journey store, as the
+/// `sim_sync` bin drives it without a wire.
+pub type JourneyService<Policy> = ProtocolService<Arc<MemoryServiceStore>, Policy>;
+
 /// In-memory service store implementing the full retention contract.
 #[derive(Debug, Default)]
 #[non_exhaustive]
-pub(crate) struct MemoryServiceStore {
+pub struct MemoryServiceStore {
     /// The one lock over every scope's state.
     ledger: Mutex<Ledger>,
 }

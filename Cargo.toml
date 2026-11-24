@@ -200,3 +200,18 @@ unwrap_used = "forbid"
 verbose_file_reads = "forbid"
 wildcard_dependencies = "forbid"
 wildcard_imports = "forbid"
+
+# automerge builds optimized in dev and test; everything else keeps full
+# debug. The seeded sync simulation is CPU bound in unoptimized automerge
+# (measured on the 8-core box in the commit that added this).
+[profile.dev.package.automerge]
+opt-level = 2
+
+[profile.dev.package.redb]
+opt-level = 2
+
+[profile.dev.package.sha2]
+opt-level = 2
+
+[profile.dev.package.blake3]
+opt-level = 2

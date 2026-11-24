@@ -397,32 +397,45 @@ where
             if thread_flag.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read(&mut byte)? == 1 {
-                head.extend_from_slice(&byte);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            // RFC 9112 section 6.3: a request with no Content-Length carries no body.
-            let declared: Option<usize> = String::from_utf8_lossy(&head).lines().find_map(|line| {
-                let lowered = line.to_ascii_lowercase();
-                let (_, value) = lowered.split_once("content-length:")?;
-                value.trim().parse().ok()
-            });
-            if let Some(declared) = declared {
-                let mut body = vec![0u8; declared];
-                let mut read = 0;
-                while read < declared {
-                    let Some(rest) = body.get_mut(read..) else {
+            let request = (|| -> std::io::Result<()> {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read(&mut byte)? == 1 {
+                    head.extend_from_slice(&byte);
+                    if head.ends_with(b"\r\n\r\n") {
                         break;
-                    };
-                    match stream.read(rest)? {
-                        0 => break,
-                        got => read = read.saturating_add(got),
                     }
                 }
+                // RFC 9112 section 6.3: a request with no Content-Length carries no body.
+                let declared: Option<usize> =
+                    String::from_utf8_lossy(&head).lines().find_map(|line| {
+                        let lowered = line.to_ascii_lowercase();
+                        let (_, value) = lowered.split_once("content-length:")?;
+                        value.trim().parse().ok()
+                    });
+                if let Some(declared) = declared {
+                    let mut body = vec![0u8; declared];
+                    let mut read = 0;
+                    while read < declared {
+                        let Some(rest) = body.get_mut(read..) else {
+                            break;
+                        };
+                        match stream.read(rest)? {
+                            0 => break,
+                            got => read = read.saturating_add(got),
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            match request {
+                // A client whose deadline fired mid-request resets the
+                // connection (RFC 9293 section 3.10.7.3); the test asserts
+                // that outcome on the client side, so the fixture just ends.
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    return Ok(());
+                }
+                other => other?,
             }
             responder(&mut stream, &released)?;
             stream.flush()?;
