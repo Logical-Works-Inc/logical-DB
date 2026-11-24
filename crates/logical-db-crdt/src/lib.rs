@@ -8,7 +8,7 @@
 
 use automerge::{
     AutoCommit, AutomergeError, Change, ChangeHash, LoadChangeError, LoadOptions, ObjId, ObjType,
-    ROOT, ReadDoc, ScalarValue, TextEncoding, Value, transaction::Transactable,
+    ROOT, ReadDoc, SaveOptions, ScalarValue, TextEncoding, Value, transaction::Transactable,
 };
 use logical_db_model::{
     ChangeDigest, MAX_CHANGE_BYTES, MAX_CHANGES_PER_PAGE, MAX_PAGE_BYTES, MAX_SNAPSHOT_BYTES,
@@ -223,13 +223,23 @@ impl Document {
         })
     }
 
-    /// Serializes a verified complete snapshot.
+    /// Serializes a complete snapshot for durable materialization.
+    ///
+    /// Verification is a load concern: [`Document::load`] refuses malformed
+    /// bytes on restore, remote install and export. Automerge's
+    /// `save_and_verify` reloads the whole document and `save` DEFLATEs the
+    /// whole history, both O(history) on every edit, so the hot path stores
+    /// uncompressed bytes of the document it just edited in memory.
     ///
     /// # Errors
     ///
-    /// Returns [`CrdtError::Automerge`] if internal document verification fails.
+    /// Returns [`CrdtError::InvalidSnapshotSize`] when the encoding is empty
+    /// or exceeds [`MAX_SNAPSHOT_BYTES`].
     pub fn save(&mut self) -> Result<Vec<u8>, CrdtError> {
-        let snapshot = self.inner.save_and_verify()?;
+        let snapshot = self.inner.save_with_options(SaveOptions {
+            deflate: false,
+            ..SaveOptions::default()
+        });
         if !is_nonempty_bounded(snapshot.len(), MAX_SNAPSHOT_BYTES) {
             return Err(CrdtError::InvalidSnapshotSize(snapshot.len()));
         }
