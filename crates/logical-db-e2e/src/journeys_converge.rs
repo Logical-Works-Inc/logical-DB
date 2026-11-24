@@ -101,12 +101,12 @@ async fn two_embedded_replicas_body() -> Result<(), JourneyError> {
 #[test]
 fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real()
 -> Result<(), JourneyError> {
-    test_runtime()?
-        .block_on(windows_default_path_lock_unicode_restart_and_read_only_failure_are_real_body())
+    windows_default_path_lock_unicode_restart_and_read_only_failure_are_real_body()
 }
 
+/// The Windows default-path journey: no network, so no runtime.
 #[cfg(target_os = "windows")]
-async fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real_body()
+fn windows_default_path_lock_unicode_restart_and_read_only_failure_are_real_body()
 -> Result<(), JourneyError> {
     use logical_db::Item;
 

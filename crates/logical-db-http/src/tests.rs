@@ -322,10 +322,18 @@ impl RawServerHandle {
         match release.try_send(()) {
             Ok(()) | Err(TrySendError::Full(()) | TrySendError::Disconnected(())) => {}
         }
-        // A refused connect means the thread already dropped its listener.
+        // A refused connect means the thread already dropped its listener; a
+        // reset means it dropped it mid-handshake, with the SYN still queued.
         let wake = match std::net::TcpStream::connect(address) {
             Ok(wake) => Some(wake),
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => None,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                None
+            }
             Err(error) => return Err(error.into()),
         };
         let outcome = match handle.join() {

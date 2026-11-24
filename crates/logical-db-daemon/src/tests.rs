@@ -25,13 +25,27 @@ use super::*;
 /// KEY
 const KEY: [u8; 32] = [0x5a; 32];
 
-/// Runs `scope`.
 /// Builds the deterministic scope for `seed`: account `seed`, space `seed + 1`,
-/// both as simple-form UUID text parsed through the identifiers' own serde.
+/// both as RFC 9562 hyphenated UUID text (the only form lgwks_std 5 accepts)
+/// parsed through the identifiers' own serde.
 fn scope(seed: u128) -> Result<Scope, lgwks_std::json::Error> {
-    let account = lgwks_std::json::from_str(&format!("\"{seed:032x}\""))?;
-    let space = lgwks_std::json::from_str(&format!("\"{:032x}\"", seed.saturating_add(1)))?;
+    let account = lgwks_std::json::from_str(&format!("\"{}\"", hyphenated(seed)))?;
+    let space = lgwks_std::json::from_str(&format!("\"{}\"", hyphenated(seed.saturating_add(1))))?;
     Ok(Scope::new(account, space))
+}
+
+/// `value` as 8-4-4-4-12 hyphenated hex (RFC 9562 section 4).
+fn hyphenated(value: u128) -> String {
+    format!("{value:032x}")
+        .chars()
+        .enumerate()
+        .flat_map(|(at, digit)| {
+            matches!(at, 8 | 12 | 16 | 20)
+                .then_some('-')
+                .into_iter()
+                .chain(std::iter::once(digit))
+        })
+        .collect()
 }
 
 /// Runs `action`.
