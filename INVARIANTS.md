@@ -10,9 +10,10 @@ One line per rule: rule | why | enforcing test or gate. Test paths are under
 - A kill during baseline restore commits nothing; a rerun installs all of it | an in-memory accumulator is not durable state | `tests/fdb_process_kill_restore.rs::killed_restore_commits_nothing_and_a_clean_rerun_recovers`
 - A replica behind the retention floor recovers state and checkpoint in one install | pruning must never strand a replica | `src/journeys_recovery.rs::fresh_replica_recovers_a_pruned_document_through_real_http`, `tests/fdb_recovery_composition.rs::fdb_recovery_composition`
 - Two replicas converge through real HTTP and keep indexes current | sync is the product | `src/journeys_converge.rs::two_embedded_replicas_converge_through_real_http_and_keep_indexes_current`
-- Lost, duplicated and post-commit-lost exchanges converge to the model on every seed | networks fail in every way | `tests/sim_sync.rs::sim_sync_converges_under_seeded_network_faults`
-- One seed replays one trace | a failure must reproduce | `tests/sim_sync.rs::sim_sync_same_seed_replays_the_same_trace`
-- Tenants sharing one service never see each other's documents | scope is the security boundary | `tests/sim_sync.rs::sim_sync_tenants_sharing_a_service_stay_isolated`
+- Lost, duplicated and post-commit-lost exchanges converge to the model on every seed | networks fail in every way | `src/bin/sim_sync.rs::sim_sync_converges_under_seeded_network_faults`
+- One seed replays one trace | a failure must reproduce | `src/bin/sim_sync.rs::sim_sync_same_seed_replays_the_same_trace`
+- Tenants sharing one service never see each other's documents | scope is the security boundary | `src/bin/sim_sync.rs::sim_sync_tenants_sharing_a_service_stay_isolated`
+- A durable edit saves the uncompressed encoding with no reverify; `load` refuses malformed bytes | a per-edit DEFLATE and reload is O(history) on every write | `crates/logical-db-crdt/tests/sim_save.rs` (giant-and-empty, weird-bytes, double-clicker, monkey, saboteur)
 - An FDB may-have-committed retry returns the first receipt and appends once | exactly-once under ambiguity | `tests/fdb_ambiguity.rs::live_fdb_recovers_unknown_commit_and_preserves_all_axes`
 - The KV cache adapter holds its contract end to end | the cache is a shipped surface | `tests/kv_journey.rs::kv_cache_journey_holds_end_to_end`
 
