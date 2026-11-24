@@ -1,0 +1,16 @@
+name: logical_ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    uses: srinji-kaggss/logical_ci/.github/workflows/gate.yml@v0.1.0
+    with:
+      tenant: logical-db
+      hardness: C
