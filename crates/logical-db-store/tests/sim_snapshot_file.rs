@@ -80,7 +80,7 @@ fn file_parity_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> 
         }
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// A stale tmp never shadows the durable snapshot.
@@ -126,7 +126,7 @@ fn stale_tmp_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     rebuilt.verify_integrity()?;
     assert_eq!(rebuilt.len(), before.len(), "rebuild preserves row count");
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Corruption is detected on verify and on query alike.
@@ -148,7 +148,9 @@ fn corruption_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             .map_err(|error| format!("sim fault offset overflow: {error}"))?
             .checked_rem(bytes.len().max(1))
             .ok_or("sim fault window empty")?;
-        bytes[at] ^= 0xFF;
+        *bytes
+            .get_mut(at)
+            .ok_or("sim fault offset outside the file")? ^= 0xFF;
         std::fs::write(&path, &bytes)?;
         let index = FileProjectionIndex::open(&path)?;
         // The header may still parse; integrity or query must refuse.
@@ -163,7 +165,7 @@ fn corruption_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let clean = FileProjectionIndex::open(&path)?;
     clean.verify_integrity()?;
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Rebuilds converge: repeated builds of evolving indexes stay exact.
@@ -197,7 +199,7 @@ fn rebuild_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(&len_bytes.to_le_bytes());
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Two files built in one run stay independent.
@@ -246,7 +248,7 @@ fn independence_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>>
     hasher.update(&right_len.to_le_bytes());
     cleanup(&left_path)?;
     cleanup(&right_path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Empty snapshots build, open, verify, and answer nothing.
@@ -277,5 +279,5 @@ fn empty_file_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(text.as_bytes());
     }
     cleanup(&path)?;
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }

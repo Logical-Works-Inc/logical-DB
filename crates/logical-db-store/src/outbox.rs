@@ -4,7 +4,7 @@
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
 
-use crate::codec::{collect_outbox_page, decode_u64, decode_uuid};
+use crate::codec::{collect_outbox_page, decode_u64, decode_uuid, decode_uuid_after};
 use crate::error::StoreError;
 use crate::keys::{
     DATA, KIND_CHECKPOINT, KIND_SEQUENCE, MAX_CHECKPOINT_BYTES, is_nonempty_bounded,
@@ -206,7 +206,7 @@ pub(crate) fn bind_upstream_in_table(
                 let error = StoreError::CorruptInternalValue;
                 return Err(error);
             }
-            decode_uuid(&key.value()[checkpoint_prefix.len()..]).map(PeerId::from_uuid)
+            decode_uuid_after(key.value(), checkpoint_prefix.len()).map(PeerId::from_uuid)
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
     let configured = match *legacy_peers.as_slice() {

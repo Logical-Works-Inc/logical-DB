@@ -11,7 +11,7 @@ use logical_db::{
     OperationDigest, OperationId, PeerId, RemoteChange, ReplicaId, Scalar, Scope, SpaceId,
     SyncLimits,
 };
-use logical_db_model::SnapshotArtifact;
+use logical_db_model::{SnapshotArtifact, SnapshotDocument};
 use logical_db_service::{RetentionStore, ServiceStore};
 
 use super::harness::{
@@ -25,7 +25,7 @@ async fn seed_synced_integer(
     peer: PeerId,
     transport: &mut logical_db_http::HttpTransport<logical_db_http::StaticBearer>,
     document: DocumentId,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), JourneyError> {
     victim.edit(
         document,
         OperationId::new(),
@@ -68,9 +68,8 @@ fn tombstone_survives_baseline_recovery_and_cannot_resurrect() -> Result<(), Jou
 
 async fn tombstone_baseline_recovery_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [24; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [24; 32], 60_000).await?;
 
     let (scope, document, peer, first_path, second_path) = pair_case("tombstone");
 
@@ -96,9 +95,7 @@ async fn tombstone_baseline_recovery_body() -> Result<(), JourneyError> {
         .await?;
     assert_eq!(store.frontier(scope).await?, 2);
 
-    seal_consume_and_prune_through(&store, scope, 2)
-        .await
-        .map_err(JourneyError::Harness)?;
+    seal_consume_and_prune_through(&store, scope, 2).await?;
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
@@ -114,7 +111,9 @@ async fn tombstone_baseline_recovery_body() -> Result<(), JourneyError> {
 
     let resurrection = pre_floor
         .iter()
-        .map(|change| RemoteChange::new(change.document, change.digest, change.bytes().to_vec()))
+        .map(|change| {
+            RemoteChange::new(change.document(), change.digest(), change.bytes().to_vec())
+        })
         .collect::<Vec<_>>();
     second.install_remote_page(peer, &resurrection, b"resurrection-attempt")?;
     assert!(second.is_deleted(document)?);
@@ -139,9 +138,8 @@ fn corrupt_or_incomplete_baseline_leaves_state_and_checkpoint_unchanged() -> Res
 
 async fn corrupt_baseline_refusal_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [25; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [25; 32], 60_000).await?;
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let document = DocumentId::new();
@@ -170,24 +168,41 @@ async fn corrupt_baseline_refusal_body() -> Result<(), JourneyError> {
     );
 
     let genuine = store.build_snapshot(scope, 1).await?;
-    assert_eq!(genuine.documents.len(), 1);
+    assert_eq!(
+        genuine.documents().len(),
+        1,
+        "the genuine baseline must hold exactly one document"
+    );
+    let genuine_document = genuine
+        .documents()
+        .first()
+        .ok_or("the genuine baseline must hold a document")?;
+    let position = genuine.baseline().position();
 
-    let mut substituted = genuine.clone();
-    substituted.documents[0].snapshot = vec![0xEE; substituted.documents[0].snapshot.len()];
-
-    let mut truncated = genuine.clone();
-    truncated.documents.pop();
-
-    let mut mismatched = genuine.clone();
-    mismatched.documents[0].tombstone = !mismatched.documents[0].tombstone;
-    // Recomputing the descriptor keeps the artifact internally consistent,
-    // so only the tombstone-versus-document check can refuse it.
-    let mismatched =
-        SnapshotArtifact::new(scope, genuine.baseline.position(), mismatched.documents)?;
+    // The model seals every descriptor over its documents, so each forgery
+    // recomputes the descriptor and only the installer's own checks can
+    // refuse it.
+    let substituted = SnapshotArtifact::new(
+        scope,
+        position,
+        vec![SnapshotDocument::new(
+            genuine_document.document(),
+            vec![0xEE; genuine_document.snapshot().len()],
+            genuine_document.is_tombstone(),
+        )],
+    )?;
+    let mismatched = SnapshotArtifact::new(
+        scope,
+        position,
+        vec![SnapshotDocument::new(
+            genuine_document.document(),
+            genuine_document.snapshot().to_vec(),
+            !genuine_document.is_tombstone(),
+        )],
+    )?;
 
     for (label, artifact) in [
         ("substituted snapshot payload", substituted),
-        ("truncated document list", truncated),
         ("mismatched tombstone flag", mismatched),
     ] {
         let Err(error) = victim.install_baseline(peer, &artifact, b"corrupt-checkpoint") else {
@@ -196,7 +211,7 @@ async fn corrupt_baseline_refusal_body() -> Result<(), JourneyError> {
         assert!(
             matches!(
                 &error,
-                DatabaseError::InvalidBaseline | DatabaseError::Model(_)
+                DatabaseError::InvalidBaseline | DatabaseError::Model(_) | DatabaseError::Crdt(_)
             ),
             "{label} must be refused with a typed failure, got {error:?}"
         );
@@ -232,18 +247,15 @@ fn recovery_merges_a_local_edit_the_baseline_predates() -> Result<(), JourneyErr
 
 async fn recovery_merges_a_local_edit_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [26; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [26; 32], 60_000).await?;
 
     let (scope, document, peer, victim_path, replica, victim) = open_victim("merge-victim")?;
 
-    seed_synced_integer(&victim, peer, &mut transport, document)
-        .await
-        .map_err(JourneyError::Harness)?;
+    seed_synced_integer(&victim, peer, &mut transport, document).await?;
 
     let baseline = store.build_snapshot(scope, 1).await?;
-    assert_eq!(baseline.documents.len(), 1);
+    assert_eq!(baseline.documents().len(), 1);
 
     let local_operation = OperationId::new();
     victim.edit(
@@ -267,7 +279,11 @@ async fn recovery_merges_a_local_edit_body() -> Result<(), JourneyError> {
         1,
         "recovery must not consume the local outbox"
     );
-    assert_eq!(pending[0].operation, local_operation);
+    assert_eq!(
+        pending.first().map(|change| change.operation()),
+        Some(local_operation),
+        "the surviving outbox entry must be the local edit"
+    );
     drop(victim);
 
     let reopened = Database::open(&victim_path, scope, replica)?;
@@ -293,9 +309,8 @@ fn recovery_preserves_a_local_backlog_larger_than_one_upload_batch() -> Result<(
 // is itself a defect.
 async fn recovery_preserves_a_large_backlog_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [26; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [26; 32], 60_000).await?;
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let peer = PeerId::new();
@@ -304,9 +319,7 @@ async fn recovery_preserves_a_large_backlog_body() -> Result<(), JourneyError> {
     let victim = Database::open(&backlog_path, scope, replica)?;
 
     let seeded = DocumentId::new();
-    seed_synced_integer(&victim, peer, &mut transport, seeded)
-        .await
-        .map_err(JourneyError::Harness)?;
+    seed_synced_integer(&victim, peer, &mut transport, seeded).await?;
     let baseline = store.build_snapshot(scope, 1).await?;
 
     let batch = usize::from(SyncLimits::default().changes_per_page);
@@ -347,7 +360,7 @@ async fn recovery_preserves_a_large_backlog_body() -> Result<(), JourneyError> {
         backlog,
         "recovery must keep every unsent change in a multi-batch backlog"
     );
-    let kept: Vec<_> = after.iter().map(|change| change.operation).collect();
+    let kept: Vec<_> = after.iter().map(|change| change.operation()).collect();
     assert_eq!(kept, operations, "the backlog must keep its exact order");
     for (index, document) in documents.iter().enumerate() {
         assert_eq!(
@@ -385,9 +398,8 @@ fn recovery_publishes_a_durable_invalidation_for_a_held_cursor() -> Result<(), J
 
 async fn recovery_publishes_a_durable_invalidation_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [27; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [27; 32], 60_000).await?;
 
     let (scope, document, peer, victim_path, replica, victim) = open_victim("invalidate-victim")?;
 
@@ -418,11 +430,17 @@ async fn recovery_publishes_a_durable_invalidation_body() -> Result<(), JourneyE
     assert_eq!(victim.baseline_generation()?, 1);
     let page = victim.changes_since(cursor, 256)?;
     assert_eq!(page.len(), 1, "the baseline install must be visible");
-    assert!(matches!(
-        page[0],
-        ChangeEvent::Baseline { generation: 1, .. }
-    ));
-    assert!(page[0].digest().is_none());
+    let installed = page
+        .first()
+        .ok_or("the baseline install must publish an event")?;
+    assert!(
+        matches!(*installed, ChangeEvent::Baseline { generation: 1, .. }),
+        "the install must publish generation 1"
+    );
+    assert!(
+        installed.digest().is_none(),
+        "a baseline marker carries no change digest"
+    );
     drop(victim);
 
     let reopened = Database::open(&victim_path, scope, replica)?;

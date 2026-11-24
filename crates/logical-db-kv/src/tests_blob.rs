@@ -48,7 +48,11 @@ pub(super) fn install_all(
     let remote: Vec<logical_db::RemoteChange> = pending
         .iter()
         .map(|change| {
-            logical_db::RemoteChange::new(change.document, change.digest, change.bytes().to_vec())
+            logical_db::RemoteChange::new(
+                change.document(),
+                change.digest(),
+                change.bytes().to_vec(),
+            )
         })
         .collect();
     let count = remote.len();
@@ -73,7 +77,7 @@ fn tiered_value_round_trips_byte_identical_on_two_synced_replicas() -> Result<()
     assert_eq!(pending.len(), 1);
     for change in &pending {
         assert!(
-            change.bytes.len() < TIER_THRESHOLD_BYTES,
+            change.bytes().len() < TIER_THRESHOLD_BYTES,
             "sidecar reference must stay inside the bounded change"
         );
     }
@@ -234,6 +238,7 @@ fn sweep_promotes_referenced_gc_staging_back_to_canonical_storage() -> Result<()
     assert!(!cache.blob_path(&digest).exists());
 
     let document = document_for("media", "new")?;
+    let size = u64::try_from(value.len())?;
     cache.database().edit(
         document,
         OperationId::new(),
@@ -251,14 +256,7 @@ fn sweep_promotes_referenced_gc_staging_back_to_canonical_storage() -> Result<()
                 Scalar::String("media".into()),
             )?;
             editor.put(&Object::root(), FIELD_BLOB, Scalar::Bytes(digest.to_vec()))?;
-            editor.put(
-                &Object::root(),
-                FIELD_SIZE,
-                Scalar::Unsigned(
-                    u64::try_from(value.len())
-                        .map_err(|_error| CrdtError::InvalidChangeSize(value.len()))?,
-                ),
-            )?;
+            editor.put(&Object::root(), FIELD_SIZE, Scalar::Unsigned(size))?;
             Ok(())
         },
     )?;
@@ -287,7 +285,9 @@ fn missing_or_damaged_blob_fails_read_loudly_without_partial_bytes() -> Result<(
     ));
     cache.put("big", &big, None)?;
     let mut damaged = std::fs::read(&file)?;
-    damaged[100] ^= 0xFF;
+    *damaged
+        .get_mut(100)
+        .ok_or("tiered blob is longer than 100 bytes")? ^= 0xFF;
     std::fs::write(&file, &damaged)?;
     assert!(matches!(cache.get("big"), Err(KvError::CorruptBlob { .. })));
     assert!(matches!(
@@ -300,7 +300,12 @@ fn missing_or_damaged_blob_fails_read_loudly_without_partial_bytes() -> Result<(
         .len()
         .checked_div(2)
         .ok_or("halving a length never fails")?;
-    std::fs::write(&file, &truncated[..half])?;
+    std::fs::write(
+        &file,
+        truncated
+            .get(..half)
+            .ok_or("half a length is within the length")?,
+    )?;
     assert!(matches!(cache.get("big"), Err(KvError::CorruptBlob { .. })));
     assert!(cache.blob_reference("big")?.is_some());
     cleanup_tree(&db_path, &cache.blob_dir)?;
@@ -692,10 +697,16 @@ fn blob_names_are_canonical_lowercase_hex_and_reject_every_near_miss() -> Result
     assert_eq!(canonical.len(), 64);
     assert_eq!(hex_to_digest(&canonical), Some([0xab; 32]));
     assert!(is_blob_name(&canonical));
-    let short = canonical[..63].to_owned();
+    let short = canonical
+        .get(..63)
+        .ok_or("a canonical name has 64 bytes")?
+        .to_owned();
     let long = format!("{canonical}0");
     let mixed_case = canonical.replace('a', "A");
-    let invalid_digit = format!("z{}", &canonical[1..]);
+    let invalid_digit = format!(
+        "z{}",
+        canonical.get(1..).ok_or("a canonical name has 64 bytes")?
+    );
     assert_eq!(hex_to_digest(&short), None);
     assert_eq!(hex_to_digest(&long), None);
     assert_eq!(hex_to_digest(&mixed_case), None);

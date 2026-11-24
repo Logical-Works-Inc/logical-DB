@@ -1,257 +1,96 @@
-# PRD: The Unified Ontology Substrate — Logical-DB + Cairn + LEM
+# PRD: the unified ontology substrate
 
-> Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
-> S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32
-> S33 S34 S35 S36 S37 S38 S39 S40 S41 S42 S43. Primary URLs:
-> `evidence/SOURCES.md`. Competitive and SOTA research sources are cited
-> inline; they were retrieved 2026-09-16 by parallel research agents.
+- Status: proposed v1 product definition, Director-scoped 2026-09-16.
+- Owner: Director.
+- 2026-11-24: the bounded `logical-db-cairn` and `logical-db-episode` ports
+  were deleted (#135). They had no storage and no caller. The Cairn
+  vocabulary need moves to #143 and the episode log need to #145. This PRD
+  keeps the target.
 
-- Status: proposed v1 product definition; Director-scoped 2026-09-16
-- Owner: Director; execution: AI agent swarms per `SPEC` section
-- Supersedes: nothing; ratifies the recorded rulings in `GOVERNANCE.md`
-  (#6 substrate-not-apps, #8 redb-local + FDB-distributed) and extends them
-  with the semantic-plane unification of ADR-0001
+## Thesis
 
-## 1. Product thesis
+One product, four domains, one identity model:
 
-One product, four independently developed domains, one identity model. The
-Cloud Plane supplies sovereign durable data and regional delivery; Cairn supplies
-observation/evidence and ontology; Logical-Event-Memory (LEM/ORIGIN) supplies
-canonical episodic memory; Forge supplies explicit receipt-producing operations.
-Together they are an embeddable ontology substrate that takes messy enterprise
-data, deduplicates it from the first write, keeps every mutation reversible, and
-exposes citation-bearing memory and an ML-training-ready graph without forcing a
-foreign data-custody dependency. Local execution reduces retained remote data,
-transfer, and cloud compute; it is not the only product surface.
+- **Cloud Plane**: sovereign durable data, regional delivery, local replicas,
+  tenant isolation. This is the code in this repo today.
+- **Cairn**: source evidence, ontology registry, candidate episodes.
+- **LEM / ORIGIN**: canonical episodic memory, clocks, provenance,
+  contradiction, LocalWorld.
+- **Forge**: capability-bound operations that emit receipts.
 
-The sovereign hyperscale claim is a target gated by ADR-0003’s nine-axis
-measurements, not a present-tense scale claim. The domain contracts are in
-`docs/PRODUCT-MAP.md` and `docs/architecture/DOMAIN-BOUNDARIES.md`.
+Legal loop: Cairn candidate, then LEM append, then LocalWorld, then Forge
+receipt, back to a Cairn candidate. Cloud is infrastructure, never semantic or
+action authority.
 
-Positioning: **Supabase's developer ergonomics × Palantir Foundry's
-ontology**, delivered embedded and AI-native. Palantir proved the ontology
-moat (semantic + kinetic layers over messy data; 120%+ net dollar
-retention analyses: https://coomia.com/blog/palantir-business-model) but
-structurally cannot ship embedded, per-developer, self-serve distribution
-without cannibalizing its forward-deployed-enterprise motion
-(https://forwarddeployedbook.com/how-palantir-makes-money analysis set).
-Databricks proved the mess-to-clean pipeline pattern (medallion:
-https://www.databricks.com/glossary/medallion-architecture) and
-governance-as-substrate (Unity Catalog:
-https://docs.databricks.com/en/data-governance/unity-catalog/index.html)
-but cannot be embedded or local. Supabase proved instant-API developer
-love (109k+ stars: https://github.com/supabase/supabase) but has **no
-semantic layer, no entity resolution, no agent memory, and no offline
-story** (inventory: https://supabase.com/llms.txt). ElectricSQL's
-absorption into Databricks proved sync alone is not a business
-(https://electric-sql.com/blog/2026/08/11/electric-joining-databricks);
-the substrate that owns state, identity, and memory is.
+Positioning: Supabase's developer ergonomics with Palantir Foundry's ontology,
+embedded and AI-native. Palantir cannot ship embedded self-serve without hurting
+its enterprise motion. Databricks cannot run embedded or local. Supabase has no
+semantic layer, entity resolution, agent memory or offline story. ElectricSQL
+joining Databricks showed sync alone is not a business; the substrate that owns
+state, identity and memory is.
 
-**The Tesler's-law bargain, stated as a contract:** complexity is
-conserved; someone must hold it. The developer hands us the mess
-(dirty records, duplicate identities, contradictory facts, schema drift)
-and we hold the complexity permanently: dedupe, resolution, provenance,
-temporal validity, and forgetting are substrate defaults, not app code.
-SOTA semantics are the *default*, and opting out is the explicit act.
+The contract: the developer hands over the mess (duplicates, conflicts, drift).
+The substrate holds dedupe, resolution, provenance, temporal validity and
+forgetting as defaults. Opting out is the explicit act.
 
-## 2. Why each buyer wants it (Director-stated, made testable)
+## Buyers and acceptance
 
-| Persona | Want | Measurable acceptance |
+| Persona | Want | Acceptance |
 |---|---|---|
-| Developer, app 1 | Ship fast; no data plumbing | 5-minute quickstart compiles first-try; next-token benchmark ≥ 90% |
-| Developer, app 2 | **Never rebuild the world** — reuse profiles, identities, ontology | "Second app checklist": onboarding app 2 onto an existing estate requires zero re-definition of user profile, identity, or ontology types; measured as steps-to-first-reuse |
-| Enterprise customer | "Be as messy as you want; the DB takes care of it" | Chaos-corpus ingest (nulls, dupes, conflicts, encodings, drift) → typed graph + quarantine ledger; zero silent loss; ER precision/recall ≥ agreed thresholds on dirty benchmarks |
-| AI agent builder | "AI agent memories just work" | Episodes with inline citations to source spans + temporal validity; LocalWorld memory beats cosine-RAG baseline on ratified eval (issue #34) |
-| ML team | Training-ready graph | PyG/OGB-compatible export with datasheets and leakage-safe split manifests; ER completeness as precondition for entity-disjoint splits |
+| Developer, app 1 | ship fast | 5-minute quickstart compiles first try |
+| Developer, app 2 | never rebuild profiles, identity, ontology | zero re-definition; steps-to-first-reuse at most 5 |
+| Enterprise | "be as messy as you want" | chaos-corpus ingest to typed graph plus quarantine ledger; zero silent loss; agreed ER precision and recall |
+| Agent builder | memory that just works | recalled records cite source spans with validity; beat cosine RAG on the ratified benchmark (#34) |
+| ML team | training-ready graph | PyG/OGB export, datasheets, leakage-safe split manifests |
 
-## 3. Architecture: four domains, shared contracts
+## Planes
 
-```text
-applications / agents / product adapters
-   |
-   | published, versioned contracts only
-   |
-   +-- Cloud Plane — durable data, regional relay/delivery/recovery,
-   |                  local replicas, tenant isolation
-   +-- Cairn — source evidence, ontology registry, candidate episodes,
-   |            reproducible operational views
-   +-- LEM / ORIGIN — canonical episodes, clocks, provenance, contradiction,
-   |                   consolidation, bounded LocalWorld
-   `-- Forge — capability-bound operations over LocalWorld; receipt candidates
+- **Ontology**: object, link and action types as versioned code. Actions are
+  the only write path: validated, transactional, revertible. Each ontology is
+  also an MCP server, read-only by default, with generated typed clients.
+- **Identity**: entity resolution is a re-runnable projection over the
+  immutable log. Write time assigns stable cluster ids; merge and split are
+  versioned, reversible events. Zero-config default: embedding blocking plus a
+  calibrated oracle for the ambiguous residue.
+- **Reversibility**: append-only log plus bitemporal facts plus generated
+  compensating transactions (undo is a computed diff, never hand-written).
+  Provenance (W3C PROV-O) is stored as columns. Erasure is an excision event
+  that keeps proof of deletion without the payload.
+- **Memory**: episodes to LocalWorld projections with inline citations and
+  validity, measured on LongMemEval and LoCoMo against Mem0 and Graphiti.
+- **ML**: bronze, silver, gold by default; lineage from use; Arrow, PyG and OGB
+  export with entity-disjoint, chronological splits.
 
-legal loop: Cairn candidate -> LEM append -> LocalWorld -> Forge receipt
-            -> Cairn candidate
-```
+## Dependencies
 
-Cloud is below the other domains as infrastructure, never semantic or action
-authority. Cairn is evidence/ontology rather than canonical memory. LEM is the
-canonical semantic domain rather than an executor. Forge is the only operations
-domain and re-enters the evidence path through receipts. The current embedded
-CRDT, index, KV, bounded sync, FDB relay, and recovery implementation is Cloud
-Plane baseline; ADR-0003 defines the still-unimplemented sovereign hyperscale
-target. `docs/architecture/DOMAIN-BOUNDARIES.md` and
-`docs/architecture/DEPENDENCY-RULES.md` are normative for workstream ownership.
+Each enters through the estate crates with provenance, licence, pin and
+justification.
 
-### 3.1 Ontology surface (new; the Palantir lesson, embedded)
+| Component | Licence | Verdict |
+|---|---|---|
+| Tantivy | MIT | wrap: ER blocking, keyword recall |
+| USearch | Apache-2.0 | wrap: ANN for blocking and recall |
+| Arrow/Parquet | Apache-2.0 | build on: batches, export |
+| redb | Apache/MIT | core: local store |
+| DuckDB | MIT | optional: batch re-projection |
+| Splink | MIT | port the method (Fellegi-Sunter), no Python |
+| Zingg | AGPL-3.0 | excluded |
+| Kuzu | MIT, archived | excluded |
+| Mem0, Graphiti, Letta, Cognee | Apache-2.0 | eval baselines only, out of process |
 
-Object types, link types, and action types as versioned artifacts defined
-in application code (schema-as-code, derives to typed clients). Actions
-are the only sanctioned write path — validated, transactional, and
-revertible — which is what makes agent writes safe and auditable
-(Palantir pattern: https://www.palantir.com/docs/foundry/action-types/overview/).
-Every ontology is also exposed as an MCP server from day one with
-read-only-by-default scoping (Supabase MCP pattern:
-https://supabase.com/docs/guides/getting-started/mcp), and typed client
-SDKs are generated from the ontology subset an application is granted
-(OSDK pattern: https://www.palantir.com/docs/foundry/ontology-sdk/overview/).
+## Metrics
 
-### 3.2 Identity plane: dedupe from the get-go (the wedge)
+- Second-app reuse: at most 5 steps, zero re-definition.
+- Quickstart: at least 90% first-try compile over N generated samples.
+- Dedupe: cluster precision and recall on WDC Products plus a chaos corpus,
+  zero config; ids stable across model upgrades.
+- Reversibility: every action type revertible by generated compensation.
+- Memory: significant win over cosine RAG and Mem0/Graphiti; citations on
+  every returned memory.
+- Ship: every CI lane green on the release head.
 
-Entity resolution is **derived, re-runnable projection over an immutable
-log**, never in-place mutation (Splink architecture:
-https://github.com/moj-analytical-services/splink). Write-time resolution
-assigns stable cluster IDs immediately; a resolution engine upgrade
-re-projects without data loss, and cluster merge/split are first-class,
-versioned, reversible events (the unsolved gap in current SOTA — no
-embeddable system does resolve-at-write with revisit-at-read: see SOTA
-gaps in §8 sources). Default profile is zero-config: embedding-based
-blocking (USearch/Tantivy) with recall targets + LLM-oracle calibration
-for the ambiguous residue; human-in-the-loop match confirmation is an
-action, not a UI afterthought.
+## Open research
 
-### 3.3 Full reversibility (the Datomic/XTDB/Dolt lesson, embedded)
-
-Append-only change log (already the Logical-DB core) + bitemporal
-validity on ontology facts (SQL:2011 / Graphiti `t_valid`/`t_invalid`
-pattern: https://arxiv.org/abs/2501.13956) + **generated compensating
-transactions**: undo is computed by diffing current ↔ target state and
-emitting the restoring write — inverses are derived from data, never
-authored by humans or agents. Point-in-time queries and time travel are
-reads, not mechanisms. Provenance (W3C PROV-O:
-https://www.w3.org/TR/prov-o/) is captured as columns, not a sidecar.
-Right-to-erasure is handled by explicit excision events that preserve
-the proof of deletion without the payload.
-
-### 3.4 Memory plane: agent memory that cites (the flagship claim)
-
-Cairn vocabulary → episodes → LocalWorld projections with **inline
-citations to source spans and temporal validity** — the provenance-first
-memory API no current system ships (Mem0, Graphiti, Letta, Cognee all
-return "relevant memories"; none return inline citations with validity:
-https://arxiv.org/abs/2504.19413, https://github.com/getzep/graphiti).
-The #34 comparative claim (LocalWorld citations beat cosine RAG) is the
-headline, measured on ratified benchmarks (LongMemEval:
-https://arxiv.org/abs/2410.10813; LoCoMo: https://arxiv.org/abs/2402.17753)
-against Mem0/Graphiti baselines.
-
-### 3.5 ML plane: messy-in, graph-out, training-ready
-
-Medallion as the shipped default (bronze raw immutable → silver resolved
-entities → gold consumption projections), lineage captured from usage not
-declaration (Unity Catalog pattern), and export to PyG/OGB/Arrow with
-datasheets (https://arxiv.org/abs/1803.09010) and **leakage-safe split
-manifests** — chronological + entity-disjoint splits, where ER
-completeness is the precondition that makes splits defensible
-(https://arxiv.org/abs/2309.15730, https://arxiv.org/abs/2307.01026).
-
-## 4. Dependency strategy (Director-authorized wrappers, via logicalworks-crates)
-
-Every wrapper enters through `logicalworks-crates` with: provenance
-record, license check, version pin, wrap-not-fork boundary, and a written
-justification. Research-verified table:
-
-| Component | License | Verdict | Justification |
-|---|---|---|---|
-| Tantivy | MIT | **wrap** | blocking candidates for ER + memory keyword recall; Rust, mature |
-| USearch | Apache-2.0 | **wrap** | ANN for embedding blocking + memory recall |
-| Arrow/Parquet | Apache-2.0 | **build on** | record batches + export format |
-| redb | Apache/MIT | already core | local store |
-| DuckDB (`duckdb-rs`) | MIT | **wrap (optional feature)** | batch ER re-projection / analytics SQL sidecar |
-| RocksDB crate | Apache grant | conditional | only if LSM needed; Apache side only |
-| Splink | MIT | **methodology port** | Fellegi-Sunter core is small math; do not shell out to Python |
-| Zingg | **AGPL-3.0** | **excluded** | copyleft poisons the substrate |
-| Datomic | proprietary | excluded | reference only |
-| Kùzu | MIT but archived | excluded | dead-end dependency risk |
-| Mem0/Graphiti/Letta/Cognee | Apache-2.0 | **eval baselines only** | separate Python processes for benchmarks, never in-process |
-
-## 5. Cairn + LEM migration (Director-authorized 2026-09-16 — "properly bring in the code")
-
-Per ADR-0001 the sibling repos were frozen read-only references with LEM
-SOT authority; the Director has now authorized the transfer. Proper
-migration contract:
-
-1. **SOT transfer record** — ADR-0002 records the authority move
-   (ORIGIN/CAIRN plane ownership into this workspace), the Director
-   authorization date, and the frozen-repo pointers. Requires the
-   migration proof below before any "canonical" claim is made.
-2. **Code migration** — port `wm-core` Rust modules
-   (`claim_schema.rs`, `geometry.rs`, `hash.rs`, `schema.rs`, `types.rs`),
-   the Cairn vocabulary surface (`world_token.py`, `ontology.py`
-   semantics already partially re-expressed in `logical-db-cairn`), and
-   LEM operators + `LocalWorld` (`~/LOGICAL-EVENT-MEMORY/src/lib.rs`,
-   685 lines) into `logical-db-cairn` / `logical-db-episode` as the
-   authoritative implementations, replacing re-expressions.
-3. **Versioned identity adapter** — the locked LEM v0 BLAKE3 wire and
-   the workspace v1 SHA-256 framing are translated by an explicit
-   versioned adapter recording hash scheme, canonicalization, payload
-   location, and migration status (ADR-0001 identity clause). No silent
-   32-byte equivalence.
-4. **Migration proof (acceptance, from ADR-0001 obligations)** — two
-   independent scopes; malformed and scheme-mismatched wire input
-   refused; duplicate/reordered delivery; restart/recovery;
-   source-coordinate preservation; bounded payloads; durable ORIGIN
-   store journey. Until the proof lands, docs say "migration in
-   progress", never "canonical".
-
-## 6. Execution: agent-swarm spec
-
-Swarm roles: **Build** (implementation), **Verify** (independent
-falsification: mutation campaigns, hostile review, black-box journeys),
-**Benchmark** (next-token score, ER P/R on dirty corpora, memory eval vs
-cosine-RAG + Mem0/Graphiti), **Docs** (quickstart, llms.txt + per-page
-.md mirrors, MCP), **Release** (crates.io, semver, changelog).
-
-Work packages (agent-sessions are planning units, not commitments):
-
-| WP | Surface it ships | Size | Human gate |
-|---|---|---|---|
-| WP0 | Batch orchestrator for external agent fleets (API-key batch runs with receipts) | 1-2 sessions | none |
-| WP1 | L0/L1 crate: prelude, put/get sugar, digest helper, KV feature, 5-line quickstart; next-token benchmark ≥90% | 3-5 sessions | crate name + publishing identity |
-| WP2 | Cairn+LEM migration per §5 (code port + adapter + proof) | 5-8 sessions | ADR-0002 ratification is recorded (done 2026-09-16); proof review |
-| WP3 | Ontology surface: object/link/action types, schema-as-code derives, revertible actions | 8-12 sessions | action-type API shape |
-| WP4 | Identity plane: blocking + zero-config default profile + match-confirmation actions | 8-12 sessions | ER thresholds on dirty corpora |
-| WP5 | Reversibility: bitemporal facts, generated compensations, PIT queries, excision | 6-10 sessions | none (acceptance is WP-internal) |
-| WP6 | Memory surface: episodes→LocalWorld with citations; #34 eval harness + run | 6-10 sessions | corpus + baseline ratification (2026-09-14 ruling) |
-| WP7 | ML export: PyG/OGB/Arrow + datasheets + split manifests | 3-5 sessions | none |
-| WP8 | MCP server + llms.txt + docs mirrors + hosted-relay surface (existing FDB stack) | 4-6 sessions | relay ops decisions |
-
-Sequence: WP1 ∥ WP2 → WP3 → WP4 ∥ WP5 → WP6 → WP7 ∥ WP8. Every WP ends
-at a merged, CI-green PR (self-hosted lanes) with black-box journey
-receipts; the top-down ladder rule applies — no WP may add depth below an
-unconsumed surface.
-
-## 7. Metrics (all measured, none asserted)
-
-- Second-app reuse: steps-to-first-reuse ≤ 5, zero re-definition of
-  profile/identity/ontology types.
-- Next-token: ≥ 90% first-try compile over N generated samples.
-- Dedupe: cluster-level P/R on WDC Products + chaos corpus with zero
-  config; stable-ID guarantee under model upgrade (merge/split events
-  only).
-- Reversibility: 100% of action types revertible via generated
-  compensation; PIT query correctness suite; provenance completeness
-  (every value traces to source episode/record).
-- Memory: statistically significant win vs cosine-RAG and Mem0/Graphiti
-  baselines on ratified eval; inline citations present on 100% of
-  returned memories.
-- Prod readiness: all REWRITE_MANIFEST gates applicable to shipped
-  surface green; self-hosted CI lanes green on release heads; ThinkPad
-  baseline measured for the embedded path.
-
-## 8. Open research obligations carried forward
-
-Unverified residuals from this PRD's research (tracked, not hidden):
-Motif paper ID unresolved; headline memory-benchmark numbers are
-vendor-run; LoCoMo data license (CC-BY-NC-SA) constrains redistribution;
-license of HippoRAG code unverified; hosted-relay business model is a
-Director decision, not an engineering one.
+Memory benchmark headline numbers are vendor-run. LoCoMo is CC-BY-NC-SA, which
+limits redistribution. HippoRAG code licence is unverified. The hosted-relay
+business model is the Director's call.

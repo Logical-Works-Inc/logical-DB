@@ -3,12 +3,6 @@
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28. Source URLs are in
 //! `evidence/SOURCES.md`.
-//!
-//! The optional `semantics` feature re-exports the bounded, non-authoritative
-//! `logical-db-cairn` and `logical-db-episode` ports for hosts that model
-//! semantic observations. It does not provide canonical LEM ORIGIN storage or
-//! LEM v0 wire compatibility. The feature stays off by default to preserve the
-//! minimal embedded footprint.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -51,10 +45,8 @@ pub use logical_db_crdt::{
     ConflictValue, CrdtError, Editor, Item, Object, ObjectKind, Reader, Scalar,
 };
 pub use logical_db_model::{
-    AccountId, ActionDigest, BackendClass, CAPABILITY_PROFILE_BYTES, CAPABILITY_PROFILE_VERSION,
-    Capability, CapabilityProfile, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId,
+    AccountId, ActionDigest, ChangeDigest, DocumentId, DocumentRevision, IndexEntry, IndexId,
     IndexValue, OperationDigest, OperationId, PeerId, ReplicaId, Scope, SnapshotArtifact, SpaceId,
-    common_guarantees,
 };
 pub use logical_db_platform::PlatformError;
 pub use logical_db_store::projection_relational::{
@@ -73,10 +65,3 @@ pub use logical_db_store::snapshot_restore::{
 };
 pub use logical_db_store::{ChangeEvent, EXPORT_VERSION, MAX_EXPORT_BYTES, RestoreCursor};
 pub use logical_db_sync::{SyncError, SyncLimits, SyncReport, Transport};
-
-/// Opt-in semantic vocabularies; off by default to keep the embedded minimal.
-#[cfg(feature = "semantics")]
-pub use logical_db_cairn;
-/// Opt-in episode log; off by default to keep the embedded minimal.
-#[cfg(feature = "semantics")]
-pub use logical_db_episode;

@@ -34,8 +34,7 @@ fn canonical_value_bytes(document: DocumentId, key: &str, value: &Scalar) -> Vec
         }
         bytes.extend_from_slice(&u32::MAX.to_be_bytes());
         if let Ok(width) = usize::try_from(u32::MAX) {
-            let take = width.min(field.len());
-            bytes.extend_from_slice(&field[..take]);
+            bytes.extend(field.iter().take(width));
         }
     }
     let mut bytes = Vec::new();
@@ -96,8 +95,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_digest_is_deterministic_and_content_sensitive()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn content_digest_is_deterministic_and_content_sensitive() {
         let document = DocumentId::new();
         let first = content_digest(document, "key", &Scalar::String("v".into()));
         let again = content_digest(document, "key", &Scalar::String("v".into()));
@@ -114,6 +112,5 @@ mod tests {
             first,
             content_digest(DocumentId::new(), "key", &Scalar::String("v".into()))
         );
-        Ok(())
     }
 }

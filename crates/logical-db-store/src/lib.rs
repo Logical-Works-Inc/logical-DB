@@ -30,19 +30,7 @@ pub(crate) mod types;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-mod tests_export;
-#[cfg(test)]
-mod tests_index;
-#[cfg(test)]
-mod tests_keys;
-#[cfg(test)]
-mod tests_restore;
-#[cfg(test)]
-mod tests_schema;
-#[cfg(test)]
-mod tests_store;
-#[cfg(test)]
-mod tests_sync;
+mod tests;
 
 pub use error::StoreError;
 pub use export::{decode_export, encode_export, restore_operation};
@@ -51,7 +39,7 @@ pub use logical_db_model::MAX_SNAPSHOT_BYTES;
 pub use remote::InstallMode;
 pub use store::EmbeddedStore;
 pub use types::{
-    ChangeEvent, CommitOutcome, CommittedOperation, ExportDocument, ExportEntry, ExportScanPage,
-    IndexHit, LocalChange, LocalCommit, MigrationDocument, MigrationIndexes, MigrationPage,
-    OutboxEntry, RemoteChange, RemoteDocument, RestoreCursor, StoredSnapshot, TextIndexPage,
+    ChangeEvent, CommitOutcome, CommittedOperation, ExportEntry, ExportScanPage, IndexHit,
+    LocalChange, LocalCommit, MigrationDocument, MigrationIndexes, MigrationPage, OutboxEntry,
+    RemoteChange, RemoteDocument, RestoreCursor, StoredSnapshot, TextIndexPage,
 };

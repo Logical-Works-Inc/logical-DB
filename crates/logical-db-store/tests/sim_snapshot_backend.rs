@@ -47,7 +47,7 @@ fn round_trip_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             .ok_or("saved snapshot should load")?;
         assert_eq!(loaded, envelope, "load returns the saved envelope");
         loaded.verify()?;
-        case.hasher.update(&loaded.hash);
+        case.hasher.update(&loaded.hash());
     }
     case.finish()
 }
@@ -116,7 +116,7 @@ fn isolation_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         assert_eq!(loaded, pair.1, "each scope sees only its own snapshot");
         let listed = case.own.store.list_snapshots(pair.0, case.own.projection)?;
         assert_eq!(listed.len(), 1, "listing stays tenant-scoped");
-        case.hasher.update(&loaded.hash);
+        case.hasher.update(&loaded.hash());
     }
     case.finish()
 }
@@ -147,8 +147,12 @@ fn latest_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             .store
             .load_latest_snapshot(case.own.scope, case.own.projection)?
             .ok_or("latest must exist after save")?;
-        assert_eq!(loaded.hash, envelope.hash, "latest tracks the newest save");
-        case.hasher.update(&loaded.hash);
+        assert_eq!(
+            loaded.hash(),
+            envelope.hash(),
+            "latest tracks the newest save"
+        );
+        case.hasher.update(&loaded.hash());
     }
     let listed = case
         .own
@@ -156,9 +160,9 @@ fn latest_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         .list_snapshots(case.own.scope, case.own.projection)?;
     assert_eq!(listed.len(), saves, "every save is listed");
     // Newest-first by creation time.
-    for window in listed.windows(2) {
+    for (newer, older) in listed.iter().zip(listed.iter().skip(1)) {
         assert!(
-            window[0].created_at_secs >= window[1].created_at_secs,
+            newer.created_at_secs >= older.created_at_secs,
             "listing runs newest-first"
         );
     }
@@ -200,7 +204,7 @@ fn delete_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     assert!(
         case.own
             .store
-            .delete_snapshot(case.own.scope, case.own.projection, &first.hash)?,
+            .delete_snapshot(case.own.scope, case.own.projection, &first.hash())?,
         "delete reports the removal"
     );
     let still = case
@@ -208,12 +212,12 @@ fn delete_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         .store
         .load_latest_snapshot(case.own.scope, case.own.projection)?
         .ok_or("latest must survive a non-latest delete")?;
-    assert_eq!(still.hash, second.hash, "latest still names the newest");
+    assert_eq!(still.hash(), second.hash(), "latest still names the newest");
     // Deleting the latest clears the pointer.
     assert!(
         case.own
             .store
-            .delete_snapshot(case.own.scope, case.own.projection, &second.hash)?,
+            .delete_snapshot(case.own.scope, case.own.projection, &second.hash())?,
         "delete reports the latest removal"
     );
     assert!(
@@ -228,11 +232,11 @@ fn delete_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         !case
             .own
             .store
-            .delete_snapshot(case.own.scope, case.own.projection, &second.hash)?,
+            .delete_snapshot(case.own.scope, case.own.projection, &second.hash())?,
         "absent delete reports false"
     );
-    case.hasher.update(&first.hash);
-    case.hasher.update(&second.hash);
+    case.hasher.update(&first.hash());
+    case.hasher.update(&second.hash());
     case.finish()
 }
 
@@ -276,8 +280,8 @@ fn projection_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             .store
             .load_latest_snapshot(case.own.scope, pair.0)?
             .ok_or("each projection keeps a latest pointer")?;
-        assert_eq!(loaded.hash, pair.1.hash, "projections stay separated");
-        case.hasher.update(&loaded.hash);
+        assert_eq!(loaded.hash(), pair.1.hash(), "projections stay separated");
+        case.hasher.update(&loaded.hash());
     }
     case.finish()
 }

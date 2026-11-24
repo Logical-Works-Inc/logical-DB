@@ -1,50 +1,89 @@
 //! External recovery consumer: install a paged baseline over real HTTP.
 //!
-//! Spawned as a real child process by the process-kill recovery journey. On the
-//! first *continued* baseline page it writes a ready file and pauses, so the
-//! parent can terminate it while the accumulator already holds earlier pages but
-//! before the replica has committed anything. A second seam signals *after*
-//! `synchronize` returns, so the parent can terminate a child whose baseline
-//! commit is already durable and check what survives it. A run with both pauses
-//! at zero recovers the whole baseline and reports it, standing in for the
-//! external consumer.
+//! Spawned as a real child process by the process-kill recovery journey. It
+//! reports each seam it reaches as one line on stdout. Told to hold at a seam,
+//! it then blocks on stdin until the parent kills it or closes the pipe, so the
+//! parent terminates it at an exact point with no sleep or timer:
+//!
+//! - `page-two`: the first *continued* baseline page has arrived; the
+//!   accumulator holds earlier pages and the replica has committed nothing.
+//! - `committed`: `synchronize` has returned, so the baseline is durable.
+//!
+//! A run with `hold=none` recovers the whole baseline and reports it, standing
+//! in for the external consumer.
 //!
 //! Evidence: S01 S02 S03 S04 S05 S06 S07 S08 S09 S10 S11 S12 S13 S14 S15
 //! S16 S17 S18 S19 S20 S21 S22 S23 S24 S25 S26 S27 S28 S29 S30 S31 S32 S33
 //! S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
-#![expect(
-    clippy::print_stderr,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
-#![expect(
-    clippy::print_stdout,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
 
-use std::{error::Error, io, path::PathBuf, time::Duration};
+use std::{
+    io::{self, Read, Write},
+    path::PathBuf,
+};
 
 use logical_db::{
-    AccountId, Database, PeerId, ReplicaId, Scope, SpaceId, SyncLimits, Transport,
-    http::{HttpError, HttpTransport, StaticBearer, Url},
+    Database, PeerId, ReplicaId, Scope, SyncLimits, Transport,
+    http::{Endpoint, HttpError, HttpTransport, StaticBearer},
     transport::{
         BaselineRequest, BaselineResult, PullRequest, PullResult, PushRequest, PushResponse,
     },
 };
-use uuid::Uuid;
+use logical_db_e2e::support::{ClientJourneyError, parse_identifier};
 
-/// HTTP transport wrapper that signals the recovery seam and can stall there.
-struct PausingTransport {
-    /// Real HTTP transport every call delegates to.
-    inner: HttpTransport<StaticBearer>,
-    /// File the orchestrator watches for the recovery-seam signal.
-    ready: PathBuf,
-    /// How long to stall once the seam has been signalled.
-    pause: Duration,
+/// The seam this run holds at, if any.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hold {
+    /// Run to completion.
+    Never,
+    /// Hold once the first continued baseline page has arrived.
+    PageTwo,
+    /// Hold once the baseline commit is durable.
+    Committed,
 }
 
-impl Transport for PausingTransport {
+impl Hold {
+    /// Parses the `hold` argument.
+    fn parse(text: &str) -> Result<Self, io::Error> {
+        match text {
+            "none" => Ok(Self::Never),
+            "page-two" => Ok(Self::PageTwo),
+            "committed" => Ok(Self::Committed),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("recovery-consumer: unknown hold {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Reports `seam` on stdout and, when this run holds there, blocks on stdin
+/// until the parent kills this process or closes the pipe.
+fn reach(seam: &str, hold: bool) -> Result<(), io::Error> {
+    let line = format!("seam {seam}\n");
+    io::stdout().lock().write_all(line.as_bytes())?;
+    io::stdout().lock().flush()?;
+    if hold {
+        let mut released = Vec::new();
+        io::stdin().lock().read_to_end(&mut released)?;
+    }
+    Ok(())
+}
+
+/// HTTP transport wrapper that reports the continued-page seam and can hold there.
+#[derive(Debug)]
+struct SeamTransport {
+    /// Real HTTP transport every call delegates to.
+    inner: HttpTransport<StaticBearer>,
+    /// Whether to hold at the continued-page seam.
+    hold: bool,
+    /// The seam report outcome, once the continued page has arrived. A failed
+    /// report is returned after synchronization; `HttpError` has no I/O case.
+    reported: Option<Result<(), io::Error>>,
+}
+
+impl Transport for SeamTransport {
     type Error = HttpError;
 
     async fn push(&mut self, request: PushRequest) -> Result<PushResponse, Self::Error> {
@@ -58,11 +97,8 @@ impl Transport for PausingTransport {
     async fn baseline(&mut self, request: BaselineRequest) -> Result<BaselineResult, Self::Error> {
         let continued = request.after_document.is_some();
         let result = self.inner.baseline(request).await?;
-        if continued && matches!(result, BaselineResult::Artifact(_)) && !self.pause.is_zero() {
-            if let Err(error) = std::fs::write(&self.ready, b"accumulated\n") {
-                eprintln!("recovery-consumer: ready signal: {error}");
-            }
-            std::thread::park_timeout(self.pause);
+        if continued && self.reported.is_none() && matches!(result, BaselineResult::Artifact(_)) {
+            self.reported = Some(reach("page-two", self.hold));
         }
         Ok(result)
     }
@@ -79,53 +115,49 @@ fn required(arguments: &[String], index: usize, name: &str) -> Result<String, io
 }
 
 /// Boots the async runtime and runs the recovery-consumer journey.
-fn main() -> Result<(), Box<dyn Error>> {
-    lgwks_bot::Runtime::new()?.block_on(recover())
+fn main() -> Result<(), ClientJourneyError> {
+    lgwks_bot::rt::runtime::Builder::new()
+        .worker_threads(std::num::NonZeroUsize::new(2))
+        .build()?
+        .block_on(recover())
 }
 
-/// Recovers the baseline over HTTP, pauses at the seam, then commits.
-async fn recover() -> Result<(), Box<dyn Error>> {
+/// Recovers the baseline over HTTP, holding at the requested seam.
+///
+/// Arguments: redb path, account, space, replica, peer, endpoint, bearer, hold.
+async fn recover() -> Result<(), ClientJourneyError> {
     let arguments = std::env::args().collect::<Vec<_>>();
     let path = PathBuf::from(required(&arguments, 1, "redb path")?);
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&required(&arguments, 2, "account")?)?),
-        SpaceId::from_uuid(Uuid::parse_str(&required(&arguments, 3, "space")?)?),
+        parse_identifier(&required(&arguments, 2, "account")?, "account")?,
+        parse_identifier(&required(&arguments, 3, "space")?, "space")?,
     );
-    let replica = ReplicaId::from_uuid(Uuid::parse_str(&required(&arguments, 4, "replica")?)?);
-    let peer = PeerId::from_uuid(Uuid::parse_str(&required(&arguments, 5, "peer")?)?);
-    let endpoint: Url = required(&arguments, 6, "endpoint")?.parse()?;
+    let replica: ReplicaId = parse_identifier(&required(&arguments, 4, "replica")?, "replica")?;
+    let peer: PeerId = parse_identifier(&required(&arguments, 5, "peer")?, "peer")?;
+    let endpoint = Endpoint::parse(&required(&arguments, 6, "endpoint")?)?;
     let bearer = StaticBearer::new(&required(&arguments, 7, "bearer")?)?;
-    let ready = PathBuf::from(required(&arguments, 8, "ready path")?);
-    let pause = Duration::from_millis(required(&arguments, 9, "pause ms")?.parse()?);
-    let committed = arguments.get(10).map(PathBuf::from);
-    let post_pause = arguments
-        .get(11)
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_default();
+    let hold = Hold::parse(&required(&arguments, 8, "hold")?)?;
 
     let database = Database::open(&path, scope, replica)?;
-    let mut transport = PausingTransport {
+    let mut transport = SeamTransport {
         inner: HttpTransport::new(endpoint, bearer)?,
-        ready,
-        pause,
+        hold: hold == Hold::PageTwo,
+        reported: None,
     };
     let report = database
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
         .await?;
+    if let Some(seam) = transport.reported {
+        seam?;
+    }
     if !report.recovered {
-        eprintln!("recovery-consumer: no baseline was installed");
-        return Err(io::Error::other("expected a state-bearing baseline").into());
+        return Err(io::Error::other("recovery-consumer: no baseline was installed").into());
     }
-    if let Some(path) = committed.filter(|_| !post_pause.is_zero()) {
-        if let Err(error) = std::fs::write(&path, b"committed\n") {
-            eprintln!("recovery-consumer: committed signal: {error}");
-        }
-        std::thread::park_timeout(post_pause);
-    }
-    println!(
-        "PASS recovery-consumer recovered={} pushed={} pulled={}",
+    reach("committed", hold == Hold::Committed)?;
+    let verdict = format!(
+        "PASS recovery-consumer recovered={} pushed={} pulled={}\n",
         report.recovered, report.pushed, report.pulled
     );
+    io::stdout().lock().write_all(verdict.as_bytes())?;
     Ok(())
 }

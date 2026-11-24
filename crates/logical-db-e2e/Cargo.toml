@@ -13,43 +13,43 @@ repository.workspace = true
 
 [features]
 default = []
-fdb = ["dep:logical-db-store-fdb", "logical-db-store-fdb/fdb"]
+fdb = [
+    "dep:logical-db-store-fdb",
+    "logical-db-store-fdb/fdb",
+    "dep:logical-db-daemon",
+    "logical-db-daemon/fdb",
+]
 
 [dependencies]
 axum.workspace = true
 lgwks_bot.workspace = true
-logical-db = { version = "0.1.0", path = "../logical-db", features = ["http", "semantics"] }
+# `support::parse_identifier` reads JSON through the estate surface.
+lgwks_std.workspace = true
+logical-db = { version = "0.1.0", path = "../logical-db", features = ["http"] }
 # The adapter layer (`[layers.adapter]`): `src/kv.rs` drives the cache journey
 # the `kv_journey` binary ships.
 logical-db-kv = { version = "0.1.0", path = "../logical-db-kv" }
-# The journey harness is a composition layer (`contract/domains/GRAPH.toml`
-# `[layers.e2e]`) and may import implementation crates from an allowed domain.
-# These four are what `src/support.rs` names directly: the shared in-memory
-# service composition used by every black-box journey.
+# `src/bin/document_journey.rs` drives the convergent `Document` directly to
+# observe concurrent conflicts, which the facade does not re-export.
+logical-db-crdt = { version = "0.1.0", path = "../logical-db-crdt" }
+# The journey harness is a composition layer and may import implementation
+# crates. These four are what `src/support.rs` names directly: the shared
+# in-memory service composition used by every black-box journey.
 logical-db-model = { version = "0.1.0", path = "../logical-db-model" }
 logical-db-protocol = { version = "0.1.0", path = "../logical-db-protocol" }
 logical-db-server = { version = "0.1.0", path = "../logical-db-server" }
 logical-db-service = { version = "0.1.0", path = "../logical-db-service" }
 logical-db-store-fdb = { version = "0.1.0", path = "../logical-db-store-fdb", optional = true }
+# The FDB journeys boot the client network through the daemon's one safe
+# `boot_network`, so this crate writes no `unsafe` of its own.
+logical-db-daemon = { version = "0.1.0", path = "../logical-db-daemon", optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true
 lgwks_deps.workspace = true
-# `clean_room_evidence` and the repository-contract tests read `cargo metadata`
-# and the domain receipt through the estate JSON surface.
-lgwks_std.workspace = true
-logical-db-cairn = { version = "0.1.0", path = "../logical-db-cairn" }
-logical-db-episode = { version = "0.1.0", path = "../logical-db-episode" }
 logical-db-http = { version = "0.1.0", path = "../logical-db-http" }
-# The repository-contract tests read `contract/*.toml` (docs/adr/0006).
-toml.workspace = true # gap: Logical-Works-Inc/logicalworks-crates#852
 
-# Inherits the workspace anti-pattern contract. This crate owns a reviewed FDB
-# network-boot FFI call, so it is one of the two crates that do not carry a
-# root `#![forbid(unsafe_code)]`; it relies on the workspace `unsafe_code =
-# "deny"` plus a scoped, documented attribute at the boot site. Cargo forbids
-# combining this inherit line with a member-local override, so the exception
-# lives here as an attribute, not as a duplicated lint table.
+# Inherits the workspace anti-pattern contract unchanged.
 [lints]
 workspace = true

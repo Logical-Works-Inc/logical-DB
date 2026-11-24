@@ -173,7 +173,8 @@ impl KvCache {
         let mut removed = 0_usize;
         for entry in entries {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() || file_type.is_symlink() {
                 continue;
             }
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -320,9 +321,14 @@ impl KvCache {
                 Ok(left) => left.min(buffer.len()),
                 Err(_) => buffer.len(),
             };
-            match file.read_exact(&mut buffer[..width]) {
+            // `width` never exceeds the buffer; a window that cannot be cut is
+            // refused as an invalid blob rather than hashed short.
+            let Some(window) = buffer.get_mut(..width) else {
+                return Ok(false);
+            };
+            match file.read_exact(window) {
                 Ok(()) => {
-                    hasher.update(&buffer[..width]);
+                    hasher.update(window);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                     return Ok(false);
@@ -436,14 +442,27 @@ pub(crate) fn hex_digest(digest: &[u8; 32]) -> String {
 
 /// Parses a lowercase hex blob name into a 32-byte digest.
 pub(crate) fn hex_to_digest(name: &str) -> Option<[u8; 32]> {
-    if name.len() != 64
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if name.len() != 64 {
         return None;
     }
-    lgwks_std::hex::decode(name).ok()?.try_into().ok()
+    let mut nibbles = name.bytes().map(lowercase_nibble);
+    let mut digest = [0_u8; 32];
+    for octet in &mut digest {
+        let high = nibbles.next()??;
+        let low = nibbles.next()??;
+        *octet = (high << 4) | low;
+    }
+    Some(digest)
+}
+
+/// Returns the value of one lowercase hexadecimal digit; uppercase and every
+/// other byte are not digits of a canonical blob name.
+fn lowercase_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => byte.checked_sub(b'0'),
+        b'a'..=b'f' => byte.checked_sub(b'a')?.checked_add(10),
+        _ => None,
+    }
 }
 
 /// Returns whether a name is a well-formed hex blob digest.

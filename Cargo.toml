@@ -19,36 +19,29 @@ members = [
   "crates/logical-db-platform",
   "crates/logical-db-daemon",
   "crates/logical-db-kv",
-  "crates/logical-db-cairn",
-  "crates/logical-db-episode",
-  "crates/logical-db-cloud-contract",
 ]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 license = "Apache-2.0"
 repository = "https://github.com/Logical-Works-Inc/logical-DB"
 
 [workspace.dependencies]
-automerge = "=0.11.0"
-redb = "=4.2.0"
-thiserror = "=2.0.20"
+automerge = "=0.12.0"
+redb = "=5.0.0"
+thiserror = "=2.0.21"
 # Estate first: `lgwks_std::id::Uuid` replaces `uuid` once it serializes, has an
 # infallible v7 constructor, and packs as an FDB tuple (docs/adr/0005).
-uuid = { version = "=1.26.1", features = ["serde", "v7"] } # gap: Logical-Works-Inc/logicalworks-crates#851
+uuid = { version = "=1.29.3", features = ["serde", "v7"] } # gap: Logical-Works-Inc/logicalworks-crates#851
 foundationdb = { version = "=0.11.0", default-features = false, features = ["embedded-fdb-include", "fdb-7_3", "uuid"] }
 foundationdb-tuple = { version = "=0.11.0", features = ["uuid"] } # gap: Logical-Works-Inc/logicalworks-crates#851
 serde_bytes = "=0.11.19"
-# Estate first: the repository contracts are read through the estate once it
-# owns a TOML reader (docs/adr/0006).
-toml = "=1.1.8" # gap: Logical-Works-Inc/logicalworks-crates#852
 ciborium = "=0.2.2"
-# FROZEN BOUNDARY (async surface): `reqwest` and `axum` are the async HTTP
-# client/server the estate does not yet supply. Every runtime *mechanic*
-# (executor, spawn, timers, channels, sockets, signals) is sourced from
-# `lgwks_bot`; these two are registered boundaries pending the estate client.
-reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy"] }
+# FROZEN BOUNDARY (async server): `axum` is the HTTP server the estate does not
+# yet supply. The client is the estate `lgwks_std::http`. Every runtime
+# *mechanic* (executor, spawn, timers, channels, sockets, signals) is sourced
+# from `lgwks_bot`.
 axum = "=0.8.9"
 tower = { version = "=0.5.3", features = ["util"] }
 # The estate foundation. `lgwks_bot` is the single async entry
@@ -65,42 +58,43 @@ tower = { version = "=0.5.3", features = ["util"] }
 #
 # `json` re-exports the serde crate the estate owns, so logical-db derives
 # through `lgwks_std::json::{Serialize, Deserialize}` and never declares serde.
-lgwks_std = { version = "3.2.2", features = ["json", "hash"] }
-lgwks_bot = { version = "6.1.0", features = ["net", "signal"] }
+lgwks_std = { version = "5.0.0", features = ["json", "hash"] }
+lgwks_bot = { version = "10.0.3", features = ["net", "signal"] }
 # The dependency gate itself. `default-features = false` keeps the storefront's
 # Rust scanner out: the contract lane only needs `check_dependencies`.
-lgwks_deps = { version = "5.1.2", default-features = false }
+lgwks_deps = { version = "8.0.0", default-features = false }
 # Row-4 kernel absorption (issue #119): the second parity engine the ported
 # projection contract needs. Exact pin with no default features, following
 # the redb boundary precedent. The durable snapshot query path uses
 # positional reads over the same LWMX bytes instead of mmap(2), so no
 # mapping edge is admitted: every crate here keeps forbid(unsafe_code).
-rusqlite = { version = "=0.41.0", default-features = false, features = ["bundled"] } # gap: Logical-Works-Inc/logicalworks-crates#828
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] } # gap: Logical-Works-Inc/logicalworks-crates#828
 
 [workspace.lints.rust]
 improper_ctypes = "forbid"
 improper_ctypes_definitions = "forbid"
-# `deny`, not `forbid`, and deliberately the only non-`forbid` entry here.
-#
-# Cargo rejects a member that both inherits the table (`[lints] workspace =
-# true`) and overrides one entry, so the exception cannot be declared per member.
-# Instead, every crate that must never permit `unsafe` states it at its own root
-# as `#![forbid(unsafe_code)]` — which is stronger than this table and cannot be
-# lowered by any `#[expect]` or `#[allow]` (E0453). Only `logical-db-daemon` and
-# `logical-db-e2e` omit that root attribute, because each owns one reviewed
-# FoundationDB network-boot FFI call that has to carry a scoped, documented
-# attribute; `deny` is what lets that scoped exception exist. This is rustc's own
-# pattern: `forbid` on the safe surface, one reasoned exception at the FFI leaf.
-#
-# `deny`, not `forbid`, for the same reason as the print/exit pair below: the
-# FFI leaf must be able to carry `#[expect(unsafe_code, reason = "...")]`, and
-# `forbid` cannot be lowered even there (E0453). Every other crate states
-# `#![forbid(unsafe_code)]` at its own root and is therefore stricter than this
-# table.
+# `deny`: no inheriting crate writes `unsafe`, and no source attribute may lower
+# it (the estate guard refuses every inline allow or expect). The one FFI leaf,
+# the FoundationDB network boot in `logical-db-daemon/src/fdb_boot.rs`, lives in
+# a crate that copies this table whole with only `unsafe_code = "allow"`
+# changed, registered in the estate guard's lint-exception list.
 unsafe_code = "deny"
 unused_must_use = "forbid"
+# The estate lint floor (rust-guard LINT_FLOOR, one list for every repo).
+elided_lifetimes_in_paths = "forbid"
+let_underscore_drop = "forbid"
+missing_debug_implementations = "forbid"
+missing_docs = "forbid"
+non_ascii_idents = "forbid"
+redundant_lifetimes = "forbid"
+trivial_casts = "forbid"
+trivial_numeric_casts = "forbid"
+unnameable_types = "forbid"
+unreachable_pub = "forbid"
+unused_lifetimes = "forbid"
 
-# 66 clippy lints, all `forbid` — a `deny` is defeated by any single
+# The clippy half of the estate lint floor, all `forbid` but the four
+# documented `deny` exceptions — a `deny` is defeated by any single
 # `#[allow]`; `forbid` cannot be lowered from source (E0453).
 [workspace.lints.clippy]
 allow_attributes = "forbid"
@@ -127,32 +121,48 @@ exit = "deny"
 expect_fun_call = "forbid"
 expect_used = "forbid"
 explicit_deref_methods = "forbid"
+fallible_impl_from = "forbid"
+filetype_is_file = "forbid"
 float_cmp = "forbid"
 fn_params_excessive_bools = "forbid"
 format_push_string = "forbid"
+get_unwrap = "forbid"
+host_endian_bytes = "forbid"
 implicit_clone = "forbid"
+indexing_slicing = "forbid"
+infinite_loop = "forbid"
 integer_division = "forbid"
 iter_over_hash_type = "forbid"
+large_futures = "forbid"
+large_include_file = "forbid"
 large_stack_arrays = "forbid"
 let_underscore_future = "forbid"
 let_underscore_must_use = "forbid"
+let_underscore_untyped = "forbid"
 lossy_float_literal = "forbid"
 manual_contains = "forbid"
 map_entry = "forbid"
+map_err_ignore = "forbid"
+match_wildcard_for_single_variants = "forbid"
 mem_forget = "forbid"
 mem_replace_with_default = "forbid"
 min_ident_chars = "forbid"
 missing_assert_message = "forbid"
 missing_docs_in_private_items = "forbid"
 missing_safety_doc = "forbid"
+mod_module_files = "forbid"
 modulo_arithmetic = "forbid"
 multiple_unsafe_ops_per_block = "forbid"
 must_use_candidate = "forbid"
+mutex_atomic = "forbid"
+mutex_integer = "forbid"
 needless_collect = "forbid"
 needless_lifetimes = "forbid"
+needless_pass_by_value = "forbid"
 needless_range_loop = "forbid"
 panic = "forbid"
 panicking_unwrap = "forbid"
+partial_pub_fields = "forbid"
 pattern_type_mismatch = "forbid"
 # `deny`, not `forbid`, for the two print lints only: the execution contract's
 # PRINTS rule exempts `main.rs`, `src/bin/`, `examples/`, and `benches/`, and
@@ -163,19 +173,30 @@ pattern_type_mismatch = "forbid"
 print_stderr = "deny"
 print_stdout = "deny"
 ptr_arg = "forbid"
+pub_underscore_fields = "forbid"
 rc_buffer = "forbid"
+rc_mutex = "forbid"
 redundant_clone = "forbid"
 ref_option_ref = "forbid"
 slow_vector_initialization = "forbid"
 str_to_string = "forbid"
 string_add = "forbid"
+string_slice = "forbid"
 todo = "forbid"
+too_many_lines = "forbid"
 transmute_ptr_to_ref = "forbid"
+try_err = "forbid"
 unchecked_time_subtraction = "forbid"
 undocumented_unsafe_blocks = "forbid"
 unimplemented = "forbid"
+unnecessary_wraps = "forbid"
+unreachable = "forbid"
+unused_async = "forbid"
 unused_io_amount = "forbid"
+unused_result_ok = "forbid"
 unwrap_in_result = "forbid"
 unwrap_or_default = "forbid"
 unwrap_used = "forbid"
+verbose_file_reads = "forbid"
+wildcard_dependencies = "forbid"
 wildcard_imports = "forbid"

@@ -66,7 +66,7 @@ fn insert_growth_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>
             hasher.update(&scored.score.to_le_bytes());
         }
     }
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Reinserting one hash replaces its terms; the row count never moves.
@@ -89,13 +89,18 @@ fn reinsert_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         for text in &terms {
             hasher.update(text.as_bytes());
         }
-        let results = projection.query(&terms[0], &[], 8)?;
+        let newest = terms.first().ok_or("sim terms empty")?;
+        let results = projection.query(newest, &[], 8)?;
         assert_eq!(results.len(), 1, "the newest term must match");
-        assert_eq!(results[0].hash, hash, "the reinserted row ranks first");
+        assert_eq!(
+            results.first().map(|scored| scored.hash),
+            Some(hash),
+            "the reinserted row ranks first"
+        );
     }
     let stale = projection.query("w999_not_indexed", &[], 8)?;
     assert!(stale.is_empty(), "never-indexed terms match nothing");
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// An empty index answers nothing on every query shape.
@@ -126,7 +131,7 @@ fn empty_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         full.is_empty(),
         "a live seed still answers nothing when empty"
     );
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Query answers are stable across repeated calls and reorderings of calls.
@@ -184,7 +189,7 @@ fn ordering_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             hasher.update(&scored.score.to_le_bytes());
         }
     }
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Tokenizer edge inputs never panic and stay deterministic.
@@ -219,7 +224,7 @@ fn tokenizer_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
                 .map_err(|error| format!("sim alphabet overflow: {error}"))?;
             let word = usize::try_from(word_draw)
                 .map_err(|error| format!("sim alphabet overflow: {error}"))?;
-            input.push_str(alphabet[word]);
+            input.push_str(alphabet.get(word).ok_or("sim alphabet draw out of range")?);
             let gap = rng
                 .below(2)
                 .map_err(|error| format!("sim gap overflow: {error}"))?;
@@ -240,7 +245,7 @@ fn tokenizer_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
             hasher.update(token.as_bytes());
         }
     }
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// With an all-zero vector seed, text overlap alone orders results.
@@ -300,7 +305,7 @@ fn overlap_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         hasher.update(&scored.hash);
         hasher.update(&scored.score.to_le_bytes());
     }
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Pure-vector mode returns every row and ranks deterministically.
@@ -327,9 +332,9 @@ fn vector_mode_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> 
     let again = projection.query("", &live_seed, 64)?;
     assert_eq!(results, again, "the ranking repeats exactly");
     // Scores descend along the answer.
-    for window in results.windows(2) {
+    for (higher, lower) in results.iter().zip(results.iter().skip(1)) {
         assert!(
-            window[0].score >= window[1].score,
+            higher.score >= lower.score,
             "scores must descend in rank order"
         );
     }
@@ -343,7 +348,7 @@ fn vector_mode_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> 
         nothing.is_empty(),
         "zero seed plus zero terms ranks nothing"
     );
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }
 
 /// Ten thousand rows still answer within the top-k bound.
@@ -382,5 +387,5 @@ fn adversarial_trace(seed: u64) -> Result<[u8; 32], Box<dyn std::error::Error>> 
         hasher.update(&scored.hash);
         hasher.update(&scored.score.to_le_bytes());
     }
-    Ok(trace_tag(hasher))
+    Ok(trace_tag(&hasher))
 }

@@ -77,7 +77,7 @@ fn length_prefix(len: usize) -> Result<[u8; 8], KvError> {
 }
 
 /// Seals a hasher into an operation digest.
-fn seal(hasher: Hasher) -> OperationDigest {
+fn seal(hasher: &Hasher) -> OperationDigest {
     OperationDigest::new(*hasher.finalize().as_bytes())
 }
 
@@ -100,20 +100,16 @@ fn frame_expiry(hasher: &mut Hasher, expires_at_ms: i64, sequence: u64) {
 }
 
 /// Extracts the wall-clock start time encoded in a UUIDv7 operation id.
+///
+/// RFC 9562 section 5.7: the version nibble is 7 and the high 48 bits are
+/// the Unix epoch milliseconds, big-endian. Forty-eight bits always fit a
+/// non-negative `i64`.
 pub(crate) fn operation_started_at_ms(operation: &OperationId) -> Result<i64, KvError> {
-    let uuid = operation.as_uuid();
-    if uuid.get_version_num() != 7 {
+    let [b0, b1, b2, b3, b4, b5, version, ..] = *operation.as_uuid().as_bytes();
+    if version & 0xf0 != 0x70 {
         return Err(KvError::InvalidOperationId);
     }
-    let Some(timestamp) = uuid.get_timestamp() else {
-        return Err(KvError::InvalidOperationId);
-    };
-    let (seconds, nanos) = timestamp.to_unix();
-    seconds
-        .checked_mul(1_000)
-        .and_then(|millis| millis.checked_add(u64::from(nanos.checked_div(1_000_000)?)))
-        .and_then(|millis| i64::try_from(millis).ok())
-        .ok_or(KvError::InvalidOperationId)
+    Ok(i64::from_be_bytes([0, 0, b0, b1, b2, b3, b4, b5]))
 }
 
 /// Derives a unique recency sequence for one index within a batch.
@@ -140,7 +136,7 @@ pub(crate) fn batch_member_operation(
     hasher.update(&[0]);
     hasher.update(batch.as_uuid().as_bytes());
     hasher.update(&length_prefix(index)?);
-    custom_id(hasher)
+    custom_id(&hasher)
 }
 
 /// Hashes a full batch request for idempotent apply and deduplication.
@@ -163,7 +159,7 @@ pub(crate) fn batch_request_digest(
         hasher.update(&entry.value);
         frame_expiry(&mut hasher, expires_at_ms, sequence);
     }
-    Ok(seal(hasher))
+    Ok(seal(&hasher))
 }
 
 /// Binds a member request digest to its parent batch request digest.
@@ -175,7 +171,7 @@ pub(crate) fn bind_batch_request(
     hasher.update(b"logical-db-kv/batch-member-request/v1");
     hasher.update(&request.into_bytes());
     hasher.update(&batch_digest.into_bytes());
-    seal(hasher)
+    seal(&hasher)
 }
 
 /// Builds the request digest for an inline put operation.
@@ -191,7 +187,7 @@ pub(crate) fn put_digest(
     hasher.update(&[0]);
     hasher.update(value);
     frame_expiry(&mut hasher, expires_at_ms, sequence);
-    seal(hasher)
+    seal(&hasher)
 }
 
 /// Builds the request digest for a tiered put operation.
@@ -209,12 +205,12 @@ pub(crate) fn tiered_put_digest(
     hasher.update(digest);
     hasher.update(&size.to_be_bytes());
     frame_expiry(&mut hasher, expires_at_ms, sequence);
-    seal(hasher)
+    seal(&hasher)
 }
 
 /// Builds the request digest for a clear/delete operation.
 pub(crate) fn clear_digest(operation: &OperationId, namespace: &str, key: &str) -> OperationDigest {
-    seal(request_hasher(
+    seal(&request_hasher(
         b"logical-db-kv/clear/v1",
         operation,
         namespace,
@@ -234,5 +230,5 @@ pub(crate) fn document_for(namespace: &str, key: &str) -> Result<DocumentId, KvE
         hasher.update(&length_prefix(field.len())?);
         hasher.update(field.as_bytes());
     }
-    custom_id::<DocumentId>(hasher)
+    custom_id::<DocumentId>(&hasher)
 }

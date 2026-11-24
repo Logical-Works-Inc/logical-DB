@@ -116,9 +116,12 @@ pub enum StoreError {
     /// Durable internal bytes did not match the v3 format.
     #[error("durable v3 internal bytes are malformed")]
     CorruptInternalValue,
-    /// Durable identifier bytes did not decode through the model contract.
-    #[error("durable identifier bytes failed model decoding: {0}")]
-    CorruptIdentifier(#[from] lgwks_std::json::Error),
+    /// Durable identifier or integer bytes did not have their fixed width.
+    #[error("durable fixed-width bytes have the wrong length: {0}")]
+    CorruptIdentifier(#[from] std::array::TryFromSliceError),
+    /// A length or count exceeded the width of its durable field.
+    #[error("length or count exceeds its durable field width: {0}")]
+    WidthOverflow(#[from] std::num::TryFromIntError),
     /// Durable text bytes were not valid UTF-8.
     #[error("durable v3 text bytes are not valid UTF-8: {0}")]
     CorruptInternalText(#[from] std::string::FromUtf8Error),

@@ -158,8 +158,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn facade_error_kinds_preserve_recovery_decisions_without_store_types()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn facade_error_kinds_preserve_recovery_decisions_without_store_types() {
         assert_eq!(
             DatabaseError::Store(StoreError::StaleDocument).kind(),
             DatabaseErrorKind::ConcurrentWrite
@@ -168,6 +167,5 @@ mod tests {
             DatabaseError::InvalidSchemaVersion.kind(),
             DatabaseErrorKind::Other
         );
-        Ok(())
     }
 }

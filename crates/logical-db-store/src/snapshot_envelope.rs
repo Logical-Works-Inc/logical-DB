@@ -16,6 +16,7 @@
 //! The backend trait, its redb implementation, and restore-or-replay live in
 //! [`super::snapshot_backend`] and [`super::snapshot_restore`].
 
+use lgwks_std::id::Uuid;
 use logical_db_model::{AccountId, IndexId, MAX_SNAPSHOT_BYTES, Scope, SpaceId};
 use thiserror::Error;
 
@@ -67,21 +68,21 @@ pub enum SnapshotEnvelopeError {
 #[non_exhaustive]
 pub(crate) struct SnapshotSeal {
     /// Owning scope.
-    pub scope: Scope,
+    pub(crate) scope: Scope,
     /// The projected index identity.
-    pub projection: IndexId,
+    pub(crate) projection: IndexId,
     /// Serialized projection state.
     pub(crate) state: Vec<u8>,
     /// Creation time in Unix seconds, caller-supplied.
-    pub created_at_secs: u64,
+    pub(crate) created_at_secs: u64,
     /// Opaque projection semantics fingerprint bound at seal.
-    pub semantics: [u8; 32],
+    pub(crate) semantics: [u8; 32],
     /// Checkpoint of the sealed state.
-    pub checkpoint: [u8; 32],
+    pub(crate) checkpoint: [u8; 32],
     /// Last row hash covered by the snapshot.
-    pub last_row: [u8; 32],
+    pub(crate) last_row: [u8; 32],
     /// Sequence number of the last covered row (tail-replay locator).
-    pub last_seq: u64,
+    pub(crate) last_seq: u64,
 }
 
 /// Encodes the state length the hash and the storage form both cover, so the
@@ -98,30 +99,96 @@ fn state_blob_len(state: &[u8]) -> Result<u64, SnapshotEnvelopeError> {
 #[non_exhaustive]
 pub struct SnapshotEnvelope {
     /// Owning account the seal binds.
-    pub account: AccountId,
+    pub(crate) account: AccountId,
     /// Owning application space the seal binds.
-    pub space: SpaceId,
+    pub(crate) space: SpaceId,
     /// The projected index identity.
-    pub projection: IndexId,
+    pub(crate) projection: IndexId,
     /// Envelope schema version, always [`SNAPSHOT_SCHEMA_VERSION`] at seal.
-    pub schema_version: u32,
+    pub(crate) schema_version: u32,
     /// Opaque projection semantics fingerprint the seal binds.
-    pub semantics: [u8; 32],
+    pub(crate) semantics: [u8; 32],
     /// Checkpoint of the sealed state, re-derived on restore.
-    pub checkpoint: [u8; 32],
+    pub(crate) checkpoint: [u8; 32],
     /// Last row hash the snapshot covers.
-    pub last_row: [u8; 32],
+    pub(crate) last_row: [u8; 32],
     /// Sequence number of the last covered row, the tail-replay locator.
-    pub last_seq: u64,
+    pub(crate) last_seq: u64,
     /// Sealed projection state bytes.
     pub(crate) state: Vec<u8>,
     /// Creation time in Unix seconds, caller-supplied.
-    pub created_at_secs: u64,
+    pub(crate) created_at_secs: u64,
     /// BLAKE3 over every other field, computed at seal.
-    pub hash: [u8; 32],
+    pub(crate) hash: [u8; 32],
 }
 
 impl SnapshotEnvelope {
+    /// Returns the owning account the seal binds.
+    #[must_use]
+    pub const fn account(&self) -> AccountId {
+        self.account
+    }
+
+    /// Returns the owning application space the seal binds.
+    #[must_use]
+    pub const fn space(&self) -> SpaceId {
+        self.space
+    }
+
+    /// Returns the projected index identity.
+    #[must_use]
+    pub const fn projection(&self) -> IndexId {
+        self.projection
+    }
+
+    /// Returns the envelope schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Returns the opaque projection semantics fingerprint the seal binds.
+    #[must_use]
+    pub const fn semantics(&self) -> [u8; 32] {
+        self.semantics
+    }
+
+    /// Returns the checkpoint of the sealed state.
+    #[must_use]
+    pub const fn checkpoint(&self) -> [u8; 32] {
+        self.checkpoint
+    }
+
+    /// Returns the last row hash the snapshot covers.
+    #[must_use]
+    pub const fn last_row(&self) -> [u8; 32] {
+        self.last_row
+    }
+
+    /// Returns the sequence number of the last covered row.
+    #[must_use]
+    pub const fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+
+    /// Borrows the sealed projection state bytes.
+    #[must_use]
+    pub fn state(&self) -> &[u8] {
+        &self.state
+    }
+
+    /// Returns the creation time in Unix seconds.
+    #[must_use]
+    pub const fn created_at_secs(&self) -> u64 {
+        self.created_at_secs
+    }
+
+    /// Returns the BLAKE3 content address computed at seal.
+    #[must_use]
+    pub const fn hash(&self) -> [u8; 32] {
+        self.hash
+    }
+
     /// Seals a whole frontier, embedding its content address.
     ///
     /// # Errors
@@ -299,9 +366,9 @@ impl SnapshotEnvelope {
             return Err(malformed("envelope carries trailing bytes"));
         }
         Ok(Self {
-            account: AccountId::from_uuid(decode_id(&account)?),
-            space: SpaceId::from_uuid(decode_id(&space)?),
-            projection: IndexId::from_uuid(decode_id(&projection)?),
+            account: AccountId::from_uuid(Uuid::from(account)),
+            space: SpaceId::from_uuid(Uuid::from(space)),
+            projection: IndexId::from_uuid(Uuid::from(projection)),
             schema_version,
             semantics,
             checkpoint,
@@ -312,17 +379,6 @@ impl SnapshotEnvelope {
             hash,
         })
     }
-}
-
-/// Decodes one identifier field, refusing malformed bytes as a malformed
-/// envelope. The three identity fields share this funnel instead of
-/// repeating the mapping.
-fn decode_id<T>(bytes: &[u8]) -> Result<T, SnapshotEnvelopeError>
-where
-    T: for<'de> lgwks_std::json::Deserialize<'de>,
-{
-    super::codec::decode_uuid(bytes)
-        .map_err(|error| SnapshotEnvelopeError::Malformed(error.to_string()))
 }
 
 /// Reads one fixed array, advancing the cursor past it.
@@ -460,11 +516,11 @@ pub trait SnapshotStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Builds one sealed envelope over a blob.
-    fn sealed(blob: Vec<u8>) -> Result<SnapshotEnvelope, SnapshotEnvelopeError> {
+    pub(crate) fn sealed(blob: Vec<u8>) -> Result<SnapshotEnvelope, SnapshotEnvelopeError> {
         let scope = Scope::new(AccountId::new(), SpaceId::new());
         SnapshotEnvelope::seal(SnapshotSeal {
             scope,
@@ -493,7 +549,7 @@ mod tests {
     #[test]
     fn tampered_blob_detection() -> Result<(), Box<dyn std::error::Error>> {
         let mut envelope = sealed(vec![3, 4, 5])?;
-        envelope.state[0] ^= 0xFF;
+        *envelope.state.first_mut().ok_or("sealed state is empty")? ^= 0xFF;
         let error = envelope.verify();
         assert!(
             matches!(error, Err(SnapshotEnvelopeError::Tampered { .. })),
@@ -596,8 +652,9 @@ mod tests {
         let envelope = sealed(vec![5, 6, 7, 8])?;
         let (hash_bytes, bytes) = envelope.serialize_for_storage()?;
         let half = bytes.len().checked_div(2).ok_or("test split")?;
+        let truncated = bytes.get(..half).ok_or("test truncation")?;
         assert!(
-            SnapshotEnvelope::deserialize_from_storage(&hash_bytes, &bytes[..half]).is_err(),
+            SnapshotEnvelope::deserialize_from_storage(&hash_bytes, truncated).is_err(),
             "truncated storage must be refused"
         );
         Ok(())

@@ -144,7 +144,7 @@ impl<'a, P> SnapshotInput<'a, P> {
 pub fn create_snapshot<S, P>(
     store: &S,
     scope: Scope,
-    input: SnapshotInput<'_, P>,
+    input: &SnapshotInput<'_, P>,
 ) -> Result<SnapshotEnvelope, SnapshotEnvelopeError>
 where
     S: SnapshotStore + ?Sized,
@@ -172,7 +172,7 @@ where
 ///
 /// Returns [`SnapshotEnvelopeError`] only when genesis replay itself fails;
 /// every snapshot or tail refusal falls back with its reason recorded.
-pub fn restore_or_replay<S, P, F>(
+pub fn restore_or_replay<S, P, F, E>(
     store: &S,
     scope: Scope,
     projection: IndexId,
@@ -182,7 +182,8 @@ pub fn restore_or_replay<S, P, F>(
 where
     S: SnapshotStore + ?Sized,
     P: RestorableProjection,
-    F: FnMut(&mut P, u64) -> Result<u64, String>,
+    F: FnMut(&mut P, u64) -> Result<u64, E>,
+    E: std::fmt::Display,
 {
     let latest = store
         .load_latest_snapshot(scope, projection)
@@ -244,7 +245,7 @@ fn restore_from_snapshot<P: RestorableProjection>(
 }
 
 /// Replays from genesis on the seed projection.
-fn fallback_to_genesis<P, F>(
+fn fallback_to_genesis<P, F, E>(
     mut seed: P,
     _scope: Scope,
     tail_replay: &mut F,
@@ -252,7 +253,8 @@ fn fallback_to_genesis<P, F>(
 ) -> Result<(P, RestoreStats), SnapshotEnvelopeError>
 where
     P: RestorableProjection,
-    F: FnMut(&mut P, u64) -> Result<u64, String>,
+    F: FnMut(&mut P, u64) -> Result<u64, E>,
+    E: std::fmt::Display,
 {
     let started = std::time::Instant::now();
     let total =
@@ -314,14 +316,14 @@ mod tests {
         create_snapshot(
             store,
             scope,
-            SnapshotInput {
+            &SnapshotInput::new(
                 projection,
-                semantics: [9_u8; 32],
+                [9_u8; 32],
                 state,
                 last_row,
                 last_seq,
-                created_at_secs: 1_700_000_000,
-            },
+                1_700_000_000,
+            ),
         )
     }
 

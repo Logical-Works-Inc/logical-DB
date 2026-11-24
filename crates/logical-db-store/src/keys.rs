@@ -8,7 +8,8 @@ use logical_db_model::{ChangeDigest, DocumentId, IndexId, OperationId, PeerId, S
 use redb::TableDefinition;
 
 /// Versioned table holding every logical-store row for this file format.
-pub(crate) const DATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("logical_data_v3");
+pub(crate) const DATA: TableDefinition<'static, &'static [u8], &'static [u8]> =
+    TableDefinition::new("logical_data_v3");
 /// Versioned magic prefix shared by every scoped storage key.
 pub(crate) const FORMAT: &[u8] = b"LDB\x03";
 /// Storage key that binds the file to one durable replica identity.

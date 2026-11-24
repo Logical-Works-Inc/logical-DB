@@ -50,10 +50,9 @@ const ARTIFACT_PREFIXES: [&str; 5] = [
 ];
 /// Contract lanes, each one `logical-db-e2e` integration-test binary: lane
 /// name, test binary, and arguments passed to the test harness.
-const E2E_LANES: [(&str, &str, &[&str]); 4] = [
-    ("domain-contract", "repository_contract", &[]),
-    ("access-graph", "access_graph", &[]),
-    ("evidence", "clean_room_evidence", &["--nocapture"]),
+const E2E_LANES: [(&str, &str, &[&str]); 3] = [
+    ("dependency-register", "dependency_contract", &[]),
+    ("crate-graph", "crate_graph", &[]),
     ("ci-routing", "ci_routing", &[]),
 ];
 /// Lines from a suppression attribute in which its `reason` must appear.
@@ -190,7 +189,10 @@ fn rust_sources(directory: &Path, found: &mut Vec<PathBuf>) -> Result<(), Failur
         let kind = entry.file_type()?;
         if kind.is_dir() && entry.file_name() != "target" {
             rust_sources(&path, found)?;
-        } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+        } else if !kind.is_dir()
+            && !kind.is_symlink()
+            && path.extension().is_some_and(|extension| extension == "rs")
+        {
             found.push(path);
         }
     }
@@ -341,7 +343,12 @@ fn run() -> Result<ExitCode, Failure> {
         "logical-DB local CI\n  head:    {sha}{dirty}\n  host:    {os} {arch}\n  mode:    {mode}\n  started: {}\n",
         timestamp()?,
     ))?;
+    run_lanes(&mut gate, fast)?;
+    report(&gate, &sha, dirty, mode, receipt)
+}
 
+/// Runs the fast lanes, then every full lane unless `fast`.
+fn run_lanes(gate: &mut Gate, fast: bool) -> Result<(), Failure> {
     gate.lane("lockfile", |gate| {
         gate.cargo(&[
             "metadata",
@@ -430,7 +437,18 @@ fn run() -> Result<ExitCode, Failure> {
         gate.lane("suppressions", suppressions)?;
         gate.lane("artifacts", artifacts)?;
     }
+    Ok(())
+}
 
+/// Prints the lane table, writes the receipt when asked, and picks the exit code.
+fn report(
+    gate: &Gate,
+    sha: &str,
+    dirty: &str,
+    mode: &str,
+    receipt: bool,
+) -> Result<ExitCode, Failure> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let rows = table(&gate.lanes);
     let failed: Vec<&str> = gate
         .lanes

@@ -24,18 +24,16 @@ through Cairn rather than silently mutating memory.
 
 ## What is data here
 
-- A change is immutable and content-addressed. Episode identity is
-  SHA-256 over a v1 framed schema, sequence, kind, scope, all seven clocks,
-  evidence, parents, and payload (`crates/logical-db-episode`); CRDT edits
-  carry an `OperationDigest` over the change bytes (`README.md` facade example).
-  Identity is recomputed on read; mismatch is refused.
+- A change is immutable and content-addressed. CRDT edits carry an
+  `OperationDigest` over the change bytes (`README.md` facade example). The
+  target episode identity hashes schema, sequence, kind, scope, all seven
+  clocks, evidence, parents and payload (#145). Identity is recomputed on read;
+  mismatch is refused.
 - Projection is deterministic. `Projection` maps document state to `IndexValue`
   rows; a database file binds one `ReplicaId` and one schema/projection digest,
   and `migrate_schema` rebuilds indexes in bounded revision-checked pages.
-- Bit/byte packing: columnar index rows over redb, 64 KiB episode payload cap
-  (`MAX_PAYLOAD_BYTES`), digest-framed content identity (`digest_frame`), and
-  the versioned CBOR push/pull wire with hard ceilings on bodies, pages, and
-  page counts.
+- Bit/byte packing: columnar index rows over redb and the versioned CBOR
+  push/pull wire with hard ceilings on bodies, pages, and page counts.
 - Von Neumann dodge: applications read and write the embedded replica with no
   daemon, network, or FDB. Sync moves digests and bounded change pages
   between replicas; full scans stay local or do not happen.
@@ -66,9 +64,9 @@ episode IDs behind it, with validity intervals and provenance intact.
 
 ### 3. Ontology contract
 
-The registry is closed and versioned: 12 `TokenKind`s, 9 `LinkRelation`s, 10
-modalities, 6 actionability levels (`crates/logical-db-cairn`), all bounds fail
-closed, unknown names rejected. Ledger-stored rules (schema/projection digest
+The target registry is closed and versioned (#143): token kinds, link
+relations, modalities and actionability levels, all bounds fail closed, unknown
+names rejected. Ledger-stored rules (schema/projection digest
 binding, deny-first steering, trust-graded memory claims) travel with the data,
 so any replica enforces the same contract. No SDK generates the ontology at
 read time; porting the registry is copying types plus the ledger, not

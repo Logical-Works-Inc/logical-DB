@@ -51,7 +51,7 @@ impl Database {
                     Ok(None)
                 } else {
                     project(&mut state.reader())
-                        .map(|value| Some((snapshot.revision, value)))
+                        .map(|value| Some((snapshot.revision(), value)))
                         .map_err(DatabaseError::from)
                 }
             }
@@ -170,9 +170,7 @@ mod tests {
         });
         let mut documents = Vec::new();
         for value in 1..=8_u128 {
-            documents.push(DocumentId::from_uuid(decode_identity_id(
-                &value.to_be_bytes(),
-            )?));
+            documents.push(decode_identity_id::<DocumentId>(&value.to_be_bytes())?);
         }
         let mut expected = BTreeMap::new();
         let mut operations = Vec::new();
@@ -183,7 +181,9 @@ mod tests {
             random ^= random << 7;
             random ^= random >> 9;
             random ^= random << 8;
-            let document = documents[usize::try_from(random % 8)?];
+            let document = *documents
+                .get(usize::try_from(random % 8)?)
+                .ok_or("eight documents were seeded")?;
             let kind = if expected.get(&document) == Some(&"note") {
                 "task"
             } else {

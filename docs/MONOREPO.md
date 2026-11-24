@@ -22,11 +22,11 @@ the only normal cross-domain imports.
 | Predecessor responsibility | Current state | Target domain | Canonical/migration rule |
 |---|---|---|---|
 | Logical-DB model, CRDT, redb replica, sync, HTTP, service, FDB | Existing `logical-db-*` core crates | Cloud Plane | Current implementation; private backend handles remain below public contracts. |
-| Cairn `wm-core` vocabulary/registry | Bounded `logical-db-cairn` re-expression | Cairn | Migrate registry and candidate contracts without importing the old workspace or copying `smb`. |
+| Cairn `wm-core` vocabulary/registry | Not migrated (bounded port deleted 2026-11-24, need in #143) | Cairn | Migrate registry and candidate contracts without importing the old workspace or copying `smb`. |
 | Cairn `wm-index` source walking/chunking/projections | Not migrated | Cairn | Future ingest/view crates emit source-coordinate candidates only. |
 | Cairn `wm-cli` / `wm-eval` | Not migrated | Cairn | Future domain tools consume published Cairn contracts; they do not become ORIGIN or Forge. |
 | Cairn `smb` fact-store twin | Frozen predecessor debt | None | Do not migrate or fork it. Any retained behavior must be rederived against a current contract and one canonical owner. |
-| LEM episode primitive, clocks, contradictions, LocalWorld | Bounded `logical-db-episode` model | LEM / ORIGIN | ADR-0002 migration in progress; v0 BLAKE3 and v1 SHA-256 remain distinct until adapter proof. |
+| LEM episode primitive, clocks, contradictions, LocalWorld | Not migrated (bounded port deleted 2026-11-24, need in #145) | LEM / ORIGIN | Future LEM crates own the episode wire; the v0 BLAKE3 wire stays the reference. |
 | LEM durable ORIGIN / FjallFactStore authority | Not migrated | LEM / ORIGIN | Future `logical-db-lem-core` owns semantic append through abstract Cloud ports, never raw FDB/redb. |
 | Forge SDK/harness action/receipt discipline | External reference only | Forge | Future action/receipt contract lives above LEM and returns candidate evidence through Cairn. |
 
@@ -39,16 +39,13 @@ The current workspace’s one-way lower-core DAG remains valid:
 
 ```text
 logical-db facade
-  ├── model / CRDT / embedded store / sync / protocol / platform
-  └── optional semantic ports: episode → cairn
+  └── model / CRDT / embedded store / sync / protocol / platform
 
 service composition: HTTP/server/daemon + service contract + FDB adapter
 ```
 
-`logical-db-cairn` and `logical-db-episode` remain optional, bounded migration
-ports. Storage, CRDT, protocol, sync, HTTP, and service crates must not depend
-on them. The future target layout adds Cloud/Cairn/LEM/Forge ownership directories
-only in incremental compatibility-preserving migrations.
+Only Cloud Plane crates exist. The target layout adds Cairn, LEM and Forge
+ownership directories only in incremental, compatibility-preserving moves.
 
 ## Migration protocol
 

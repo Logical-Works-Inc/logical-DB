@@ -217,10 +217,16 @@ fn action_hash(kind: &[u8], scope: Scope, intent: OperationDigest) -> Hasher {
     digest
 }
 
+/// The frame length prefix is the big-endian `usize`; the wire form is 8 bytes,
+/// so a target with another pointer width is refused at compile time.
+const _: () = assert!(
+    size_of::<usize>() == size_of::<u64>(),
+    "the action frame prefix is an 8-byte length; this target's usize differs"
+);
+
 /// Feeds one length-prefixed byte frame into the action hasher.
 fn frame(digest: &mut Hasher, bytes: &[u8]) {
-    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    digest.update(&length.to_be_bytes());
+    digest.update(&bytes.len().to_be_bytes());
     digest.update(bytes);
 }
 
@@ -229,6 +235,7 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+    use lgwks_std::id::Uuid;
     use logical_db_model::{AccountId, ChangeDigest, DocumentId, OperationId, SpaceId};
 
     /// Builds one valid change envelope with distinct non-fixture identities.
@@ -248,12 +255,12 @@ mod tests {
     fn write_action_v1_has_a_portable_golden_encoding() -> Result<(), Box<dyn Error>> {
         let change = ChangeEnvelope {
             scope: Scope::new(
-                AccountId::from_uuid("01010101-0101-0101-0101-010101010101".parse()?),
-                SpaceId::from_uuid("02020202-0202-0202-0202-020202020202".parse()?),
+                AccountId::from_uuid(Uuid::parse("01010101-0101-0101-0101-010101010101")?),
+                SpaceId::from_uuid(Uuid::parse("02020202-0202-0202-0202-020202020202")?),
             ),
-            document: DocumentId::from_uuid("03030303-0303-0303-0303-030303030303".parse()?),
-            operation: OperationId::from_uuid("04040404-0404-0404-0404-040404040404".parse()?),
-            replica: ReplicaId::from_uuid("05050505-0505-0505-0505-050505050505".parse()?),
+            document: DocumentId::from_uuid(Uuid::parse("03030303-0303-0303-0303-030303030303")?),
+            operation: OperationId::from_uuid(Uuid::parse("04040404-0404-0404-0404-040404040404")?),
+            replica: ReplicaId::from_uuid(Uuid::parse("05050505-0505-0505-0505-050505050505")?),
             request: OperationDigest::new([6; 32]),
             digest: ChangeDigest::new([7; 32]),
             bytes: vec![0, 1, 255],
@@ -281,15 +288,42 @@ mod tests {
             write_action(&original),
             "the action digest must be deterministic"
         );
-        let mut variants = vec![original.clone(); 8];
-        variants[0].scope = Scope::new(AccountId::new(), original.scope.space());
-        variants[1].scope = Scope::new(original.scope.account(), SpaceId::new());
-        variants[2].document = DocumentId::new();
-        variants[3].operation = OperationId::new();
-        variants[4].replica = ReplicaId::new();
-        variants[5].request = OperationDigest::new([5; 32]);
-        variants[6].digest = ChangeDigest::new([6; 32]);
-        variants[7].bytes.push(7);
+        let mut longer = original.bytes.clone();
+        longer.push(7);
+        let variants = [
+            ChangeEnvelope {
+                scope: Scope::new(AccountId::new(), original.scope.space()),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                scope: Scope::new(original.scope.account(), SpaceId::new()),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                document: DocumentId::new(),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                operation: OperationId::new(),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                replica: ReplicaId::new(),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                request: OperationDigest::new([5; 32]),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                digest: ChangeDigest::new([6; 32]),
+                ..original.clone()
+            },
+            ChangeEnvelope {
+                bytes: longer,
+                ..original
+            },
+        ];
         for variant in variants {
             assert_ne!(
                 expected,

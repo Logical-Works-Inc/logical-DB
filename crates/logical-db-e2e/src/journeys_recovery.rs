@@ -27,9 +27,8 @@ fn fresh_replica_recovers_a_pruned_document_through_real_http() -> Result<(), Jo
 
 async fn fresh_replica_recovers_a_pruned_document_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [23; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [23; 32], 60_000).await?;
 
     let (scope, document, peer, first_path, second_path) = pair_case("recovery");
 
@@ -45,9 +44,7 @@ async fn fresh_replica_recovers_a_pruned_document_body() -> Result<(), JourneyEr
         .await?;
     assert_eq!(store.frontier(scope).await?, 1);
 
-    seal_consume_and_prune(&store, scope)
-        .await
-        .map_err(JourneyError::Harness)?;
+    seal_consume_and_prune(&store, scope).await?;
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
@@ -75,9 +72,8 @@ fn a_baseline_larger_than_one_page_recovers_through_real_http() -> Result<(), Jo
 
 async fn a_baseline_larger_than_one_page_recovers_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [25; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [25; 32], 60_000).await?;
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let peer = PeerId::new();
@@ -87,7 +83,9 @@ async fn a_baseline_larger_than_one_page_recovers_body() -> Result<(), JourneyEr
     let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
     // The first document of page two is deleted on the seeding replica, so
     // its tombstone crosses the page boundary inside the sealed baseline.
-    let tombstoned = documents[MAX_BASELINE_PAGE_DOCUMENTS];
+    let tombstoned = *documents
+        .get(MAX_BASELINE_PAGE_DOCUMENTS)
+        .ok_or("the fixture must span more than one baseline page")?;
 
     let first = Database::open(&first_path, scope, ReplicaId::new())?;
     for (batch, chunk) in documents.chunks(150).enumerate() {
@@ -121,9 +119,7 @@ async fn a_baseline_larger_than_one_page_recovers_body() -> Result<(), JourneyEr
     }
     assert_eq!(store.frontier(scope).await?, seeded);
 
-    seal_consume_and_prune_through(&store, scope, seeded)
-        .await
-        .map_err(JourneyError::Harness)?;
+    seal_consume_and_prune_through(&store, scope, seeded).await?;
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let report = second
@@ -161,10 +157,10 @@ fn a_local_edit_landing_between_recovery_pages_survives_the_install() -> Result<
 }
 
 /// Seeds the recovery fixture: one baseline page plus one document of chunks.
-async fn seed_interleave_documents(
+fn seed_interleave_documents(
     first: &Database,
     total: usize,
-) -> Result<Vec<DocumentId>, Box<dyn std::error::Error>> {
+) -> Result<Vec<DocumentId>, JourneyError> {
     let documents = (0..total).map(|_| DocumentId::new()).collect::<Vec<_>>();
     for (batch, chunk) in documents.chunks(150).enumerate() {
         let mut edits = Vec::with_capacity(chunk.len());
@@ -191,7 +187,7 @@ async fn drain_seeded_uploads(
     transport: &mut HttpTransport<StaticBearer>,
     store: &MemoryServiceStore,
     seeded: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), JourneyError> {
     for _round in 0..8 {
         first
             .synchronize(peer, transport, SyncLimits::default(), || false)
@@ -206,9 +202,8 @@ async fn drain_seeded_uploads(
 
 async fn local_edit_between_pages_body() -> Result<(), JourneyError> {
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [27; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [27; 32], 60_000).await?;
 
     let scope = Scope::new(AccountId::new(), SpaceId::new());
     let peer = PeerId::new();
@@ -217,28 +212,25 @@ async fn local_edit_between_pages_body() -> Result<(), JourneyError> {
     let total = MAX_BASELINE_PAGE_DOCUMENTS + 1;
 
     let first = Database::open(&first_path, scope, ReplicaId::new())?;
-    let documents = seed_interleave_documents(&first, total)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let documents = seed_interleave_documents(&first, total)?;
+    let probe = *documents
+        .first()
+        .ok_or("the interleave fixture must seed at least one document")?;
     let seeded = u64::try_from(total)?;
-    drain_seeded_uploads(&first, peer, &mut transport, &store, seeded)
-        .await
-        .map_err(JourneyError::Harness)?;
-    seal_consume_and_prune_through(&store, scope, seeded)
-        .await
-        .map_err(JourneyError::Harness)?;
+    drain_seeded_uploads(&first, peer, &mut transport, &store, seeded).await?;
+    seal_consume_and_prune_through(&store, scope, seeded).await?;
 
     let second = Database::open(&second_path, scope, ReplicaId::new())?;
     let local_document = DocumentId::new();
     let local_operation = OperationId::new();
     let mut calls = 0usize;
     let mut landed = false;
-    let mut seam_error: Option<Box<dyn std::error::Error>> = None;
+    let mut seam_error: Option<JourneyError> = None;
     let report = second
         .synchronize(peer, &mut transport, SyncLimits::default(), || {
             calls = calls.saturating_add(1);
             if calls == 2 {
-                match second.read(documents[0], |reader| reader.get(&Object::root(), "page")) {
+                match second.read(probe, |reader| reader.get(&Object::root(), "page")) {
                     Ok(Some(_)) => {
                         seam_error = Some(
                             "the edit must land after the first page and before any install".into(),
@@ -268,7 +260,7 @@ async fn local_edit_between_pages_body() -> Result<(), JourneyError> {
         })
         .await?;
     if let Some(error) = seam_error {
-        return Err(JourneyError::Harness(error));
+        return Err(error);
     }
 
     assert!(
@@ -295,7 +287,7 @@ async fn local_edit_between_pages_body() -> Result<(), JourneyError> {
     assert!(
         pending
             .iter()
-            .any(|change| change.operation == local_operation),
+            .any(|change| change.operation() == local_operation),
         "the concurrent edit must remain in the outbox for upload"
     );
 

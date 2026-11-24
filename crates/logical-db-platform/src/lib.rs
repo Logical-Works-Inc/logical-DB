@@ -13,6 +13,12 @@ use thiserror::Error;
 /// Upper bound on a stable application identifier before it is rejected.
 const MAX_APPLICATION_ID_BYTES: usize = 128;
 
+/// File name of the embedded replica; the `v3` names its persisted format.
+///
+/// One constant owns the name, so a format bump changes the path and every
+/// reader together and an older file is never silently reused.
+const REPLICA_FILE_NAME: &str = "replica-v3.redb";
+
 /// Returns a per-user default replica path without creating directories.
 ///
 /// Callers that already own placement policy should continue passing an
@@ -41,7 +47,7 @@ pub fn database_path_in(
         .into()
         .join("LogicalDB")
         .join(application_id)
-        .join("replica-v3.redb"))
+        .join(REPLICA_FILE_NAME))
 }
 
 /// Resolves the native per-user data root for the compiled target.
@@ -144,13 +150,14 @@ mod tests {
             path,
             root.join("LogicalDB")
                 .join("com.example.notes")
-                .join("replica-v3.redb")
+                .join(REPLICA_FILE_NAME),
+            "a Windows-shaped root keeps its spaces and Unicode"
         );
         Ok(())
     }
 
     #[test]
-    fn application_identifier_cannot_become_a_path() -> Result<(), Box<dyn Error>> {
+    fn application_identifier_cannot_become_a_path() {
         for invalid in ["", ".", "..", "../escape", r"a\b", "snowman-☃"] {
             assert_eq!(
                 database_path_in("root", invalid),
@@ -168,20 +175,26 @@ mod tests {
             Err(PlatformError::InvalidApplicationId),
             "an identifier one byte over the bound is refused"
         );
-        Ok(())
     }
 
     #[test]
     fn native_root_and_default_path_are_nonempty_and_composed_exactly() -> Result<(), Box<dyn Error>>
     {
         let root = platform_data_root()?;
-        assert!(!root.as_os_str().is_empty());
+        assert!(
+            !root.as_os_str().is_empty(),
+            "the native data root is non-empty"
+        );
         assert_eq!(
             default_database_path("com.example.logicaldb")?,
-            database_path_in(root, "com.example.logicaldb")?
+            database_path_in(root, "com.example.logicaldb")?,
+            "the default path composes the native root exactly"
         );
         #[cfg(any(target_os = "macos", all(unix, not(target_os = "macos"))))]
-        assert!(!nonempty_env("HOME")?.is_empty());
+        assert!(
+            !nonempty_env("HOME")?.is_empty(),
+            "HOME is set on unix hosts"
+        );
         Ok(())
     }
 
@@ -189,7 +202,8 @@ mod tests {
     fn environment_derived_root_must_never_be_relative_to_process_cwd() {
         assert_eq!(
             absolute_data_root(OsString::from("relative/data")),
-            Err(PlatformError::RelativeDataRoot)
+            Err(PlatformError::RelativeDataRoot),
+            "a relative environment root is refused"
         );
     }
 }

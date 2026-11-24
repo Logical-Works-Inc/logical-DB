@@ -19,6 +19,15 @@ pub struct EmbeddedStore {
     replica: ReplicaId,
 }
 
+impl std::fmt::Debug for EmbeddedStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedStore")
+            .field("replica", &self.replica)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EmbeddedStore {
     /// Opens or creates one local replica database at an explicit path.
     ///
@@ -59,8 +68,11 @@ impl EmbeddedStore {
             }
             Some(_) => {}
             None => {
-                let mut entries = table.iter()?;
-                if entries.next().transpose()?.is_some() {
+                let has_rows = {
+                    let mut entries = table.iter()?;
+                    entries.next().transpose()?.is_some()
+                };
+                if has_rows {
                     let error = StoreError::MissingReplicaBinding;
                     return Err(error);
                 }

@@ -43,7 +43,7 @@ fn every_authored_external_edge_is_owned() -> Result<(), Box<dyn std::error::Err
         contract.entry_count()
     );
     assert!(
-        contract.enforce,
+        contract.enforce(),
         "the register stands enforcement down; that is a reviewable diff, not a default"
     );
     Ok(())
@@ -265,7 +265,7 @@ fn an_enforcement_stand_down_is_reported_not_silently_honoured()
 -> Result<(), Box<dyn std::error::Error>> {
     let mutated = committed_register()?.replace("enforce = true", "enforce = false");
     let (contract, refusals) = gate_with(&mutated)?;
-    assert!(!contract.enforce, "the stand-down was not read back");
+    assert!(!contract.enforce(), "the stand-down was not read back");
     assert!(
         refusals.is_empty(),
         "the fixture register must otherwise be clean: {refusals:?}"

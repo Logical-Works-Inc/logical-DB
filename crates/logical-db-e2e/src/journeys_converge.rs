@@ -26,9 +26,8 @@ async fn two_embedded_replicas_body() -> Result<(), JourneyError> {
     use std::sync::Arc;
 
     let store = Arc::new(MemoryServiceStore::default());
-    let (mut transport, mut server_tasks) = serve_test_router(Arc::clone(&store), [21; 32], 60_000)
-        .await
-        .map_err(JourneyError::Harness)?;
+    let (mut transport, mut server_tasks) =
+        serve_test_router(Arc::clone(&store), [21; 32], 60_000).await?;
 
     let first_path = path("first");
     let second_path = path("second");
@@ -88,7 +87,7 @@ async fn two_embedded_replicas_body() -> Result<(), JourneyError> {
         .await?;
 
     for database in [&first, &second] {
-        assert_converged(database, document, index).map_err(JourneyError::Harness)?;
+        assert_converged(database, document, index)?;
     }
 
     drop((first, second));

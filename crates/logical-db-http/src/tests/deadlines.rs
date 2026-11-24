@@ -85,7 +85,7 @@ impl Refresh {
     }
 }
 impl CredentialProvider for Refresh {
-    async fn authorization(&mut self) -> Result<HeaderValue, CredentialError> {
+    async fn authorization(&mut self) -> Result<Authorization, CredentialError> {
         let _guard = DropCount(Arc::clone(&self.drops));
         match self.delay {
             Some(delay) => sleep(delay).await,
@@ -94,16 +94,20 @@ impl CredentialProvider for Refresh {
         if self.fail {
             Err(CredentialError::Refresh)
         } else {
-            Ok(HeaderValue::from_static("Bearer never-print-me"))
+            Authorization::new("Bearer never-print-me".to_owned())
         }
     }
 }
 
-fn undispatched_endpoint() -> Result<(TcpListener, Url), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+fn undispatched_endpoint() -> Result<(TcpListener, Endpoint), Box<dyn std::error::Error>> {
+    // An ephemeral loopback port nothing ever connects to.
+    let listener = TcpListener::bind(std::net::SocketAddr::from((
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    )))?;
     listener.set_nonblocking(true)?;
     let endpoint = format!("http://{}/", listener.local_addr()?);
-    Ok((listener, endpoint.parse()?))
+    Ok((listener, Endpoint::parse(&endpoint)?))
 }
 
 fn assert_undispatched(listener: &TcpListener) -> Result<(), Box<dyn std::error::Error>> {
@@ -120,7 +124,7 @@ fn assert_undispatched(listener: &TcpListener) -> Result<(), Box<dyn std::error:
 
 fn successful_endpoint(
     operation: Operation,
-) -> Result<(Url, super::RawServerHandle), Box<dyn std::error::Error>> {
+) -> Result<(Endpoint, super::RawServerHandle), Box<dyn std::error::Error>> {
     let (status, body) = match operation {
         Operation::Push => (
             "200 OK",
@@ -137,7 +141,7 @@ fn successful_endpoint(
         ),
         Operation::Baseline => ("404 Not Found", Vec::new()),
     };
-    spawn_raw_server(move |stream| {
+    spawn_raw_server(move |stream, _release| {
         write_bytes(
             &mut *stream,
             format!(
@@ -145,8 +149,8 @@ fn successful_endpoint(
                 body.len()
             )
             .as_bytes(),
-        );
-        write_bytes(&mut *stream, &body);
+        )?;
+        write_bytes(&mut *stream, &body)
     })
 }
 
@@ -178,18 +182,20 @@ fn refresh_and_http_headers_or_body_share_one_budget() -> Result<(), Box<dyn std
     test_runtime()?.block_on(async {
         for operation in OPERATIONS {
             for stall_body in [false, true] {
-                let (endpoint, _server) = spawn_raw_server(move |stream| {
-                    if !stall_body {
-                        std::thread::park_timeout(Duration::from_millis(300));
-                    }
-                    write_bytes(&mut *stream, &chunked_head());
-                    if stall_body {
-                        chunk(&mut *stream, &[0xa0]);
-                        std::thread::park_timeout(Duration::from_millis(300));
-                    } else {
-                        chunk(&mut *stream, &[0xa0]);
-                    }
-                    write_bytes(&mut *stream, b"0\r\n\r\n");
+                let (endpoint, server) = spawn_raw_server(move |stream, release| {
+                    // The client gives up mid-stall and hangs up, so a refused
+                    // write after the stall is this fixture's expected end.
+                    peer_gone((|| {
+                        if !stall_body {
+                            stall(release, Duration::from_millis(300));
+                        }
+                        write_bytes(&mut *stream, &chunked_head())?;
+                        chunk(&mut *stream, &[0xa0])?;
+                        if stall_body {
+                            stall(release, Duration::from_millis(300));
+                        }
+                        write_bytes(&mut *stream, b"0\r\n\r\n")
+                    })())
                 })?;
                 let mut transport =
                     HttpTransport::new(endpoint, Refresh::new(Some(Duration::from_millis(300))))?;
@@ -204,6 +210,7 @@ fn refresh_and_http_headers_or_body_share_one_budget() -> Result<(), Box<dyn std
                 );
                 assert!(elapsed >= transport.operation_timeout);
                 assert!(elapsed < Duration::from_secs(1));
+                server.finish()?;
             }
         }
 
@@ -227,10 +234,11 @@ fn cancelling_refresh_drops_it_and_reuses_the_same_transport()
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 1);
             assert_undispatched(&listener)?;
             transport.credentials.delay = Some(Duration::ZERO);
-            let (endpoint, _server) = successful_endpoint(operation)?;
+            let (endpoint, server) = successful_endpoint(operation)?;
             transport.endpoint = endpoint;
             timeout(Duration::from_secs(2), invoke(&mut transport, operation)).await??;
             assert_eq!(transport.credentials.drops.load(Ordering::SeqCst), 2);
+            server.finish()?;
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -274,13 +282,15 @@ fn static_and_refreshed_credentials_keep_all_routes_working()
 -> Result<(), Box<dyn std::error::Error>> {
     test_runtime()?.block_on(async {
         for operation in OPERATIONS {
-            let (endpoint, _server) = successful_endpoint(operation)?;
+            let (endpoint, server) = successful_endpoint(operation)?;
             let mut transport = HttpTransport::new(endpoint, StaticBearer::new("integration")?)?;
             invoke(&mut transport, operation).await?;
-            let (endpoint, _refresh_server) = successful_endpoint(operation)?;
+            server.finish()?;
+            let (endpoint, refresh_server) = successful_endpoint(operation)?;
             let mut transport =
                 HttpTransport::new(endpoint, Refresh::new(Some(Duration::from_millis(10))))?;
             invoke(&mut transport, operation).await?;
+            refresh_server.finish()?;
         }
 
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -308,11 +318,13 @@ fn late_ready_credentials_are_refused_before_dispatch() -> Result<(), Box<dyn st
     impl CredentialProvider for Late {
         fn authorization(
             &mut self,
-        ) -> impl std::future::Future<Output = Result<HeaderValue, CredentialError>> {
+        ) -> impl std::future::Future<Output = Result<Authorization, CredentialError>> {
             // Deliberately violate the cooperative-provider contract to prove
             // the post-poll check rejects a late ready value, not to promise preemption.
-            std::thread::park_timeout(Duration::from_millis(50));
-            std::future::ready(Ok(HeaderValue::from_static("Bearer never-print-me")))
+            let (hold, wait) = std::sync::mpsc::sync_channel::<()>(0);
+            stall(&wait, Duration::from_millis(50));
+            drop(hold);
+            std::future::ready(Authorization::new("Bearer never-print-me".to_owned()))
         }
     }
     test_runtime()?.block_on(async {

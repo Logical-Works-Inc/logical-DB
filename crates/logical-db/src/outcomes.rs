@@ -47,13 +47,24 @@ pub(crate) struct PreparedBatchEdit {
 #[non_exhaustive]
 pub struct BatchEdit {
     /// Document receiving the edit.
-    pub document: DocumentId,
+    pub(crate) document: DocumentId,
     /// Retryable logical operation identity.
-    pub operation: OperationId,
+    pub(crate) operation: OperationId,
     /// Canonical caller request identity.
-    pub request: OperationDigest,
+    pub(crate) request: OperationDigest,
     /// Structured edit applied to the document snapshot before commit.
     pub(crate) edit: Box<BatchEditFunction>,
+}
+
+impl std::fmt::Debug for BatchEdit {
+    /// Shows the edit identity; the edit closure has no rendering.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BatchEdit")
+            .field("document", &self.document)
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BatchEdit {
@@ -83,9 +94,9 @@ impl BatchEdit {
 #[non_exhaustive]
 pub struct RemoteChange {
     /// Document receiving the change.
-    pub document: DocumentId,
+    pub(crate) document: DocumentId,
     /// Claimed native CRDT identity, verified before commit.
-    pub digest: ChangeDigest,
+    pub(crate) digest: ChangeDigest,
     /// Canonical CRDT change bytes, bounded before decoding.
     pub(crate) bytes: Vec<u8>,
 }
@@ -115,16 +126,22 @@ impl RemoteChange {
 #[non_exhaustive]
 pub struct PendingChange {
     /// Monotonic outbox position of this change within its scope.
-    pub sequence: u64,
+    pub(crate) sequence: u64,
     /// The verified change identity shared with the wire envelope.
     pub(crate) envelope: ChangeEnvelope,
 }
 
 impl PendingChange {
+    /// The monotonic outbox position of this change within its scope.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     /// Borrows the verified canonical Automerge change bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.envelope.bytes
+        self.envelope.bytes()
     }
 }
 

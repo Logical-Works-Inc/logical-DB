@@ -394,10 +394,21 @@ pub struct KvCache {
     blob_lock: Mutex<()>,
 }
 
+impl std::fmt::Debug for KvCache {
+    /// Names the cache's namespace and blob directory; the replica handle stays out.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KvCache")
+            .field("namespace", &self.namespace)
+            .field("blob_dir", &self.blob_dir)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Shapes the first sixteen digest bytes of `hasher` into the custom
 /// (version 8) RFC 4122 UUID layout the key mapping fixes forever, and
 /// builds the requested identity from them.
-fn custom_id<T>(hasher: Hasher) -> Result<T, KvError>
+fn custom_id<T>(hasher: &Hasher) -> Result<T, KvError>
 where
     T: for<'de> lgwks_std::json::Deserialize<'de>,
 {

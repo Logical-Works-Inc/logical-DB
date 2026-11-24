@@ -5,23 +5,24 @@
 //! S33 S34 S35 S36 S37 S38 S39. Source URLs are in `evidence/SOURCES.md`.
 
 #![forbid(unsafe_code)]
-#![expect(
-    clippy::print_stderr,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
-#![expect(
-    clippy::print_stdout,
-    reason = "src/bin/ is the PRINTS-exempt binary surface per the execution contract"
-)]
 
-use std::{error::Error, fs, io};
+use std::{
+    fs,
+    io::{self, Write},
+};
 
+use lgwks_std::json::serde::de::DeserializeOwned;
 use logical_db::{
     AccountId, Database, DocumentId, Item, Object, OperationDigest, OperationId, PeerId, ReplicaId,
     Scalar, Scope, SpaceId, SyncLimits,
-    http::{HttpTransport, StaticBearer, Url},
+    http::{Endpoint, HttpTransport, StaticBearer},
 };
-use uuid::Uuid;
+use logical_db_e2e::support::{ClientJourneyError, parse_identifier};
+
+/// Parses one identifier environment variable.
+fn identifier<T: DeserializeOwned>(name: &'static str) -> Result<T, io::Error> {
+    parse_identifier(&required(name)?, name)
+}
 
 /// Reads one required environment variable, naming it when it is missing.
 fn required(name: &'static str) -> Result<String, io::Error> {
@@ -34,20 +35,22 @@ fn required(name: &'static str) -> Result<String, io::Error> {
 }
 
 /// Boots the async runtime and drives the facade journey to completion.
-fn main() -> Result<(), Box<dyn Error>> {
-    lgwks_bot::Runtime::new()?.block_on(journey())
+fn main() -> Result<(), ClientJourneyError> {
+    lgwks_bot::rt::runtime::Builder::new()
+        .build()?
+        .block_on(journey())
 }
 
 /// Pulls, verifies, and reopens one document through the public facade.
-async fn journey() -> Result<(), Box<dyn Error>> {
-    let endpoint: Url = required("LOGICAL_DB_JOURNEY_ENDPOINT")?.parse()?;
+async fn journey() -> Result<(), ClientJourneyError> {
+    let endpoint = Endpoint::parse(&required("LOGICAL_DB_JOURNEY_ENDPOINT")?)?;
     let bearer_token = required("LOGICAL_DB_BEARER_TOKEN")?;
     let bearer = StaticBearer::new(&bearer_token)?;
     let scope = Scope::new(
-        AccountId::from_uuid(Uuid::parse_str(&required("LOGICAL_DB_ACCOUNT_ID")?)?),
-        SpaceId::from_uuid(Uuid::parse_str(&required("LOGICAL_DB_SPACE_ID")?)?),
+        identifier::<AccountId>("LOGICAL_DB_ACCOUNT_ID")?,
+        identifier::<SpaceId>("LOGICAL_DB_SPACE_ID")?,
     );
-    let run = Uuid::now_v7();
+    let run = std::process::id();
     let first_path = std::env::temp_dir().join(format!("logical-db-fdb-first-{run}.redb"));
     let second_path = std::env::temp_dir().join(format!("logical-db-fdb-second-{run}.redb"));
     let first = Database::open(&first_path, scope, ReplicaId::new())?;
@@ -80,26 +83,26 @@ async fn journey() -> Result<(), Box<dyn Error>> {
             "facade-http-authority-fdb".into(),
         ))))
     {
-        eprintln!("facade-fdb-journey: replica did not materialize verified state");
         return Err(io::Error::other("replica did not materialize verified state").into());
     }
     let retry = first
         .synchronize(peer, &mut transport, SyncLimits::default(), || false)
         .await?;
     if upload.pushed != 1 || download.pulled != 1 || retry.pushed != 0 {
-        eprintln!(
-            "facade-fdb-journey: unexpected counts pushed={} pulled={} retry={}",
+        return Err(io::Error::other(format!(
+            "journey report violated exact retry semantics: pushed={} pulled={} retry={}",
             upload.pushed, download.pulled, retry.pushed
-        );
-        return Err(io::Error::other("journey report violated exact retry semantics").into());
+        ))
+        .into());
     }
 
     drop((first, second));
     fs::remove_file(&first_path)?;
     fs::remove_file(&second_path)?;
-    println!(
-        "PASS facade-http-authority-fdb pushed={} pulled={} retry={}",
+    let verdict = format!(
+        "PASS facade-http-authority-fdb pushed={} pulled={} retry={}\n",
         upload.pushed, download.pulled, retry.pushed
     );
+    io::stdout().lock().write_all(verdict.as_bytes())?;
     Ok(())
 }

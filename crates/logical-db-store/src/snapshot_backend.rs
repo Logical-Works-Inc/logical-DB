@@ -18,9 +18,11 @@ use super::snapshot_envelope::{
 };
 
 /// Table holding every snapshot record: key to envelope bytes.
-const SNAPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("projection_snapshots_v1");
+const SNAPS: TableDefinition<'static, &'static [u8], &'static [u8]> =
+    TableDefinition::new("projection_snapshots_v1");
 /// Table holding one latest pointer per scope and projection.
-const LATEST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("projection_latest_v1");
+const LATEST: TableDefinition<'static, &'static [u8], &'static [u8]> =
+    TableDefinition::new("projection_latest_v1");
 
 /// Key for one snapshot record: fixed-width scope and projection plus hash.
 fn snapshot_key(scope: Scope, projection: IndexId, hash: &[u8; 32]) -> Vec<u8> {
@@ -117,6 +119,19 @@ impl RedbSnapshotStore {
         Ok(Self { database })
     }
 
+    /// Opens one read transaction, naming the failing operation on error.
+    fn read_transaction(
+        &self,
+        at: &'static str,
+    ) -> Result<redb::ReadTransaction, SnapshotEnvelopeError> {
+        self.database
+            .begin_read()
+            .map_err(|error| SnapshotEnvelopeError::BackendFailed {
+                at,
+                reason: error.to_string(),
+            })
+    }
+
     /// Resolves the latest pointer to its content hash, or `None` cold-start.
     fn resolve_latest_hash(
         &self,
@@ -127,10 +142,7 @@ impl RedbSnapshotStore {
             at: "read latest pointer",
             reason,
         };
-        let transaction = self
-            .database
-            .begin_read()
-            .map_err(|error| failed(error.to_string()))?;
+        let transaction = self.read_transaction("read latest pointer")?;
         let table = transaction
             .open_table(LATEST)
             .map_err(|error| failed(error.to_string()))?;
@@ -208,13 +220,11 @@ impl SnapshotStore for RedbSnapshotStore {
             at: "load snapshot record",
             reason,
         };
-        let transaction = self
-            .database
-            .begin_read()
-            .map_err(|error| failed(error.to_string()))?;
-        let Some(record) = transaction
+        let transaction = self.read_transaction("load snapshot record")?;
+        let table = transaction
             .open_table(SNAPS)
-            .map_err(|error| failed(error.to_string()))?
+            .map_err(|error| failed(error.to_string()))?;
+        let Some(record) = table
             .get(key.as_slice())
             .map_err(|error| failed(error.to_string()))?
         else {
@@ -235,10 +245,7 @@ impl SnapshotStore for RedbSnapshotStore {
             at: "list snapshots",
             reason,
         };
-        let transaction = self
-            .database
-            .begin_read()
-            .map_err(|error| failed(error.to_string()))?;
+        let transaction = self.read_transaction("list snapshots")?;
         let table = transaction
             .open_table(SNAPS)
             .map_err(|error| failed(error.to_string()))?;
@@ -258,15 +265,17 @@ impl SnapshotStore for RedbSnapshotStore {
                 });
             }
             let (key, value) = item.map_err(|error| failed(error.to_string()))?;
-            let Some(hash_start) = key.value().len().checked_sub(32) else {
+            let Some(key_hash) = key
+                .value()
+                .len()
+                .checked_sub(32)
+                .and_then(|hash_start| key.value().get(hash_start..))
+            else {
                 return Err(SnapshotEnvelopeError::Malformed(String::from(
                     "snapshot key shorter than hash",
                 )));
             };
-            let envelope = SnapshotEnvelope::deserialize_from_storage(
-                &key.value()[hash_start..],
-                value.value(),
-            )?;
+            let envelope = SnapshotEnvelope::deserialize_from_storage(key_hash, value.value())?;
             let expected = snapshot_key(scope, projection, &envelope.hash);
             if key.value() != expected.as_slice() {
                 return Err(SnapshotEnvelopeError::Tampered {
